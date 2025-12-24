@@ -1,0 +1,105 @@
+# render.yaml - Render Deployment Configuration
+
+services:
+  # ==========================================
+  # Backend API Server (Node.js + Express)
+  # ==========================================
+  - type: web
+    name: telegram-copier-api
+    runtime: node
+    region: oregon
+    plan: starter # Free tier (can upgrade to standard/pro)
+    branch: main
+    rootDir: server
+    buildCommand: npm install
+    startCommand: node index.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5000
+      - key: MONGODB_URI
+        fromDatabase:
+          name: telegram-copier-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: telegram-copier-redis
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: META_API_TOKEN
+        sync: false
+      - key: CLIENT_URL
+        value: https://telegram-copier-web.onrender.com
+      - key: MAX_DAILY_TRADES
+        value: 20
+      - key: MAX_OPEN_POSITIONS
+        value: 5
+      - key: MAX_DAILY_DRAWDOWN_PERCENT
+        value: 5
+      - key: RISK_MODE
+        value: fixed
+      - key: RISK_PERCENT_PER_TRADE
+        value: 1
+      - key: AUTO_BREAKEVEN_ENABLED
+        value: true
+      - key: AUTO_BREAKEVEN_TRIGGER_PIPS
+        value: 15
+      - key: AUTO_BREAKEVEN_LOCK_PIPS
+        value: 2
+      - key: TRAILING_STOP_ENABLED
+        value: false
+      - key: TRAILING_STOP_PIPS
+        value: 10
+      - key: SIGNAL_COOLDOWN_SECONDS
+        value: 300
+      - key: MIN_SIGNAL_CONFIDENCE
+        value: 0.5
+      - key: LOG_LEVEL
+        value: info
+
+  # ==========================================
+  # Frontend (React + Vite)
+  # ==========================================
+  - type: web
+    name: telegram-copier-web
+    runtime: node
+    region: oregon
+    plan: starter
+    branch: main
+    rootDir: client
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./dist
+    envVars:
+      - key: VITE_API_URL
+        value: https://telegram-copier-api.onrender.com
+
+# ==========================================
+# Database (MongoDB)
+# ==========================================
+databases:
+  - name: telegram-copier-db
+    databaseName: telegram_copier
+    user: telegram_copier_user
+    region: oregon
+    plan: starter # Free 256MB MongoDB instance
+    ipAllowList: []
+
+# ==========================================
+# Redis Cache
+# ==========================================
+services:
+  - type: redis
+    name: telegram-copier-redis
+    region: oregon
+    plan: starter # Free 25MB Redis instance
+    maxmemoryPolicy: allkeys-lru
+    ipAllowList: []
