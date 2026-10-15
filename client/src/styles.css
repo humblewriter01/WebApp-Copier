@@ -108,3 +108,16 @@ button,input,textarea,select{touch-action:manipulation}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
 
 .field-error{font-size:12px;color:#9b302a;line-height:1.45}.telegram-form input[aria-invalid="true"]{border-color:#bb4b43}
+
+/* Workspace view control: hide the fixed navigation to reclaim the full canvas. */
+.sidebar{transition:transform .22s ease,visibility .22s ease}
+.main-area{transition:margin-left .22s ease,width .22s ease}
+.app-shell.sidebar-hidden .sidebar{transform:translateX(calc(-100% - 8px));visibility:hidden;pointer-events:none}
+.app-shell.sidebar-hidden .main-area{margin-left:0;width:100%}
+.sidebar-toggle{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:44px;white-space:nowrap}
+.sidebar-toggle svg{width:17px;height:17px;flex:0 0 17px}
+@media(max-width:700px){
+  .sidebar-toggle{width:44px;padding:8px;gap:0}
+  .sidebar-toggle span{display:none}
+}
+@media(prefers-reduced-motion:reduce){.sidebar,.main-area{transition:none}}
