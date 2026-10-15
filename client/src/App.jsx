@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 
 const configuredApiUrl = import.meta.env.VITE_API_URL || '';
 const apiUrl = import.meta.env.PROD && configuredApiUrl.includes('telegram-copier-api.onrender.com')
@@ -11,6 +11,7 @@ const tabs = [
   ['signals', 'Signals'],
   ['accounts', 'Accounts'],
   ['settings', 'Risk settings'],
+  ['metaapi', 'MetaAPI'],
 ];
 
 async function request(path, token, options = {}) {
@@ -121,6 +122,95 @@ function TelegramPanel({ token, channels, refresh }) {
   </div>;
 }
 
+function MetaApiPanel({ token }) {
+  const [status, setStatus] = useState({ configured: false, linkedAccounts: 0 });
+  const [availableAccounts, setAvailableAccounts] = useState([]);
+  const [linkedAccounts, setLinkedAccounts] = useState([]);
+  const [apiToken, setApiToken] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+
+  const refresh = useCallback(async () => {
+    setBusy(true); setError('');
+    try {
+      const current = await request('/api/metaapi/status', token);
+      setStatus(current);
+      if (current.configured) {
+        const [available, linked] = await Promise.all([
+          request('/api/metaapi/accounts', token),
+          request('/api/metaapi/linked-accounts', token),
+        ]);
+        setAvailableAccounts(available.accounts || []);
+        setLinkedAccounts(linked.accounts || []);
+      } else {
+        setAvailableAccounts([]); setLinkedAccounts([]);
+      }
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  }, [token]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const saveToken = async (event) => {
+    event.preventDefault(); setBusy(true); setError(''); setNotice('');
+    try {
+      const result = await request('/api/metaapi/connection', token, { method: 'PUT', body: { apiToken } });
+      setApiToken(''); setNotice(`MetaAPI connection verified. ${result.accountCount} account(s) found.`);
+      await refresh();
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const linkAccount = async (account) => {
+    setBusy(true); setError(''); setNotice('');
+    try {
+      await request('/api/metaapi/accounts/link', token, { method: 'POST', body: { accountId: account.id } });
+      setNotice(`${account.name || account.login || 'Account'} linked.`); await refresh();
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const unlinkAccount = async (account) => {
+    setBusy(true); setError(''); setNotice('');
+    try {
+      await request(`/api/metaapi/accounts/${encodeURIComponent(account.metaApiAccountId)}`, token, { method: 'DELETE' });
+      setNotice('MetaAPI account unlinked from this workspace.'); await refresh();
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const disconnect = async () => {
+    if (!window.confirm('Remove the encrypted MetaAPI token and unlink MetaAPI accounts from this workspace?')) return;
+    setBusy(true); setError(''); setNotice('');
+    try {
+      await request('/api/metaapi/connection', token, { method: 'DELETE' });
+      setStatus({ configured: false, linkedAccounts: 0 }); setAvailableAccounts([]); setLinkedAccounts([]);
+      setNotice('MetaAPI connection removed.');
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const linkedIds = new Set(linkedAccounts.map((account) => account.metaApiAccountId));
+  return <div className="panel-grid">
+    <section className="panel">
+      <div className="panel-heading"><div><p className="eyebrow">BROKER CONNECTION</p><h2>MetaAPI</h2></div><span className={`status-pill ${status.configured ? 'online' : ''}`}>{status.configured ? 'Connected' : 'Not connected'}</span></div>
+      <p className="muted">Connect your MetaAPI token to discover existing MT4/MT5 accounts. The token is encrypted before storage and never returned to the browser.</p>
+      <form className="form-stack" onSubmit={saveToken}>
+        <label>MetaAPI API token<input type="password" autoComplete="new-password" value={apiToken} onChange={(event) => setApiToken(event.target.value)} placeholder={status.configured ? 'Enter a replacement token to rotate it' : 'Paste your MetaAPI token'} required minLength={20} maxLength={4096} /></label>
+        <div className="button-row"><button className="button button-primary" disabled={busy || !apiToken.trim()}>{busy ? 'Checking…' : 'Verify and save token'}</button>{status.configured && <button type="button" className="button button-danger" disabled={busy} onClick={disconnect}>Disconnect</button>}</div>
+      </form>
+      <div className="note-box">This integration only reads account details and links accounts to your workspace. It does not create or deploy trading accounts, and it does not submit, modify, or close orders.</div>
+    </section>
+    <section className="panel">
+      <div className="panel-heading"><div><p className="eyebrow">EXISTING ACCOUNTS</p><h2>Available on MetaAPI</h2></div><button type="button" className="button button-secondary button-small" disabled={busy || !status.configured} onClick={refresh}>{busy ? 'Loading…' : 'Refresh'}</button></div>
+      {!status.configured ? <div className="empty-state"><strong>Connect a MetaAPI token first</strong><span>Use a token from your MetaAPI account to discover its existing accounts.</span></div> : !availableAccounts.length ? <div className="empty-state"><strong>No MetaAPI accounts found</strong><span>Check the MetaAPI account or refresh the list.</span></div> : <div className="chat-list">{availableAccounts.map((account) => <div className="chat-row" key={account.id}><div><strong>{account.name || account.login || account.id}</strong><small>{[account.platform?.toUpperCase(), account.login && `Login ${account.login}`, account.state].filter(Boolean).join(' · ')}</small></div><button className="button button-small" disabled={busy || linkedIds.has(account.id)} onClick={() => linkAccount(account)}>{linkedIds.has(account.id) ? 'Linked' : 'Link'}</button></div>)}</div>}
+      {linkedAccounts.length > 0 && <><h3 className="section-title">Linked to this workspace</h3><div className="chat-list">{linkedAccounts.map((account) => <div className="chat-row" key={account.id}><div><strong>{account.name || account.login || account.metaApiAccountId}</strong><small>{[account.platform?.toUpperCase(), account.login && `Login ${account.login}`, account.state].filter(Boolean).join(' · ')}</small></div><button className="icon-button" disabled={busy} onClick={() => unlinkAccount(account)}>Unlink</button></div>)}</div></>}
+    </section>
+    {(error || notice) && <div className={`alert ${error ? 'alert-error' : 'alert-success'}`}>{error || notice}</div>}
+  </div>;
+}
+
 function App() {
   const [token, setToken] = useState(sessionStorage.getItem('signal-token') || '');
   const [user, setUser] = useState(null);
@@ -181,6 +271,7 @@ function App() {
           <section className="panel"><div className="panel-heading"><div><p className="eyebrow">LATEST ACTIVITY</p><h2>Recent signals</h2></div><button className="text-button" onClick={() => setTab('signals')}>View all</button></div><SignalTable signals={dashboard?.signals || []} compact /></section>
         </>}
         {tab === 'telegram' && <TelegramPanel token={token} channels={channels} refresh={refresh} />}
+        {tab === 'metaapi' && <MetaApiPanel token={token} />}
         {tab === 'signals' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">CAPTURED MESSAGES</p><h2>Signal history</h2></div><span className="count-badge">{signals.length}</span></div><SignalTable signals={signals} /></section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">MANUAL ENTRY</p><h2>Add a signal note</h2></div></div><p className="muted">Save a message for tracking. The parser may identify a symbol, direction, entry, stop, and target.</p><form className="form-stack" onSubmit={addManualSignal}><label>Signal message<textarea rows="7" value={signalText} onChange={e => setSignalText(e.target.value)} placeholder={'BUY EURUSD\nEntry: 1.0850\nSL: 1.0800\nTP: 1.0950'} required maxLength={5000} /></label><button className="button button-primary">Save signal</button></form></section></div>}
         {tab === 'accounts' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">REFERENCE ONLY</p><h2>Account notes</h2></div><span className="count-badge">{accounts.length}</span></div><p className="muted">Store labels and non-sensitive references. Do not enter broker passwords, API tokens, or account credentials.</p>{!accounts.length ? <div className="empty-state"><strong>No account notes yet</strong><span>Add a label for your own reference.</span></div> : <div className="chat-list">{accounts.map(account => <div className="chat-row" key={account.id}><div><strong>{account.label}</strong><small>{[account.broker, account.platform, account.accountReference].filter(Boolean).join(' · ') || 'Reference only'}</small></div><button className="icon-button" onClick={async () => { await request(`/api/accounts/${account.id}`, token, { method: 'DELETE' }); await refresh(); }}>Remove</button></div>)}</div>}</section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">ADD ENTRY</p><h2>Account note</h2></div></div><form className="form-stack" onSubmit={addAccount}><label>Label<input value={accountForm.label} onChange={e => setAccountForm({ ...accountForm, label: e.target.value })} placeholder="Demo MT5 account" required maxLength={100} /></label><div className="form-row"><label>Broker<input value={accountForm.broker} onChange={e => setAccountForm({ ...accountForm, broker: e.target.value })} /></label><label>Platform<input value={accountForm.platform} onChange={e => setAccountForm({ ...accountForm, platform: e.target.value })} placeholder="MT4, MT5…" /></label></div><label>Non-sensitive reference<input value={accountForm.accountReference} onChange={e => setAccountForm({ ...accountForm, accountReference: e.target.value })} placeholder="Optional alias only" /></label><button className="button button-primary">Save note</button></form></section></div>}
         {tab === 'settings' && <section className="panel settings-panel"><div className="panel-heading"><div><p className="eyebrow">PREFERENCES</p><h2>Risk limits</h2></div></div><p className="muted">These values are saved as planning preferences only. No broker integration or live execution is enabled.</p><form className="form-stack settings-form" onSubmit={saveSettings}><label>Risk model<select value={settings.riskMode} onChange={e => setSettings({ ...settings, riskMode: e.target.value })}><option value="fixed">Fixed risk</option><option value="percent">Percentage based</option></select></label><label>Risk percent per position<input type="number" min="0.1" max="5" step="0.1" value={settings.riskPercent} onChange={e => setSettings({ ...settings, riskPercent: e.target.value })} /></label><label>Maximum open positions<input type="number" min="1" max="50" step="1" value={settings.maxOpenPositions} onChange={e => setSettings({ ...settings, maxOpenPositions: e.target.value })} /></label><label>Daily loss limit (%)<input type="number" min="1" max="25" step="0.5" value={settings.dailyLossLimit} onChange={e => setSettings({ ...settings, dailyLossLimit: e.target.value })} /></label><button className="button button-primary">Save preferences</button></form></section>}

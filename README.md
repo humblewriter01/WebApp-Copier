@@ -1,28 +1,38 @@
 # Telegram Signal Desk
 
-A deployable MVP for capturing Telegram channel messages, extracting common trade-signal fields, and organizing channel/account/risk notes. The project includes a React/Vite client, Express API, PostgreSQL persistence, password-based accounts, and optional Telegram user-session integration.
+A deployable React/Vite and Express app for capturing Telegram channel messages, extracting common trade-signal fields, and organizing channel, account, and risk notes. The current deployment uses Supabase PostgreSQL and Render for the API and static frontend.
 
-## Important scope and safety limits
+## Features
 
-- **Live broker execution is deliberately disabled.** This app does not submit, modify, or close broker orders. Account entries are reference notes only; never enter broker passwords or trading API secrets.
-- Risk settings are planning preferences and do not cause trades.
-- Telegram sessions are encrypted in the database with `SESSION_ENCRYPTION_KEY`. Telegram login codes and 2FA passwords are not logged or stored.
-- A single-instance, always-on backend is needed for continuous Telegram monitoring. Render's free web services can sleep, so this configuration is for evaluation, not unattended signal monitoring.
-- The Render free PostgreSQL plan is suitable for a temporary test deployment only; use a durable paid database plan before storing important account data.
-- This software is not financial advice. Review and test all signals independently.
+- Password-based user accounts and a responsive dashboard.
+- Optional Telegram user-session integration for monitoring selected channels.
+- Signal history and manual signal notes.
+- Reference-only account notes.
+- **MetaAPI connection:** each signed-in user can securely save their MetaAPI API token, discover existing MT4/MT5 accounts, and link account references to their workspace.
+- Risk preferences for planning only.
+
+## Important safety and data notes
+
+- **Live broker execution is disabled.** This application does not submit, modify, or close trading orders. The MetaAPI integration only lists account metadata and verifies/links existing accounts; it does not create or deploy accounts.
+- MetaAPI tokens are submitted over HTTPS, encrypted at rest with AES-256-GCM, stored in a private per-user database table, and never returned to the frontend after saving. `SESSION_ENCRYPTION_KEY` is the server-side encryption key; keep it private and stable. Do not send it or an API token in chat or commit it to Git.
+- The MetaAPI REST client follows the FX Telegram Copier's provisioning API base URL, `auth-token` request header, 30-second timeout, and strict HTTPS behavior. It intentionally does not include the source bot's order-placement or position-modification functions.
+- Telegram sessions are encrypted in the database with the same server encryption key. Rotating that key without re-encrypting existing values will invalidate saved sessions/tokens.
+- Render free web services can sleep, so continuous Telegram monitoring is not reliable on the free tier. Use an always-on backend before relying on unattended monitoring.
+- The app is not financial advice. Review all signals independently.
 
 ## Stack
 
 - Client: React 18 + Vite
 - API: Node.js 18+, Express, Socket.IO
-- Persistence: Render PostgreSQL / PostgreSQL 13+
+- Persistence: Supabase PostgreSQL (or another PostgreSQL 13+ database)
 - Telegram client: GramJS (`telegram` npm package)
+- MetaAPI access: HTTPS REST API via Node's built-in `fetch`
 
 ## Local development
 
 1. Install Node.js 18 or later and PostgreSQL.
-2. Create a PostgreSQL database and copy `.env.example` to `server/.env` (or load its values through your shell).
-3. Set `DATABASE_URL` and a random `JWT_SECRET` of at least 32 characters.
+2. Copy `.env.example` to `server/.env` (or load the variables through your shell).
+3. Set `DATABASE_URL`, a `JWT_SECRET` with at least 32 characters, and a stable `SESSION_ENCRYPTION_KEY`.
 4. Install and start the backend:
 
    ```bash
@@ -39,26 +49,38 @@ A deployable MVP for capturing Telegram channel messages, extracting common trad
    VITE_API_URL=http://localhost:5000 npm run dev
    ```
 
-6. Open the Vite URL printed in the client terminal. The API health endpoint is `http://localhost:5000/health`.
+6. Open the Vite URL printed by the client. The API health endpoint is `http://localhost:5000/health`.
 
-Database tables and indexes are created automatically at first server start.
+The app creates its PostgreSQL tables and indexes on backend startup. The new `metaapi_credentials` and `metaapi_accounts` tables have row-level security enabled; the backend uses its private database role.
 
-## Render deployment
+## MetaAPI setup
 
-`render.yaml` describes a Render web service, static site, and PostgreSQL database. The selected deployment uses the `free` plans to avoid creating billable resources; the free database is temporary and the backend can sleep. Upgrade only after selecting a durable production plan.
+1. Obtain an API token directly from your MetaAPI account.
+2. Sign in to the web app and open **MetaAPI** in the left navigation.
+3. Paste the token into the password field and choose **Verify and save token**. The backend validates it by listing your existing accounts, then stores it encrypted for your signed-in user.
+4. Link only the accounts you want shown in this workspace. Unlinking removes the app's reference; it does not change the MetaAPI account.
 
-Required backend variables:
+No service-wide `META_API_KEY` is needed. The optional `META_API_URL` only overrides the MetaAPI HTTPS API base URL.
+
+## Backend environment variables
 
 | Variable | Required | Purpose |
 |---|---:|---|
-| `DATABASE_URL` | Yes | PostgreSQL connection string |
+| `DATABASE_URL` | Yes | PostgreSQL connection string (Supabase or another PostgreSQL provider) |
 | `JWT_SECRET` | Yes | Signs user access tokens; use at least 32 random characters |
-| `CLIENT_URL` | Yes in production | Exact frontend origin for CORS |
-| `SESSION_ENCRYPTION_KEY` | For Telegram | Encrypts saved Telegram StringSessions; keep stable and secret |
-| `API_ID` / `API_HASH` | For Telegram | Telegram application credentials from `my.telegram.org` |
+| `SESSION_ENCRYPTION_KEY` | Yes | Stable private key for encrypting Telegram sessions and MetaAPI API tokens |
+| `CLIENT_URL` | Production | Exact frontend origin for CORS |
+| `API_ID` / `API_HASH` | For Telegram | Telegram application credentials from [my.telegram.org](https://my.telegram.org) |
+| `META_API_URL` | No | Optional MetaAPI HTTPS base URL override; defaults to `https://mt-provisioning-api-v1.agiliumtrade.ai` |
 | `PORT` | No | Render supplies this automatically |
 
-The initial UI/API work without Telegram credentials; Telegram login is shown as unavailable until `API_ID` and `API_HASH` are configured. Create and verify Telegram application credentials at [my.telegram.org](https://my.telegram.org). Do not commit real credentials to Git.
+The UI/API can be used without Telegram credentials; Telegram is shown as unavailable until `API_ID` and `API_HASH` are configured. Never commit real credentials to Git.
+
+## Render deployment
+
+The deployed architecture uses two Render services because the frontend is a static site and the API is a Node web service. The API connects to Supabase PostgreSQL through its private `DATABASE_URL`; the Render Blueprint no longer provisions a second Render database. The static site uses `VITE_API_URL` to target the API service.
+
+Required API variables: `DATABASE_URL`, `JWT_SECRET`, `SESSION_ENCRYPTION_KEY`, and `CLIENT_URL`. Add `API_ID` and `API_HASH` only if Telegram integration is enabled. MetaAPI users add their own API token in the authenticated MetaAPI page; it is not a shared Render environment variable.
 
 ## API overview
 
@@ -68,6 +90,7 @@ The initial UI/API work without Telegram credentials; Telegram login is shown as
 - `GET/POST /api/signals`
 - `GET/POST /api/accounts`, `DELETE /api/accounts/:id`
 - `GET/PUT /api/settings`
+- `GET /api/metaapi/status`, `PUT/DELETE /api/metaapi/connection`, `GET /api/metaapi/accounts`, `GET /api/metaapi/linked-accounts`, `POST /api/metaapi/accounts/link`, `DELETE /api/metaapi/accounts/:accountId`
 - `GET /api/telegram/status`, `POST /api/telegram/request-code`, `POST /api/telegram/verify-code`, `POST /api/telegram/verify-password`, `GET /api/telegram/chats`, `POST /api/telegram/disconnect`
 - `GET /health`
 

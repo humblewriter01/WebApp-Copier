@@ -13,6 +13,7 @@ import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { NewMessage } from 'telegram/events/index.js';
 import { pool, initializeDatabase } from './db.js';
+import { metaApiRequest, toSafeMetaApiAccount } from './services/metaapi.js';
 
 const app = express();
 const httpServer = createServer(app);
@@ -24,7 +25,7 @@ const telegramLogins = new Map();
 
 const log = (level, message, extra = {}) => {
   const safe = { ...extra };
-  delete safe.phoneNumber; delete safe.token; delete safe.session; delete safe.password;
+  delete safe.phoneNumber; delete safe.token; delete safe.apiToken; delete safe.metaApiToken; delete safe.session; delete safe.password;
   console[level]?.(JSON.stringify({ at: new Date().toISOString(), level, message, ...safe }));
 };
 const asyncRoute = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
@@ -42,6 +43,7 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '1mb' }));
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false }));
+app.use('/api/metaapi', rateLimit({ windowMs: 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false }));
 
 function parseSignal(message) {
   const sideMatch = /\b(BUY|SELL|LONG|SHORT)\b/i.exec(message);
@@ -56,9 +58,9 @@ function parseSignal(message) {
   };
 }
 
-function encryptSession(value) {
+function encryptSecret(value) {
   const secret = process.env.SESSION_ENCRYPTION_KEY;
-  if (!secret) throw new Error('Telegram session encryption is not configured');
+  if (!secret) throw new Error('Application credential encryption is not configured');
   const key = crypto.createHash('sha256').update(secret).digest();
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
@@ -66,9 +68,9 @@ function encryptSession(value) {
   return `${iv.toString('base64')}.${cipher.getAuthTag().toString('base64')}.${ciphertext.toString('base64')}`;
 }
 
-function decryptSession(value) {
+function decryptSecret(value) {
   const secret = process.env.SESSION_ENCRYPTION_KEY;
-  if (!secret) throw new Error('Telegram session encryption is not configured');
+  if (!secret) throw new Error('Application credential encryption is not configured');
   const [ivText, tagText, bodyText] = value.split('.');
   const key = crypto.createHash('sha256').update(secret).digest();
   const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(ivText, 'base64'));
@@ -92,6 +94,11 @@ function authenticate(req, res, next) {
   }
 }
 function publicUser(row) { return { id: row.id, name: row.name, email: row.email, createdAt: row.created_at }; }
+
+async function getMetaApiToken(userId) {
+  const { rows } = await pool.query('SELECT encrypted_api_token FROM metaapi_credentials WHERE user_id=$1', [userId]);
+  return rows[0]?.encrypted_api_token ? decryptSecret(rows[0].encrypted_api_token) : null;
+}
 
 async function saveSignal(userId, message, channel = {}) {
   const parsed = parseSignal(message);
@@ -134,7 +141,7 @@ async function restoreTelegramClient(userId) {
   const { rows } = await pool.query('SELECT telegram_session FROM users WHERE id=$1', [userId]);
   if (!rows[0]?.telegram_session) return null;
   if (!process.env.API_ID || !process.env.API_HASH) throw new Error('Telegram API credentials are not configured');
-  const client = new TelegramClient(new StringSession(decryptSession(rows[0].telegram_session)), Number(process.env.API_ID), process.env.API_HASH, { connectionRetries: 3 });
+  const client = new TelegramClient(new StringSession(decryptSecret(rows[0].telegram_session)), Number(process.env.API_ID), process.env.API_HASH, { connectionRetries: 3 });
   await client.connect();
   if (!(await client.checkAuthorization())) {
     await client.disconnect();
@@ -265,6 +272,69 @@ app.delete('/api/accounts/:id', authenticate, asyncRoute(async (req, res) => {
   res.json({ ok: true });
 }));
 
+app.get('/api/metaapi/status', authenticate, asyncRoute(async (req, res) => {
+  const [{ rows: credentials }, { rows: linked }] = await Promise.all([
+    pool.query('SELECT updated_at FROM metaapi_credentials WHERE user_id=$1', [req.userId]),
+    pool.query('SELECT COUNT(*)::int AS count FROM metaapi_accounts WHERE user_id=$1', [req.userId]),
+  ]);
+  res.json({ configured: Boolean(credentials[0]), linkedAccounts: linked[0].count, updatedAt: credentials[0]?.updated_at || null });
+}));
+app.put('/api/metaapi/connection', authenticate, asyncRoute(async (req, res) => {
+  const apiToken = typeof req.body.apiToken === 'string' ? req.body.apiToken.trim() : '';
+  if (apiToken.length < 20 || apiToken.length > 4096) return fail(res, 400, 'Enter a valid MetaAPI token.');
+  const accounts = await metaApiRequest(apiToken, '/users/current/accounts');
+  if (!Array.isArray(accounts)) return fail(res, 502, 'MetaAPI returned an unexpected account list.');
+  const encryptedApiToken = encryptSecret(apiToken);
+  await pool.query(
+    `INSERT INTO metaapi_credentials(user_id,encrypted_api_token) VALUES($1,$2)
+     ON CONFLICT(user_id) DO UPDATE SET encrypted_api_token=EXCLUDED.encrypted_api_token,updated_at=NOW()`,
+    [req.userId, encryptedApiToken],
+  );
+  res.json({ configured: true, accountCount: accounts.length });
+}));
+app.delete('/api/metaapi/connection', authenticate, asyncRoute(async (req, res) => {
+  await pool.query('DELETE FROM metaapi_credentials WHERE user_id=$1', [req.userId]);
+  await pool.query('DELETE FROM metaapi_accounts WHERE user_id=$1', [req.userId]);
+  res.json({ configured: false, ok: true });
+}));
+app.get('/api/metaapi/accounts', authenticate, asyncRoute(async (req, res) => {
+  const apiToken = await getMetaApiToken(req.userId);
+  if (!apiToken) return fail(res, 409, 'Connect a MetaAPI token first.');
+  const accounts = await metaApiRequest(apiToken, '/users/current/accounts');
+  if (!Array.isArray(accounts)) return fail(res, 502, 'MetaAPI returned an unexpected account list.');
+  res.json({ accounts: accounts.map(toSafeMetaApiAccount).filter(Boolean) });
+}));
+app.get('/api/metaapi/linked-accounts', authenticate, asyncRoute(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT id,metaapi_account_id AS "metaApiAccountId",login,name,platform,state,created_at AS "createdAt"
+     FROM metaapi_accounts WHERE user_id=$1 ORDER BY created_at DESC`,
+    [req.userId],
+  );
+  res.json({ accounts: rows });
+}));
+app.post('/api/metaapi/accounts/link', authenticate, asyncRoute(async (req, res) => {
+  const apiToken = await getMetaApiToken(req.userId);
+  if (!apiToken) return fail(res, 409, 'Connect a MetaAPI token first.');
+  const accountId = String(req.body.accountId || '').trim();
+  if (!accountId || accountId.length > 200) return fail(res, 400, 'A valid MetaAPI account ID is required.');
+  const accountDetails = await metaApiRequest(apiToken, `/users/current/accounts/${encodeURIComponent(accountId)}`);
+  const account = toSafeMetaApiAccount(accountDetails);
+  if (!account || account.id !== accountId) return fail(res, 502, 'MetaAPI returned invalid account details.');
+  const { rows } = await pool.query(
+    `INSERT INTO metaapi_accounts(user_id,metaapi_account_id,login,name,platform,state)
+     VALUES($1,$2,$3,$4,$5,$6)
+     ON CONFLICT(user_id,metaapi_account_id) DO UPDATE SET login=EXCLUDED.login,name=EXCLUDED.name,platform=EXCLUDED.platform,state=EXCLUDED.state
+     RETURNING id,metaapi_account_id AS "metaApiAccountId",login,name,platform,state,created_at AS "createdAt"`,
+    [req.userId, account.id, account.login, account.name, account.platform, account.state],
+  );
+  res.status(201).json({ account: rows[0] });
+}));
+app.delete('/api/metaapi/accounts/:accountId', authenticate, asyncRoute(async (req, res) => {
+  const result = await pool.query('DELETE FROM metaapi_accounts WHERE user_id=$1 AND metaapi_account_id=$2', [req.userId, req.params.accountId]);
+  if (!result.rowCount) return fail(res, 404, 'Linked MetaAPI account not found.');
+  res.json({ ok: true });
+}));
+
 app.get('/api/settings', authenticate, asyncRoute(async (req, res) => {
   const { rows } = await pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit" FROM settings WHERE user_id=$1', [req.userId]);
   res.json({ settings: rows[0] || { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 5, dailyLossLimit: 5 } });
@@ -317,7 +387,7 @@ app.post('/api/telegram/request-code', authenticate, asyncRoute(async (req, res)
 
 async function finishTelegramLogin(req, res, client) {
   const session = client.session.save();
-  const encrypted = encryptSession(session);
+  const encrypted = encryptSecret(session);
   await pool.query('UPDATE users SET telegram_session=$1,telegram_connected=TRUE,telegram_phone=$2 WHERE id=$3', [encrypted, telegramLogins.get(req.userId)?.phoneNumber || null, req.userId]);
   telegramLogins.delete(req.userId);
   telegramClients.set(req.userId, { client, handler: null });
