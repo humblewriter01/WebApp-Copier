@@ -1,10 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
+import Sidebar from './components/Sidebar.jsx';
+import TelegramConnect from './components/TelegramConnect.jsx';
+import { request } from './lib/api.js';
 
-const configuredApiUrl = import.meta.env.VITE_API_URL || '';
-const apiUrl = import.meta.env.PROD && configuredApiUrl.includes('telegram-copier-api.onrender.com')
-  ? 'https://telegram-copier-api-l1mj.onrender.com'
-  : configuredApiUrl || (import.meta.env.PROD ? 'https://telegram-copier-api-l1mj.onrender.com' : 'http://localhost:5000');
-const API_URL = apiUrl.replace(/\/$/, '');
 const tabs = [
   ['overview', 'Overview'],
   ['telegram', 'Telegram'],
@@ -13,21 +11,6 @@ const tabs = [
   ['settings', 'Risk settings'],
   ['metaapi', 'MetaAPI'],
 ];
-
-async function request(path, token, options = {}) {
-  const response = await fetch(`${API_URL}${path}`, {
-    ...options,
-    headers: {
-      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...options.headers,
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined,
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok && response.status !== 202) throw new Error(payload.error || payload.message || `Request failed (${response.status})`);
-  return payload;
-}
 
 function AuthScreen({ onAuthenticated, installPrompt, onInstall }) {
   const [mode, setMode] = useState('login');
@@ -65,62 +48,18 @@ function Metric({ label, value, note }) {
   return <div className="metric-card"><span className="metric-label">{label}</span><strong>{value ?? '—'}</strong><span className="metric-note">{note}</span></div>;
 }
 
-function SignalTable({ signals, compact = false }) {
-  if (!signals?.length) return <div className="empty-state"><strong>No signals yet</strong><span>Connect a Telegram channel or add a signal message manually.</span></div>;
+function SignalTable({ signals, compact = false, onEmptyAction }) {
+  if (!signals?.length) return <div className="empty-state signal-empty">
+    <span className="empty-icon" aria-hidden="true">↗</span>
+    <strong>No signals yet</strong>
+    <span>Connect a Telegram source to start collecting messages, or add a note from Signal history.</span>
+    {onEmptyAction && <button className="button button-secondary" type="button" onClick={onEmptyAction}>Connect Telegram</button>}
+  </div>;
   return <div className="signal-list">{signals.map(signal => <article className="signal-item" key={signal.id}>
     <div className="signal-top"><div><strong>{signal.symbol || 'Unparsed message'}</strong><span className="signal-source">{signal.channelTitle || 'Telegram source'}</span></div><span className={`badge ${signal.side === 'buy' ? 'badge-buy' : signal.side === 'sell' ? 'badge-sell' : ''}`}>{signal.side || 'received'}</span></div>
     <p className="signal-message">{signal.message}</p>
     <div className="signal-meta">{signal.entryPrice != null && <span>Entry {signal.entryPrice}</span>}{signal.stopLoss != null && <span>SL {signal.stopLoss}</span>}{signal.takeProfit != null && <span>TP {signal.takeProfit}</span>}<time>{signal.createdAt ? new Date(signal.createdAt).toLocaleString() : ''}</time></div>
   </article>)}</div>;
-}
-
-function TelegramPanel({ token, channels, refresh }) {
-  const [status, setStatus] = useState({ configured: false, connected: false });
-  const [chats, setChats] = useState([]);
-  const [phone, setPhone] = useState('');
-  const [code, setCode] = useState('');
-  const [password, setPassword] = useState('');
-  const [step, setStep] = useState('phone');
-  const [message, setMessage] = useState('');
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
-  const checkStatus = useCallback(async () => { try { const s = await request('/api/telegram/status', token); setStatus(s); } catch (e) { setError(e.message); } }, [token]);
-  const loadChats = useCallback(async () => { try { const data = await request('/api/telegram/chats', token); setChats(data.chats || []); } catch (e) { setError(e.message); } }, [token]);
-  useEffect(() => { checkStatus(); }, [checkStatus]);
-  useEffect(() => { if (status.connected) loadChats(); }, [status.connected, loadChats]);
-  const action = async (path, body, success) => {
-    setBusy(true); setError(''); setMessage('');
-    try { const result = await request(path, token, { method: 'POST', body }); if (result.requiresPassword) { setStep('password'); setMessage(result.message); } else { setMessage(success || result.message || 'Done.'); if (result.connected) { setStep('phone'); await checkStatus(); await loadChats(); } } }
-    catch (e) { setError(e.message); } finally { setBusy(false); }
-  };
-  const addChannel = async (chat) => {
-    try { await request('/api/channels', token, { method: 'POST', body: chat }); setMessage(`Added ${chat.title}.`); await refresh(); } catch (e) { setError(e.message); }
-  };
-  const removeChannel = async (id) => {
-    try { await request(`/api/channels/${id}`, token, { method: 'DELETE' }); await refresh(); } catch (e) { setError(e.message); }
-  };
-  return <div className="panel-grid">
-    <section className="panel">
-      <div className="panel-heading"><div><p className="eyebrow">SOURCE ACCOUNT</p><h2>Telegram connection</h2></div><span className={`status-pill ${status.connected ? 'online' : ''}`}>{status.connected ? 'Connected' : 'Not connected'}</span></div>
-      {!status.configured && <div className="alert alert-info telegram-setup"><strong>Enable Telegram login</strong><ol><li>Get your API ID and API hash at <a href="https://my.telegram.org/apps" target="_blank" rel="noreferrer">my.telegram.org/apps</a>.</li><li>In Render, open the <code>telegram-copier-api</code> service → <strong>Environment</strong>. Add <code>API_ID</code> with the numeric ID and <code>API_HASH</code> with the hash.</li><li>Save the changes and wait for the API service to redeploy. Keep these values out of frontend variables and GitHub.</li></ol></div>}
-      {status.connected ? <>
-        <p className="muted">Your Telegram session is stored encrypted in the database. Only channels you subscribe to are monitored.</p>
-        <div className="button-row"><button className="button button-secondary" onClick={loadChats}>Refresh channel list</button><button className="button button-danger" onClick={async () => { if (!window.confirm('Disconnect Telegram and delete the saved session?')) return; await action('/api/telegram/disconnect', {}, 'Telegram disconnected.'); setStatus({ ...status, connected: false }); setChats([]); await refresh(); }}>Disconnect</button></div>
-        <h3 className="section-title">Available chats</h3>
-        {!chats.length ? <p className="muted">No groups or channels were returned. Use Refresh to try again.</p> : <div className="chat-list">{chats.map(chat => { const added = channels.some(c => c.channelId === chat.channelId); return <div className="chat-row" key={chat.channelId}><div><strong>{chat.title}</strong><small>{chat.username ? `@${chat.username}` : chat.channelId}</small></div><button className="button button-small" disabled={added} onClick={() => addChannel(chat)}>{added ? 'Added' : 'Monitor'}</button></div>; })}</div>}
-      </> : <>
-        <p className="muted">Connect using Telegram’s login code. The service never asks for your Telegram password unless two-step verification requires it.</p>
-        {step === 'phone' && <form className="form-stack" onSubmit={e => { e.preventDefault(); action('/api/telegram/request-code', { phoneNumber: phone }, 'Code requested.'); setStep('code'); }}><label>Phone number<input type="tel" placeholder="+15551234567" value={phone} onChange={e => setPhone(e.target.value)} required /></label><button className="button button-primary" disabled={busy || !status.configured}>{busy ? 'Requesting…' : 'Send Telegram code'}</button></form>}
-        {step === 'code' && <form className="form-stack" onSubmit={e => { e.preventDefault(); action('/api/telegram/verify-code', { code }, 'Telegram connected.'); }}><label>Login code<input autoComplete="one-time-code" value={code} onChange={e => setCode(e.target.value)} required /></label><button className="button button-primary" disabled={busy}>{busy ? 'Verifying…' : 'Verify code'}</button></form>}
-        {step === 'password' && <form className="form-stack" onSubmit={e => { e.preventDefault(); action('/api/telegram/verify-password', { password }, 'Telegram connected.'); }}><label>Two-step verification password<input type="password" autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} required /></label><button className="button button-primary" disabled={busy}>{busy ? 'Verifying…' : 'Verify password'}</button></form>}
-      </>}
-      {message && <div className="alert alert-success">{message}</div>}{error && <div className="alert alert-error">{error}</div>}
-    </section>
-    <section className="panel"><div className="panel-heading"><div><p className="eyebrow">MONITORED SOURCES</p><h2>Subscribed channels</h2></div><span className="count-badge">{channels.length}</span></div>
-      {!channels.length ? <div className="empty-state"><strong>No channels selected</strong><span>Connect Telegram and choose the channels to monitor.</span></div> : <div className="chat-list">{channels.map(channel => <div className="chat-row" key={channel.id}><div><strong>{channel.title}</strong><small>{channel.enabled ? 'Monitoring enabled' : 'Paused'}</small></div><button className="icon-button" aria-label={`Remove ${channel.title}`} onClick={() => removeChannel(channel.id)}>Remove</button></div>)}</div>}
-      <div className="note-box">Only new posts received while the service is awake are captured. A free Render web service can sleep; continuous monitoring requires an always-on deployment.</div>
-    </section>
-  </div>;
 }
 
 function MetaApiPanel({ token }) {
@@ -279,19 +218,19 @@ function App() {
   if (!token) return <AuthScreen onAuthenticated={authenticated} installPrompt={installPrompt} onInstall={installApp} />;
   if (loading) return <main className="loading-shell"><div className="spinner" /><span>Loading your workspace…</span></main>;
   return <div className="app-shell">
-    <aside className="sidebar"><div className="side-brand"><div className="brand-mark"><img src="/icons/signal-desk-icon-192.png" alt="" /></div><div><strong>Signal Desk</strong><small>Telegram copier</small></div></div><nav>{tabs.map(([key, label]) => <button key={key} className={`nav-item ${tab === key ? 'active' : ''}`} onClick={() => setTab(key)}><span className="nav-dot" />{label}</button>)}</nav><div className="sidebar-bottom"><div className="user-mini"><span className="avatar">{(user?.name || 'U').slice(0, 1).toUpperCase()}</span><div><strong>{user?.name}</strong><small>{user?.email}</small></div></div><button className="logout-button" onClick={logout}>Sign out</button></div></aside>
+    <Sidebar active={tab} onNavigate={setTab} user={user} onSignOut={logout} />
     <main className="main-area"><header className="topbar"><div><span className="eyebrow">PERSONAL WORKSPACE</span><h1>{tabs.find(([key]) => key === tab)?.[1] || 'Overview'}</h1></div><div className="topbar-right">{installPrompt && <button className="button button-primary button-small install-app-button" onClick={installApp}>Install app</button>}<span className="status-pill online"><i /> Connected</span><button className="button button-secondary button-small" onClick={refresh}>Refresh</button></div></header>
-      {error && <div className="alert alert-error global-alert">{error}<button className="alert-close" onClick={() => setError('')}>×</button></div>}{notice && <div className="alert alert-success global-alert">{notice}<button className="alert-close" onClick={() => setNotice('')}>×</button></div>}
+      {error && <div className="alert alert-error global-alert" role="alert">{error}<button className="alert-close" onClick={() => setError('')}>×</button></div>}{notice && <div className="alert alert-success global-alert" role="status" aria-live="polite">{notice}<button className="alert-close" onClick={() => setNotice('')}>×</button></div>}
       <div className="content-area">
         {tab === 'overview' && <>
           <section className="welcome-row"><div><h2>Good to see you, {user?.name?.split(' ')[0] || 'trader'}.</h2><p>Monitor Telegram signals and keep your setup organized.</p></div><span className="live-label"><i /> Signal monitoring</span></section>
           <div className="metrics-grid"><Metric label="Signals captured" value={dashboard?.stats?.totalSignals ?? 0} note="Across your workspace" /><Metric label="Active sources" value={dashboard?.stats?.activeChannels ?? 0} note="Telegram channels" /><Metric label="Account notes" value={dashboard?.stats?.accounts ?? 0} note="No secrets stored" /><Metric label="Live trades" value="Disabled" note="No live orders sent" /></div>
           <div className="notice-banner"><strong>Live execution is off</strong><span>This deployment captures and organizes signal messages. It does not connect to broker accounts or place orders.</span></div>
-          <section className="panel"><div className="panel-heading"><div><p className="eyebrow">LATEST ACTIVITY</p><h2>Recent signals</h2></div><button className="text-button" onClick={() => setTab('signals')}>View all</button></div><SignalTable signals={dashboard?.signals || []} compact /></section>
+          <section className="panel"><div className="panel-heading"><div><p className="eyebrow">LATEST ACTIVITY</p><h2>Recent signals</h2></div><button className="text-button" onClick={() => setTab('signals')}>View all</button></div><SignalTable signals={dashboard?.signals || []} compact onEmptyAction={() => setTab('telegram')} /></section>
         </>}
-        {tab === 'telegram' && <TelegramPanel token={token} channels={channels} refresh={refresh} />}
+        {tab === 'telegram' && <TelegramConnect token={token} channels={channels} onRefresh={refresh} />}
         {tab === 'metaapi' && <MetaApiPanel token={token} />}
-        {tab === 'signals' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">CAPTURED MESSAGES</p><h2>Signal history</h2></div><span className="count-badge">{signals.length}</span></div><SignalTable signals={signals} /></section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">MANUAL ENTRY</p><h2>Add a signal note</h2></div></div><p className="muted">Save a message for tracking. The parser may identify a symbol, direction, entry, stop, and target.</p><form className="form-stack" onSubmit={addManualSignal}><label>Signal message<textarea rows="7" value={signalText} onChange={e => setSignalText(e.target.value)} placeholder={'BUY EURUSD\nEntry: 1.0850\nSL: 1.0800\nTP: 1.0950'} required maxLength={5000} /></label><button className="button button-primary">Save signal</button></form></section></div>}
+        {tab === 'signals' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">CAPTURED MESSAGES</p><h2>Signal history</h2></div><span className="count-badge">{signals.length}</span></div><SignalTable signals={signals} onEmptyAction={() => setTab('telegram')} /></section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">MANUAL ENTRY</p><h2>Add a signal note</h2></div></div><p className="muted">Save a message for tracking. The parser may identify a symbol, direction, entry, stop, and target.</p><form className="form-stack" onSubmit={addManualSignal}><label>Signal message<textarea rows="7" value={signalText} onChange={e => setSignalText(e.target.value)} placeholder={'BUY EURUSD\nEntry: 1.0850\nSL: 1.0800\nTP: 1.0950'} required maxLength={5000} /></label><button className="button button-primary">Save signal</button></form></section></div>}
         {tab === 'accounts' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">REFERENCE ONLY</p><h2>Account notes</h2></div><span className="count-badge">{accounts.length}</span></div><p className="muted">Store labels and non-sensitive references. Do not enter broker passwords, API tokens, or account credentials.</p>{!accounts.length ? <div className="empty-state"><strong>No account notes yet</strong><span>Add a label for your own reference.</span></div> : <div className="chat-list">{accounts.map(account => <div className="chat-row" key={account.id}><div><strong>{account.label}</strong><small>{[account.broker, account.platform, account.accountReference].filter(Boolean).join(' · ') || 'Reference only'}</small></div><button className="icon-button" onClick={async () => { await request(`/api/accounts/${account.id}`, token, { method: 'DELETE' }); await refresh(); }}>Remove</button></div>)}</div>}</section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">ADD ENTRY</p><h2>Account note</h2></div></div><form className="form-stack" onSubmit={addAccount}><label>Label<input value={accountForm.label} onChange={e => setAccountForm({ ...accountForm, label: e.target.value })} placeholder="Demo MT5 account" required maxLength={100} /></label><div className="form-row"><label>Broker<input value={accountForm.broker} onChange={e => setAccountForm({ ...accountForm, broker: e.target.value })} /></label><label>Platform<input value={accountForm.platform} onChange={e => setAccountForm({ ...accountForm, platform: e.target.value })} placeholder="MT4, MT5…" /></label></div><label>Non-sensitive reference<input value={accountForm.accountReference} onChange={e => setAccountForm({ ...accountForm, accountReference: e.target.value })} placeholder="Optional alias only" /></label><button className="button button-primary">Save note</button></form></section></div>}
         {tab === 'settings' && <section className="panel settings-panel"><div className="panel-heading"><div><p className="eyebrow">PREFERENCES</p><h2>Risk limits</h2></div></div><p className="muted">These values are saved as planning preferences only. No broker integration or live execution is enabled.</p><form className="form-stack settings-form" onSubmit={saveSettings}><label>Risk model<select value={settings.riskMode} onChange={e => setSettings({ ...settings, riskMode: e.target.value })}><option value="fixed">Fixed risk</option><option value="percent">Percentage based</option></select></label><label>Risk percent per position<input type="number" min="0.1" max="5" step="0.1" value={settings.riskPercent} onChange={e => setSettings({ ...settings, riskPercent: e.target.value })} /></label><label>Maximum open positions<input type="number" min="1" max="50" step="1" value={settings.maxOpenPositions} onChange={e => setSettings({ ...settings, maxOpenPositions: e.target.value })} /></label><label>Daily loss limit (%)<input type="number" min="1" max="25" step="0.5" value={settings.dailyLossLimit} onChange={e => setSettings({ ...settings, dailyLossLimit: e.target.value })} /></label><button className="button button-primary">Save preferences</button></form></section>}
       </div>
