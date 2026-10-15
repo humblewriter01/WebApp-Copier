@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
 
-const API_URL = (import.meta.env.VITE_API_URL || 'http://localhost:5000').replace(/\/$/, '');
+const configuredApiUrl = import.meta.env.VITE_API_URL || '';
+const apiUrl = import.meta.env.PROD && configuredApiUrl.includes('telegram-copier-api.onrender.com')
+  ? 'https://telegram-copier-api-l1mj.onrender.com'
+  : configuredApiUrl || (import.meta.env.PROD ? 'https://telegram-copier-api-l1mj.onrender.com' : 'http://localhost:5000');
+const API_URL = apiUrl.replace(/\/$/, '');
 const tabs = [
   ['overview', 'Overview'],
   ['telegram', 'Telegram'],
