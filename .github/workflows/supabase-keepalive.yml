@@ -1,0 +1,31 @@
+name: Supabase daily keep-alive
+
+on:
+  schedule:
+    # Run daily at 09:17 UTC. Supabase receives a lightweight read-only DB query.
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  keepalive:
+    name: Query Supabase
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Call read-only keep-alive RPC
+        env:
+          # Both values are public client configuration; never place a database password or service-role key here.
+          SUPABASE_URL: https://vphckospghbeezvwpjwp.supabase.co
+          SUPABASE_PUBLISHABLE_KEY: sb_publishable_KzOiEouPTpCA9xx0mudKHw_kQMncouM
+        shell: bash
+        run: |
+          set -euo pipefail
+          response="$(curl --fail-with-body --silent --show-error --retry 3 --retry-delay 2 \
+            --request POST "${SUPABASE_URL%/}/rest/v1/rpc/github_keepalive" \
+            --header "apikey: ${SUPABASE_PUBLISHABLE_KEY}" \
+            --header "Authorization: Bearer ${SUPABASE_PUBLISHABLE_KEY}" \
+            --header 'Content-Type: application/json' \
+            --data '{}')"
+          echo "Supabase keep-alive succeeded: ${response}"
