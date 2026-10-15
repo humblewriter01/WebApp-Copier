@@ -16,7 +16,9 @@ export async function request(path, token, options = {}) {
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok && response.status !== 202) {
-    throw new Error(payload.error || payload.message || `Request failed (${response.status})`);
+    const error = new Error(payload.error || payload.message || `Request failed (${response.status})`);
+    if (payload.telegramErrorCode) error.telegramErrorCode = payload.telegramErrorCode;
+    throw error;
   }
   return payload;
 }

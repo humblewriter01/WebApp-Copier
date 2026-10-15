@@ -9,11 +9,12 @@ import helmet from 'helmet';
 import compression from 'compression';
 import rateLimit from 'express-rate-limit';
 import { Server } from 'socket.io';
-import { TelegramClient } from 'telegram';
+import { Api, TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { NewMessage } from 'telegram/events/index.js';
 import { pool, initializeDatabase } from './db.js';
 import { metaApiRequest, toSafeMetaApiAccount } from './services/metaapi.js';
+import { getTelegramErrorCode, isTelegramPasswordNeeded, shouldDiscardTelegramLogin, telegramAuthErrorPayload } from './services/telegram-auth.js';
 
 const app = express();
 const httpServer = createServer(app);
@@ -366,67 +367,206 @@ app.get('/api/telegram/status', authenticate, asyncRoute(async (req, res) => {
   }
   res.json({ configured, connected, message: configured ? null : 'Add Telegram API ID and API hash in the service environment to enable Telegram.' });
 }));
+async function persistTelegramLoginAttempt(userId, attempt) {
+  const stringSession = attempt.client.session.save();
+  if (!stringSession) throw new Error('Telegram returned an empty pending session');
+  const encryptedState = encryptSecret(JSON.stringify({ phoneNumber: attempt.phoneNumber, phoneCodeHash: attempt.phoneCodeHash, stringSession }));
+  await pool.query(
+    `INSERT INTO telegram_login_attempts(user_id,encrypted_state,expires_at)
+     VALUES($1,$2,$3)
+     ON CONFLICT(user_id) DO UPDATE SET encrypted_state=EXCLUDED.encrypted_state,expires_at=EXCLUDED.expires_at,updated_at=NOW()`,
+    [userId, encryptedState, new Date(attempt.expiresAt)],
+  );
+}
+
+async function loadTelegramLoginAttempt(userId) {
+  const inMemory = telegramLogins.get(userId);
+  if (inMemory && inMemory.expiresAt > Date.now()) return inMemory;
+  if (inMemory?.client) await inMemory.client.disconnect().catch(() => {});
+  telegramLogins.delete(userId);
+
+  const { rows } = await pool.query(
+    'SELECT encrypted_state,expires_at FROM telegram_login_attempts WHERE user_id=$1',
+    [userId],
+  );
+  const row = rows[0];
+  if (!row) return null;
+  const expiresAt = new Date(row.expires_at).getTime();
+  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+    await pool.query('DELETE FROM telegram_login_attempts WHERE user_id=$1', [userId]);
+    return null;
+  }
+
+  let state;
+  try { state = JSON.parse(decryptSecret(row.encrypted_state)); }
+  catch {
+    await pool.query('DELETE FROM telegram_login_attempts WHERE user_id=$1', [userId]);
+    return null;
+  }
+  if (!state.phoneNumber || !state.phoneCodeHash || !state.stringSession) {
+    await pool.query('DELETE FROM telegram_login_attempts WHERE user_id=$1', [userId]);
+    return null;
+  }
+  const apiId = Number(process.env.API_ID);
+  const client = new TelegramClient(new StringSession(state.stringSession), apiId, process.env.API_HASH, { connectionRetries: 3 });
+  try { await client.connect(); }
+  catch (error) {
+    await client.disconnect().catch(() => {});
+    throw error;
+  }
+  const attempt = { client, phoneNumber: state.phoneNumber, phoneCodeHash: state.phoneCodeHash, expiresAt };
+  telegramLogins.set(userId, attempt);
+  return attempt;
+}
+
+async function loadTelegramLoginAttemptOrRespond(userId, res) {
+  try { return await loadTelegramLoginAttempt(userId); }
+  catch (error) {
+    const code = getTelegramErrorCode(error);
+    if (shouldDiscardTelegramLogin(code)) await pool.query('DELETE FROM telegram_login_attempts WHERE user_id=$1', [userId]);
+    log('warn', 'Pending Telegram login restore failed', { userId, telegramErrorCode: code || 'TELEGRAM_LOGIN_RESTORE_FAILED' });
+    res.status(503).json({
+      error: 'Could not resume the pending Telegram login right now. Retry, or request a fresh code if it continues.',
+      telegramErrorCode: code || 'TELEGRAM_LOGIN_RESTORE_FAILED',
+    });
+    return undefined;
+  }
+}
+
+async function discardTelegramLoginAttempt(userId, attempt = telegramLogins.get(userId)) {
+  telegramLogins.delete(userId);
+  if (attempt?.client) await attempt.client.disconnect().catch(() => {});
+  await pool.query('DELETE FROM telegram_login_attempts WHERE user_id=$1', [userId]);
+}
+
 app.post('/api/telegram/request-code', authenticate, asyncRoute(async (req, res) => {
-  if (!process.env.API_ID || !process.env.API_HASH) return fail(res, 503, 'Telegram API credentials are not configured on the service.');
+  if (!process.env.API_ID || !process.env.API_HASH || !process.env.SESSION_ENCRYPTION_KEY) {
+    return fail(res, 503, 'Telegram sign-in is not fully configured on the service.');
+  }
+  const apiId = Number(process.env.API_ID);
+  if (!Number.isSafeInteger(apiId) || apiId <= 0) return res.status(503).json({ ...telegramAuthErrorPayload({ errorMessage: 'API_ID_INVALID' }) });
   const phoneNumber = String(req.body.phoneNumber || '').trim();
   if (!/^\+[1-9]\d{7,14}$/.test(phoneNumber)) return fail(res, 400, 'Use an international phone number, such as +15551234567.');
-  const previous = telegramLogins.get(req.userId);
-  if (previous?.client) await previous.client.disconnect().catch(() => {});
-  const client = new TelegramClient(new StringSession(''), Number(process.env.API_ID), process.env.API_HASH, { connectionRetries: 3 });
-  await client.connect();
+
+  const client = new TelegramClient(new StringSession(''), apiId, process.env.API_HASH, { connectionRetries: 3 });
+  let sentToTelegram = false;
   try {
-    const sent = await client.sendCode({ apiId: Number(process.env.API_ID), apiHash: process.env.API_HASH }, phoneNumber);
-    telegramLogins.set(req.userId, { client, phoneNumber, phoneCodeHash: sent.phoneCodeHash, expiresAt: Date.now() + 5 * 60_000 });
-    res.json({ ok: true, message: 'Telegram sent a login code to your account. Enter it here to continue.' });
+    await client.connect();
+    const sent = await client.sendCode({ apiId, apiHash: process.env.API_HASH }, phoneNumber);
+    sentToTelegram = true;
+    if (!sent?.phoneCodeHash) {
+      const error = new Error('Telegram did not return a phone code hash');
+      error.errorMessage = 'PHONE_CODE_HASH_EMPTY';
+      throw error;
+    }
+    const attempt = { client, phoneNumber, phoneCodeHash: sent.phoneCodeHash, expiresAt: Date.now() + 5 * 60_000 };
+    await persistTelegramLoginAttempt(req.userId, attempt);
+    const previous = telegramLogins.get(req.userId);
+    if (previous?.client && previous.client !== client) await previous.client.disconnect().catch(() => {});
+    telegramLogins.set(req.userId, attempt);
+    return res.json({ ok: true, message: 'Telegram sent a login code. Enter the newest code here to continue.' });
   } catch (error) {
     await client.disconnect().catch(() => {});
-    log('warn', 'Telegram code request failed', { userId: req.userId, error: error.message });
-    fail(res, 400, 'Telegram could not send a login code. Check the phone number and try again.');
+    if (sentToTelegram && !getTelegramErrorCode(error)) {
+      log('error', 'Pending Telegram login could not be stored', { userId: req.userId, errorType: error?.constructor?.name || 'Error' });
+      return fail(res, 500, 'Telegram sent a code, but the secure login state could not be saved. Request a new code and try again.');
+    }
+    const details = telegramAuthErrorPayload(error);
+    log('warn', 'Telegram code request failed', { userId: req.userId, telegramErrorCode: details.telegramErrorCode });
+    return res.status(400).json(details);
   }
 }));
 
-async function finishTelegramLogin(req, res, client) {
-  const session = client.session.save();
+async function finishTelegramLogin(req, res, attempt) {
+  const session = attempt.client.session.save();
   const encrypted = encryptSecret(session);
-  await pool.query('UPDATE users SET telegram_session=$1,telegram_connected=TRUE,telegram_phone=$2 WHERE id=$3', [encrypted, telegramLogins.get(req.userId)?.phoneNumber || null, req.userId]);
+  await pool.query('UPDATE users SET telegram_session=$1,telegram_connected=TRUE,telegram_phone=$2 WHERE id=$3', [encrypted, attempt.phoneNumber, req.userId]);
+  await pool.query('DELETE FROM telegram_login_attempts WHERE user_id=$1', [req.userId]);
   telegramLogins.delete(req.userId);
-  telegramClients.set(req.userId, { client, handler: null });
-  await startTelegramListener(req.userId, client);
-  res.json({ ok: true, connected: true });
+  telegramClients.set(req.userId, { client: attempt.client, handler: null });
+  await startTelegramListener(req.userId, attempt.client);
+  return res.json({ ok: true, connected: true });
 }
+
 app.post('/api/telegram/verify-code', authenticate, asyncRoute(async (req, res) => {
-  const attempt = telegramLogins.get(req.userId);
-  if (!attempt || attempt.expiresAt < Date.now()) return fail(res, 400, 'Login attempt expired. Request a fresh code.');
+  const attempt = await loadTelegramLoginAttemptOrRespond(req.userId, res);
+  if (attempt === undefined) return;
+  if (!attempt) return res.status(400).json({ error: 'This Telegram login attempt expired. Request a fresh code.', telegramErrorCode: 'TELEGRAM_LOGIN_SESSION_EXPIRED' });
   const code = String(req.body.code || '').replace(/\s/g, '');
-  if (!code) return fail(res, 400, 'Enter the code sent by Telegram.');
+  if (!/^\d{3,10}$/.test(code)) return fail(res, 400, 'Enter the numeric code sent by Telegram.');
+
   try {
-    await attempt.client.signIn({ phoneNumber: attempt.phoneNumber, phoneCodeHash: attempt.phoneCodeHash, phoneCode: code });
-    return await finishTelegramLogin(req, res, attempt.client);
+    const result = await attempt.client.invoke(new Api.auth.SignIn({
+      phoneNumber: attempt.phoneNumber,
+      phoneCodeHash: attempt.phoneCodeHash,
+      phoneCode: code,
+    }));
+    if (result instanceof Api.auth.AuthorizationSignUpRequired) {
+      await discardTelegramLoginAttempt(req.userId, attempt);
+      return res.status(409).json({ error: 'This phone number is not registered to a Telegram account (PHONE_NUMBER_UNOCCUPIED).', telegramErrorCode: 'PHONE_NUMBER_UNOCCUPIED' });
+    }
+    return await finishTelegramLogin(req, res, attempt);
   } catch (error) {
-    if (/SESSION_PASSWORD_NEEDED|password is required/i.test(error.message || '')) return res.status(202).json({ ok: false, requiresPassword: true, message: 'This Telegram account requires its two-step verification password.' });
-    log('warn', 'Telegram code verification failed', { userId: req.userId, error: error.message });
-    return fail(res, 400, 'The code was not accepted. Check it and try again.');
+    const codeName = getTelegramErrorCode(error);
+    if (isTelegramPasswordNeeded(error)) {
+      await persistTelegramLoginAttempt(req.userId, attempt);
+      return res.status(202).json({ ok: false, requiresPassword: true, message: 'This Telegram account requires its two-step verification password.', telegramErrorCode: 'SESSION_PASSWORD_NEEDED' });
+    }
+    if (shouldDiscardTelegramLogin(codeName)) await discardTelegramLoginAttempt(req.userId, attempt);
+    else {
+      try { await persistTelegramLoginAttempt(req.userId, attempt); }
+      catch (persistError) { log('error', 'Pending Telegram login state refresh failed', { userId: req.userId, errorType: persistError?.constructor?.name || 'Error' }); }
+    }
+    const details = telegramAuthErrorPayload(error);
+    log('warn', 'Telegram code verification failed', { userId: req.userId, telegramErrorCode: details.telegramErrorCode });
+    return res.status(400).json(details);
   }
 }));
+
 app.post('/api/telegram/verify-password', authenticate, asyncRoute(async (req, res) => {
-  const attempt = telegramLogins.get(req.userId);
-  if (!attempt || attempt.expiresAt < Date.now()) return fail(res, 400, 'Login attempt expired. Request a fresh code.');
+  const attempt = await loadTelegramLoginAttemptOrRespond(req.userId, res);
+  if (attempt === undefined) return;
+  if (!attempt) return res.status(400).json({ error: 'This Telegram login attempt expired. Request a fresh code.', telegramErrorCode: 'TELEGRAM_LOGIN_SESSION_EXPIRED' });
   const password = String(req.body.password || '');
   if (!password) return fail(res, 400, 'Enter your Telegram two-step verification password.');
+
+  let passwordAuthError = null;
   try {
-    await attempt.client.signInWithPassword({ apiId: Number(process.env.API_ID), apiHash: process.env.API_HASH }, { password });
-    return await finishTelegramLogin(req, res, attempt.client);
+    await attempt.client.signInWithPassword(
+      { apiId: Number(process.env.API_ID), apiHash: process.env.API_HASH },
+      {
+        password: async () => password,
+        onError: async (error) => { passwordAuthError = error; return true; },
+      },
+    );
+    return await finishTelegramLogin(req, res, attempt);
   } catch (error) {
-    log('warn', 'Telegram password verification failed', { userId: req.userId, error: error.message });
-    return fail(res, 400, 'Telegram did not accept that password.');
+    const actualError = passwordAuthError || error;
+    const codeName = getTelegramErrorCode(actualError);
+    if (shouldDiscardTelegramLogin(codeName)) await discardTelegramLoginAttempt(req.userId, attempt);
+    else {
+      try { await persistTelegramLoginAttempt(req.userId, attempt); }
+      catch (persistError) { log('error', 'Pending Telegram login state refresh failed', { userId: req.userId, errorType: persistError?.constructor?.name || 'Error' }); }
+    }
+    const details = telegramAuthErrorPayload(actualError);
+    log('warn', 'Telegram password verification failed', { userId: req.userId, telegramErrorCode: details.telegramErrorCode });
+    return res.status(400).json(details);
   }
 }));
+
 app.get('/api/telegram/chats', authenticate, asyncRoute(async (req, res) => {
   const client = await restoreTelegramClient(req.userId);
   if (!client) return fail(res, 409, 'Connect Telegram first.');
-  const dialogs = await client.getDialogs({ limit: 100 });
-  const chats = dialogs.filter((dialog) => dialog.isChannel || dialog.isGroup).map((dialog) => ({ channelId: dialog.id.toString(), title: dialog.title || 'Telegram chat', username: dialog.entity?.username || null }));
-  res.json({ chats });
+  const dialogs = await client.getDialogs({ limit: 200 });
+  const chats = dialogs
+    .filter((dialog) => dialog.isChannel || dialog.isGroup)
+    .map((dialog) => ({
+      channelId: dialog.id.toString(),
+      title: dialog.title || 'Telegram chat',
+      username: dialog.entity?.username || null,
+      type: dialog.isGroup || dialog.entity?.megagroup ? 'Group' : 'Channel',
+    }));
+  res.json({ chats, limit: 200 });
 }));
 app.post('/api/telegram/disconnect', authenticate, asyncRoute(async (req, res) => {
   const current = telegramClients.get(req.userId);
@@ -435,6 +575,7 @@ app.post('/api/telegram/disconnect', authenticate, asyncRoute(async (req, res) =
   if (login?.client) await login.client.disconnect().catch(() => {});
   telegramClients.delete(req.userId);
   telegramLogins.delete(req.userId);
+  await pool.query('DELETE FROM telegram_login_attempts WHERE user_id=$1', [req.userId]);
   await pool.query('UPDATE users SET telegram_session=NULL,telegram_phone=NULL,telegram_connected=FALSE WHERE id=$1', [req.userId]);
   res.json({ ok: true });
 }));
@@ -450,6 +591,7 @@ async function start() {
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
   if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) throw new Error('JWT_SECRET must contain at least 32 characters');
   await initializeDatabase();
+  await pool.query('DELETE FROM telegram_login_attempts WHERE expires_at <= NOW()');
   httpServer.listen(PORT, '0.0.0.0', () => log('info', 'Server listening', { port: PORT }));
 }
 start().catch((error) => { log('error', 'Startup failed', { error: error.message }); process.exit(1); });

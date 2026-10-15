@@ -147,3 +147,5 @@ button,input,textarea,select{touch-action:manipulation}
   .sidebar-close:hover{background:rgba(255,255,255,.16)}
   .sidebar-close svg{display:block;width:19px;height:19px}
 }
+
+.chat-row .button-small{min-height:44px;white-space:nowrap}

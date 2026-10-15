@@ -95,11 +95,19 @@ export async function initializeDatabase() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       UNIQUE(user_id, metaapi_account_id)
     );
+    CREATE TABLE IF NOT EXISTS telegram_login_attempts (
+      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      encrypted_state TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
     CREATE INDEX IF NOT EXISTS signals_user_created_idx ON signals(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS channels_user_enabled_idx ON channels(user_id, enabled);
     CREATE INDEX IF NOT EXISTS metaapi_accounts_user_created_idx ON metaapi_accounts(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS telegram_login_attempts_expiry_idx ON telegram_login_attempts(expires_at);
     ALTER TABLE metaapi_credentials ENABLE ROW LEVEL SECURITY;
     ALTER TABLE metaapi_accounts ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE telegram_login_attempts ENABLE ROW LEVEL SECURITY;
   `);
   await pool.query('SELECT 1');
 }

@@ -11,10 +11,12 @@ function isValidPhone(value) {
 }
 
 function friendlyTelegramError(error) {
-  if (/credentials are not configured|API ID and API hash|not configured on the service/i.test(error.message)) {
+  const message = error?.message || 'Telegram could not complete the request. Please try again.';
+  if (/credentials are not configured|API ID and API hash|not configured on the service/i.test(message)) {
     return 'Telegram sign-in is temporarily unavailable. Please try again later or contact your administrator.';
   }
-  return error.message;
+  const code = error?.telegramErrorCode;
+  return code && !message.includes(code) ? `${message} (${code})` : message;
 }
 
 export default function TelegramConnect({ token, channels, onRefresh }) {
@@ -89,6 +91,27 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
       setCode('');
       setStep('code');
       notify('Telegram sent a login code. Enter the code to continue.');
+    } catch (error) {
+      notify(friendlyTelegramError(error), 'error');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resendCode = async () => {
+    const phoneNumber = normalizePhone(phone);
+    if (!/^\+[1-9]\d{7,14}$/.test(phoneNumber)) {
+      notify('Enter a valid international phone number before requesting a new code.', 'error');
+      return;
+    }
+    setBusy(true);
+    setToast(null);
+    try {
+      await request('/api/telegram/request-code', token, { method: 'POST', body: { phoneNumber } });
+      setPhone(phoneNumber);
+      setCode('');
+      setStep('code');
+      notify('A fresh Telegram login code was sent. Use the newest code.');
     } catch (error) {
       notify(friendlyTelegramError(error), 'error');
     } finally {
@@ -192,7 +215,7 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
     try {
       await request(`/api/channels/${id}`, token, { method: 'DELETE' });
       await onRefresh();
-      notify('The channel was removed from monitored sources.');
+      notify('Monitoring stopped for the selected Telegram chat.');
     } catch (error) {
       notify(friendlyTelegramError(error), 'error');
     } finally {
@@ -207,15 +230,16 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
         <span className={`status-pill ${status.connected ? 'online' : ''}`} aria-live="polite">{status.connected ? 'Connected' : 'Not connected'}</span>
       </div>
       {status.connected ? <>
-        <p className="muted">Your Telegram session is stored encrypted. Only channels you choose are monitored.</p>
+        <p className="muted">Your Telegram session is stored encrypted. Only the groups and channels you choose are monitored.</p>
         <div className="button-row">
-          <button className="button button-secondary" type="button" disabled={loadingChats} onClick={loadChats}>{loadingChats ? 'Refreshing…' : 'Refresh channel list'}</button>
+          <button className="button button-secondary" type="button" disabled={loadingChats} onClick={loadChats}>{loadingChats ? 'Refreshing…' : 'Refresh groups & channels'}</button>
           <button className="button button-danger" type="button" disabled={busy} onClick={disconnect}>{busy ? 'Disconnecting…' : 'Disconnect'}</button>
         </div>
-        <h3 className="section-title">Available chats</h3>
+        <h3 className="section-title">Available groups &amp; channels</h3>
+        <p className="field-help">Choose which Telegram chats to monitor. You can stop monitoring any time.</p>
         {loadingChats && !chats.length ? <p className="muted" role="status">Loading Telegram chats…</p> : !chats.length ? <div className="empty-state compact-empty"><strong>No groups or channels found</strong><span>Refresh the list after joining a Telegram group or channel.</span></div> : <div className="chat-list">{chats.map((chat) => {
-          const added = channels.some((channel) => channel.channelId === chat.channelId);
-          return <div className="chat-row" key={chat.channelId}><div><strong>{chat.title}</strong><small>{chat.username ? `@${chat.username}` : chat.channelId}</small></div><button className="button button-small" type="button" disabled={added || busy} onClick={() => addChannel(chat)}>{added ? 'Added' : busy ? 'Adding…' : 'Monitor'}</button></div>;
+          const selected = channels.find((channel) => String(channel.channelId) === String(chat.channelId));
+          return <div className="chat-row" key={chat.channelId}><div><strong>{chat.title}</strong><small>{chat.type || 'Group or channel'} · {chat.username ? `@${chat.username}` : chat.channelId}</small></div><button className="button button-small" type="button" aria-label={selected ? `Stop monitoring ${chat.title}` : `Monitor ${chat.title}`} aria-pressed={Boolean(selected)} disabled={busy} onClick={() => selected ? removeChannel(selected.id) : addChannel(chat)}>{busy ? (selected ? 'Updating…' : 'Adding…') : (selected ? 'Stop monitoring' : 'Monitor')}</button></div>;
         })}</div>}
       </> : <>
         <p className="muted">Connect with your phone number and Telegram login code. If two-step verification is enabled, Telegram will also ask for your password.</p>
@@ -233,6 +257,7 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
           </label>
           <small id="telegram-code-help" className="field-help">Enter the numeric code from your Telegram app or SMS.</small>
           <button className="button button-primary" type="submit" disabled={busy || !/^\d{3,10}$/.test(code.replace(/\s/g, ''))}>{busy ? 'Verifying…' : 'Verify code'}</button>
+          <button className="text-button change-number" type="button" disabled={busy} onClick={resendCode}>{busy ? 'Sending…' : 'Resend code'}</button>
           <button className="text-button change-number" type="button" disabled={busy} onClick={changeNumber}>Use a different phone number</button>
         </form> : <form className="form-stack telegram-form" onSubmit={verifyPassword} aria-busy={busy}>
           <p className="code-destination">Your code was accepted. Enter the password for Telegram two-step verification.</p>
@@ -247,8 +272,8 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
       <Toast toast={toast} onDismiss={() => setToast(null)} />
     </section>
     <section className="panel" aria-labelledby="monitored-sources-title">
-      <div className="panel-heading"><div><p className="eyebrow">MONITORED SOURCES</p><h2 id="monitored-sources-title">Subscribed channels</h2></div><span className="count-badge">{channels.length}</span></div>
-      {!channels.length ? <div className="empty-state"><span className="empty-icon" aria-hidden="true">⌁</span><strong>No channels selected</strong><span>Connect Telegram and choose which groups or channels to follow.</span></div> : <div className="chat-list">{channels.map((channel) => <div className="chat-row" key={channel.id}><div><strong>{channel.title}</strong><small>{channel.enabled ? 'Monitoring enabled' : 'Paused'}</small></div><button className="icon-button" type="button" aria-label={`Remove ${channel.title}`} disabled={busy} onClick={() => removeChannel(channel.id)}>Remove</button></div>)}</div>}
+      <div className="panel-heading"><div><p className="eyebrow">MONITORED SOURCES</p><h2 id="monitored-sources-title">Monitored groups &amp; channels</h2></div><span className="count-badge">{channels.length}</span></div>
+      {!channels.length ? <div className="empty-state"><span className="empty-icon" aria-hidden="true">⌁</span><strong>No chats selected</strong><span>Connect Telegram and choose which groups or channels to monitor.</span></div> : <div className="chat-list">{channels.map((channel) => <div className="chat-row" key={channel.id}><div><strong>{channel.title}</strong><small>{channel.enabled ? 'Monitoring enabled' : 'Paused'}</small></div><button className="button button-small button-secondary" type="button" aria-label={`Stop monitoring ${channel.title}`} disabled={busy} onClick={() => removeChannel(channel.id)}>Stop monitoring</button></div>)}</div>}
       <div className="note-box">Only new posts received while the service is awake are captured. A free Render web service may sleep; continuous monitoring requires an always-on deployment.</div>
     </section>
   </div>;
