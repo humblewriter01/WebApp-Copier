@@ -57,7 +57,7 @@ The app creates its PostgreSQL tables and indexes on backend startup. The new `m
 ## MetaAPI account setup
 
 1. The workspace owner adds a MetaAPI provisioning token to the backend environment as `METAAPI_PROVISIONING_TOKEN`.
-2. In Signal Desk, open **MetaAPI** and enter an account name, MT4/MT5 platform, and the exact broker server name.
+2. In Signal Desk, open **Trading Accounts** and enter an account name, MT4/MT5 platform, and the exact broker server name.
 3. Signal Desk creates the account setup and returns a secure link hosted by MetaAPI. Enter the trading login and password only on that page. For monitoring, choose an investor/read-only password if your broker offers one.
 4. Return to Signal Desk and refresh the account status. Removing an account from Signal Desk removes only its local link; it does not delete the MetaAPI or broker account.
 
@@ -73,7 +73,7 @@ The app creates its PostgreSQL tables and indexes on backend startup. The new `m
 | `CLIENT_URL` | Production | Exact frontend origin for CORS |
 | `API_ID` / `API_HASH` | For Telegram | Telegram application credentials from [my.telegram.org](https://my.telegram.org) |
 | `METAAPI_PROVISIONING_TOKEN` | For MT4/MT5 setup | Server-only MetaAPI token used to create accounts and secure setup links |
-| `META_API_URL` | No | Optional MetaAPI HTTPS base URL override; defaults to `https://mt-provisioning-api-v1.agiliumtrade.ai` |
+| `META_API_URL` | No | Optional MetaAPI HTTPS base URL override; defaults to `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai` |
 | `PORT` | No | Render supplies this automatically |
 
 The UI/API can be used without Telegram credentials; Telegram is shown as unavailable until `API_ID` and `API_HASH` are configured. Never commit real credentials to Git.

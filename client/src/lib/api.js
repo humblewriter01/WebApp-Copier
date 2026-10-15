@@ -16,11 +16,15 @@ export async function request(path, token, options = {}) {
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok && response.status !== 202) {
-    const message = response.status >= 500
-      ? 'We could not complete that request. Please try again in a moment.'
-      : payload.error || payload.message || 'Please check your details and try again.';
+    const message = typeof payload.userMessage === 'string' && payload.userMessage.trim()
+      ? payload.userMessage
+      : response.status >= 500
+        ? 'We could not complete that request. Please try again in a moment.'
+        : payload.error || payload.message || 'Please check your details and try again.';
     const error = new Error(message);
     if (payload.telegramErrorCode) error.telegramErrorCode = payload.telegramErrorCode;
+    if (Number.isInteger(payload.metaApiStatus)) error.metaApiStatus = payload.metaApiStatus;
+    if (typeof payload.metaApiErrorCode === 'string') error.metaApiErrorCode = payload.metaApiErrorCode;
     throw error;
   }
   return payload;

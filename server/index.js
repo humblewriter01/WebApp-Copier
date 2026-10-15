@@ -17,6 +17,7 @@ import { createMetaApiConfigurationLink, metaApiRequest, toSafeMetaApiAccount } 
 import { getTelegramErrorCode, isTelegramPasswordNeeded, shouldDiscardTelegramLogin, telegramAuthErrorPayload } from './services/telegram-auth.js';
 
 const app = express();
+app.set('trust proxy', 1);
 const httpServer = createServer(app);
 const allowedOrigins = (process.env.CLIENT_URL || '').split(',').map((item) => item.trim()).filter(Boolean);
 const io = new Server(httpServer, { cors: { origin: allowedOrigins.length ? allowedOrigins : true, credentials: true } });
@@ -354,12 +355,24 @@ app.post('/api/metaapi/provisioned-accounts', authenticate, asyncRoute(async (re
   );
 
   let configurationLink = null;
+  let setupError = null;
   try {
     configurationLink = await createMetaApiConfigurationLink(apiToken, account.id);
   } catch (error) {
-    log('warn', 'Secure MetaAPI setup link could not be created', { userId: req.userId, metaApiAccountId: account.id, error: error.message });
+    setupError = {
+      message: typeof error.userMessage === 'string' ? error.userMessage : error.message,
+      ...(Number.isInteger(error.metaApiStatus) ? { metaApiStatus: error.metaApiStatus } : {}),
+      ...(typeof error.metaApiErrorCode === 'string' ? { metaApiErrorCode: error.metaApiErrorCode } : {}),
+    };
+    log('warn', 'Secure MetaAPI setup link could not be created', {
+      userId: req.userId,
+      metaApiAccountId: account.id,
+      error: error.message,
+      metaApiStatus: error.metaApiStatus,
+      metaApiErrorCode: error.metaApiErrorCode,
+    });
   }
-  res.set('Cache-Control', 'no-store').status(201).json({ account: rows[0], configurationLink });
+  res.set('Cache-Control', 'no-store').status(201).json({ account: rows[0], configurationLink, setupError });
 }));
 app.post('/api/metaapi/provisioned-accounts/:accountId/configuration-link', authenticate, asyncRoute(async (req, res) => {
   const apiToken = getMetaApiProvisioningToken();
@@ -668,9 +681,18 @@ app.post('/api/telegram/disconnect', authenticate, asyncRoute(async (req, res) =
 
 app.use((req, res) => res.status(404).json({ error: 'We could not find that page or action. Return to your workspace and try again.' }));
 app.use((error, _req, res, _next) => {
-  log('error', 'Request failed', { error: error.message, code: error.code });
+  log('error', 'Request failed', {
+    error: error.message,
+    code: error.code,
+    metaApiStatus: error.metaApiStatus,
+    metaApiErrorCode: error.metaApiErrorCode,
+  });
   if (res.headersSent) return;
-  res.status(error.status || 500).json({ error: error.status ? error.message : 'Something went wrong. Please try again in a moment.' });
+  const payload = { error: error.status ? error.message : 'Something went wrong. Please try again in a moment.' };
+  if (typeof error.userMessage === 'string') payload.userMessage = error.userMessage;
+  if (Number.isInteger(error.metaApiStatus)) payload.metaApiStatus = error.metaApiStatus;
+  if (typeof error.metaApiErrorCode === 'string') payload.metaApiErrorCode = error.metaApiErrorCode;
+  res.status(error.status || 500).json(payload);
 });
 
 async function start() {

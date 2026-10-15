@@ -52,11 +52,15 @@ export default function MetaApiPanel({ token }) {
       setForm((current) => ({ ...current, name: '', server: '' }));
       if (result.configurationLink) {
         setSetupLink({ accountId: result.account.metaApiAccountId, url: result.configurationLink });
+      }
+      await refresh();
+      if (result.setupError?.message) {
+        setError(result.setupError.message);
+      } else if (result.configurationLink) {
         setNotice('Account setup is ready. Open the secure MetaAPI page to finish connecting it.');
       } else {
         setNotice('Your account was added. Create a secure setup link below to finish connecting it.');
       }
-      await refresh();
     } catch (requestError) {
       setError(requestError.message || 'We could not start account setup. Please try again.');
     } finally {

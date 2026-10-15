@@ -15,6 +15,22 @@ function restoreGlobals() {
   else process.env.META_API_URL = originalBaseUrl;
 }
 
+test('defaults to the documented MetaAPI provisioning host and auth-token header', async () => {
+  delete process.env.META_API_URL;
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return new Response('[]', { status: 200 });
+  };
+  try {
+    const result = await metaApiRequest('server-token', '/users/current/accounts');
+    assert.deepEqual(result, []);
+    assert.equal(request.url, 'https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts');
+    assert.equal(request.options.headers['auth-token'], 'server-token');
+    assert.equal(request.options.headers.Authorization, undefined);
+  } finally { restoreGlobals(); }
+});
+
 test('creates an account without accepting login or password fields', async () => {
   process.env.META_API_URL = 'https://metaapi.example.test';
   globalThis.fetch = async () => new Response(JSON.stringify({ id: 'account-1', state: 'DRAFT' }), { status: 201 });
@@ -29,7 +45,7 @@ test('creates an account without accepting login or password fields', async () =
   } finally { restoreGlobals(); }
 });
 
-test('polls an accepted account-creation request with the same transaction ID and no credentials', async () => {
+test('polls an accepted account-creation request with the same transaction ID and documented payload', async () => {
   process.env.META_API_URL = 'https://metaapi.example.test';
   const seen = [];
   globalThis.fetch = async (url, options) => {
@@ -52,12 +68,20 @@ test('polls an accepted account-creation request with the same transaction ID an
   } finally { restoreGlobals(); }
 });
 
-test('returns a MetaAPI-hosted HTTPS configuration link', async () => {
+test('returns a MetaAPI-hosted HTTPS configuration link using the documented PUT contract', async () => {
   process.env.META_API_URL = 'https://metaapi.example.test';
-  globalThis.fetch = async () => new Response(JSON.stringify({ configurationLink: 'https://app.metaapi.cloud/configure-trading-account-credentials/account-1/opaque-link' }), { status: 200 });
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return new Response(JSON.stringify({ configurationLink: 'https://app.metaapi.cloud/configure-trading-account-credentials/account-1/opaque-link' }), { status: 200 });
+  };
   try {
     const link = await createMetaApiConfigurationLink('server-token', 'account-1');
     assert.match(link, /^https:\/\/app\.metaapi\.cloud\/configure-trading-account-credentials\//);
+    assert.equal(request.url, 'https://metaapi.example.test/users/current/accounts/account-1/configuration-link');
+    assert.equal(request.options.method, 'PUT');
+    assert.equal(request.options.headers['auth-token'], 'server-token');
+    assert.equal(request.options.body, undefined);
   } finally { restoreGlobals(); }
 });
 
@@ -69,13 +93,66 @@ test('rejects configuration links to an unexpected destination', async () => {
   } finally { restoreGlobals(); }
 });
 
-test('maps unauthorized errors to a safe message without echoing provider response details', async () => {
+test('returns the MetaAPI status and sanitized provider message without echoing credentials', async () => {
   process.env.META_API_URL = 'https://metaapi.example.test';
-  globalThis.fetch = async () => new Response(JSON.stringify({ message: 'private token detail' }), { status: 401 });
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    message: 'Authentication failed; auth-token: super-secret-token',
+    details: { code: 'E_TOKEN_INVALID' },
+  }), { status: 401 });
   try {
     await assert.rejects(
-      metaApiRequest('server-token', '/users/current/accounts', { unauthorizedMessage: 'Account setup is temporarily unavailable.' }),
-      (error) => error.status === 503 && error.message === 'Account setup is temporarily unavailable.' && !error.message.includes('private token detail'),
+      metaApiRequest('server-token', '/users/current/accounts', { unauthorizedMessage: 'Check the server token and its account-management access.' }),
+      (error) => error.status === 503
+        && error.message === 'Check the server token and its account-management access.'
+        && error.userMessage.includes('HTTP 401')
+        && error.userMessage.includes('E_TOKEN_INVALID')
+        && error.userMessage.includes('Authentication failed')
+        && !error.userMessage.includes('super-secret-token')
+        && error.metaApiStatus === 401
+        && error.metaApiErrorCode === 'E_TOKEN_INVALID',
+    );
+  } finally { restoreGlobals(); }
+});
+
+test('includes the actual sanitized MetaAPI validation message for server-name errors', async () => {
+  process.env.META_API_URL = 'https://metaapi.example.test';
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    message: 'Broker server Demo-Server was not found. Suggested server names: Demo-MT5.',
+    details: { code: 'E_SRV_NOT_FOUND' },
+  }), { status: 400 });
+  try {
+    await assert.rejects(
+      metaApiRequest('server-token', '/users/current/accounts', { method: 'POST', body: { name: 'Demo', server: 'Demo-Server', platform: 'mt5', magic: 0 } }),
+      (error) => error.status === 422
+        && error.userMessage.includes('HTTP 400')
+        && error.userMessage.includes('E_SRV_NOT_FOUND')
+        && error.userMessage.includes('Suggested server names: Demo-MT5'),
+    );
+  } finally { restoreGlobals(); }
+});
+
+test('redacts a bare provisioning token echoed in a provider message', async () => {
+  process.env.META_API_URL = 'https://metaapi.example.test';
+  globalThis.fetch = async () => new Response(JSON.stringify({ message: 'The token super-secret-token-value was rejected.' }), { status: 401 });
+  try {
+    await assert.rejects(
+      metaApiRequest('super-secret-token-value', '/users/current/accounts'),
+      (error) => error.userMessage.includes('The token [redacted] was rejected.')
+        && !error.userMessage.includes('super-secret-token-value'),
+    );
+  } finally { restoreGlobals(); }
+});
+
+test('includes safe connection error codes when MetaAPI cannot be reached', async () => {
+  process.env.META_API_URL = 'https://metaapi.example.test';
+  const cause = Object.assign(new Error('Name or service not known'), { code: 'ENOTFOUND' });
+  globalThis.fetch = async () => { throw new TypeError('fetch failed', { cause }); };
+  try {
+    await assert.rejects(
+      metaApiRequest('server-token', '/users/current/accounts'),
+      (error) => error.status === 502
+        && error.userMessage.includes('ENOTFOUND')
+        && error.metaApiErrorCode === 'ENOTFOUND',
     );
   } finally { restoreGlobals(); }
 });

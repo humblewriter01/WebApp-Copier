@@ -6,7 +6,7 @@ const items = [
   ['signals', 'Signals', 'M4 19V9m5 10V5m5 14v-7m5 7V8M2 21h20'],
   ['accounts', 'Accounts', 'M20 21a8 8 0 0 0-16 0m8-10a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z'],
   ['settings', 'Risk settings', 'M4 6h6m4 0h6M4 12h10m4 0h2M4 18h2m4 0h10M12 6a2 2 0 1 0 0 .01M16 12a2 2 0 1 0 0 .01M8 18a2 2 0 1 0 0 .01'],
-  ['metaapi', 'MetaAPI', 'M7 12h.01M12 7h.01M17 12h.01M12 17h.01M7 12l5-5 5 5-5 5-5-5Z'],
+  ['metaapi', 'Trading Accounts', 'M7 12h.01M12 7h.01M17 12h.01M12 17h.01M7 12l5-5 5 5-5 5-5-5Z'],
 ];
 
 function NavIcon({ path }) {

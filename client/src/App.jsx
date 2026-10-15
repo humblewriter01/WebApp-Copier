@@ -10,7 +10,7 @@ const tabs = [
   ['signals', 'Signals'],
   ['accounts', 'Accounts'],
   ['settings', 'Risk settings'],
-  ['metaapi', 'MetaAPI'],
+  ['metaapi', 'Trading Accounts'],
 ];
 
 function AuthScreen({ onAuthenticated, installPrompt, onInstall }) {

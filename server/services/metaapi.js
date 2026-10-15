@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 
-const DEFAULT_BASE_URL = 'https://mt-provisioning-api-v1.agiliumtrade.ai';
+const DEFAULT_BASE_URL = 'https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai';
 const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_PROVISIONING_WAIT_MS = 240_000;
 const ACCOUNT_ENDPOINT = '/users/current/accounts';
@@ -27,11 +27,39 @@ function isAllowedRequest(method, endpoint, body) {
   return method === 'PUT' && body === undefined && new RegExp(`^${ACCOUNT_ENDPOINT}/[A-Za-z0-9_-]{1,200}/configuration-link$`).test(endpoint);
 }
 
-function safeMetaApiError(status, payload, unauthorizedMessage) {
-  const detail = typeof payload?.details === 'string' ? payload.details : payload?.details?.code;
+function providerErrorCode(payload) {
+  const value = typeof payload?.details === 'string' ? payload.details : payload?.details?.code;
+  return typeof value === 'string' && /^[A-Za-z0-9_.-]{1,80}$/.test(value) ? value : '';
+}
+
+function safeProviderMessage(payload, apiToken) {
+  const raw = typeof payload?.message === 'string'
+    ? payload.message
+    : typeof payload?.error === 'string' ? payload.error : '';
+  if (!raw) return '';
+  let safe = raw
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/["']?\b(authorization|auth[-_ ]?token|password|passwd|secret|api[-_ ]?key|token)["']?\s*[:=]\s*(?:Bearer\s+)?["']?[^\s,"';}]+/gi, '$1=[redacted]')
+    .replace(/\b(token|secret|api[-_ ]?key|password|passwd)\s+(?:is\s+)?["']?[A-Za-z0-9._~+/-]{12,}={0,2}["']?/gi, '$1 [redacted]')
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]{12,}={0,2}/gi, 'Bearer [redacted]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 500);
+  if (typeof apiToken === 'string' && apiToken.length >= 4) safe = safe.replaceAll(apiToken, '[redacted]');
+  return safe;
+}
+
+function safeNetworkCode(cause) {
+  const value = cause?.cause?.code || cause?.code || (cause?.name === 'TimeoutError' ? 'TIMEOUT' : '');
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(value) ? value : '';
+}
+
+function safeMetaApiError(status, payload, unauthorizedMessage, apiToken) {
+  const detail = providerErrorCode(payload);
+  const providerMessage = safeProviderMessage(payload, apiToken);
   let message;
   if (status === 401 || status === 403) {
-    message = unauthorizedMessage || 'MetaAPI rejected that connection. Check the token and try again.';
+    message = unauthorizedMessage || 'MetaAPI rejected the server token or its account-management permissions.';
   } else if (status === 429) {
     message = 'Too many account requests were made. Wait briefly, then try again.';
   } else if (detail === 'E_SRV_NOT_FOUND' || /server .*not found|\.dat file.*not found/i.test(payload?.message || '')) {
@@ -39,18 +67,25 @@ function safeMetaApiError(status, payload, unauthorizedMessage) {
   } else if (detail === 'E_AUTH') {
     message = 'MetaAPI could not connect with those account details. Check the platform, server, and credentials on the secure setup page.';
   } else if (status === 400) {
-    message = 'We could not set up that account. Check the broker server and platform, then try again.';
+    message = 'MetaAPI rejected the account setup request. Check the broker server and platform.';
   } else if (status === 404) {
     message = 'That account could not be found. Refresh the account list and try again.';
   } else {
     message = 'MetaAPI is temporarily unavailable. Please try again shortly.';
   }
 
+  const diagnostics = [detail && `code ${detail}`, providerMessage].filter(Boolean);
+  const diagnosticText = diagnostics.length
+    ? ` MetaAPI returned HTTP ${status}: ${diagnostics.join(' — ')}`
+    : ` (MetaAPI HTTP ${status})`;
   const error = new Error(message);
   error.status = status === 401 || status === 403 || status === 429 ? 503
     : status === 400 ? 422
       : status === 404 ? 404
         : 502;
+  error.metaApiStatus = status;
+  if (detail) error.metaApiErrorCode = detail;
+  error.userMessage = `${message}${diagnosticText}`;
   return error;
 }
 
@@ -72,13 +107,24 @@ export async function metaApiRequest(apiToken, endpoint, { method = 'GET', body,
   if (typeof apiToken !== 'string' || !apiToken.trim()) throw new Error('MetaAPI token is required.');
   if (!isAllowedRequest(method, endpoint, body)) throw new Error('Unsupported MetaAPI request.');
 
+  let requestUrl;
+  try {
+    requestUrl = `${getBaseUrl()}${endpoint}`;
+  } catch {
+    const error = new Error('MetaAPI endpoint configuration is invalid.');
+    error.status = 503;
+    error.metaApiErrorCode = 'INVALID_ENDPOINT';
+    error.userMessage = 'Could not connect to MetaAPI. The account-setup endpoint is misconfigured; please contact the workspace owner.';
+    throw error;
+  }
+
   const requestId = method === 'POST' ? (transactionId || crypto.randomUUID().replaceAll('-', '')) : null;
   const startedAt = Date.now();
 
   while (true) {
     let response;
     try {
-      response = await fetch(`${getBaseUrl()}${endpoint}`, {
+      response = await fetch(requestUrl, {
         method,
         headers: {
           'auth-token': apiToken,
@@ -89,9 +135,13 @@ export async function metaApiRequest(apiToken, endpoint, { method = 'GET', body,
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
-    } catch {
+    } catch (cause) {
+      const code = safeNetworkCode(cause);
       const error = new Error('MetaAPI could not be reached. Try again shortly.');
       error.status = 502;
+      error.code = code || 'METAAPI_NETWORK_ERROR';
+      error.metaApiErrorCode = code || 'NETWORK_ERROR';
+      error.userMessage = `Could not connect to MetaAPI${code ? ` (${code})` : ''}. Check the server endpoint or try again shortly.`;
       throw error;
     }
 
@@ -106,13 +156,14 @@ export async function metaApiRequest(apiToken, endpoint, { method = 'GET', body,
       if (Date.now() - startedAt + delay > MAX_PROVISIONING_WAIT_MS) {
         const error = new Error('Account setup is taking longer than expected. Wait a little, refresh your accounts, and try again if it is still missing.');
         error.status = 503;
+        error.userMessage = error.message;
         throw error;
       }
       await sleep(delay);
       continue;
     }
 
-    if (!response.ok) throw safeMetaApiError(response.status, payload, unauthorizedMessage);
+    if (!response.ok) throw safeMetaApiError(response.status, payload, unauthorizedMessage, apiToken);
     return payload;
   }
 }

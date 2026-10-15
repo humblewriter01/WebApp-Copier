@@ -28,7 +28,7 @@ services:
       - key: METAAPI_PROVISIONING_TOKEN
         sync: false
       - key: META_API_URL
-        value: https://mt-provisioning-api-v1.agiliumtrade.ai
+        value: https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai
   - type: web
     name: telegram-copier-web
     runtime: static

@@ -5,20 +5,20 @@
 - `client/src/App.jsx` holds the dashboard shell and top-level routes.
 - `client/src/components/TelegramConnect.jsx` owns Telegram authentication, chat selection, and monitoring controls.
 - `client/src/components/MetaApiPanel.jsx` owns the user-facing MT4/MT5 setup workflow.
-- `server/index.js` owns authenticated API routes and database ownership checks.
+- `server/index.js` owns authenticated API routes, rate limiting, and database ownership checks.
 - `server/services/metaapi.js` owns the allowlisted HTTPS calls to MetaAPI.
 - `server/db.js` initializes the PostgreSQL schema used by the Render API and Supabase.
 - `render.yaml` defines the API and static-site services.
 
 ## Implementation approach
 
-Reuse the current product styling. Add live client-side search over Telegram chat names and handles, replace infrastructure-specific copy with plain language, and provide a standard not-financial-advice disclaimer. Audit user-visible error paths and use friendly generic text for unexpected system errors while preserving safe, actionable Telegram and MetaAPI errors.
+Reuse the current product styling. Keep the existing Telegram chat search and plain-language copy. Rename the sidebar item from “MetaAPI” to “Trading Accounts,” which describes the page’s purpose rather than the provider.
 
-Use a server-only `METAAPI_PROVISIONING_TOKEN` for the account setup flow. The authenticated backend creates a MetaAPI account without receiving the trading login or password, requests a MetaAPI-hosted configuration link, and associates only safe account metadata with the signed-in user. The user enters credentials on MetaAPI's HTTPS page. The app supports refreshing account status and regenerating the setup link, but does not submit, modify, or close trades, nor delete the underlying MetaAPI account when removing its local association. Enforce user ownership before every account-specific MetaAPI call. Keep this feature unavailable with a friendly message until the server secret is configured.
+The recent setup failure is caused by a non-resolving MetaAPI base hostname: Render logs show the request could not reach MetaAPI, and a no-token check confirms the current single-`agiliumtrade.ai` hostname fails DNS while the hostname in MetaAPI's official examples responds. Use `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai` as the server-side endpoint in the helper, Render configuration, and documentation. Keep the official `auth-token` request header; the current account body (`name`, `server`, `platform`, `magic: 0`) is valid and intentionally omits login/password.
 
-Add idempotent schema changes to the existing account table for app-provisioned-account provenance and broker-server metadata. Extend the MetaAPI client with a strict method/path and request-body allowlist plus safe error mapping. Do not send MetaAPI service credentials or broker passwords to the browser or logs.
+Improve error reporting without exposing secrets. Keep explicit friendly mapping for known MetaAPI errors, attach a sanitized provider message/status/error code to errors returned from the MetaAPI helper, and let the server return a separate safe `userMessage`. The shared frontend request helper must display that field for MetaAPI errors even when the HTTP status is 5xx, while unexpected server failures continue to use the existing generic message. Never return tokens, broker credentials, stack traces, or unfiltered provider payloads.
 
-Declare `autoDeployTrigger: commit` for both `main`-branch services in `render.yaml`. Preserve the existing Render resources, build commands, URLs, and environment settings otherwise.
+Keep the existing secure account setup flow, ownership checks, and no-trading-order boundary. Configure Express to trust the Render reverse-proxy hop before the rate limiters so per-client rate limiting uses the forwarded client IP without trusting all proxy hops.
 
 ## Design
 
