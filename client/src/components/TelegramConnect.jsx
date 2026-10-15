@@ -22,6 +22,7 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
   const [chats, setChats] = useState([]);
   const [phone, setPhone] = useState('');
   const [code, setCode] = useState('');
+  const [password, setPassword] = useState('');
   const [step, setStep] = useState('phone');
   const [busy, setBusy] = useState(false);
   const [loadingChats, setLoadingChats] = useState(false);
@@ -42,6 +43,16 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
     setStatus(current);
     return current;
   }, [token]);
+
+  const completeLogin = async () => {
+    setStep('phone');
+    setPhone('');
+    setCode('');
+    setPassword('');
+    await checkStatus();
+    await onRefresh();
+    notify('Telegram is connected to your workspace.');
+  };
 
   const loadChats = useCallback(async () => {
     setLoadingChats(true);
@@ -97,19 +108,38 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
     try {
       const result = await request('/api/telegram/verify-code', token, { method: 'POST', body: { code: oneTimeCode } });
       if (result.requiresPassword) {
-        notify('This account requires Telegram two-step verification. This sign-in flow supports phone number and one-time code only.', 'error');
+        setPassword('');
+        setStep('password');
+        notify(result.message || 'This account requires its Telegram two-step verification password.');
         return;
       }
       if (!result.connected) {
         notify(result.message || 'Telegram could not verify that code. Please try again.', 'error');
         return;
       }
-      setStep('phone');
-      setCode('');
-      setPhone('');
-      await checkStatus();
-      await onRefresh();
-      notify('Telegram is connected to your workspace.');
+      await completeLogin();
+    } catch (error) {
+      notify(friendlyTelegramError(error), 'error');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const verifyPassword = async (event) => {
+    event.preventDefault();
+    if (!password) {
+      notify('Enter your Telegram two-step verification password.', 'error');
+      return;
+    }
+    setBusy(true);
+    setToast(null);
+    try {
+      const result = await request('/api/telegram/verify-password', token, { method: 'POST', body: { password } });
+      if (!result.connected) {
+        notify(result.message || 'Telegram could not verify that password. Please try again.', 'error');
+        return;
+      }
+      await completeLogin();
     } catch (error) {
       notify(friendlyTelegramError(error), 'error');
     } finally {
@@ -119,6 +149,7 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
 
   const changeNumber = () => {
     setCode('');
+    setPassword('');
     setStep('phone');
     setToast(null);
   };
@@ -132,6 +163,7 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
       setChats([]);
       setPhone('');
       setCode('');
+      setPassword('');
       setStep('phone');
       await onRefresh();
       notify('Telegram has been disconnected.');
@@ -186,7 +218,7 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
           return <div className="chat-row" key={chat.channelId}><div><strong>{chat.title}</strong><small>{chat.username ? `@${chat.username}` : chat.channelId}</small></div><button className="button button-small" type="button" disabled={added || busy} onClick={() => addChannel(chat)}>{added ? 'Added' : busy ? 'Adding…' : 'Monitor'}</button></div>;
         })}</div>}
       </> : <>
-        <p className="muted">Connect your Telegram account with your phone number and the one-time code Telegram sends you.</p>
+        <p className="muted">Connect with your phone number and Telegram login code. If two-step verification is enabled, Telegram will also ask for your password.</p>
         {step === 'phone' ? <form className="form-stack telegram-form" onSubmit={sendCode} aria-busy={busy}>
           <label htmlFor="telegram-phone">Phone number
             <input id="telegram-phone" type="tel" inputMode="tel" autoComplete="tel" placeholder="+15551234567" value={phone} onChange={(event) => setPhone(event.target.value)} aria-describedby="telegram-phone-help" aria-invalid={Boolean(phone) && !isValidPhone(phone)} required />
@@ -194,13 +226,21 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
           <small id="telegram-phone-help" className="field-help">Include the country code, for example +15551234567.</small>
           {phone && !isValidPhone(phone) && <small className="field-error" role="alert">Enter a valid international phone number with its country code.</small>}
           <button className="button button-primary" type="submit" disabled={busy || !isValidPhone(phone)}>{busy ? 'Sending…' : 'Send Telegram code'}</button>
-        </form> : <form className="form-stack telegram-form" onSubmit={verifyCode} aria-busy={busy}>
+        </form> : step === 'code' ? <form className="form-stack telegram-form" onSubmit={verifyCode} aria-busy={busy}>
           <p className="code-destination">Enter the code sent to <strong>{phone}</strong>.</p>
           <label htmlFor="telegram-code">Telegram login code
             <input id="telegram-code" type="text" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9 ]{3,10}" maxLength={10} placeholder="Enter the code" value={code} onChange={(event) => setCode(event.target.value)} aria-describedby="telegram-code-help" required />
           </label>
           <small id="telegram-code-help" className="field-help">Enter the numeric code from your Telegram app or SMS.</small>
           <button className="button button-primary" type="submit" disabled={busy || !/^\d{3,10}$/.test(code.replace(/\s/g, ''))}>{busy ? 'Verifying…' : 'Verify code'}</button>
+          <button className="text-button change-number" type="button" disabled={busy} onClick={changeNumber}>Use a different phone number</button>
+        </form> : <form className="form-stack telegram-form" onSubmit={verifyPassword} aria-busy={busy}>
+          <p className="code-destination">Your code was accepted. Enter the password for Telegram two-step verification.</p>
+          <label htmlFor="telegram-two-step-password">Telegram two-step verification password
+            <input id="telegram-two-step-password" type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} aria-describedby="telegram-password-help" required />
+          </label>
+          <small id="telegram-password-help" className="field-help">This password is sent to Telegram to finish signing in and is not saved in this form.</small>
+          <button className="button button-primary" type="submit" disabled={busy || !password}>{busy ? 'Verifying…' : 'Verify password'}</button>
           <button className="text-button change-number" type="button" disabled={busy} onClick={changeNumber}>Use a different phone number</button>
         </form>}
       </>}
