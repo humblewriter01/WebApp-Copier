@@ -49,10 +49,10 @@ button,input,textarea,select{touch-action:manipulation}
 @keyframes toast-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
 @media(max-width:1050px){.metrics-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:700px){
-  :root{--sidebar-width:max(150px,min(38vw,210px))}
+  :root{--sidebar-width:min(82vw,280px)}
   .sidebar{width:var(--sidebar-width);padding:calc(15px + env(safe-area-inset-top)) 9px calc(13px + env(safe-area-inset-bottom))}
   .sidebar .side-brand{padding:0 3px 20px;gap:8px}
-  .sidebar .side-brand>div:last-child{display:block;min-width:0}
+  .sidebar .side-brand .brand-copy{display:block;min-width:0;flex:1}
   .side-brand strong{font-size:12px}
   .side-brand small{font-size:9px}
   .sidebar .brand-mark{width:32px;height:32px;border-radius:10px}
@@ -133,6 +133,17 @@ button,input,textarea,select{touch-action:manipulation}
   .main-area{margin-left:0;width:100%;min-width:0}
   .sidebar{z-index:30;box-shadow:12px 0 32px rgba(10,20,34,.2)}
   .app-shell:not(.sidebar-hidden) .sidebar{transform:translateX(0);visibility:visible;pointer-events:auto}
-  .sidebar-backdrop{position:fixed;inset:0;z-index:20;border:0;padding:0;background:rgba(12,20,34,.3);cursor:pointer}
-  .app-shell:not(.sidebar-hidden) .sidebar-toggle{position:relative;z-index:31}
+  .sidebar-backdrop{position:fixed;inset:0;z-index:20;border:0;padding:0;background:rgba(0,0,0,.6);cursor:pointer}
+  .app-shell:not(.sidebar-hidden) .sidebar-toggle{display:none}
+}
+
+
+/* Keep the mobile close affordance in the drawer header, clear of the nav labels. */
+.sidebar-close{display:none}
+@media(max-width:700px){
+  .sidebar .side-brand{align-items:center;gap:8px}
+  .sidebar .side-brand .brand-copy{display:block;min-width:0;flex:1}
+  .sidebar-close{display:inline-flex;align-items:center;justify-content:center;flex:0 0 44px;width:44px;height:44px;min-width:44px;min-height:44px;padding:0;border:1px solid rgba(255,255,255,.24);border-radius:11px;background:rgba(255,255,255,.08);color:#fff}
+  .sidebar-close:hover{background:rgba(255,255,255,.16)}
+  .sidebar-close svg{display:block;width:19px;height:19px}
 }
