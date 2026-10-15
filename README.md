@@ -5,6 +5,7 @@ A deployable React/Vite and Express app for capturing Telegram channel messages,
 ## Features
 
 - Password-based user accounts and a responsive dashboard.
+- Installable Chrome PWA with a standalone window and branded launcher icon.
 - Optional Telegram user-session integration for monitoring selected channels.
 - Signal history and manual signal notes.
 - Reference-only account notes.
@@ -81,6 +82,17 @@ The UI/API can be used without Telegram credentials; Telegram is shown as unavai
 The deployed architecture uses two Render services because the frontend is a static site and the API is a Node web service. The API connects to Supabase PostgreSQL through its private `DATABASE_URL`; the Render Blueprint no longer provisions a second Render database. The static site uses `VITE_API_URL` to target the API service.
 
 Required API variables: `DATABASE_URL`, `JWT_SECRET`, `SESSION_ENCRYPTION_KEY`, and `CLIENT_URL`. Add `API_ID` and `API_HASH` only if Telegram integration is enabled. MetaAPI users add their own API token in the authenticated MetaAPI page; it is not a shared Render environment variable.
+
+### Add Telegram API credentials in Render
+
+1. Sign in to [my.telegram.org/apps](https://my.telegram.org/apps), create or open your Telegram application, and copy its **API ID** and **API Hash**.
+2. In the Render dashboard, open the **`telegram-copier-api`** web service and go to **Environment**.
+3. Add `API_ID` with the numeric ID and `API_HASH` with the hash, then save changes and wait for the API service to redeploy.
+4. Do not add these as `VITE_*` frontend variables, commit them to GitHub, or paste the hash into chat.
+
+### Install from Chrome
+
+The static site is served over HTTPS and includes a linked web app manifest, 192×192 and 512×512 icons (including a maskable icon), and standalone display metadata. Open [Telegram Signal Desk](https://telegram-copier-web.onrender.com/) in Chrome. Use Chrome's **Install app** menu item, or the in-app **Install app** button when Chrome exposes it. Chrome may wait for a page interaction and some time on the site before offering its install prompt. On Android, the exact menu wording can vary by Chrome/device version.
 
 ## API overview
 

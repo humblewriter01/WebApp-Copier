@@ -29,7 +29,7 @@ async function request(path, token, options = {}) {
   return payload;
 }
 
-function AuthScreen({ onAuthenticated }) {
+function AuthScreen({ onAuthenticated, installPrompt, onInstall }) {
   const [mode, setMode] = useState('login');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -42,7 +42,7 @@ function AuthScreen({ onAuthenticated }) {
     } catch (e) { setError(e.message); } finally { setBusy(false); }
   };
   return <main className="auth-shell">
-    <div className="auth-brand"><div className="brand-mark">TS</div><span>Signal Desk</span></div>
+    <div className="auth-brand"><div className="brand-mark"><img src="/icons/signal-desk-icon-192.png" alt="" /></div><span>Signal Desk</span></div>
     <section className="auth-card">
       <p className="eyebrow">TELEGRAM SIGNAL MONITOR</p>
       <h1>{mode === 'login' ? 'Welcome back' : 'Create your workspace'}</h1>
@@ -56,6 +56,7 @@ function AuthScreen({ onAuthenticated }) {
       </form>
       <p className="auth-switch">{mode === 'login' ? 'New to Signal Desk?' : 'Already have an account?'} <button className="text-button" onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError(''); }}>{mode === 'login' ? 'Create account' : 'Sign in'}</button></p>
       <p className="fine-print">Signal capture and organization only. This deployment does not place live trades.</p>
+      {installPrompt && <button type="button" className="button button-primary button-wide install-button" onClick={onInstall}>Install Signal Desk</button>}
     </section>
   </main>;
 }
@@ -101,7 +102,7 @@ function TelegramPanel({ token, channels, refresh }) {
   return <div className="panel-grid">
     <section className="panel">
       <div className="panel-heading"><div><p className="eyebrow">SOURCE ACCOUNT</p><h2>Telegram connection</h2></div><span className={`status-pill ${status.connected ? 'online' : ''}`}>{status.connected ? 'Connected' : 'Not connected'}</span></div>
-      {!status.configured && <div className="alert alert-info">Telegram is not enabled on this deployment yet. Add <code>API_ID</code> and <code>API_HASH</code> in the backend service environment to enable login.</div>}
+      {!status.configured && <div className="alert alert-info telegram-setup"><strong>Enable Telegram login</strong><ol><li>Get your API ID and API hash at <a href="https://my.telegram.org/apps" target="_blank" rel="noreferrer">my.telegram.org/apps</a>.</li><li>In Render, open the <code>telegram-copier-api</code> service → <strong>Environment</strong>. Add <code>API_ID</code> with the numeric ID and <code>API_HASH</code> with the hash.</li><li>Save the changes and wait for the API service to redeploy. Keep these values out of frontend variables and GitHub.</li></ol></div>}
       {status.connected ? <>
         <p className="muted">Your Telegram session is stored encrypted in the database. Only channels you subscribe to are monitored.</p>
         <div className="button-row"><button className="button button-secondary" onClick={loadChats}>Refresh channel list</button><button className="button button-danger" onClick={async () => { if (!window.confirm('Disconnect Telegram and delete the saved session?')) return; await action('/api/telegram/disconnect', {}, 'Telegram disconnected.'); setStatus({ ...status, connected: false }); setChats([]); await refresh(); }}>Disconnect</button></div>
@@ -225,6 +226,24 @@ function App() {
   const [notice, setNotice] = useState('');
   const [signalText, setSignalText] = useState('');
   const [accountForm, setAccountForm] = useState({ label: '', broker: '', platform: '', accountReference: '' });
+  const [installPrompt, setInstallPrompt] = useState(null);
+
+  useEffect(() => {
+    const captureInstallPrompt = (event) => { event.preventDefault(); setInstallPrompt(event); };
+    const handleInstalled = () => setInstallPrompt(null);
+    window.addEventListener('beforeinstallprompt', captureInstallPrompt);
+    window.addEventListener('appinstalled', handleInstalled);
+    return () => {
+      window.removeEventListener('beforeinstallprompt', captureInstallPrompt);
+      window.removeEventListener('appinstalled', handleInstalled);
+    };
+  }, []);
+
+  const installApp = async () => {
+    if (!installPrompt) return;
+    try { await installPrompt.prompt(); await installPrompt.userChoice; } catch {}
+    setInstallPrompt(null);
+  };
 
   const logout = useCallback(() => { sessionStorage.removeItem('signal-token'); setToken(''); setUser(null); setDashboard(null); setLoading(false); }, []);
   const refresh = useCallback(async () => {
@@ -257,11 +276,11 @@ function App() {
     catch (e) { setError(e.message); }
   };
 
-  if (!token) return <AuthScreen onAuthenticated={authenticated} />;
+  if (!token) return <AuthScreen onAuthenticated={authenticated} installPrompt={installPrompt} onInstall={installApp} />;
   if (loading) return <main className="loading-shell"><div className="spinner" /><span>Loading your workspace…</span></main>;
   return <div className="app-shell">
-    <aside className="sidebar"><div className="side-brand"><div className="brand-mark">TS</div><div><strong>Signal Desk</strong><small>Telegram copier</small></div></div><nav>{tabs.map(([key, label]) => <button key={key} className={`nav-item ${tab === key ? 'active' : ''}`} onClick={() => setTab(key)}><span className="nav-dot" />{label}</button>)}</nav><div className="sidebar-bottom"><div className="user-mini"><span className="avatar">{(user?.name || 'U').slice(0, 1).toUpperCase()}</span><div><strong>{user?.name}</strong><small>{user?.email}</small></div></div><button className="logout-button" onClick={logout}>Sign out</button></div></aside>
-    <main className="main-area"><header className="topbar"><div><span className="eyebrow">PERSONAL WORKSPACE</span><h1>{tabs.find(([key]) => key === tab)?.[1] || 'Overview'}</h1></div><div className="topbar-right"><span className="status-pill online"><i /> Connected</span><button className="button button-secondary button-small" onClick={refresh}>Refresh</button></div></header>
+    <aside className="sidebar"><div className="side-brand"><div className="brand-mark"><img src="/icons/signal-desk-icon-192.png" alt="" /></div><div><strong>Signal Desk</strong><small>Telegram copier</small></div></div><nav>{tabs.map(([key, label]) => <button key={key} className={`nav-item ${tab === key ? 'active' : ''}`} onClick={() => setTab(key)}><span className="nav-dot" />{label}</button>)}</nav><div className="sidebar-bottom"><div className="user-mini"><span className="avatar">{(user?.name || 'U').slice(0, 1).toUpperCase()}</span><div><strong>{user?.name}</strong><small>{user?.email}</small></div></div><button className="logout-button" onClick={logout}>Sign out</button></div></aside>
+    <main className="main-area"><header className="topbar"><div><span className="eyebrow">PERSONAL WORKSPACE</span><h1>{tabs.find(([key]) => key === tab)?.[1] || 'Overview'}</h1></div><div className="topbar-right">{installPrompt && <button className="button button-primary button-small install-app-button" onClick={installApp}>Install app</button>}<span className="status-pill online"><i /> Connected</span><button className="button button-secondary button-small" onClick={refresh}>Refresh</button></div></header>
       {error && <div className="alert alert-error global-alert">{error}<button className="alert-close" onClick={() => setError('')}>×</button></div>}{notice && <div className="alert alert-success global-alert">{notice}<button className="alert-close" onClick={() => setNotice('')}>×</button></div>}
       <div className="content-area">
         {tab === 'overview' && <>
