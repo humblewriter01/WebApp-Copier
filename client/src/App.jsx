@@ -16,12 +16,13 @@ function AuthScreen({ onAuthenticated, installPrompt, onInstall }) {
   const [mode, setMode] = useState('login');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [rememberMe, setRememberMe] = useState(true);
   const [form, setForm] = useState({ name: '', email: '', password: '' });
   const submit = async (event) => {
     event.preventDefault(); setBusy(true); setError('');
     try {
-      const data = await request(`/api/auth/${mode === 'login' ? 'login' : 'register'}`, null, { method: 'POST', body: form });
-      onAuthenticated(data);
+      const data = await request(`/api/auth/${mode === 'login' ? 'login' : 'register'}`, null, { method: 'POST', body: { ...form, rememberMe } });
+      onAuthenticated(data, rememberMe);
     } catch (e) { setError(e.message); } finally { setBusy(false); }
   };
   return <main className="auth-shell">
@@ -34,6 +35,8 @@ function AuthScreen({ onAuthenticated, installPrompt, onInstall }) {
         {mode === 'register' && <label>Your name<input autoComplete="name" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} required maxLength={100} /></label>}
         <label>Email<input type="email" autoComplete="email" value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} required /></label>
         <label>Password<input type="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} required minLength={mode === 'register' ? 10 : 1} />{mode === 'register' && <small>Use at least 10 characters.</small>}</label>
+        <label className="remember-session"><input type="checkbox" checked={rememberMe} onChange={(event) => setRememberMe(event.target.checked)} /><span>Keep me signed in for 30 days</span></label>
+        <small className="remember-hint">Leave checked on your personal device. Uncheck it on shared devices.</small>
         {error && <div className="alert alert-error">{error}</div>}
         <button className="button button-primary button-wide" disabled={busy}>{busy ? 'Please wait…' : mode === 'login' ? 'Sign in' : 'Create account'}</button>
       </form>
@@ -152,7 +155,10 @@ function MetaApiPanel({ token }) {
 }
 
 function App() {
-  const [token, setToken] = useState(sessionStorage.getItem('signal-token') || '');
+  const [token, setToken] = useState(() => {
+    try { return localStorage.getItem('signal-token') || sessionStorage.getItem('signal-token') || ''; }
+    catch { return sessionStorage.getItem('signal-token') || ''; }
+  });
   const [user, setUser] = useState(null);
   const [tab, setTab] = useState('overview');
   const [dashboard, setDashboard] = useState(null);
@@ -193,7 +199,7 @@ function App() {
     return next;
   });
 
-  const logout = useCallback(() => { sessionStorage.removeItem('signal-token'); setToken(''); setUser(null); setDashboard(null); setLoading(false); }, []);
+  const logout = useCallback(() => { try { localStorage.removeItem('signal-token'); } catch {} sessionStorage.removeItem('signal-token'); setToken(''); setUser(null); setDashboard(null); setLoading(false); }, []);
   const refresh = useCallback(async () => {
     if (!token) return;
     try {
@@ -207,7 +213,14 @@ function App() {
   }, [token, logout]);
   useEffect(() => { if (!token) { setLoading(false); return; } refresh(); const timer = setInterval(refresh, 20_000); return () => clearInterval(timer); }, [token, refresh]);
 
-  const authenticated = (data) => { sessionStorage.setItem('signal-token', data.token); setToken(data.token); setUser(data.user); setLoading(true); };
+  const authenticated = (data, rememberMe = true) => {
+    sessionStorage.removeItem('signal-token');
+    try {
+      localStorage.removeItem('signal-token');
+      (rememberMe ? localStorage : sessionStorage).setItem('signal-token', data.token);
+    } catch { sessionStorage.setItem('signal-token', data.token); }
+    setToken(data.token); setUser(data.user); setLoading(true);
+  };
   const addManualSignal = async (event) => {
     event.preventDefault(); setError(''); setNotice('');
     try { await request('/api/signals', token, { method: 'POST', body: { message: signalText } }); setSignalText(''); setNotice('Signal saved.'); await refresh(); }

@@ -121,3 +121,9 @@ button,input,textarea,select{touch-action:manipulation}
   .sidebar-toggle span{display:none}
 }
 @media(prefers-reduced-motion:reduce){.sidebar,.main-area{transition:none}}
+
+/* Remember-device preference */
+.remember-session{display:flex!important;flex-direction:row!important;align-items:center;gap:10px!important;min-height:44px;cursor:pointer}
+.remember-session input[type="checkbox"]{width:18px!important;height:18px!important;min-height:18px!important;padding:0;flex:0 0 18px;accent-color:#1e6878}
+.remember-session span{font-size:12px;font-weight:600;color:#344258}
+.remember-hint{color:#657286!important;font-size:11px;line-height:1.45;margin-top:-10px}

@@ -78,8 +78,8 @@ function decryptSecret(value) {
   return Buffer.concat([decipher.update(Buffer.from(bodyText, 'base64')), decipher.final()]).toString('utf8');
 }
 
-function issueToken(user) {
-  return jwt.sign({ sub: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '12h' });
+function issueToken(user, rememberMe = false) {
+  return jwt.sign({ sub: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: rememberMe ? '30d' : '12h' });
 }
 function authenticate(req, res, next) {
   const token = req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
@@ -179,7 +179,7 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
     const { rows } = await pool.query('INSERT INTO users(name,email,password_hash) VALUES($1,$2,$3) RETURNING id,name,email,created_at', [name, email, hash]);
     await pool.query('INSERT INTO settings(user_id) VALUES($1) ON CONFLICT DO NOTHING', [rows[0].id]);
     const user = publicUser(rows[0]);
-    res.status(201).json({ token: issueToken(user), user });
+    res.status(201).json({ token: issueToken(user, req.body.rememberMe === true), user });
   } catch (error) {
     if (error.code === '23505') return fail(res, 409, 'An account with that email already exists.');
     throw error;
@@ -192,7 +192,7 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
   if (!rows[0] || !(await bcrypt.compare(password, rows[0].password_hash))) return fail(res, 401, 'Email or password is incorrect.');
   await pool.query('UPDATE users SET last_login=NOW() WHERE id=$1', [rows[0].id]);
   const user = publicUser(rows[0]);
-  res.json({ token: issueToken(user), user });
+  res.json({ token: issueToken(user, req.body.rememberMe === true), user });
 }));
 app.get('/api/auth/me', authenticate, asyncRoute(async (req, res) => {
   const { rows } = await pool.query('SELECT id,name,email,created_at FROM users WHERE id=$1', [req.userId]);
