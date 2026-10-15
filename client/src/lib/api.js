@@ -25,6 +25,8 @@ export async function request(path, token, options = {}) {
     if (payload.telegramErrorCode) error.telegramErrorCode = payload.telegramErrorCode;
     if (Number.isInteger(payload.metaApiStatus)) error.metaApiStatus = payload.metaApiStatus;
     if (typeof payload.metaApiErrorCode === 'string') error.metaApiErrorCode = payload.metaApiErrorCode;
+    if (typeof payload.metaApiErrorType === 'string') error.metaApiErrorType = payload.metaApiErrorType;
+    if (typeof payload.metaApiNetworkDiagnostic === 'string') error.metaApiNetworkDiagnostic = payload.metaApiNetworkDiagnostic;
     throw error;
   }
   return payload;

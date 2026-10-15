@@ -30,7 +30,7 @@ export default function MetaApiPanel({ token }) {
       setAvailable(Boolean(status.available));
       setAccounts(linked.accounts || []);
     } catch (requestError) {
-      setError(requestError.message || 'We could not load your accounts. Please try again.');
+      setError(requestError.message || 'We could not load your trading accounts. Please try again.');
     } finally {
       setLoading(false);
     }
@@ -57,12 +57,12 @@ export default function MetaApiPanel({ token }) {
       if (result.setupError?.message) {
         setError(result.setupError.message);
       } else if (result.configurationLink) {
-        setNotice('Account setup is ready. Open the secure MetaAPI page to finish connecting it.');
+        setNotice('Trading account setup is ready. Open the secure MetaAPI page to finish connecting it.');
       } else {
-        setNotice('Your account was added. Create a secure setup link below to finish connecting it.');
+        setNotice('Your trading account was added. Create a secure setup link below to finish connecting it.');
       }
     } catch (requestError) {
-      setError(requestError.message || 'We could not start account setup. Please try again.');
+      setError(requestError.message || 'We could not start trading account setup. Please try again.');
     } finally {
       setBusy(false);
     }
@@ -90,16 +90,16 @@ export default function MetaApiPanel({ token }) {
     try {
       await request(`/api/metaapi/provisioned-accounts/${encodeURIComponent(account.metaApiAccountId)}/refresh`, token, { method: 'POST', body: {} });
       await refresh();
-      setNotice('Account status updated.');
+      setNotice('Trading account status updated.');
     } catch (requestError) {
-      setError(requestError.message || 'We could not refresh this account. Please try again.');
+      setError(requestError.message || 'We could not refresh this trading account. Please try again.');
     } finally {
       setBusy(false);
     }
   };
 
   const removeAccount = async (account) => {
-    if (!window.confirm('Remove this account from Signal Desk? It will remain in your MetaAPI account.')) return;
+    if (!window.confirm('Remove this trading account from Signal Desk? It will remain in your MetaAPI account.')) return;
     setBusy(true);
     setError('');
     setNotice('');
@@ -107,9 +107,9 @@ export default function MetaApiPanel({ token }) {
       await request(`/api/metaapi/accounts/${encodeURIComponent(account.metaApiAccountId)}`, token, { method: 'DELETE' });
       if (setupLink?.accountId === account.metaApiAccountId) setSetupLink(null);
       await refresh();
-      setNotice('Account removed from Signal Desk.');
+      setNotice('Trading account removed from Signal Desk.');
     } catch (requestError) {
-      setError(requestError.message || 'We could not remove this account. Please try again.');
+      setError(requestError.message || 'We could not remove this trading account. Please try again.');
     } finally {
       setBusy(false);
     }
@@ -124,7 +124,7 @@ export default function MetaApiPanel({ token }) {
         <div><p className="eyebrow">TRADING ACCOUNT</p><h2 id="metaapi-setup-title">Add an MT4/MT5 account</h2></div>
         <span className={`status-pill ${available ? 'online' : ''}`}>{available ? 'Ready' : 'Unavailable'}</span>
       </div>
-      <p className="muted">Enter the account name, platform, and broker server. You’ll enter your trading login and password on MetaAPI’s secure page—not in Signal Desk.</p>
+      <p className="muted">Enter the trading account name, platform, and broker server. You’ll enter your trading login and password on MetaAPI’s secure page—not in Signal Desk.</p>
       {available ? <form className="form-stack" onSubmit={createAccount} aria-busy={busy}>
         <label htmlFor="metaapi-account-name">Account name
           <input id="metaapi-account-name" value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="My MT5 account" maxLength={100} autoComplete="off" required />
@@ -141,12 +141,12 @@ export default function MetaApiPanel({ token }) {
         <small className="field-help">Use the exact server name shown by your broker. For monitoring, choose an investor/read-only password on MetaAPI if your broker offers one.</small>
         <button className="button button-primary" type="submit" disabled={busy || loading || !form.name.trim() || !form.server.trim()}>{busy ? 'Preparing secure setup…' : 'Create secure setup link'}</button>
       </form> : <div className="empty-state compact-empty"><strong>Account setup is not available yet</strong><span>Please ask the workspace owner to finish setting up account connections.</span></div>}
-      <div className="note-box">Signal Desk does not receive your trading password and does not place, change, or close trades. MetaAPI usage limits or charges may apply when an account is connected.</div>
+      <div className="note-box">Signal Desk does not receive your trading password and does not place, change, or close trades. MetaAPI usage limits or charges may apply when a trading account is connected.</div>
     </section>
 
     <section className="panel" aria-labelledby="metaapi-accounts-title">
       <div className="panel-heading">
-        <div><p className="eyebrow">YOUR ACCOUNTS</p><h2 id="metaapi-accounts-title">Connected accounts</h2></div>
+        <div><p className="eyebrow">TRADING ACCOUNTS</p><h2 id="metaapi-accounts-title">Connected trading accounts</h2></div>
         <button type="button" className="button button-secondary button-small" disabled={busy || loading} onClick={refresh}>{loading ? 'Loading…' : 'Refresh'}</button>
       </div>
       {setupLink && <div className="secure-link-card" role="status">
@@ -154,7 +154,7 @@ export default function MetaApiPanel({ token }) {
         <p>The secure link is valid for seven days. Your broker password is entered on MetaAPI, not stored by Signal Desk.</p>
         <a className="button button-primary" href={setupLink.url} target="_blank" rel="noopener noreferrer">Open secure setup</a>
       </div>}
-      {loading && !accounts.length ? <p className="muted" role="status">Loading your accounts…</p> : !accounts.length ? <div className="empty-state compact-empty"><strong>No accounts connected</strong><span>Add an MT4 or MT5 account to get started.</span></div> : <div className="chat-list">
+      {loading && !accounts.length ? <p className="muted" role="status">Loading your trading accounts…</p> : !accounts.length ? <div className="empty-state compact-empty"><strong>No trading accounts connected</strong><span>Add an MT4 or MT5 account to get started.</span></div> : <div className="chat-list">
         {provisionedAccounts.map((account) => <div className="chat-row account-row" key={account.id}>
           <div><strong>{account.name || 'Trading account'}</strong><small>{[account.platform?.toUpperCase(), account.server, account.login && `Login ${account.login}`, accountStateLabel(account.state)].filter(Boolean).join(' · ')}</small></div>
           <div className="account-actions">
@@ -169,7 +169,7 @@ export default function MetaApiPanel({ token }) {
         </div>)}
       </div>}
       {(error || notice) && <div className={`alert ${error ? 'alert-error' : 'alert-success'}`} role={error ? 'alert' : 'status'} aria-live="polite">{error || notice}</div>}
-      <p className="field-help account-retention-note">Removing an account here only removes its link to Signal Desk. It does not delete the account from MetaAPI or your broker.</p>
+      <p className="field-help account-retention-note">Removing a trading account here only removes its link to Signal Desk. It does not delete the account from MetaAPI or your broker.</p>
     </section>
   </div>;
 }

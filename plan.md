@@ -2,23 +2,24 @@
 
 ## Existing structure
 
-- `client/src/App.jsx` holds the dashboard shell and top-level routes.
+- `client/src/navigation.js` defines the shared navigation keys and labels used by the app shell and sidebar.
+- `client/src/App.jsx` holds the dashboard shell, page titles, and account-note screens.
+- `client/src/components/Sidebar.jsx` renders the shared navigation labels.
 - `client/src/components/TelegramConnect.jsx` owns Telegram authentication, chat selection, and monitoring controls.
-- `client/src/components/MetaApiPanel.jsx` owns the user-facing MT4/MT5 setup workflow.
-- `server/index.js` owns authenticated API routes, rate limiting, and database ownership checks.
-- `server/services/metaapi.js` owns the allowlisted HTTPS calls to MetaAPI.
+- `client/src/components/MetaApiPanel.jsx` owns the user-facing MT4/MT5 setup workflow and diagnostic display.
+- `server/index.js` owns authenticated API routes, safe error responses, and database ownership checks.
+- `server/services/metaapi.js` owns allowlisted HTTPS calls, provider/network error details, credential redaction, and funding classification.
 - `server/db.js` initializes the PostgreSQL schema used by the Render API and Supabase.
-- `render.yaml` defines the API and static-site services.
 
 ## Implementation approach
 
-Reuse the current product styling. Keep the existing Telegram chat search and plain-language copy. Rename the sidebar item from “MetaAPI” to “Trading Accounts,” which describes the page’s purpose rather than the provider.
+Use one shared navigation definition for the sidebar and top-level page title so they cannot drift. Name the reference-only section **Account Notes** and the MetaAPI provisioning/connected-account section **Trading Accounts**. Update related metric, section headings, and the account-note cross-link to use these terms consistently; keep descriptive action labels such as “Add an MT4/MT5 account.”
 
-The recent setup failure is caused by a non-resolving MetaAPI base hostname: Render logs show the request could not reach MetaAPI, and a no-token check confirms the current single-`agiliumtrade.ai` hostname fails DNS while the hostname in MetaAPI's official examples responds. Use `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai` as the server-side endpoint in the helper, Render configuration, and documentation. Keep the official `auth-token` request header; the current account body (`name`, `server`, `platform`, `magic: 0`) is valid and intentionally omits login/password.
+MetaAPI's documented create-account responses include validation, authorization, permission, provisioning-profile, and broker/account errors. The docs do not specify a deposit or insufficient-funds response for this flow, although they note separately billed resource options and possible charges for repeated credential/settings errors. Preserve any provider-supplied message and HTTP status/code, redact tokens and passwords, and detect funding/billing language (for example insufficient funds/balance, deposit, or payment) so such a provider response is labeled accurately without paraphrasing away its exact text. If `fetch` fails before an HTTP response, capture the safe nested cause/code (including nested causes or aggregate errors), state that MetaAPI returned no provider response, and do not present it as a confirmed funding issue. Keep internal logs useful but secret-free.
 
-Improve error reporting without exposing secrets. Keep explicit friendly mapping for known MetaAPI errors, attach a sanitized provider message/status/error code to errors returned from the MetaAPI helper, and let the server return a separate safe `userMessage`. The shared frontend request helper must display that field for MetaAPI errors even when the HTTP status is 5xx, while unexpected server failures continue to use the existing generic message. Never return tokens, broker credentials, stack traces, or unfiltered provider payloads.
+The shared frontend API helper must display the backend's safe diagnostic message for MetaAPI failures rather than replacing it with a generic connection message. Keep unexpected internal errors generic. The initial account-creation route must continue to show a configuration-link failure even when MetaAPI has already created the draft account. Do not expose stack traces, raw payloads, tokens, or broker credentials, and do not add trading order operations.
 
-Keep the existing secure account setup flow, ownership checks, and no-trading-order boundary. Configure Express to trust the Render reverse-proxy hop before the rate limiters so per-client rate limiting uses the forwarded client IP without trusting all proxy hops.
+Reuse the existing navy/teal product styling and secure hosted-credentials flow. No new infrastructure or external service integration is needed.
 
 ## Design
 

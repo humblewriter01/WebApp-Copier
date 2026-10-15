@@ -363,6 +363,8 @@ app.post('/api/metaapi/provisioned-accounts', authenticate, asyncRoute(async (re
       message: typeof error.userMessage === 'string' ? error.userMessage : error.message,
       ...(Number.isInteger(error.metaApiStatus) ? { metaApiStatus: error.metaApiStatus } : {}),
       ...(typeof error.metaApiErrorCode === 'string' ? { metaApiErrorCode: error.metaApiErrorCode } : {}),
+      ...(typeof error.metaApiErrorType === 'string' ? { metaApiErrorType: error.metaApiErrorType } : {}),
+      ...(typeof error.metaApiNetworkDiagnostic === 'string' ? { metaApiNetworkDiagnostic: error.metaApiNetworkDiagnostic } : {}),
     };
     log('warn', 'Secure MetaAPI setup link could not be created', {
       userId: req.userId,
@@ -370,6 +372,8 @@ app.post('/api/metaapi/provisioned-accounts', authenticate, asyncRoute(async (re
       error: error.message,
       metaApiStatus: error.metaApiStatus,
       metaApiErrorCode: error.metaApiErrorCode,
+      metaApiErrorType: error.metaApiErrorType,
+      metaApiNetworkDiagnostic: error.metaApiNetworkDiagnostic,
     });
   }
   res.set('Cache-Control', 'no-store').status(201).json({ account: rows[0], configurationLink, setupError });
@@ -686,12 +690,16 @@ app.use((error, _req, res, _next) => {
     code: error.code,
     metaApiStatus: error.metaApiStatus,
     metaApiErrorCode: error.metaApiErrorCode,
+    metaApiErrorType: error.metaApiErrorType,
+    metaApiNetworkDiagnostic: error.metaApiNetworkDiagnostic,
   });
   if (res.headersSent) return;
   const payload = { error: error.status ? error.message : 'Something went wrong. Please try again in a moment.' };
   if (typeof error.userMessage === 'string') payload.userMessage = error.userMessage;
   if (Number.isInteger(error.metaApiStatus)) payload.metaApiStatus = error.metaApiStatus;
   if (typeof error.metaApiErrorCode === 'string') payload.metaApiErrorCode = error.metaApiErrorCode;
+  if (typeof error.metaApiErrorType === 'string') payload.metaApiErrorType = error.metaApiErrorType;
+  if (typeof error.metaApiNetworkDiagnostic === 'string') payload.metaApiNetworkDiagnostic = error.metaApiNetworkDiagnostic;
   res.status(error.status || 500).json(payload);
 });
 

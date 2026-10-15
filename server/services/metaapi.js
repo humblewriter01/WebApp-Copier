@@ -27,38 +27,87 @@ function isAllowedRequest(method, endpoint, body) {
   return method === 'PUT' && body === undefined && new RegExp(`^${ACCOUNT_ENDPOINT}/[A-Za-z0-9_-]{1,200}/configuration-link$`).test(endpoint);
 }
 
-function providerErrorCode(payload) {
+function providerErrorCode(payload, apiToken) {
   const value = typeof payload?.details === 'string' ? payload.details : payload?.details?.code;
-  return typeof value === 'string' && /^[A-Za-z0-9_.-]{1,80}$/.test(value) ? value : '';
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_.-]{1,80}$/.test(value)) return '';
+  if (typeof apiToken === 'string' && apiToken.length >= 4 && value.includes(apiToken)) return '';
+  return value;
 }
 
 function safeProviderMessage(payload, apiToken) {
-  const raw = typeof payload?.message === 'string'
-    ? payload.message
-    : typeof payload?.error === 'string' ? payload.error : '';
-  if (!raw) return '';
-  let safe = raw
+  const candidates = [payload?.message, payload?.details?.message, payload?.error?.message, payload?.error]
+    .filter((value) => typeof value === 'string' && value.trim());
+  if (!candidates.length) return '';
+  const sanitized = candidates.map((raw) => {
+    let safe = raw
     .replace(/[\u0000-\u001f\u007f]+/g, ' ')
-    .replace(/["']?\b(authorization|auth[-_ ]?token|password|passwd|secret|api[-_ ]?key|token)["']?\s*[:=]\s*(?:Bearer\s+)?["']?[^\s,"';}]+/gi, '$1=[redacted]')
+    .replace(/(https?:\/\/)[^/\s?#]*@([^/\s?#]*)/gi, '$1[redacted]@$2')
+    .replace(/["']?\b(authorization|auth[-_ ]?token|access[-_ ]?token|api[-_ ]?token|password|passwd|secret|api[-_ ]?key|token)["']?\s*[:=]\s*(?:Bearer\s+)?["']?[^&\s,"';}]+/gi, '$1=[redacted]')
     .replace(/\b(token|secret|api[-_ ]?key|password|passwd)\s+(?:is\s+)?["']?[A-Za-z0-9._~+/-]{12,}={0,2}["']?/gi, '$1 [redacted]')
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]{12,}={0,2}/gi, 'Bearer [redacted]')
+    .replace(/\bBearer\s+[^\s,"';}]{4,}/gi, 'Bearer [redacted]')
     .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 500);
-  if (typeof apiToken === 'string' && apiToken.length >= 4) safe = safe.replaceAll(apiToken, '[redacted]');
-  return safe;
+    .trim();
+    if (typeof apiToken === 'string' && apiToken.length >= 4) safe = safe.replaceAll(apiToken, '[redacted]');
+    return safe;
+  });
+  const unique = [...new Set(sanitized)];
+  const informative = unique.filter((value) => !/^(bad request|validationerror|error|request failed|failed request)$/i.test(value));
+  return (informative.length ? informative : unique).join(' — ').slice(0, 1000);
 }
 
-function safeNetworkCode(cause) {
-  const value = cause?.cause?.code || cause?.code || (cause?.name === 'TimeoutError' ? 'TIMEOUT' : '');
-  return typeof value === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(value) ? value : '';
+function safeNetworkDiagnostics(cause, apiToken) {
+  const queue = [cause];
+  const seen = new Set();
+  const nodes = [];
+  while (queue.length && nodes.length < 16) {
+    const current = queue.shift();
+    if (!current || typeof current !== 'object' || seen.has(current)) continue;
+    seen.add(current);
+    nodes.push(current);
+    if (current.cause && typeof current.cause === 'object') queue.push(current.cause);
+    if (Array.isArray(current.errors)) queue.push(...current.errors.slice(0, 5));
+  }
+  const code = nodes.map((node) => node.code).find((value) => typeof value === 'string'
+    && /^(?:E[A-Z0-9_]{1,40}|ERR_[A-Z0-9_]{1,56}|UND_ERR_[A-Z0-9_]{1,56}|ABORT_ERR)$/.test(value)
+    && !(typeof apiToken === 'string' && apiToken.length >= 4 && value.includes(apiToken)))
+    || (nodes.some((node) => node.name === 'TimeoutError') ? 'TIMEOUT' : '');
+  const messages = nodes.map((node) => node.message).filter((value) => typeof value === 'string' && value.trim());
+  const rawMessage = messages.find((value) => !/^(fetch failed|request failed|network error|all promises were rejected)$/i.test(value.trim())) || messages[0] || '';
+  return { code, message: rawMessage ? safeProviderMessage({ message: rawMessage }, apiToken) : '' };
+}
+
+function isFundingIssue(status, detail, providerMessage, payload) {
+  if (status === 402) return true;
+  const source = `${detail} ${providerMessage} ${payload?.message || ''} ${payload?.details?.message || ''} ${typeof payload?.error === 'string' ? payload.error : payload?.error?.message || ''}`;
+  return /\binsufficient[\s_-]*(?:funds?|balance|credits?)\b|\bnot[\s_-]+enough[\s_-]*(?:funds?|balance|credits?)\b|\b(?:deposit|funding|top[\s-]?up)\b|\b(?:billing|payment)\s+(?:required|failed|declined|issue|problem|error)\b|\bE_(?:INSUFFICIENT_FUNDS|INSUFFICIENT_BALANCE|NOT_ENOUGH_(?:FUNDS|BALANCE|CREDITS)|NO_CREDITS|PAYMENT_REQUIRED|BILLING_REQUIRED|FUNDING_REQUIRED|DEPOSIT_REQUIRED)\b/i.test(source);
+}
+
+function metaApiTransportError(cause, apiToken, responseStatus = null) {
+  const { code, message: causeMessage } = safeNetworkDiagnostics(cause, apiToken);
+  const diagnostic = [code, causeMessage].filter(Boolean).join(' — ');
+  const error = new Error('MetaAPI could not be reached. Try again shortly.');
+  error.status = 502;
+  error.code = code || 'METAAPI_NETWORK_ERROR';
+  error.metaApiErrorCode = code || 'NETWORK_ERROR';
+  error.metaApiErrorType = 'transport';
+  error.metaApiNetworkDiagnostic = diagnostic || 'fetch failed without an underlying cause';
+  if (Number.isInteger(responseStatus)) {
+    error.metaApiStatus = responseStatus;
+    error.userMessage = `MetaAPI returned HTTP ${responseStatus}, but its response body could not be read${diagnostic ? ` (${diagnostic})` : ''}. No complete provider funding or deposit message was received.`;
+  } else {
+    error.userMessage = `The request to MetaAPI failed before an HTTP response${diagnostic ? ` (${diagnostic})` : ''}. MetaAPI did not return a deposit or funding message.`;
+  }
+  return error;
 }
 
 function safeMetaApiError(status, payload, unauthorizedMessage, apiToken) {
-  const detail = providerErrorCode(payload);
+  const detail = providerErrorCode(payload, apiToken);
   const providerMessage = safeProviderMessage(payload, apiToken);
+  const fundingIssue = isFundingIssue(status, detail, providerMessage, payload);
   let message;
-  if (status === 401 || status === 403) {
+  if (fundingIssue) {
+    message = providerMessage || 'MetaAPI reported a funding or deposit issue.';
+  } else if (status === 401 || status === 403) {
     message = unauthorizedMessage || 'MetaAPI rejected the server token or its account-management permissions.';
   } else if (status === 429) {
     message = 'Too many account requests were made. Wait briefly, then try again.';
@@ -75,9 +124,6 @@ function safeMetaApiError(status, payload, unauthorizedMessage, apiToken) {
   }
 
   const diagnostics = [detail && `code ${detail}`, providerMessage].filter(Boolean);
-  const diagnosticText = diagnostics.length
-    ? ` MetaAPI returned HTTP ${status}: ${diagnostics.join(' — ')}`
-    : ` (MetaAPI HTTP ${status})`;
   const error = new Error(message);
   error.status = status === 401 || status === 403 || status === 429 ? 503
     : status === 400 ? 422
@@ -85,7 +131,13 @@ function safeMetaApiError(status, payload, unauthorizedMessage, apiToken) {
         : 502;
   error.metaApiStatus = status;
   if (detail) error.metaApiErrorCode = detail;
-  error.userMessage = `${message}${diagnosticText}`;
+  if (fundingIssue) {
+    error.metaApiErrorType = 'funding';
+    error.userMessage = `MetaAPI reported a funding or deposit issue (HTTP ${status}${detail ? `, code ${detail}` : ''}): ${providerMessage || message}`;
+  } else {
+    error.metaApiErrorType = 'provider';
+    error.userMessage = `${message} MetaAPI returned HTTP ${status}${diagnostics.length ? `: ${diagnostics.join(' — ')}` : ''}.`;
+  }
   return error;
 }
 
@@ -136,19 +188,16 @@ export async function metaApiRequest(apiToken, endpoint, { method = 'GET', body,
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (cause) {
-      const code = safeNetworkCode(cause);
-      const error = new Error('MetaAPI could not be reached. Try again shortly.');
-      error.status = 502;
-      error.code = code || 'METAAPI_NETWORK_ERROR';
-      error.metaApiErrorCode = code || 'NETWORK_ERROR';
-      error.userMessage = `Could not connect to MetaAPI${code ? ` (${code})` : ''}. Check the server endpoint or try again shortly.`;
-      throw error;
+      throw metaApiTransportError(cause, apiToken);
     }
 
-    const text = await response.text();
+    let text;
+    try { text = await response.text(); }
+    catch (cause) { throw metaApiTransportError(cause, apiToken, response.status); }
     let payload = null;
     if (text) {
-      try { payload = JSON.parse(text); } catch { payload = null; }
+      try { payload = JSON.parse(text); }
+      catch { payload = response.headers.get('content-type')?.toLowerCase().startsWith('text/plain') ? { message: text } : null; }
     }
 
     if (response.status === 202 && method === 'POST') {

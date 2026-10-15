@@ -131,6 +131,43 @@ test('includes the actual sanitized MetaAPI validation message for server-name e
   } finally { restoreGlobals(); }
 });
 
+test('returns funding-related provider errors verbatim with a funding classification', async () => {
+  process.env.META_API_URL = 'https://metaapi.example.test';
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    message: 'Bad Request',
+    details: { code: 'E_INSUFFICIENT_FUNDS', message: 'Insufficient balance. Please deposit funds before creating another account.' },
+  }), { status: 402 });
+  try {
+    await assert.rejects(
+      metaApiRequest('server-token', '/users/current/accounts'),
+      (error) => error.metaApiStatus === 402
+        && error.metaApiErrorType === 'funding'
+        && error.userMessage.includes('HTTP 402')
+        && error.userMessage.includes('E_INSUFFICIENT_FUNDS')
+        && error.userMessage.includes('Insufficient balance. Please deposit funds before creating another account.')
+        && !error.userMessage.includes('Bad Request'),
+    );
+  } finally { restoreGlobals(); }
+});
+
+test('detects funding text in details.message even when the provider code is generic', async () => {
+  process.env.META_API_URL = 'https://metaapi.example.test';
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    message: 'Bad Request',
+    details: { code: 'E_VALIDATION_ERROR', message: 'Your MetaAPI balance is insufficient; a deposit is required.' },
+  }), { status: 400 });
+  try {
+    await assert.rejects(
+      metaApiRequest('server-token', '/users/current/accounts'),
+      (error) => error.metaApiErrorType === 'funding'
+        && error.userMessage.includes('HTTP 400')
+        && error.userMessage.includes('E_VALIDATION_ERROR')
+        && error.userMessage.includes('Your MetaAPI balance is insufficient; a deposit is required.')
+        && !error.userMessage.includes('Bad Request'),
+    );
+  } finally { restoreGlobals(); }
+});
+
 test('redacts a bare provisioning token echoed in a provider message', async () => {
   process.env.META_API_URL = 'https://metaapi.example.test';
   globalThis.fetch = async () => new Response(JSON.stringify({ message: 'The token super-secret-token-value was rejected.' }), { status: 401 });
@@ -143,16 +180,73 @@ test('redacts a bare provisioning token echoed in a provider message', async () 
   } finally { restoreGlobals(); }
 });
 
-test('includes safe connection error codes when MetaAPI cannot be reached', async () => {
+test('does not return a provisioning token echoed as a provider error code', async () => {
   process.env.META_API_URL = 'https://metaapi.example.test';
-  const cause = Object.assign(new Error('Name or service not known'), { code: 'ENOTFOUND' });
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    message: 'Authorization failed.',
+    details: { code: 'super-secret-token-value' },
+  }), { status: 401 });
+  try {
+    await assert.rejects(
+      metaApiRequest('super-secret-token-value', '/users/current/accounts'),
+      (error) => !error.userMessage.includes('super-secret-token-value')
+        && error.metaApiErrorCode === undefined,
+    );
+  } finally { restoreGlobals(); }
+});
+
+test('redacts URL userinfo and short token query parameters from nested transport causes', async () => {
+  process.env.META_API_URL = 'https://metaapi.example.test';
+  const cause = Object.assign(new Error('Request to https://username:short@pass@metaapi.example.test/status?api_token=short&access_token=xy failed'), { code: 'ECONNRESET' });
   globalThis.fetch = async () => { throw new TypeError('fetch failed', { cause }); };
   try {
     await assert.rejects(
       metaApiRequest('server-token', '/users/current/accounts'),
+      (error) => error.userMessage.includes('https://[redacted]@metaapi.example.test/status?api_token=[redacted]&access_token=[redacted]')
+        && !error.userMessage.includes('username')
+        && !error.userMessage.includes('short@pass')
+        && !error.userMessage.includes('api_token=short')
+        && !error.userMessage.includes('access_token=xy'),
+    );
+  } finally { restoreGlobals(); }
+});
+
+test('includes safe connection error codes when MetaAPI cannot be reached', async () => {
+  process.env.META_API_URL = 'https://metaapi.example.test';
+  const nestedCause = Object.assign(new Error('getaddrinfo EAI_AGAIN mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai'), { code: 'EAI_AGAIN' });
+  const aggregateCause = new AggregateError([nestedCause], 'All promises were rejected');
+  const cause = new TypeError('fetch failed', { cause: aggregateCause });
+  globalThis.fetch = async () => { throw cause; };
+  try {
+    await assert.rejects(
+      metaApiRequest('server-token', '/users/current/accounts'),
       (error) => error.status === 502
-        && error.userMessage.includes('ENOTFOUND')
-        && error.metaApiErrorCode === 'ENOTFOUND',
+        && error.userMessage.includes('EAI_AGAIN')
+        && error.userMessage.includes('getaddrinfo EAI_AGAIN mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai')
+        && error.userMessage.includes('did not return a deposit or funding message')
+        && error.metaApiErrorCode === 'EAI_AGAIN'
+        && error.metaApiErrorType === 'transport',
+    );
+  } finally { restoreGlobals(); }
+});
+
+test('reports a network cause when the MetaAPI response body cannot be read', async () => {
+  process.env.META_API_URL = 'https://metaapi.example.test';
+  const response = {
+    status: 403,
+    headers: new Headers({ 'content-type': 'application/json' }),
+    text: async () => { throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }); },
+  };
+  globalThis.fetch = async () => response;
+  try {
+    await assert.rejects(
+      metaApiRequest('server-token', '/users/current/accounts'),
+      (error) => error.status === 502
+        && error.metaApiStatus === 403
+        && error.metaApiErrorCode === 'ECONNRESET'
+        && error.userMessage.includes('HTTP 403')
+        && error.userMessage.includes('ECONNRESET')
+        && error.userMessage.includes('No complete provider funding or deposit message was received'),
     );
   } finally { restoreGlobals(); }
 });
