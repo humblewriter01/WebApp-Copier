@@ -9,14 +9,14 @@ A deployable React/Vite and Express app for capturing Telegram channel messages,
 - Optional Telegram user-session integration for monitoring selected channels.
 - Signal history and manual signal notes.
 - Reference-only account notes.
-- **MetaAPI connection:** each signed-in user can securely save their MetaAPI API token, discover existing MT4/MT5 accounts, and link account references to their workspace.
+- **MT4/MT5 account setup:** signed-in users can create an account setup and enter broker credentials on a MetaAPI-hosted secure page.
 - Risk preferences for planning only.
 
 ## Important safety and data notes
 
-- **Live broker execution is disabled.** This application does not submit, modify, or close trading orders. The MetaAPI integration only lists account metadata and verifies/links existing accounts; it does not create or deploy accounts.
-- MetaAPI tokens are submitted over HTTPS, encrypted at rest with AES-256-GCM, stored in a private per-user database table, and never returned to the frontend after saving. `SESSION_ENCRYPTION_KEY` is the server-side encryption key; keep it private and stable. Do not send it or an API token in chat or commit it to Git.
-- The MetaAPI REST client follows the FX Telegram Copier's provisioning API base URL, `auth-token` request header, 30-second timeout, and strict HTTPS behavior. It intentionally does not include the source bot's order-placement or position-modification functions.
+- **No trading orders are placed.** Signal Desk can create and connect an account through MetaAPI, but it does not submit, modify, or close trades.
+- The API uses `METAAPI_PROVISIONING_TOKEN` only on the server. Users enter their broker login and password on MetaAPI's HTTPS setup page; Signal Desk does not receive or store those credentials.
+- The MetaAPI client uses HTTPS and an allowlist of account-setup and account-read operations. It does not include order-placement or position-modification functions.
 - Telegram sessions are encrypted in the database with the same server encryption key. Rotating that key without re-encrypting existing values will invalidate saved sessions/tokens.
 - Render free web services can sleep, so continuous Telegram monitoring is not reliable on the free tier. Use an always-on backend before relying on unattended monitoring.
 - The app is not financial advice. Review all signals independently.
@@ -54,14 +54,14 @@ A deployable React/Vite and Express app for capturing Telegram channel messages,
 
 The app creates its PostgreSQL tables and indexes on backend startup. The new `metaapi_credentials` and `metaapi_accounts` tables have row-level security enabled; the backend uses its private database role.
 
-## MetaAPI setup
+## MetaAPI account setup
 
-1. Obtain an API token directly from your MetaAPI account.
-2. Sign in to the web app and open **MetaAPI** in the left navigation.
-3. Paste the token into the password field and choose **Verify and save token**. The backend validates it by listing your existing accounts, then stores it encrypted for your signed-in user.
-4. Link only the accounts you want shown in this workspace. Unlinking removes the app's reference; it does not change the MetaAPI account.
+1. The workspace owner adds a MetaAPI provisioning token to the backend environment as `METAAPI_PROVISIONING_TOKEN`.
+2. In Signal Desk, open **MetaAPI** and enter an account name, MT4/MT5 platform, and the exact broker server name.
+3. Signal Desk creates the account setup and returns a secure link hosted by MetaAPI. Enter the trading login and password only on that page. For monitoring, choose an investor/read-only password if your broker offers one.
+4. Return to Signal Desk and refresh the account status. Removing an account from Signal Desk removes only its local link; it does not delete the MetaAPI or broker account.
 
-No service-wide `META_API_KEY` is needed. The optional `META_API_URL` only overrides the MetaAPI HTTPS API base URL.
+`META_API_URL` is an optional HTTPS base-URL override. Never add `METAAPI_PROVISIONING_TOKEN` to a `VITE_*` variable, frontend code, or Git.
 
 ## Backend environment variables
 
@@ -72,6 +72,7 @@ No service-wide `META_API_KEY` is needed. The optional `META_API_URL` only overr
 | `SESSION_ENCRYPTION_KEY` | Yes | Stable private key for encrypting Telegram sessions and MetaAPI API tokens |
 | `CLIENT_URL` | Production | Exact frontend origin for CORS |
 | `API_ID` / `API_HASH` | For Telegram | Telegram application credentials from [my.telegram.org](https://my.telegram.org) |
+| `METAAPI_PROVISIONING_TOKEN` | For MT4/MT5 setup | Server-only MetaAPI token used to create accounts and secure setup links |
 | `META_API_URL` | No | Optional MetaAPI HTTPS base URL override; defaults to `https://mt-provisioning-api-v1.agiliumtrade.ai` |
 | `PORT` | No | Render supplies this automatically |
 
@@ -79,9 +80,9 @@ The UI/API can be used without Telegram credentials; Telegram is shown as unavai
 
 ## Render deployment
 
-The deployed architecture uses two Render services because the frontend is a static site and the API is a Node web service. The API connects to Supabase PostgreSQL through its private `DATABASE_URL`; the Render Blueprint no longer provisions a second Render database. The static site uses `VITE_API_URL` to target the API service.
+The deployed architecture uses two Render services because the frontend is a static site and the API is a Node web service. The API connects to Supabase PostgreSQL through its private `DATABASE_URL`; the Render Blueprint no longer provisions a second Render database. The static site uses `VITE_API_URL` to target the API service. Both services are configured to deploy each commit pushed to `main` (`autoDeployTrigger: commit` in `render.yaml`).
 
-Required API variables: `DATABASE_URL`, `JWT_SECRET`, `SESSION_ENCRYPTION_KEY`, and `CLIENT_URL`. Add `API_ID` and `API_HASH` only if Telegram integration is enabled. MetaAPI users add their own API token in the authenticated MetaAPI page; it is not a shared Render environment variable.
+Required API variables: `DATABASE_URL`, `JWT_SECRET`, `SESSION_ENCRYPTION_KEY`, and `CLIENT_URL`. Add `API_ID` and `API_HASH` for Telegram sign-in. Add `METAAPI_PROVISIONING_TOKEN` to the API service's Environment settings to enable MT4/MT5 account setup. Keep it out of the static-site environment.
 
 ### Add Telegram API credentials in Render
 
@@ -102,7 +103,7 @@ The static site is served over HTTPS and includes a linked web app manifest, 192
 - `GET/POST /api/signals`
 - `GET/POST /api/accounts`, `DELETE /api/accounts/:id`
 - `GET/PUT /api/settings`
-- `GET /api/metaapi/status`, `PUT/DELETE /api/metaapi/connection`, `GET /api/metaapi/accounts`, `GET /api/metaapi/linked-accounts`, `POST /api/metaapi/accounts/link`, `DELETE /api/metaapi/accounts/:accountId`
+- `GET /api/metaapi/provisioning-status`, `GET /api/metaapi/linked-accounts`, `POST /api/metaapi/provisioned-accounts`, `POST /api/metaapi/provisioned-accounts/:accountId/configuration-link`, `POST /api/metaapi/provisioned-accounts/:accountId/refresh`, `DELETE /api/metaapi/accounts/:accountId`
 - `GET /api/telegram/status`, `POST /api/telegram/request-code`, `POST /api/telegram/verify-code`, `POST /api/telegram/verify-password`, `GET /api/telegram/chats`, `POST /api/telegram/disconnect`
 - `GET /health`
 

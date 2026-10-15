@@ -19,7 +19,7 @@ class AppErrorBoundary extends React.Component {
 
   render() {
     if (this.state.failed) {
-      return <main className="loading-shell"><section className="panel"><h1>Signal Desk could not start</h1><p className="muted">A page error interrupted startup. Reload the page; if this keeps happening, share the error with your app administrator.</p><button className="button button-primary" onClick={() => window.location.reload()}>Reload app</button></section></main>;
+      return <main className="loading-shell"><section className="panel"><h1>Signal Desk could not open</h1><p className="muted">Please reload the page. If the problem continues, contact support.</p><button className="button button-primary" onClick={() => window.location.reload()}>Reload app</button></section></main>;
     }
     return this.props.children;
   }

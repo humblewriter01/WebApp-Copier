@@ -5,6 +5,7 @@ services:
     plan: free
     region: frankfurt
     branch: main
+    autoDeployTrigger: commit
     rootDir: server
     buildCommand: npm ci
     startCommand: npm start
@@ -24,6 +25,8 @@ services:
         sync: false
       - key: API_HASH
         sync: false
+      - key: METAAPI_PROVISIONING_TOKEN
+        sync: false
       - key: META_API_URL
         value: https://mt-provisioning-api-v1.agiliumtrade.ai
   - type: web
@@ -31,6 +34,7 @@ services:
     runtime: static
     plan: free
     branch: main
+    autoDeployTrigger: commit
     rootDir: client
     buildCommand: npm ci && npm run build
     staticPublishPath: ./dist

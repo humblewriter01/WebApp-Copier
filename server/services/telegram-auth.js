@@ -12,8 +12,8 @@ const TELEGRAM_ERROR_MESSAGES = {
   PASSWORD_HASH_INVALID: 'Telegram rejected the two-step verification password (PASSWORD_HASH_INVALID). Check it and try again.',
   PASSWORD_EMPTY: 'Enter your Telegram two-step verification password (PASSWORD_EMPTY).',
   PASSWORD_TOO_FRESH: 'Telegram is temporarily preventing a password change (PASSWORD_TOO_FRESH). Try again later.',
-  API_ID_INVALID: 'Telegram rejected the API_ID configured on the service (API_ID_INVALID). Contact the administrator.',
-  API_ID_PUBLISHED_FLOOD: 'Telegram has restricted this API application (API_ID_PUBLISHED_FLOOD). Contact the administrator.',
+  API_ID_INVALID: 'Telegram sign-in is temporarily unavailable. Please try again later.',
+  API_ID_PUBLISHED_FLOOD: 'Telegram sign-in is temporarily unavailable. Please try again later.',
   AUTH_KEY_UNREGISTERED: 'The Telegram login session is no longer valid (AUTH_KEY_UNREGISTERED). Request a fresh code.',
   AUTH_RESTART: 'Telegram restarted the login request (AUTH_RESTART). Request a fresh code.',
 };
@@ -38,6 +38,9 @@ export function shouldDiscardTelegramLogin(code) {
 
 export function telegramAuthErrorPayload(error) {
   const telegramErrorCode = getTelegramErrorCode(error);
+  if (['API_ID_INVALID', 'API_ID_PUBLISHED_FLOOD'].includes(telegramErrorCode)) {
+    return { error: 'Telegram sign-in is temporarily unavailable. Please try again later.', telegramErrorCode: null };
+  }
   const floodWait = /^FLOOD_WAIT_(\d+)$/.exec(telegramErrorCode || '');
   const message = floodWait
     ? `Telegram is temporarily limiting sign-in (FLOOD_WAIT_${floodWait[1]}). Wait before retrying.`

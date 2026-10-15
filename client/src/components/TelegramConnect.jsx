@@ -12,9 +12,6 @@ function isValidPhone(value) {
 
 function friendlyTelegramError(error) {
   const message = error?.message || 'Telegram could not complete the request. Please try again.';
-  if (/credentials are not configured|API ID and API hash|not configured on the service/i.test(message)) {
-    return 'Telegram sign-in is temporarily unavailable. Please try again later or contact your administrator.';
-  }
   const code = error?.telegramErrorCode;
   return code && !message.includes(code) ? `${message} (${code})` : message;
 }
@@ -29,6 +26,7 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
   const [busy, setBusy] = useState(false);
   const [loadingChats, setLoadingChats] = useState(false);
   const [toast, setToast] = useState(null);
+  const [chatSearch, setChatSearch] = useState('');
 
   const notify = useCallback((message, tone = 'success') => {
     setToast({ message, tone, id: Date.now() });
@@ -51,6 +49,7 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
     setPhone('');
     setCode('');
     setPassword('');
+    setChatSearch('');
     await checkStatus();
     await onRefresh();
     notify('Telegram is connected to your workspace.');
@@ -75,6 +74,9 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
   useEffect(() => {
     if (status.connected) loadChats();
   }, [status.connected, loadChats]);
+
+  const searchTerm = chatSearch.trim().toLocaleLowerCase();
+  const filteredChats = chats.filter((chat) => `${chat.title || ''} ${chat.username || ''}`.toLocaleLowerCase().includes(searchTerm));
 
   const sendCode = async (event) => {
     event.preventDefault();
@@ -187,6 +189,7 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
       setPhone('');
       setCode('');
       setPassword('');
+      setChatSearch('');
       setStep('phone');
       await onRefresh();
       notify('Telegram has been disconnected.');
@@ -230,14 +233,15 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
         <span className={`status-pill ${status.connected ? 'online' : ''}`} aria-live="polite">{status.connected ? 'Connected' : 'Not connected'}</span>
       </div>
       {status.connected ? <>
-        <p className="muted">Your Telegram session is stored encrypted. Only the groups and channels you choose are monitored.</p>
+        <p className="muted">Your sign-in is protected. Only the groups and channels you choose are monitored.</p>
         <div className="button-row">
           <button className="button button-secondary" type="button" disabled={loadingChats} onClick={loadChats}>{loadingChats ? 'Refreshing…' : 'Refresh groups & channels'}</button>
           <button className="button button-danger" type="button" disabled={busy} onClick={disconnect}>{busy ? 'Disconnecting…' : 'Disconnect'}</button>
         </div>
+        <label className="chat-search"><span className="sr-only">Search groups and channels</span><input type="search" value={chatSearch} onChange={(event) => setChatSearch(event.target.value)} placeholder="Search groups and channels" aria-label="Search groups and channels" disabled={!chats.length || loadingChats} /></label>
         <h3 className="section-title">Available groups &amp; channels</h3>
         <p className="field-help">Choose which Telegram chats to monitor. You can stop monitoring any time.</p>
-        {loadingChats && !chats.length ? <p className="muted" role="status">Loading Telegram chats…</p> : !chats.length ? <div className="empty-state compact-empty"><strong>No groups or channels found</strong><span>Refresh the list after joining a Telegram group or channel.</span></div> : <div className="chat-list">{chats.map((chat) => {
+        {loadingChats && !chats.length ? <p className="muted" role="status">Loading Telegram chats…</p> : !chats.length ? <div className="empty-state compact-empty"><strong>No groups or channels found</strong><span>Refresh the list after joining a Telegram group or channel.</span></div> : !filteredChats.length ? <div className="empty-state compact-empty"><strong>No chats match that search</strong><span>Try a different name or username.</span></div> : <div className="chat-list">{filteredChats.map((chat) => {
           const selected = channels.find((channel) => String(channel.channelId) === String(chat.channelId));
           return <div className="chat-row" key={chat.channelId}><div><strong>{chat.title}</strong><small>{chat.type || 'Group or channel'} · {chat.username ? `@${chat.username}` : chat.channelId}</small></div><button className="button button-small" type="button" aria-label={selected ? `Stop monitoring ${chat.title}` : `Monitor ${chat.title}`} aria-pressed={Boolean(selected)} disabled={busy} onClick={() => selected ? removeChannel(selected.id) : addChannel(chat)}>{busy ? (selected ? 'Updating…' : 'Adding…') : (selected ? 'Stop monitoring' : 'Monitor')}</button></div>;
         })}</div>}
@@ -274,7 +278,7 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
     <section className="panel" aria-labelledby="monitored-sources-title">
       <div className="panel-heading"><div><p className="eyebrow">MONITORED SOURCES</p><h2 id="monitored-sources-title">Monitored groups &amp; channels</h2></div><span className="count-badge">{channels.length}</span></div>
       {!channels.length ? <div className="empty-state"><span className="empty-icon" aria-hidden="true">⌁</span><strong>No chats selected</strong><span>Connect Telegram and choose which groups or channels to monitor.</span></div> : <div className="chat-list">{channels.map((channel) => <div className="chat-row" key={channel.id}><div><strong>{channel.title}</strong><small>{channel.enabled ? 'Monitoring enabled' : 'Paused'}</small></div><button className="button button-small button-secondary" type="button" aria-label={`Stop monitoring ${channel.title}`} disabled={busy} onClick={() => removeChannel(channel.id)}>Stop monitoring</button></div>)}</div>}
-      <div className="note-box">Only new posts received while the service is awake are captured. A free Render web service may sleep; continuous monitoring requires an always-on deployment.</div>
+      <div className="note-box">Monitoring may pause if the service goes to sleep.</div>
     </section>
   </div>;
 }

@@ -92,9 +92,13 @@ export async function initializeDatabase() {
       name TEXT,
       platform TEXT,
       state TEXT,
+      server TEXT,
+      managed_by_app BOOLEAN NOT NULL DEFAULT FALSE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       UNIQUE(user_id, metaapi_account_id)
     );
+    ALTER TABLE metaapi_accounts ADD COLUMN IF NOT EXISTS server TEXT;
+    ALTER TABLE metaapi_accounts ADD COLUMN IF NOT EXISTS managed_by_app BOOLEAN NOT NULL DEFAULT FALSE;
     CREATE TABLE IF NOT EXISTS telegram_login_attempts (
       user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       encrypted_state TEXT NOT NULL,

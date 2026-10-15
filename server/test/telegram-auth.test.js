@@ -56,3 +56,12 @@ test('preserves Telegram flood-wait duration in the user-facing error', () => {
   assert.equal(payload.telegramErrorCode, 'FLOOD_WAIT_42');
   assert.match(payload.error, /42/);
 });
+
+test('hides API application configuration details from user-facing errors', () => {
+  for (const errorMessage of ['API_ID_INVALID', 'API_ID_PUBLISHED_FLOOD']) {
+    const payload = telegramAuthErrorPayload({ errorMessage });
+    assert.equal(payload.telegramErrorCode, null);
+    assert.match(payload.error, /temporarily unavailable/i);
+    assert.doesNotMatch(payload.error, /API_ID|service environment|API application/i);
+  }
+});

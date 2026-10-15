@@ -13,7 +13,7 @@ import { Api, TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { NewMessage } from 'telegram/events/index.js';
 import { pool, initializeDatabase } from './db.js';
-import { metaApiRequest, toSafeMetaApiAccount } from './services/metaapi.js';
+import { createMetaApiConfigurationLink, metaApiRequest, toSafeMetaApiAccount } from './services/metaapi.js';
 import { getTelegramErrorCode, isTelegramPasswordNeeded, shouldDiscardTelegramLogin, telegramAuthErrorPayload } from './services/telegram-auth.js';
 
 const app = express();
@@ -99,6 +99,10 @@ function publicUser(row) { return { id: row.id, name: row.name, email: row.email
 async function getMetaApiToken(userId) {
   const { rows } = await pool.query('SELECT encrypted_api_token FROM metaapi_credentials WHERE user_id=$1', [userId]);
   return rows[0]?.encrypted_api_token ? decryptSecret(rows[0].encrypted_api_token) : null;
+}
+
+function getMetaApiProvisioningToken() {
+  return process.env.METAAPI_PROVISIONING_TOKEN?.trim() || null;
 }
 
 async function saveSignal(userId, message, channel = {}) {
@@ -280,6 +284,9 @@ app.get('/api/metaapi/status', authenticate, asyncRoute(async (req, res) => {
   ]);
   res.json({ configured: Boolean(credentials[0]), linkedAccounts: linked[0].count, updatedAt: credentials[0]?.updated_at || null });
 }));
+app.get('/api/metaapi/provisioning-status', authenticate, (_req, res) => {
+  res.set('Cache-Control', 'no-store').json({ available: Boolean(getMetaApiProvisioningToken()) });
+});
 app.put('/api/metaapi/connection', authenticate, asyncRoute(async (req, res) => {
   const apiToken = typeof req.body.apiToken === 'string' ? req.body.apiToken.trim() : '';
   if (apiToken.length < 20 || apiToken.length > 4096) return fail(res, 400, 'Enter a valid MetaAPI token.');
@@ -295,7 +302,7 @@ app.put('/api/metaapi/connection', authenticate, asyncRoute(async (req, res) => 
 }));
 app.delete('/api/metaapi/connection', authenticate, asyncRoute(async (req, res) => {
   await pool.query('DELETE FROM metaapi_credentials WHERE user_id=$1', [req.userId]);
-  await pool.query('DELETE FROM metaapi_accounts WHERE user_id=$1', [req.userId]);
+  await pool.query('DELETE FROM metaapi_accounts WHERE user_id=$1 AND managed_by_app=FALSE', [req.userId]);
   res.json({ configured: false, ok: true });
 }));
 app.get('/api/metaapi/accounts', authenticate, asyncRoute(async (req, res) => {
@@ -307,11 +314,90 @@ app.get('/api/metaapi/accounts', authenticate, asyncRoute(async (req, res) => {
 }));
 app.get('/api/metaapi/linked-accounts', authenticate, asyncRoute(async (req, res) => {
   const { rows } = await pool.query(
-    `SELECT id,metaapi_account_id AS "metaApiAccountId",login,name,platform,state,created_at AS "createdAt"
+    `SELECT id,metaapi_account_id AS "metaApiAccountId",login,name,platform,state,server,
+       managed_by_app AS "managedByApp",created_at AS "createdAt"
      FROM metaapi_accounts WHERE user_id=$1 ORDER BY created_at DESC`,
     [req.userId],
   );
   res.json({ accounts: rows });
+}));
+app.post('/api/metaapi/provisioned-accounts', authenticate, asyncRoute(async (req, res) => {
+  const apiToken = getMetaApiProvisioningToken();
+  if (!apiToken) return fail(res, 503, 'Account setup is temporarily unavailable. Please contact the workspace owner.');
+  if (Object.hasOwn(req.body || {}, 'login') || Object.hasOwn(req.body || {}, 'password')) {
+    return fail(res, 400, 'For your security, enter your trading login and password only on the secure MetaAPI page.');
+  }
+  const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+  const server = typeof req.body?.server === 'string' ? req.body.server.trim() : '';
+  const platform = typeof req.body?.platform === 'string' ? req.body.platform.trim().toLowerCase() : '';
+  if (!name || name.length > 100) return fail(res, 400, 'Enter an account name of 1 to 100 characters.');
+  if (!server || server.length > 160) return fail(res, 400, 'Enter the broker server name shown in your MetaTrader account details.');
+  if (!['mt4', 'mt5'].includes(platform)) return fail(res, 400, 'Choose MetaTrader 4 or MetaTrader 5.');
+
+  const accountData = await metaApiRequest(apiToken, '/users/current/accounts', {
+    method: 'POST',
+    body: { name, server, platform, magic: 0 },
+    transactionId: crypto.randomUUID().replaceAll('-', ''),
+    unauthorizedMessage: 'Account setup is temporarily unavailable. Please contact the workspace owner.',
+  });
+  const account = toSafeMetaApiAccount(accountData);
+  if (!account) return fail(res, 502, 'The account could not be added. Please try again.');
+
+  const { rows } = await pool.query(
+    `INSERT INTO metaapi_accounts(user_id,metaapi_account_id,login,name,platform,state,server,managed_by_app)
+     VALUES($1,$2,$3,$4,$5,$6,$7,TRUE)
+     ON CONFLICT(user_id,metaapi_account_id) DO UPDATE SET login=EXCLUDED.login,name=EXCLUDED.name,
+       platform=EXCLUDED.platform,state=EXCLUDED.state,server=EXCLUDED.server,managed_by_app=TRUE
+     RETURNING id,metaapi_account_id AS "metaApiAccountId",login,name,platform,state,server,
+       managed_by_app AS "managedByApp",created_at AS "createdAt"`,
+    [req.userId, account.id, account.login, account.name || name, account.platform || platform, account.state || accountData.state || 'DRAFT', server],
+  );
+
+  let configurationLink = null;
+  try {
+    configurationLink = await createMetaApiConfigurationLink(apiToken, account.id);
+  } catch (error) {
+    log('warn', 'Secure MetaAPI setup link could not be created', { userId: req.userId, metaApiAccountId: account.id, error: error.message });
+  }
+  res.set('Cache-Control', 'no-store').status(201).json({ account: rows[0], configurationLink });
+}));
+app.post('/api/metaapi/provisioned-accounts/:accountId/configuration-link', authenticate, asyncRoute(async (req, res) => {
+  const apiToken = getMetaApiProvisioningToken();
+  if (!apiToken) return fail(res, 503, 'Account setup is temporarily unavailable. Please contact the workspace owner.');
+  const accountId = String(req.params.accountId || '');
+  const { rows } = await pool.query(
+    'SELECT metaapi_account_id FROM metaapi_accounts WHERE user_id=$1 AND metaapi_account_id=$2 AND managed_by_app=TRUE',
+    [req.userId, accountId],
+  );
+  if (!rows[0]) return fail(res, 404, 'That account is not available in your workspace.');
+  const configurationLink = await createMetaApiConfigurationLink(apiToken, rows[0].metaapi_account_id);
+  res.set('Cache-Control', 'no-store').json({ configurationLink });
+}));
+app.post('/api/metaapi/provisioned-accounts/:accountId/refresh', authenticate, asyncRoute(async (req, res) => {
+  const apiToken = getMetaApiProvisioningToken();
+  if (!apiToken) return fail(res, 503, 'Account setup is temporarily unavailable. Please contact the workspace owner.');
+  const accountId = String(req.params.accountId || '');
+  const { rows: ownedAccounts } = await pool.query(
+    `SELECT metaapi_account_id AS "metaApiAccountId",name,platform,server
+     FROM metaapi_accounts WHERE user_id=$1 AND metaapi_account_id=$2 AND managed_by_app=TRUE`,
+    [req.userId, accountId],
+  );
+  const ownedAccount = ownedAccounts[0];
+  if (!ownedAccount) return fail(res, 404, 'That account is not available in your workspace.');
+
+  const accountData = await metaApiRequest(apiToken, `/users/current/accounts/${encodeURIComponent(accountId)}`, {
+    unauthorizedMessage: 'Account setup is temporarily unavailable. Please contact the workspace owner.',
+  });
+  const account = toSafeMetaApiAccount(accountData);
+  if (!account || account.id !== accountId) return fail(res, 502, 'We could not refresh this account. Please try again.');
+  const { rows } = await pool.query(
+    `UPDATE metaapi_accounts SET login=$1,name=$2,platform=$3,state=$4,server=$5
+     WHERE user_id=$6 AND metaapi_account_id=$7 AND managed_by_app=TRUE
+     RETURNING id,metaapi_account_id AS "metaApiAccountId",login,name,platform,state,server,
+       managed_by_app AS "managedByApp",created_at AS "createdAt"`,
+    [account.login, account.name || ownedAccount.name, account.platform || ownedAccount.platform, account.state || 'DRAFT', ownedAccount.server, req.userId, accountId],
+  );
+  res.set('Cache-Control', 'no-store').json({ account: rows[0] });
 }));
 app.post('/api/metaapi/accounts/link', authenticate, asyncRoute(async (req, res) => {
   const apiToken = await getMetaApiToken(req.userId);
@@ -365,7 +451,7 @@ app.get('/api/telegram/status', authenticate, asyncRoute(async (req, res) => {
   if (rows[0]?.telegram_connected && !connected && configured) {
     try { connected = Boolean(await restoreTelegramClient(req.userId)); } catch (error) { log('warn', 'Telegram session restore deferred', { userId: req.userId, error: error.message }); }
   }
-  res.json({ configured, connected, message: configured ? null : 'Add Telegram API ID and API hash in the service environment to enable Telegram.' });
+  res.json({ configured, connected, message: configured ? null : 'Telegram sign-in is temporarily unavailable. Please try again later.' });
 }));
 async function persistTelegramLoginAttempt(userId, attempt) {
   const stringSession = attempt.client.session.save();
@@ -441,7 +527,7 @@ async function discardTelegramLoginAttempt(userId, attempt = telegramLogins.get(
 
 app.post('/api/telegram/request-code', authenticate, asyncRoute(async (req, res) => {
   if (!process.env.API_ID || !process.env.API_HASH || !process.env.SESSION_ENCRYPTION_KEY) {
-    return fail(res, 503, 'Telegram sign-in is not fully configured on the service.');
+    return fail(res, 503, 'Telegram sign-in is temporarily unavailable. Please try again later.');
   }
   const apiId = Number(process.env.API_ID);
   if (!Number.isSafeInteger(apiId) || apiId <= 0) return res.status(503).json({ ...telegramAuthErrorPayload({ errorMessage: 'API_ID_INVALID' }) });
@@ -580,11 +666,11 @@ app.post('/api/telegram/disconnect', authenticate, asyncRoute(async (req, res) =
   res.json({ ok: true });
 }));
 
-app.use((req, res) => res.status(404).json({ error: `Not found: ${req.method} ${req.path}` }));
+app.use((req, res) => res.status(404).json({ error: 'We could not find that page or action. Return to your workspace and try again.' }));
 app.use((error, _req, res, _next) => {
   log('error', 'Request failed', { error: error.message, code: error.code });
   if (res.headersSent) return;
-  res.status(error.status || 500).json({ error: error.status ? error.message : 'Unexpected server error' });
+  res.status(error.status || 500).json({ error: error.status ? error.message : 'Something went wrong. Please try again in a moment.' });
 });
 
 async function start() {
