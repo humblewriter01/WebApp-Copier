@@ -172,7 +172,9 @@ function App() {
   const [signalText, setSignalText] = useState('');
   const [accountForm, setAccountForm] = useState({ label: '', broker: '', platform: '', accountReference: '' });
   const [installPrompt, setInstallPrompt] = useState(null);
+  const [isMobileViewport, setIsMobileViewport] = useState(() => window.matchMedia('(max-width:700px)').matches);
   const [sidebarVisible, setSidebarVisible] = useState(() => {
+    if (window.matchMedia('(max-width:700px)').matches) return false;
     try { return window.localStorage.getItem('signal-sidebar-visible') !== 'false'; } catch { return true; }
   });
 
@@ -195,9 +197,37 @@ function App() {
 
   const toggleSidebar = () => setSidebarVisible((visible) => {
     const next = !visible;
-    try { window.localStorage.setItem('signal-sidebar-visible', String(next)); } catch {}
+    if (!isMobileViewport) {
+      try { window.localStorage.setItem('signal-sidebar-visible', String(next)); } catch {}
+    }
     return next;
   });
+  const closeMobileSidebar = () => { if (isMobileViewport) setSidebarVisible(false); };
+  const navigateToTab = (nextTab) => { setTab(nextTab); closeMobileSidebar(); };
+
+  useEffect(() => {
+    const media = window.matchMedia('(max-width:700px)');
+    const handleViewportChange = (event) => {
+      setIsMobileViewport(event.matches);
+      if (event.matches) setSidebarVisible(false);
+      else {
+        try { setSidebarVisible(window.localStorage.getItem('signal-sidebar-visible') !== 'false'); } catch { setSidebarVisible(true); }
+      }
+    };
+    if (media.addEventListener) media.addEventListener('change', handleViewportChange);
+    else media.addListener(handleViewportChange);
+    return () => {
+      if (media.removeEventListener) media.removeEventListener('change', handleViewportChange);
+      else media.removeListener(handleViewportChange);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isMobileViewport || !sidebarVisible) return undefined;
+    const closeOnEscape = (event) => { if (event.key === 'Escape') setSidebarVisible(false); };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [isMobileViewport, sidebarVisible]);
 
   const logout = useCallback(() => { try { localStorage.removeItem('signal-token'); } catch {} sessionStorage.removeItem('signal-token'); setToken(''); setUser(null); setDashboard(null); setLoading(false); }, []);
   const refresh = useCallback(async () => {
@@ -240,7 +270,8 @@ function App() {
   if (!token) return <AuthScreen onAuthenticated={authenticated} installPrompt={installPrompt} onInstall={installApp} />;
   if (loading) return <main className="loading-shell"><div className="spinner" /><span>Loading your workspace…</span></main>;
   return <div className={`app-shell ${sidebarVisible ? '' : 'sidebar-hidden'}`}>
-    <Sidebar active={tab} onNavigate={setTab} user={user} onSignOut={logout} visible={sidebarVisible} />
+    <Sidebar active={tab} onNavigate={navigateToTab} user={user} onSignOut={logout} visible={sidebarVisible} />
+    {isMobileViewport && sidebarVisible && <button type="button" className="sidebar-backdrop" aria-label="Close navigation menu" onClick={closeMobileSidebar} />}
     <main className="main-area"><header className="topbar"><div><span className="eyebrow">PERSONAL WORKSPACE</span><h1>{tabs.find(([key]) => key === tab)?.[1] || 'Overview'}</h1></div><div className="topbar-right"><button type="button" className="button button-secondary button-small sidebar-toggle" aria-controls="workspace-sidebar" aria-expanded={sidebarVisible} aria-label={sidebarVisible ? 'Hide sidebar' : 'Show sidebar'} title={sidebarVisible ? 'Hide sidebar' : 'Show sidebar'} onClick={toggleSidebar}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d={sidebarVisible ? 'M9 4v16' : 'M15 4v16'} /></svg><span>{sidebarVisible ? 'Hide sidebar' : 'Show sidebar'}</span></button>{installPrompt && <button className="button button-primary button-small install-app-button" onClick={installApp}>Install app</button>}<span className="status-pill online"><i /> Connected</span><button className="button button-secondary button-small" onClick={refresh}>Refresh</button></div></header>
       {error && <div className="alert alert-error global-alert" role="alert">{error}<button className="alert-close" onClick={() => setError('')}>×</button></div>}{notice && <div className="alert alert-success global-alert" role="status" aria-live="polite">{notice}<button className="alert-close" onClick={() => setNotice('')}>×</button></div>}
       <div className="content-area">

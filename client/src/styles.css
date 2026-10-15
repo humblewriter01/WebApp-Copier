@@ -127,3 +127,12 @@ button,input,textarea,select{touch-action:manipulation}
 .remember-session input[type="checkbox"]{width:18px!important;height:18px!important;min-height:18px!important;padding:0;flex:0 0 18px;accent-color:#1e6878}
 .remember-session span{font-size:12px;font-weight:600;color:#344258}
 .remember-hint{color:#657286!important;font-size:11px;line-height:1.45;margin-top:-10px}
+
+/* Mobile navigation drawer: closed by default, overlays the page, and dismisses on backdrop click. */
+@media(max-width:700px){
+  .main-area{margin-left:0;width:100%;min-width:0}
+  .sidebar{z-index:30;box-shadow:12px 0 32px rgba(10,20,34,.2)}
+  .app-shell:not(.sidebar-hidden) .sidebar{transform:translateX(0);visibility:visible;pointer-events:auto}
+  .sidebar-backdrop{position:fixed;inset:0;z-index:20;border:0;padding:0;background:rgba(12,20,34,.3);cursor:pointer}
+  .app-shell:not(.sidebar-hidden) .sidebar-toggle{position:relative;z-index:31}
+}
