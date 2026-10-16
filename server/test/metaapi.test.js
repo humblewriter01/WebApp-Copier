@@ -31,6 +31,36 @@ test('defaults to the documented MetaAPI provisioning host and auth-token header
   } finally { restoreGlobals(); }
 });
 
+test('removes copied Unicode direction marks from the MetaAPI auth-token header', async () => {
+  process.env.META_API_URL = 'https://metaapi.example.test';
+  let sentToken;
+  globalThis.fetch = async (_url, options) => {
+    sentToken = options.headers['auth-token'];
+    return new Response('[]', { status: 200 });
+  };
+  try {
+    await metaApiRequest('\u200e server-token\u200f', '/users/current/accounts');
+    assert.equal(sentToken, 'server-token');
+  } finally { restoreGlobals(); }
+});
+
+test('rejects unsupported token characters with safe guidance before calling fetch', async () => {
+  process.env.META_API_URL = 'https://metaapi.example.test';
+  let fetchCalled = false;
+  globalThis.fetch = async () => { fetchCalled = true; return new Response('[]', { status: 200 }); };
+  try {
+    await assert.rejects(
+      metaApiRequest('server-🔒-token', '/users/current/accounts'),
+      (error) => error.status === 503
+        && error.metaApiErrorCode === 'INVALID_TOKEN_ENCODING'
+        && error.metaApiErrorType === 'configuration'
+        && error.userMessage.includes('unsupported characters')
+        && !error.userMessage.includes('server-🔒-token'),
+    );
+    assert.equal(fetchCalled, false);
+  } finally { restoreGlobals(); }
+});
+
 test('creates an account without accepting login or password fields', async () => {
   process.env.META_API_URL = 'https://metaapi.example.test';
   globalThis.fetch = async () => new Response(JSON.stringify({ id: 'account-1', state: 'DRAFT' }), { status: 201 });

@@ -155,8 +155,22 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function normalizeMetaApiToken(token) {
+  const normalizedToken = token.replace(/\p{Cf}/gu, '').trim();
+  if (/^[\x21-\x7e]+$/.test(normalizedToken)) return normalizedToken;
+
+  const error = new Error('The saved MetaAPI access token contains unsupported characters. Remove any invisible formatting marks, save it again, and retry.');
+  error.status = 503;
+  error.code = 'METAAPI_TOKEN_ENCODING_INVALID';
+  error.metaApiErrorCode = 'INVALID_TOKEN_ENCODING';
+  error.metaApiErrorType = 'configuration';
+  error.userMessage = error.message;
+  throw error;
+}
+
 export async function metaApiRequest(apiToken, endpoint, { method = 'GET', body, transactionId, unauthorizedMessage } = {}) {
   if (typeof apiToken !== 'string' || !apiToken.trim()) throw new Error('MetaAPI token is required.');
+  const headerToken = normalizeMetaApiToken(apiToken);
   if (!isAllowedRequest(method, endpoint, body)) throw new Error('Unsupported MetaAPI request.');
 
   let requestUrl;
@@ -179,7 +193,7 @@ export async function metaApiRequest(apiToken, endpoint, { method = 'GET', body,
       response = await fetch(requestUrl, {
         method,
         headers: {
-          'auth-token': apiToken,
+          'auth-token': headerToken,
           Accept: 'application/json',
           'Content-Type': 'application/json',
           ...(requestId ? { 'transaction-id': requestId } : {}),
@@ -188,12 +202,12 @@ export async function metaApiRequest(apiToken, endpoint, { method = 'GET', body,
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (cause) {
-      throw metaApiTransportError(cause, apiToken);
+      throw metaApiTransportError(cause, headerToken);
     }
 
     let text;
     try { text = await response.text(); }
-    catch (cause) { throw metaApiTransportError(cause, apiToken, response.status); }
+    catch (cause) { throw metaApiTransportError(cause, headerToken, response.status); }
     let payload = null;
     if (text) {
       try { payload = JSON.parse(text); }
@@ -212,7 +226,7 @@ export async function metaApiRequest(apiToken, endpoint, { method = 'GET', body,
       continue;
     }
 
-    if (!response.ok) throw safeMetaApiError(response.status, payload, unauthorizedMessage, apiToken);
+    if (!response.ok) throw safeMetaApiError(response.status, payload, unauthorizedMessage, headerToken);
     return payload;
   }
 }
