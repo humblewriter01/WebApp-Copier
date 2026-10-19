@@ -155,7 +155,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function normalizeMetaApiToken(token) {
+export function normalizeMetaApiToken(token) {
   const normalizedToken = token.replace(/\p{Cf}/gu, '').trim();
   if (/^[\x21-\x7e]+$/.test(normalizedToken)) return normalizedToken;
 

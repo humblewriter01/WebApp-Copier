@@ -141,7 +141,7 @@ export default function MetaApiPanel({ token }) {
         <small className="field-help">Use the exact server name shown by your broker. For monitoring, choose an investor/read-only password on MetaAPI if your broker offers one.</small>
         <button className="button button-primary" type="submit" disabled={busy || loading || !form.name.trim() || !form.server.trim()}>{busy ? 'Preparing secure setup…' : 'Create secure setup link'}</button>
       </form> : <div className="empty-state compact-empty"><strong>Account setup is not available yet</strong><span>Please ask the workspace owner to finish setting up account connections.</span></div>}
-      <div className="note-box">Signal Desk does not receive your trading password and does not place, change, or close trades. MetaAPI usage limits or charges may apply when a trading account is connected.</div>
+      <div className="note-box">Adding an account only connects it to Signal Desk; it does not place trades. Optional Auto-Trading is controlled separately in Risk Settings and starts off. MetaAPI usage limits or charges may apply when a trading account is connected.</div>
     </section>
 
     <section className="panel" aria-labelledby="metaapi-accounts-title">

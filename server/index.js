@@ -15,6 +15,10 @@ import { NewMessage } from 'telegram/events/index.js';
 import { pool, initializeDatabase } from './db.js';
 import { createMetaApiConfigurationLink, metaApiRequest, toSafeMetaApiAccount } from './services/metaapi.js';
 import { getTelegramErrorCode, isTelegramPasswordNeeded, shouldDiscardTelegramLogin, telegramAuthErrorPayload } from './services/telegram-auth.js';
+import { parseSignal } from './services/signal-parser.js';
+import { createMetaApiTradingAdapter } from './services/metaapi-trading.js';
+import { createExecutionEngine } from './services/execution-engine.js';
+import { createExecutionWorker } from './services/execution-worker.js';
 
 const app = express();
 app.set('trust proxy', 1);
@@ -24,6 +28,8 @@ const io = new Server(httpServer, { cors: { origin: allowedOrigins.length ? allo
 const PORT = Number(process.env.PORT || 5000);
 const telegramClients = new Map();
 const telegramLogins = new Map();
+const autoTradingRuntimeEnabled = String(process.env.AUTO_TRADING_RUNTIME_ENABLED || '').toLowerCase() === 'true';
+const tradingAdapter = createMetaApiTradingAdapter();
 
 const log = (level, message, extra = {}) => {
   const safe = { ...extra };
@@ -46,19 +52,6 @@ app.use(cors({
 app.use(express.json({ limit: '1mb' }));
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false }));
 app.use('/api/metaapi', rateLimit({ windowMs: 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false }));
-
-function parseSignal(message) {
-  const sideMatch = /\b(BUY|SELL|LONG|SHORT)\b/i.exec(message);
-  const symbolMatch = /\b(?:XAU\/?USD|XAG\/?USD|BTC\/?USD|ETH\/?USD|[A-Z]{3}\/?[A-Z]{3}|[A-Z]{2,10}USDT)\b/i.exec(message.toUpperCase());
-  const findNumber = (pattern) => { const match = pattern.exec(message); return match ? Number(match[1]) : null; };
-  return {
-    symbol: symbolMatch?.[0]?.replace('/', '') || null,
-    side: sideMatch ? (['BUY', 'LONG'].includes(sideMatch[1].toUpperCase()) ? 'buy' : 'sell') : null,
-    entryPrice: findNumber(/\b(?:ENTRY|PRICE|AT)\s*[:=@-]?\s*(\d+(?:\.\d+)?)/i),
-    stopLoss: findNumber(/\b(?:SL|STOP(?:\s+LOSS)?)\s*[:=@-]?\s*(\d+(?:\.\d+)?)/i),
-    takeProfit: findNumber(/\b(?:TP\d*|TAKE\s+PROFIT)\s*[:=@-]?\s*(\d+(?:\.\d+)?)/i),
-  };
-}
 
 function encryptSecret(value) {
   const secret = process.env.SESSION_ENCRYPTION_KEY;
@@ -106,17 +99,57 @@ function getMetaApiProvisioningToken() {
   return process.env.METAAPI_PROVISIONING_TOKEN?.trim() || null;
 }
 
+async function resolveExecutionToken(userId, accountId, managedByApp) {
+  if (managedByApp === true) return getMetaApiProvisioningToken();
+  return getMetaApiToken(userId);
+}
+
+const executionEngine = createExecutionEngine({
+  pool,
+  trading: tradingAdapter,
+  resolveToken: resolveExecutionToken,
+  runtimeEnabled: autoTradingRuntimeEnabled,
+});
+const executionWorker = createExecutionWorker({ pool, engine: executionEngine, logger: console });
+
 async function saveSignal(userId, message, channel = {}) {
   const parsed = parseSignal(message);
+  const source = channel.source === 'manual' ? 'manual' : 'telegram';
+  const telegramMessageId = source === 'telegram' && channel.telegramMessageId != null ? String(channel.telegramMessageId) : null;
+  const savedText = String(message || '').slice(0, 5000);
   const { rows } = await pool.query(
-    `INSERT INTO signals(user_id,channel_id,channel_title,message,symbol,side,entry_price,stop_loss,take_profit)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
-     RETURNING id,channel_id AS "channelId",channel_title AS "channelTitle",message,symbol,side,
-       entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",status,created_at AS "createdAt"`,
-    [userId, channel.channelId || null, channel.title || null, message, parsed.symbol, parsed.side, parsed.entryPrice, parsed.stopLoss, parsed.takeProfit],
+    `INSERT INTO signals(user_id,channel_id,channel_title,telegram_message_id,source,message,symbol,side,entry_price,stop_loss,take_profit,execution_ready,parse_error,status)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+     ON CONFLICT DO NOTHING
+     RETURNING id,channel_id AS "channelId",channel_title AS "channelTitle",telegram_message_id AS "telegramMessageId",source,message,symbol,side,
+       entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",status,created_at AS "createdAt"`,
+    [userId, channel.channelId || null, channel.title || null, telegramMessageId, source, savedText, parsed.symbol, parsed.side, parsed.entryPrice, parsed.stopLoss, parsed.takeProfit, parsed.executionReady, parsed.parseError || null, parsed.executionReady ? 'received' : 'unparsed'],
   );
-  io.to(`user:${userId}`).emit('signal:received', rows[0]);
-  return rows[0];
+  let signal = rows[0];
+  if (!signal && telegramMessageId) {
+    const existing = await pool.query(
+      `SELECT id,channel_id AS "channelId",channel_title AS "channelTitle",telegram_message_id AS "telegramMessageId",source,message,symbol,side,
+         entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",status,created_at AS "createdAt"
+       FROM signals WHERE user_id=$1 AND channel_id=$2 AND telegram_message_id=$3 AND source='telegram' LIMIT 1`,
+      [userId, channel.channelId, telegramMessageId],
+    );
+    signal = existing.rows[0];
+    return signal;
+  }
+  if (!signal) throw new Error('The signal could not be saved.');
+
+  if (source === 'telegram' && telegramMessageId && parsed.executionReady) {
+    const { rows: settingsRows } = await pool.query('SELECT auto_trading_enabled FROM settings WHERE user_id=$1 LIMIT 1', [userId]);
+    if (settingsRows[0]?.auto_trading_enabled === true) {
+      await pool.query(
+        `INSERT INTO execution_jobs(user_id,signal_id,status,expires_at)
+         VALUES($1,$2,'queued',NOW()+INTERVAL '2 minutes') ON CONFLICT(signal_id) DO NOTHING`,
+        [userId, signal.id],
+      );
+    }
+  }
+  io.to(`user:${userId}`).emit('signal:received', signal);
+  return signal;
 }
 
 async function startTelegramListener(userId, client) {
@@ -132,7 +165,7 @@ async function startTelegramListener(userId, client) {
         'SELECT channel_id AS "channelId",title FROM channels WHERE user_id=$1 AND channel_id=$2 AND enabled=TRUE',
         [userId, chatId],
       );
-      if (rows.length) await saveSignal(userId, text, { channelId: chatId, title: rows[0].title });
+      if (rows.length) await saveSignal(userId, text, { source: 'telegram', channelId: chatId, title: rows[0].title, telegramMessageId: message.id });
     } catch (error) {
       log('error', 'Telegram update processing failed', { userId, error: error.message });
     }
@@ -212,13 +245,13 @@ app.get('/api/dashboard', authenticate, asyncRoute(async (req, res) => {
     pool.query('SELECT COUNT(*)::int AS count FROM channels WHERE user_id=$1 AND enabled=TRUE', [req.userId]),
     pool.query('SELECT COUNT(*)::int AS count FROM accounts WHERE user_id=$1', [req.userId]),
     pool.query(`SELECT id,channel_title AS "channelTitle",message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT 10`, [req.userId]),
-    pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit" FROM settings WHERE user_id=$1', [req.userId]),
+    pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled" FROM settings WHERE user_id=$1', [req.userId]),
   ]);
   res.json({
     stats: { totalSignals: signalsCount.rows[0].count, activeChannels: channelsCount.rows[0].count, accounts: accountsCount.rows[0].count },
     signals: recentSignals.rows,
     settings: settings.rows[0] || { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 5, dailyLossLimit: 5 },
-    trading: { liveExecutionEnabled: false, message: 'Signal capture only. This deployment does not send live orders.' },
+    trading: { liveExecutionEnabled: autoTradingRuntimeEnabled, autoTradingEnabled: settings.rows[0]?.autoTradingEnabled === true, message: autoTradingRuntimeEnabled ? 'Live execution is available only when explicitly enabled in Risk Settings.' : 'Live execution is currently unavailable.' },
   });
 }));
 
@@ -249,13 +282,13 @@ app.delete('/api/channels/:id', authenticate, asyncRoute(async (req, res) => {
 
 app.get('/api/signals', authenticate, asyncRoute(async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
-  const { rows } = await pool.query(`SELECT id,channel_title AS "channelTitle",message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2`, [req.userId, limit]);
+  const { rows } = await pool.query(`SELECT id,channel_title AS "channelTitle",message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2`, [req.userId, limit]);
   res.json({ signals: rows });
 }));
 app.post('/api/signals', authenticate, asyncRoute(async (req, res) => {
   const message = String(req.body.message || '').trim().slice(0, 5000);
   if (!message) return fail(res, 400, 'Enter a signal message.');
-  const signal = await saveSignal(req.userId, message, { title: 'Manual entry' });
+  const signal = await saveSignal(req.userId, message, { source: 'manual', title: 'Manual entry' });
   res.status(201).json({ signal });
 }));
 
@@ -434,31 +467,65 @@ app.post('/api/metaapi/accounts/link', authenticate, asyncRoute(async (req, res)
   res.status(201).json({ account: rows[0] });
 }));
 app.delete('/api/metaapi/accounts/:accountId', authenticate, asyncRoute(async (req, res) => {
+  await pool.query('UPDATE settings SET auto_trading_enabled=FALSE,execution_account_id=NULL,updated_at=NOW() WHERE user_id=$1 AND execution_account_id=$2', [req.userId, req.params.accountId]);
   const result = await pool.query('DELETE FROM metaapi_accounts WHERE user_id=$1 AND metaapi_account_id=$2', [req.userId, req.params.accountId]);
   if (!result.rowCount) return fail(res, 404, 'Linked MetaAPI account not found.');
   res.json({ ok: true });
 }));
 
 app.get('/api/settings', authenticate, asyncRoute(async (req, res) => {
-  const { rows } = await pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit" FROM settings WHERE user_id=$1', [req.userId]);
-  res.json({ settings: rows[0] || { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 5, dailyLossLimit: 5 } });
+  const { rows } = await pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",lot_size_mode AS "lotSizeMode",fixed_lot_size AS "fixedLotSize",max_daily_trades AS "maxDailyTrades",execution_account_id AS "executionAccountId" FROM settings WHERE user_id=$1', [req.userId]);
+  res.set('Cache-Control', 'no-store').json({
+    settings: { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 3, dailyLossLimit: 5, autoTradingEnabled: false, lotSizeMode: 'fixed', fixedLotSize: 0.01, maxDailyTrades: 10, executionAccountId: '', ...(rows[0] || {}) },
+    runtimeEnabled: autoTradingRuntimeEnabled,
+  });
 }));
 app.put('/api/settings', authenticate, asyncRoute(async (req, res) => {
   const riskMode = ['fixed', 'percent'].includes(req.body.riskMode) ? req.body.riskMode : 'fixed';
-  const riskPercent = Math.min(Math.max(Number(req.body.riskPercent) || 1, 0.1), 5);
-  const maxOpenPositions = Math.min(Math.max(Math.trunc(Number(req.body.maxOpenPositions) || 5), 1), 50);
-  const dailyLossLimit = Math.min(Math.max(Number(req.body.dailyLossLimit) || 5, 1), 25);
+  const numeric = (value, fallback) => value === '' || value === null || value === undefined ? fallback : Number(value);
+  const riskPercent = numeric(req.body.riskPercent, 1);
+  const maxOpenPositions = Math.trunc(numeric(req.body.maxOpenPositions, 3));
+  const dailyLossLimit = numeric(req.body.dailyLossLimit, 5);
+  const maxDailyTrades = Math.trunc(numeric(req.body.maxDailyTrades, 10));
+  const fixedLotSize = numeric(req.body.fixedLotSize, 0.01);
+  const lotSizeMode = req.body.lotSizeMode === 'risk_based' ? 'risk_based' : req.body.lotSizeMode === 'fixed' ? 'fixed' : null;
+  const autoTradingEnabled = req.body.autoTradingEnabled === true;
+  const executionAccountId = typeof req.body.executionAccountId === 'string' ? req.body.executionAccountId.trim() : '';
+  if (!lotSizeMode) return fail(res, 400, 'Choose a valid lot size mode.');
+  if (!Number.isFinite(riskPercent) || riskPercent < 0.1 || riskPercent > 5) return fail(res, 400, 'Risk percent must be between 0.1 and 5.');
+  if (!Number.isInteger(maxOpenPositions) || maxOpenPositions < 1 || maxOpenPositions > 50) return fail(res, 400, 'Maximum open trades must be between 1 and 50.');
+  if (!Number.isFinite(dailyLossLimit) || dailyLossLimit < 0.1 || dailyLossLimit > 25) return fail(res, 400, 'Daily loss limit must be between 0.1% and 25%.');
+  if (!Number.isInteger(maxDailyTrades) || maxDailyTrades < 1 || maxDailyTrades > 100) return fail(res, 400, 'Maximum daily trades must be between 1 and 100.');
+  if (!Number.isFinite(fixedLotSize) || fixedLotSize < 0.01 || fixedLotSize > 100) return fail(res, 400, 'Fixed lot size must be between 0.01 and 100.');
+  if (autoTradingEnabled && !autoTradingRuntimeEnabled) return fail(res, 409, 'Auto-Trading is not available on this service right now.');
+  if (autoTradingEnabled && !executionAccountId) return fail(res, 400, 'Select a connected trading account before enabling Auto-Trading.');
+  let ownedAccount = null;
+  if (executionAccountId) {
+    const { rows: accountRows } = await pool.query(
+      'SELECT metaapi_account_id,managed_by_app,state FROM metaapi_accounts WHERE user_id=$1 AND metaapi_account_id=$2 LIMIT 1',
+      [req.userId, executionAccountId],
+    );
+    ownedAccount = accountRows[0];
+    if (!ownedAccount) return fail(res, 404, 'The selected trading account is not connected to your workspace.');
+    if (autoTradingEnabled && String(ownedAccount.state || '').toUpperCase() !== 'DEPLOYED') return fail(res, 409, 'The selected trading account must be deployed before Auto-Trading can be enabled.');
+  }
+  const { rows: previousRows } = await pool.query('SELECT auto_trading_enabled AS "autoTradingEnabled",execution_account_id AS "executionAccountId" FROM settings WHERE user_id=$1 LIMIT 1', [req.userId]);
+  const previous = previousRows[0] || {};
+  if (autoTradingEnabled && (!previous.autoTradingEnabled || previous.executionAccountId !== executionAccountId)) {
+    try { await executionEngine.captureDailyBaseline(req.userId, executionAccountId); }
+    catch { return fail(res, 409, 'A safe daily loss baseline could not be captured. Confirm the account is deployed and connected, then try again. Auto-Trading remains off.'); }
+  }
   const { rows } = await pool.query(
-    `INSERT INTO settings(user_id,risk_mode,risk_percent,max_open_positions,daily_loss_limit)
-     VALUES($1,$2,$3,$4,$5) ON CONFLICT(user_id) DO UPDATE SET risk_mode=EXCLUDED.risk_mode,risk_percent=EXCLUDED.risk_percent,max_open_positions=EXCLUDED.max_open_positions,daily_loss_limit=EXCLUDED.daily_loss_limit,updated_at=NOW()
-     RETURNING risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit"`,
-    [req.userId, riskMode, riskPercent, maxOpenPositions, dailyLossLimit],
+    `INSERT INTO settings(user_id,risk_mode,risk_percent,max_open_positions,daily_loss_limit,auto_trading_enabled,lot_size_mode,fixed_lot_size,max_daily_trades,execution_account_id)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(user_id) DO UPDATE SET risk_mode=EXCLUDED.risk_mode,risk_percent=EXCLUDED.risk_percent,max_open_positions=EXCLUDED.max_open_positions,daily_loss_limit=EXCLUDED.daily_loss_limit,auto_trading_enabled=EXCLUDED.auto_trading_enabled,lot_size_mode=EXCLUDED.lot_size_mode,fixed_lot_size=EXCLUDED.fixed_lot_size,max_daily_trades=EXCLUDED.max_daily_trades,execution_account_id=EXCLUDED.execution_account_id,updated_at=NOW()
+     RETURNING risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",lot_size_mode AS "lotSizeMode",fixed_lot_size AS "fixedLotSize",max_daily_trades AS "maxDailyTrades",execution_account_id AS "executionAccountId"`,
+    [req.userId, riskMode, riskPercent, maxOpenPositions, dailyLossLimit, autoTradingEnabled, lotSizeMode, fixedLotSize, maxDailyTrades, executionAccountId || null],
   );
-  res.json({ settings: rows[0] });
+  res.set('Cache-Control', 'no-store').json({ settings: rows[0], runtimeEnabled: autoTradingRuntimeEnabled });
 }));
 app.get('/api/trades', authenticate, asyncRoute(async (req, res) => {
-  const { rows } = await pool.query('SELECT id,symbol,side,quantity,entry_price AS "entryPrice",exit_price AS "exitPrice",pnl,status,created_at AS "createdAt" FROM trades WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50', [req.userId]);
-  res.json({ trades: rows, liveExecutionEnabled: false });
+  const { rows } = await pool.query('SELECT id,signal_id AS "signalId",metaapi_account_id AS "metaApiAccountId",symbol,side,quantity,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",exit_price AS "exitPrice",pnl,status,broker_order_id AS "brokerOrderId",broker_position_id AS "brokerPositionId",error_message AS "errorMessage",created_at AS "createdAt",executed_at AS "executedAt" FROM trades WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50', [req.userId]);
+  res.set('Cache-Control', 'no-store').json({ trades: rows, liveExecutionEnabled: autoTradingRuntimeEnabled });
 }));
 
 app.get('/api/telegram/status', authenticate, asyncRoute(async (req, res) => {
@@ -708,13 +775,27 @@ async function start() {
   if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) throw new Error('JWT_SECRET must contain at least 32 characters');
   await initializeDatabase();
   await pool.query('DELETE FROM telegram_login_attempts WHERE expires_at <= NOW()');
+  executionWorker.start();
   httpServer.listen(PORT, '0.0.0.0', () => log('info', 'Server listening', { port: PORT }));
+  const { rows: telegramUsers } = await pool.query('SELECT id FROM users WHERE telegram_connected=TRUE AND telegram_session IS NOT NULL');
+  for (const row of telegramUsers) {
+    void restoreTelegramClient(row.id).catch((error) => log('warn', 'Telegram listener restore failed', { userId: row.id, errorType: error?.constructor?.name || 'Error' }));
+  }
 }
 start().catch((error) => { log('error', 'Startup failed', { error: error.message }); process.exit(1); });
 
-process.on('SIGTERM', async () => {
+async function shutdown() {
+  const serverClosed = new Promise((resolve) => {
+    if (!httpServer.listening) return resolve();
+    httpServer.close(resolve);
+  });
+  await executionWorker.stop();
+  await serverClosed;
   for (const entry of telegramClients.values()) await entry.client.disconnect().catch(() => {});
   for (const entry of telegramLogins.values()) await entry.client.disconnect().catch(() => {});
+  await tradingAdapter.close().catch(() => {});
   await pool.end().catch(() => {});
-  httpServer.close(() => process.exit(0));
-});
+  process.exit(0);
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);

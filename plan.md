@@ -1,37 +1,50 @@
-# Telegram Signal Desk update plan
+# Telegram Signal Desk Phase 3 implementation plan
 
-## Existing structure
+## Existing project structure
 
-- `client/src/navigation.js` defines the shared navigation keys and labels used by the app shell and sidebar.
-- `client/src/App.jsx` holds the dashboard shell, page titles, and account-note screens.
-- `client/src/components/Sidebar.jsx` renders the shared navigation labels.
-- `client/src/components/TelegramConnect.jsx` owns Telegram authentication, chat selection, and monitoring controls.
-- `client/src/components/MetaApiPanel.jsx` owns the user-facing MT4/MT5 setup workflow and diagnostic display.
-- `server/index.js` owns authenticated API routes, safe error responses, and database ownership checks.
-- `server/services/metaapi.js` owns allowlisted HTTPS calls, provider/network error details, credential redaction, and funding classification.
-- `server/db.js` initializes the PostgreSQL schema used by the Render API and Supabase.
+- `client/src/App.jsx` owns the dashboard shell, navigation/page titles, overview, signals, account notes, and preferences.
+- `client/src/components/Sidebar.jsx` renders the shared navigation labels; `client/src/components/TelegramConnect.jsx` handles Telegram login and channel selection; `client/src/components/MetaApiPanel.jsx` handles secure MT4/MT5 setup and connected-account display.
+- `client/src/components/ExecutionSettings.jsx` will own execution preferences, account selection, the default-off Auto-Trading toggle, and the required safety banner.
+- `server/index.js` owns authenticated HTTP routes, Telegram listeners, signal capture, MetaAPI account ownership, and worker lifecycle.
+- `server/db.js` initializes the existing PostgreSQL schema. It will add execution settings, idempotent Telegram event identifiers, persistent execution jobs, daily equity snapshots, and trade-result fields using idempotent migrations.
+- `server/services/signal-parser.js` will replace the basic inline regex parser with a strict, testable parser. Existing signal capture remains available when a message is not executable.
+- `server/services/metaapi-trading.js` will own a long-lived `metaapi.cloud-sdk` instance and synchronized streaming connections. It will use the provisioning token for app-created accounts and the user's encrypted token for previously linked accounts.
+- `server/services/execution-engine.js` will apply the opt-in, account, trade-count, daily-loss, signal-freshness, quote, and position-size checks before placing an order.
+- `server/services/execution-worker.js` will claim durable Postgres jobs with row locking, record each outcome, and stop cleanly during shutdown. Unit tests will mock the broker adapter; no test or deployment will place a live order.
 
 ## Implementation approach
 
-Use one shared navigation definition for the sidebar and top-level page title so they cannot drift. Name the reference-only section **Account Notes** and the MetaAPI provisioning/connected-account section **Trading Accounts**. Update related metric, section headings, and the account-note cross-link to use these terms consistently; keep descriptive action labels such as “Add an MT4/MT5 account.”
+Add an **Execution Settings** section inside Risk Settings. Persist Auto-Trading (default off), lot size mode (Fixed Lot or Risk-Based), fixed lot size, maximum open trades, maximum daily trades, maximum risk per position, daily loss limit, and one user-selected connected MT4/MT5 account. Keep the required red warning text exactly: “Warning: Enabling Auto-Trading will execute live trades on your connected broker account. Ensure you are using a demo account for testing. You are fully responsible for any financial losses.” Replace the obsolete “reference only/no trades” copy with an accurate explanation of the opt-in flow.
 
-MetaAPI's documented create-account responses include validation, authorization, permission, provisioning-profile, and broker/account errors. The docs do not specify a deposit or insufficient-funds response for this flow, although they note separately billed resource options and possible charges for repeated credential/settings errors. Preserve any provider-supplied message and HTTP status/code, redact tokens and passwords, and detect funding/billing language (for example insufficient funds/balance, deposit, or payment) so such a provider response is labeled accurately without paraphrasing away its exact text. If `fetch` fails before an HTTP response, capture the safe nested cause/code (including nested causes or aggregate errors), state that MetaAPI returned no provider response, and do not present it as a confirmed funding issue. Keep internal logs useful but secret-free.
+The Telegram listener already performs basic regex extraction. Replace it with deterministic parsing and validation for an explicit BUY/SELL, symbol, optional single entry, mandatory stop loss, and optional single take-profit. Continue saving every monitored message for review, but queue only new, deduplicated Telegram messages that parse safely and whose user's setting is opted in. Do not auto-execute manual notes, unrecognized messages, ambiguous entry ranges, or messages with multiple take-profits. Expire queued signals after two minutes so a sleeping or restarted service cannot execute stale messages.
 
-The shared frontend API helper must display the backend's safe diagnostic message for MetaAPI failures rather than replacing it with a generic connection message. Keep unexpected internal errors generic. The initial account-creation route must continue to show a configuration-link failure even when MetaAPI has already created the draft account. Normalize invisible Unicode formatting marks out of the saved MetaAPI token before placing it in the `auth-token` header; validate remaining characters and return a safe setup message instead of a Fetch ByteString exception. Do not expose stack traces, raw payloads, tokens, or broker credentials, and do not add trading order operations.
+Run the worker continuously while the API process is online, as the user explicitly requested; set the API's server-side `AUTO_TRADING_RUNTIME_ENABLED` switch to `true`. Keep each user's Auto-Trading toggle and settings OFF by default, so no orders are placed without that user's explicit opt-in. The API and static frontend are separate Render services: UptimeRobot must ping the API `/health` endpoint, not the static website, to keep the worker's service active. The current API is on Render Free and may still sleep or restart, so explain that keep-alive monitoring does not guarantee uninterrupted trading. Expire stale jobs and fail closed when any safety data is missing. Do not change or upgrade the Render service plan.
 
-Reuse the existing navy/teal product styling and secure hosted-credentials flow. No new infrastructure or external service integration is needed.
+Before processing an order, re-check the user's opt-in, selected account ownership and deployed state, signal age, synchronized broker connection, current open-position count, Signal Desk orders submitted during the current UTC day, and daily loss. Count every open broker position against the open-trade cap. Use persisted UTC-day account-equity snapshots for loss limits, including floating account equity; if a required baseline is missing or stale, do not trade. When Auto-Trading is first enabled mid-day, capture current equity as the baseline for the remainder of that UTC day. Keep the execution limits in the UI clear about what is counted.
+
+Require a valid stop loss on the correct side of the current quote. For Fixed Lot, validate the user's amount against the broker's min/max and volume step. For Risk-Based, compute risk cash as account balance multiplied by risk percent, divide by the stop-distance loss per lot using MetaAPI `lossTickValue` and the symbol `tickSize`, then round down to the broker's `volumeStep` and reject values below the minimum. Reject stale quotes and unsupported symbols. Use market buy/sell methods only: when a signal includes an entry price, submit a market trade only if the current quote is not worse than that entry for the signal direction; otherwise skip and record why. Use one explicit TP; multiple targets remain captured but are not auto-traded until their handling is configured.
+
+Create a trade record before submitting the MetaAPI order and update it with a sanitized provider response, broker order/position IDs, execution status, and any safe rejection details. Use a stable `clientId` derived from the signal/job to reduce duplicate orders. Do not automatically retry an ambiguous network failure because the broker may already have accepted the first request; record it as unknown and require reconciliation. Any provider rejection is persisted with its exact sanitized message and code. Do not add a simulation or paper-trading path.
 
 ## Design
 
-- **Design movement:** Continue the existing restrained dark-navy and teal dashboard aesthetic, with high-contrast white cards and compact information hierarchy.
-- **Core principles:** Clear, trustworthy, calm, and mobile-first.
-- **Color philosophy:** Preserve navy for structure, teal for positive actions and connection states, and muted neutrals for secondary information; use warm amber only for caution.
-- **Layout paradigm:** Keep the familiar dashboard shell and focused two-panel workspace, collapsing into a single column on narrow screens.
-- **Signature elements:** Retain the compact status pills and softly bordered cards; use a distinct secure-link card to make the hosted MetaAPI step obvious.
-- **Interaction philosophy:** Make progress and success visible, disable duplicate submissions, and keep sensitive credentials on MetaAPI rather than in Signal Desk.
-- **Animation:** Reuse existing short transitions and honor `prefers-reduced-motion`; do not introduce decorative motion.
-- **Typography system:** Preserve the existing DM Sans body and Manrope heading pairing, with consistent readable sizes and line heights.
-- **Brand essence:** A focused workspace for reviewing Telegram signals and organizing account connections; practical, composed, and transparent.
-- **Brand voice:** Plain and reassuring. Example: “Search your Telegram chats.” “Your trading password is entered on MetaAPI, not here.”
-- **Wordmark and logo:** Keep the current Signal Desk wordmark and installed-app icon; do not replace existing brand assets.
-- **Signature brand color:** Retain the current teal (`#1e6878`) as the primary action color.
+- **Design movement:** Continue the restrained navy-and-teal dashboard style, with a clear visual distinction between saved preferences and executable settings.
+- **Core principles:** Explicit opt-in, fail-closed safeguards, legible status, and mobile-first touch access.
+- **Color philosophy:** Preserve navy structure and teal actions; reserve saturated red for the live-trading warning and blocked safety conditions.
+- **Layout paradigm:** Keep the existing dashboard shell and present execution controls in a focused section that stacks vertically on mobile.
+- **Signature elements:** A prominent red Auto-Trading warning, visible OFF/ON status, and concise execution-result badges.
+- **Interaction philosophy:** Auto-Trading starts OFF; do not allow it to be saved as ON without an available runtime and a connected account. Show exactly why a signal was skipped or rejected without exposing secrets.
+- **Animation:** Reuse existing short transitions and honor `prefers-reduced-motion`; do not add decorative motion.
+- **Typography system:** Preserve DM Sans body text and Manrope headings.
+- **Brand essence:** A composed workspace for monitoring Telegram signals and safely controlling optional account automation; practical, explicit, and transparent.
+- **Brand voice:** Plain and direct. Examples: “Auto-Trading is off.” “This signal was skipped because its stop loss was missing.”
+- **Wordmark and logo:** Keep the existing Signal Desk mark and installed-app icon.
+- **Signature brand color:** Retain teal `#1e6878` for primary actions; use red only for material execution risk.
+
+
+## MetaAPI contract references
+
+- The official JavaScript SDK README specifies `metaapi.cloud-sdk/esm-node` for native Node.js ECMAScript modules. The streaming guide requires synchronizing before relying on terminal state and shows market buy/sell orders with stop loss, take profit and `clientId`: https://github.com/metaapi/metaapi-javascript-sdk/blob/main/readme.md and https://github.com/metaapi/metaapi-javascript-sdk/blob/master/docs/metaApi/streamingApi.md
+- MetaApi's symbol specification exposes `tickSize`, `minVolume`, `maxVolume` and `volumeStep`; current symbol-price objects expose bid, ask, `lossTickValue` and quote time. Risk-based volume therefore uses the synchronized quote's losing tick value and the symbol specification's tick size, while failing closed if either is missing: https://metaapi.cloud/docs/client/models/metatraderSymbolSpecification/ and https://metaapi.cloud/docs/client/models/metatraderSymbolPrice/
+- MetaTrader deals classify `entryType` as `DEAL_ENTRY_IN`, `DEAL_ENTRY_OUT`, `DEAL_ENTRY_INOUT` or `DEAL_ENTRY_OUT_BY`; the daily cap counts unique opening order/deal identifiers and skips exits: https://metaapi.cloud/docs/client/models/metatraderDeal/
+- MetaApi streaming documentation exposes terminal account state, positions, pending orders, specifications, prices and synchronized history; history is treated as unavailable until deal synchronization completes: https://metaapi.cloud/docs/client/websocket/usingStreamingApi/
