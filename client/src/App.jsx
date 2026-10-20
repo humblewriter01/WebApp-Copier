@@ -3,8 +3,11 @@ import Sidebar from './components/Sidebar.jsx';
 import TelegramConnect from './components/TelegramConnect.jsx';
 import MetaApiPanel from './components/MetaApiPanel.jsx';
 import ExecutionSettings from './components/ExecutionSettings.jsx';
+import AccountDeletionSettings from './components/AccountDeletionSettings.jsx';
+import UpdatePasswordPage from './components/UpdatePasswordPage.jsx';
 import { navigationItems } from './navigation.js';
 import { request } from './lib/api.js';
+import { supabase } from './lib/supabase.js';
 
 const tabs = navigationItems.map(({ key, label }) => [key, label]);
 
@@ -12,31 +15,45 @@ function AuthScreen({ onAuthenticated, installPrompt, onInstall }) {
   const [mode, setMode] = useState('login');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [resetSent, setResetSent] = useState(false);
   const [rememberMe, setRememberMe] = useState(true);
   const [form, setForm] = useState({ name: '', email: '', password: '' });
   const submit = async (event) => {
     event.preventDefault(); setBusy(true); setError('');
     try {
+      if (mode === 'forgot') {
+        if (!supabase) throw new Error('Password recovery is not configured for this workspace yet.');
+        await request('/api/auth/prepare-password-reset', null, { method: 'POST', body: { email: form.email.trim().toLowerCase() } });
+        const { error: resetError } = await supabase.auth.resetPasswordForEmail(form.email.trim().toLowerCase(), { redirectTo: `${window.location.origin}/update-password` });
+        if (resetError) throw new Error('We could not process that reset request right now. Please try again later.');
+        setResetSent(true);
+        return;
+      }
       const data = await request(`/api/auth/${mode === 'login' ? 'login' : 'register'}`, null, { method: 'POST', body: { ...form, rememberMe } });
       onAuthenticated(data, rememberMe);
     } catch (e) { setError(e.message); } finally { setBusy(false); }
   };
+  const changeMode = (nextMode) => { setMode(nextMode); setError(''); setResetSent(false); };
   return <main className="auth-shell">
     <div className="auth-brand"><div className="brand-mark"><img src="/icons/signal-desk-icon-192.png" alt="" /></div><span>Signal Desk</span></div>
     <section className="auth-card">
-      <p className="eyebrow">AUTOMATED SIGNAL EXECUTION</p>
-      <h1>{mode === 'login' ? 'Welcome back' : 'Create your workspace'}</h1>
-      <p className="muted">Automate your trading by executing Telegram signals directly to your broker.</p>
-      <form onSubmit={submit} className="form-stack">
+      <p className="eyebrow">{mode === 'forgot' ? 'ACCOUNT RECOVERY' : 'AUTOMATED SIGNAL EXECUTION'}</p>
+      <h1>{mode === 'login' ? 'Welcome back' : mode === 'register' ? 'Create your workspace' : resetSent ? 'Check your email' : 'Reset your password'}</h1>
+      <p className="muted">{mode === 'forgot' ? 'Enter the email address for your Signal Desk account. If it exists, we will send a secure reset link.' : 'Automate your trading by executing Telegram signals directly to your broker.'}</p>
+      {mode === 'forgot' && resetSent ? <>
+        <div className="alert alert-success" role="status">If an account exists for that address, a password reset link has been sent. Check your inbox and spam folder.</div>
+        <button type="button" className="button button-secondary button-wide auth-mode-button" onClick={() => changeMode('login')}>Back to sign in</button>
+      </> : <form onSubmit={submit} className="form-stack">
         {mode === 'register' && <label>Your name<input autoComplete="name" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} required maxLength={100} /></label>}
         <label>Email<input type="email" autoComplete="email" value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} required /></label>
-        <label>Password<input type="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} required minLength={mode === 'register' ? 10 : 1} />{mode === 'register' && <small>Use at least 10 characters.</small>}</label>
-        <label className="remember-session"><input type="checkbox" checked={rememberMe} onChange={(event) => setRememberMe(event.target.checked)} /><span>Keep me signed in for 30 days</span></label>
-        <small className="remember-hint">Leave checked on your personal device. Uncheck it on shared devices.</small>
-        {error && <div className="alert alert-error">{error}</div>}
-        <button className="button button-primary button-wide" disabled={busy}>{busy ? 'Please wait…' : mode === 'login' ? 'Sign in' : 'Create account'}</button>
-      </form>
-      <p className="auth-switch">{mode === 'login' ? 'New to Signal Desk?' : 'Already have an account?'} <button className="text-button" onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError(''); }}>{mode === 'login' ? 'Create account' : 'Sign in'}</button></p>
+        {mode !== 'forgot' && <label>Password<input type="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} required minLength={mode === 'register' ? 10 : 1} />{mode === 'register' && <small>Use at least 10 characters.</small>}</label>}
+        {mode === 'login' && <div className="forgot-password-row"><button type="button" className="text-button" onClick={() => changeMode('forgot')}>Forgot Password?</button></div>}
+        {mode === 'login' && <><label className="remember-session"><input type="checkbox" checked={rememberMe} onChange={(event) => setRememberMe(event.target.checked)} /><span>Keep me signed in for 30 days</span></label><small className="remember-hint">Leave checked on your personal device. Uncheck it on shared devices.</small></>}
+        {error && <div className="alert alert-error" role="alert">{error}</div>}
+        <button className="button button-primary button-wide" disabled={busy}>{busy ? (mode === 'forgot' ? 'Sending…' : 'Please wait…') : mode === 'login' ? 'Sign in' : mode === 'register' ? 'Create account' : 'Send reset link'}</button>
+        {mode === 'forgot' && <button type="button" className="button button-secondary button-wide auth-mode-button" onClick={() => changeMode('login')}>Back to sign in</button>}
+      </form>}
+      {mode !== 'forgot' && <p className="auth-switch">{mode === 'login' ? 'New to Signal Desk?' : 'Already have an account?'} <button type="button" className="text-button" onClick={() => changeMode(mode === 'login' ? 'register' : 'login')}>{mode === 'login' ? 'Create account' : 'Sign in'}</button></p>}
       <p className="fine-print">Auto-Trading is ON by default for new workspaces. New eligible Telegram signals may place live orders after you select a deployed trading account. Review the risk settings and turn it off whenever you want to stop new orders.</p>
       {installPrompt && <button type="button" className="button button-primary button-wide install-button" onClick={onInstall}>Install Signal Desk</button>}
     </section>
@@ -140,7 +157,7 @@ function App() {
     return () => window.removeEventListener('keydown', closeOnEscape);
   }, [isMobileViewport, sidebarVisible]);
 
-  const logout = useCallback(() => { try { localStorage.removeItem('signal-token'); } catch {} sessionStorage.removeItem('signal-token'); setToken(''); setUser(null); setDashboard(null); setLoading(false); }, []);
+  const logout = useCallback(() => { try { void supabase?.auth.signOut({ scope: 'local' }); } catch {} try { localStorage.removeItem('signal-token'); } catch {} sessionStorage.removeItem('signal-token'); setToken(''); setUser(null); setDashboard(null); setLoading(false); }, []);
   const refresh = useCallback(async () => {
     if (!token) return;
     try {
@@ -191,6 +208,7 @@ function App() {
     finally { setSettingsSaving(false); }
   };
 
+  if (window.location.pathname.replace(/\/+$/, '') === '/update-password') return <UpdatePasswordPage />;
   if (!token) return <AuthScreen onAuthenticated={authenticated} installPrompt={installPrompt} onInstall={installApp} />;
   if (loading) return <main className="loading-shell"><div className="spinner" /><span>Loading your workspace…</span></main>;
   return <div className={`app-shell ${sidebarVisible ? '' : 'sidebar-hidden'}`}>
@@ -210,7 +228,7 @@ function App() {
         {tab === 'metaapi' && <MetaApiPanel token={token} />}
         {tab === 'signals' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">CAPTURED MESSAGES</p><h2>Signal history</h2></div><span className="count-badge">{signals.length}</span></div><SignalTable signals={signals} onEmptyAction={() => setTab('telegram')} /></section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">MANUAL ENTRY</p><h2>Add a signal note</h2></div></div><p className="muted">Save a message for tracking. Signal Desk may identify the symbol, direction, entry, stop, and target.</p><form className="form-stack" onSubmit={addManualSignal}><label>Signal message<textarea rows="7" value={signalText} onChange={e => setSignalText(e.target.value)} placeholder={'BUY EURUSD\nEntry: 1.0850\nSL: 1.0800\nTP: 1.0950'} required maxLength={5000} /></label><button className="button button-primary">Save signal</button></form></section></div>}
         {tab === 'accounts' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">YOUR NOTES</p><h2>Account Notes</h2></div><span className="count-badge">{accounts.length}</span></div><p className="muted">Save a label or optional reference for your own notes. To connect a trading account, open Trading Accounts.</p>{!accounts.length ? <div className="empty-state"><strong>No account notes yet</strong><span>Add a label for your own reference.</span></div> : <div className="chat-list">{accounts.map(account => <div className="chat-row" key={account.id}><div><strong>{account.label}</strong><small>{[account.broker, account.platform, account.accountReference].filter(Boolean).join(' · ') || 'Reference only'}</small></div><button className="icon-button" onClick={async () => { await request(`/api/accounts/${account.id}`, token, { method: 'DELETE' }); await refresh(); }}>Remove</button></div>)}</div>}</section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">ADD A NOTE</p><h2>Account note</h2></div></div><form className="form-stack" onSubmit={addAccount}><label>Label<input value={accountForm.label} onChange={e => setAccountForm({ ...accountForm, label: e.target.value })} placeholder="Demo MT5 account" required maxLength={100} /></label><div className="form-row"><label>Broker<input value={accountForm.broker} onChange={e => setAccountForm({ ...accountForm, broker: e.target.value })} /></label><label>Platform<input value={accountForm.platform} onChange={e => setAccountForm({ ...accountForm, platform: e.target.value })} placeholder="MT4, MT5…" /></label></div><label>Reference<input value={accountForm.accountReference} onChange={e => setAccountForm({ ...accountForm, accountReference: e.target.value })} placeholder="Optional alias" /></label><button className="button button-primary">Save note</button></form></section></div>}
-        {tab === 'settings' && <ExecutionSettings settings={settings} accounts={linkedAccounts} trades={trades} runtimeAvailable={executionRuntimeEnabled} onChange={setSettings} onSubmit={saveSettings} onToggle={toggleAutoTrading} saving={settingsSaving} />}
+        {tab === 'settings' && <><ExecutionSettings settings={settings} accounts={linkedAccounts} trades={trades} runtimeAvailable={executionRuntimeEnabled} onChange={setSettings} onSubmit={saveSettings} onToggle={toggleAutoTrading} saving={settingsSaving} /><AccountDeletionSettings token={token} onDeleted={logout} /></>}
       </div>
       <footer className="footer">Not financial advice. Use at your own risk.</footer>
     </main>

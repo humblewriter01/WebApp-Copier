@@ -19,6 +19,7 @@ import { parseSignal } from './services/signal-parser.js';
 import { createMetaApiTradingAdapter } from './services/metaapi-trading.js';
 import { createExecutionEngine } from './services/execution-engine.js';
 import { createExecutionWorker } from './services/execution-worker.js';
+import { createSupabaseAuthBridge } from './services/supabase-auth.js';
 
 const app = express();
 app.set('trust proxy', 1);
@@ -30,6 +31,7 @@ const telegramClients = new Map();
 const telegramLogins = new Map();
 const autoTradingRuntimeEnabled = String(process.env.AUTO_TRADING_RUNTIME_ENABLED || '').toLowerCase() === 'true';
 const tradingAdapter = createMetaApiTradingAdapter();
+const supabaseAuthBridge = createSupabaseAuthBridge();
 
 const log = (level, message, extra = {}) => {
   const safe = { ...extra };
@@ -52,6 +54,7 @@ app.use(cors({
 app.use(express.json({ limit: '1mb' }));
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false }));
 app.use('/api/metaapi', rateLimit({ windowMs: 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false }));
+const passwordResetLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 5, standardHeaders: true, legacyHeaders: false });
 
 function encryptSecret(value) {
   const secret = process.env.SESSION_ENCRYPTION_KEY;
@@ -213,25 +216,173 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
   const password = String(req.body.password || '');
   if (!name || !/^\S+@\S+\.\S+$/.test(email) || password.length < 10) return fail(res, 400, 'Enter a name, valid email, and password with at least 10 characters.');
+  const duplicate = await pool.query('SELECT id FROM users WHERE email=$1 LIMIT 1', [email]);
+  if (duplicate.rows.length) return fail(res, 409, 'An account with that email already exists.');
+  let supabaseUserId = null;
+  try { supabaseUserId = await supabaseAuthBridge.createRegistrationIdentity({ email, password, name }); }
+  catch (error) {
+    if (error.status === 409) return fail(res, 409, error.message);
+    log('warn', 'Supabase Auth registration bridge failed', { code: error.code || 'AUTH_PROVIDER_ERROR' });
+    return fail(res, 503, 'Account registration is temporarily unavailable. Please try again later.');
+  }
   const hash = await bcrypt.hash(password, 12);
+  const dbClient = await pool.connect();
   try {
-    const { rows } = await pool.query("INSERT INTO users(name,email,password_hash,role) VALUES($1,$2,$3,CASE WHEN lower($2)='ameenujaafar432@gmail.com' THEN 'admin' ELSE 'user' END) RETURNING id,name,email,created_at", [name, email, hash]);
-    await pool.query('INSERT INTO settings(user_id) VALUES($1) ON CONFLICT DO NOTHING', [rows[0].id]);
+    await dbClient.query('BEGIN');
+    const { rows } = await dbClient.query("INSERT INTO users(name,email,password_hash,supabase_user_id,role) VALUES($1,$2,$3,$4,CASE WHEN lower($2)='ameenujaafar432@gmail.com' THEN 'admin' ELSE 'user' END) RETURNING id,name,email,created_at", [name, email, hash, supabaseUserId]);
+    await dbClient.query('INSERT INTO settings(user_id) VALUES($1) ON CONFLICT DO NOTHING', [rows[0].id]);
+    await dbClient.query('COMMIT');
     const user = publicUser(rows[0]);
     res.status(201).json({ token: issueToken(user, req.body.rememberMe === true), user });
   } catch (error) {
+    await dbClient.query('ROLLBACK').catch(() => {});
+    if (supabaseUserId) await supabaseAuthBridge.deleteAuthUser(supabaseUserId).catch((cleanupError) => log('error', 'Orphan Supabase Auth registration cleanup failed', { code: cleanupError.code || 'AUTH_PROVIDER_ERROR' }));
     if (error.code === '23505') return fail(res, 409, 'An account with that email already exists.');
     throw error;
-  }
+  } finally { dbClient.release(); }
 }));
 app.post('/api/auth/login', asyncRoute(async (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
   const password = String(req.body.password || '');
-  const { rows } = await pool.query('SELECT id,name,email,password_hash,created_at FROM users WHERE email=$1', [email]);
-  if (!rows[0] || !(await bcrypt.compare(password, rows[0].password_hash))) return fail(res, 401, 'Email or password is incorrect.');
+  const { rows } = await pool.query('SELECT id,name,email,password_hash,supabase_user_id,created_at FROM users WHERE email=$1', [email]);
+  if (!rows[0]) return fail(res, 401, 'Email or password is incorrect.');
+  const localPasswordValid = await bcrypt.compare(password, rows[0].password_hash);
+  if (rows[0].supabase_user_id && supabaseAuthBridge.isPublicConfigured()) {
+    let authUser;
+    try { authUser = await supabaseAuthBridge.verifyPassword(email, password); }
+    catch (error) {
+      log('warn', 'Supabase Auth sign-in verification failed', { userId: rows[0].id, code: error.code || 'AUTH_PROVIDER_ERROR' });
+      return fail(res, 503, 'Sign-in could not be verified right now. Please try again.');
+    }
+    if (!authUser || authUser.id !== rows[0].supabase_user_id) return fail(res, 401, 'Email or password is incorrect.');
+    if (!localPasswordValid) {
+      const hash = await bcrypt.hash(password, 12);
+      await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2', [hash, rows[0].id]);
+    }
+  } else if (!localPasswordValid && supabaseAuthBridge.isPublicConfigured()) {
+    let authUser;
+    try { authUser = await supabaseAuthBridge.verifyPassword(email, password); }
+    catch (error) {
+      log('warn', 'Supabase Auth recovery sign-in verification failed', { userId: rows[0].id, code: error.code || 'AUTH_PROVIDER_ERROR' });
+      return fail(res, 503, 'Sign-in could not be verified right now. Please try again.');
+    }
+    if (!authUser) return fail(res, 401, 'Email or password is incorrect.');
+    const hash = await bcrypt.hash(password, 12);
+    const linked = await pool.query('UPDATE users SET password_hash=$1,supabase_user_id=$2 WHERE id=$3 AND (supabase_user_id IS NULL OR supabase_user_id=$2)', [hash, authUser.id, rows[0].id]);
+    if (!linked.rowCount) return fail(res, 409, 'This sign-in could not be linked to your Signal Desk account. Please contact support.');
+    rows[0].supabase_user_id = authUser.id;
+    rows[0].password_hash = hash;
+  } else if (!localPasswordValid) return fail(res, 401, 'Email or password is incorrect.');
+  if (!rows[0].supabase_user_id) {
+    try {
+      const linkedId = await supabaseAuthBridge.ensureLegacyLoginIdentity({ email, password, name: rows[0].name });
+      if (linkedId) {
+        await pool.query('UPDATE users SET supabase_user_id=$1 WHERE id=$2 AND supabase_user_id IS NULL', [linkedId, rows[0].id]);
+        rows[0].supabase_user_id = linkedId;
+      }
+    } catch (error) {
+      log('warn', 'Legacy account Auth bridge deferred', { userId: rows[0].id, code: error.code || 'AUTH_PROVIDER_ERROR' });
+    }
+  }
   await pool.query('UPDATE users SET last_login=NOW() WHERE id=$1', [rows[0].id]);
   const user = publicUser(rows[0]);
   res.json({ token: issueToken(user, req.body.rememberMe === true), user });
+}));
+app.post('/api/auth/prepare-password-reset', passwordResetLimiter, asyncRoute(async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  if (!/^\S+@\S+\.\S+$/.test(email)) return res.json({ ok: true });
+  if (!supabaseAuthBridge.isAdminConfigured()) return fail(res, 503, 'Password recovery is temporarily unavailable. Please try again later.');
+  const { rows } = await pool.query('SELECT id,name,email,supabase_user_id FROM users WHERE email=$1 LIMIT 1', [email]);
+  if (rows[0]) {
+    try {
+      const prepared = await supabaseAuthBridge.prepareRecoveryIdentity({ email, name: rows[0].name, currentId: rows[0].supabase_user_id });
+      if (prepared.created && prepared.linkable) await pool.query('UPDATE users SET supabase_user_id=$1 WHERE id=$2 AND (supabase_user_id IS NULL OR supabase_user_id=$3)', [prepared.id, rows[0].id, rows[0].supabase_user_id]);
+    } catch (error) {
+      // Keep the response identical for known and unknown emails to avoid account enumeration.
+      log('warn', 'Password recovery identity preparation failed', { code: error.code || 'AUTH_PROVIDER_ERROR' });
+    }
+  }
+  res.json({ ok: true });
+}));
+app.post('/api/auth/sync-password', asyncRoute(async (req, res) => {
+  const accessToken = req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+  const password = String(req.body.password || '');
+  if (!accessToken) return fail(res, 401, 'The password reset session is invalid or expired. Request a new reset link.');
+  if (password.length < 10) return fail(res, 400, 'Use at least 10 characters for your new password.');
+  const authUser = await supabaseAuthBridge.getUserFromAccessToken(accessToken);
+  const email = String(authUser?.email || '').trim().toLowerCase();
+  if (!authUser?.id || !email) return fail(res, 401, 'The password reset session is invalid or expired. Request a new reset link.');
+  const { rows } = await pool.query('SELECT id,supabase_user_id FROM users WHERE email=$1 LIMIT 1', [email]);
+  const localUser = rows[0];
+  if (!localUser || (localUser.supabase_user_id && localUser.supabase_user_id !== authUser.id)) return fail(res, 404, 'We could not match this reset session to a Signal Desk account.');
+  const hash = await bcrypt.hash(password, 12);
+  const updated = await pool.query('UPDATE users SET password_hash=$1,supabase_user_id=$2 WHERE id=$3 AND (supabase_user_id IS NULL OR supabase_user_id=$2)', [hash, authUser.id, localUser.id]);
+  if (!updated.rowCount) return fail(res, 409, 'This password reset session is no longer linked to your account. Request a new link.');
+  res.json({ ok: true });
+}));
+app.delete('/api/auth/account', authenticate, asyncRoute(async (req, res) => {
+  if (String(req.body.confirmation || '').trim() !== 'DELETE') return fail(res, 400, 'Type DELETE to confirm account removal.');
+  const password = String(req.body.password || '');
+  if (!password) return fail(res, 400, 'Enter your current password to confirm account removal.');
+  const { rows } = await pool.query('SELECT id,email,password_hash,supabase_user_id FROM users WHERE id=$1 LIMIT 1', [req.userId]);
+  const user = rows[0];
+  if (!user) return fail(res, 404, 'This Signal Desk account no longer exists.');
+  let passwordValid = false;
+  if (user.supabase_user_id && supabaseAuthBridge.isPublicConfigured()) {
+    try {
+      const verified = await supabaseAuthBridge.verifyPassword(user.email, password);
+      if (verified?.id === user.supabase_user_id) {
+        passwordValid = true;
+        const hash = await bcrypt.hash(password, 12);
+        await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2', [hash, user.id]);
+      } else {
+        const linkedAuthUser = await supabaseAuthBridge.findUserById(user.supabase_user_id);
+        passwordValid = !linkedAuthUser && await bcrypt.compare(password, user.password_hash);
+      }
+    } catch (error) {
+      log('warn', 'Account deletion password verification unavailable', { userId: user.id, code: error.code || 'AUTH_PROVIDER_ERROR' });
+      return fail(res, 503, 'We could not verify your password right now. Please try again.');
+    }
+  } else passwordValid = await bcrypt.compare(password, user.password_hash);
+  if (!passwordValid) return fail(res, 401, 'Your current password is incorrect.');
+  await pool.query('UPDATE settings SET auto_trading_enabled=FALSE WHERE user_id=$1', [user.id]);
+
+  if (user.supabase_user_id) {
+    try { await supabaseAuthBridge.deleteAuthUser(user.supabase_user_id); }
+    catch (error) {
+      log('error', 'Supabase Auth account deletion failed', { userId: user.id, code: error.code || 'AUTH_PROVIDER_ERROR' });
+      return fail(res, 503, 'We could not complete account deletion. No Signal Desk data was removed. Please try again later.');
+    }
+  } else {
+    if (!supabaseAuthBridge.isAdminConfigured()) return fail(res, 503, 'Account deletion is temporarily unavailable. Please try again later.');
+    try {
+      const existingAuthUser = await supabaseAuthBridge.findUserByEmail(user.email);
+      if (existingAuthUser) return fail(res, 409, 'Verify your email with the Forgot Password link before deleting this account.');
+    } catch (error) {
+      log('error', 'Supabase Auth account ownership lookup failed', { userId: user.id, code: error.code || 'AUTH_PROVIDER_ERROR' });
+      return fail(res, 503, 'We could not verify account ownership. No Signal Desk data was removed. Please try again later.');
+    }
+  }
+
+  const dbClient = await pool.connect();
+  try {
+    await dbClient.query('BEGIN');
+    const deleted = await dbClient.query('DELETE FROM users WHERE id=$1', [user.id]);
+    if (!deleted.rowCount) { await dbClient.query('ROLLBACK'); return fail(res, 404, 'This Signal Desk account no longer exists.'); }
+    await dbClient.query('COMMIT');
+  } catch (error) {
+    await dbClient.query('ROLLBACK').catch(() => {});
+    log('error', 'Local account data cleanup failed after Auth deletion', { userId: user.id, code: error.code || 'DATABASE_ERROR' });
+    return fail(res, 503, 'Your Auth account was removed, but workspace cleanup could not finish. Please retry account deletion to finish cleanup.');
+  } finally { dbClient.release(); }
+
+  for (const map of [telegramClients, telegramLogins]) {
+    const entry = map.get(user.id);
+    if (entry?.client) await entry.client.disconnect().catch(() => {});
+    map.delete(user.id);
+  }
+  io.in(`user:${user.id}`).disconnectSockets(true);
+  res.json({ ok: true });
 }));
 app.get('/api/auth/me', authenticate, asyncRoute(async (req, res) => {
   const { rows } = await pool.query('SELECT id,name,email,created_at FROM users WHERE id=$1', [req.userId]);

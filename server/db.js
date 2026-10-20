@@ -26,6 +26,8 @@ export async function initializeDatabase() {
       last_login TIMESTAMPTZ
     );
     ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS supabase_user_id UUID;
+    CREATE UNIQUE INDEX IF NOT EXISTS users_supabase_user_id_unique_idx ON users(supabase_user_id) WHERE supabase_user_id IS NOT NULL;
     DO $$ BEGIN
       IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_role_check' AND conrelid = 'users'::regclass) THEN
         ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('user', 'admin'));

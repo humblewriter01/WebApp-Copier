@@ -19,6 +19,12 @@ services:
         sync: false
       - key: SESSION_ENCRYPTION_KEY
         sync: false
+      - key: SUPABASE_URL
+        value: https://vphckospghbeezvwpjwp.supabase.co
+      - key: SUPABASE_PUBLISHABLE_KEY
+        value: sb_publishable_KzOiEouPTpCA9xx0mudKHw_kQMncouM
+      - key: SUPABASE_SECRET_KEY
+        sync: false
       - key: CLIENT_URL
         value: https://telegram-copier-web.onrender.com
       - key: API_ID
@@ -47,3 +53,7 @@ services:
     envVars:
       - key: VITE_API_URL
         value: https://telegram-copier-api-l1mj.onrender.com
+      - key: VITE_SUPABASE_URL
+        value: https://vphckospghbeezvwpjwp.supabase.co
+      - key: VITE_SUPABASE_PUBLISHABLE_KEY
+        value: sb_publishable_KzOiEouPTpCA9xx0mudKHw_kQMncouM
