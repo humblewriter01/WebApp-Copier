@@ -11,7 +11,7 @@ const baseItem = {
   metaapi_account_id: 'account-1', managed_by_app: true, account_state: 'DEPLOYED',
 };
 
-function fakePool({ baseline = 1000, localTrades = 0 } = {}) {
+function fakePool({ baseline = 1000, localTrades = 0, disableBeforeSubmit = false } = {}) {
   const calls = [];
   return {
     calls,
@@ -20,6 +20,7 @@ function fakePool({ baseline = 1000, localTrades = 0 } = {}) {
       if (sql.includes('SELECT ej.id AS job_id')) return { rows: [{ ...baseItem }] };
       if (sql.includes('SELECT baseline_equity')) return { rows: [{ baseline_equity: baseline }] };
       if (sql.includes('SELECT COUNT(*)::int AS count FROM trades')) return { rows: [{ count: localTrades }] };
+      if (sql.includes('SELECT auto_trading_enabled AS "autoTradingEnabled"')) return { rows: [{ autoTradingEnabled: !disableBeforeSubmit, executionAccountId: 'account-1' }] };
       if (sql.includes('INSERT INTO trades')) return { rows: [{ id: 'trade-1' }] };
       return { rows: [], rowCount: 1 };
     },
@@ -70,4 +71,15 @@ test('fully gated test signal sends only to the injected fake adapter and persis
   const insert = pool.calls.find(({ sql }) => sql.includes('INSERT INTO trades'));
   assert.ok(insert, 'trade row is created before submitting the market order');
   assert.ok(pool.calls.some(({ sql }) => sql.includes("SET status='executed'")));
+});
+
+test('a newly turned-off setting blocks queued work before any MetaAPI order call', async () => {
+  const pool = fakePool({ disableBeforeSubmit: true });
+  const trading = fakeTrading();
+  const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true });
+  const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.equal(result.status, 'skipped');
+  assert.match(result.message, /turned off/i);
+  assert.equal(trading.calls.filter((call) => typeof call === 'object').length, 0);
+  assert.equal(pool.calls.some(({ sql }) => sql.includes('INSERT INTO trades')), false);
 });

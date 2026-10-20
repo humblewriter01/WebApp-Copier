@@ -242,6 +242,13 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
         specification: state.specification,
         price: quote,
       });
+      const { rows: latestSettings } = await pool.query(
+        'SELECT auto_trading_enabled AS "autoTradingEnabled",execution_account_id AS "executionAccountId" FROM settings WHERE user_id=$1 LIMIT 1',
+        [job.user_id],
+      );
+      if (latestSettings[0]?.autoTradingEnabled !== true || latestSettings[0]?.executionAccountId !== item.metaapi_account_id) {
+        return stop(job, 'skipped', 'Auto-Trading was turned off or the selected account changed before order submission.');
+      }
       const clientId = `SD${String(job.id).replaceAll('-', '').slice(0, 24)}`;
       const { rows: tradeRows } = await pool.query(
         `INSERT INTO trades(user_id,signal_id,execution_job_id,metaapi_account_id,symbol,side,quantity,entry_price,stop_loss,take_profit,status,client_id)

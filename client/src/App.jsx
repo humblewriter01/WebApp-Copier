@@ -24,9 +24,9 @@ function AuthScreen({ onAuthenticated, installPrompt, onInstall }) {
   return <main className="auth-shell">
     <div className="auth-brand"><div className="brand-mark"><img src="/icons/signal-desk-icon-192.png" alt="" /></div><span>Signal Desk</span></div>
     <section className="auth-card">
-      <p className="eyebrow">TELEGRAM SIGNAL MONITOR</p>
+      <p className="eyebrow">AUTOMATED SIGNAL EXECUTION</p>
       <h1>{mode === 'login' ? 'Welcome back' : 'Create your workspace'}</h1>
-      <p className="muted">Review channel signals and organize your trading setup in one place.</p>
+      <p className="muted">Automate your trading by executing Telegram signals directly to your broker.</p>
       <form onSubmit={submit} className="form-stack">
         {mode === 'register' && <label>Your name<input autoComplete="name" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} required maxLength={100} /></label>}
         <label>Email<input type="email" autoComplete="email" value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} required /></label>
@@ -37,7 +37,7 @@ function AuthScreen({ onAuthenticated, installPrompt, onInstall }) {
         <button className="button button-primary button-wide" disabled={busy}>{busy ? 'Please wait…' : mode === 'login' ? 'Sign in' : 'Create account'}</button>
       </form>
       <p className="auth-switch">{mode === 'login' ? 'New to Signal Desk?' : 'Already have an account?'} <button className="text-button" onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError(''); }}>{mode === 'login' ? 'Create account' : 'Sign in'}</button></p>
-      <p className="fine-print">Live trading is optional and requires explicit activation in Risk Settings.</p>
+      <p className="fine-print">Auto-Trading is ON by default for new workspaces. New eligible Telegram signals may place live orders after you select a deployed trading account. Review the risk settings and turn it off whenever you want to stop new orders.</p>
       {installPrompt && <button type="button" className="button button-primary button-wide install-button" onClick={onInstall}>Install Signal Desk</button>}
     </section>
   </main>;
@@ -178,6 +178,18 @@ function App() {
     catch (e) { setError(e.message); }
     finally { setSettingsSaving(false); }
   };
+  const toggleAutoTrading = async (enabled) => {
+    if (settingsSaving) return;
+    const previous = settings;
+    const updated = { ...previous, autoTradingEnabled: enabled };
+    setSettings(updated); setError(''); setNotice(''); setSettingsSaving(true);
+    try {
+      const result = await request('/api/settings', token, { method: 'PUT', body: updated });
+      setSettings(result.settings); setExecutionRuntimeEnabled(Boolean(result.runtimeEnabled));
+      setNotice(enabled ? 'Auto-Trading is on. New eligible Telegram signals may place live orders.' : 'Auto-Trading is off. No new signal orders will be submitted.');
+    } catch (e) { setSettings(previous); setError(e.message); }
+    finally { setSettingsSaving(false); }
+  };
 
   if (!token) return <AuthScreen onAuthenticated={authenticated} installPrompt={installPrompt} onInstall={installApp} />;
   if (loading) return <main className="loading-shell"><div className="spinner" /><span>Loading your workspace…</span></main>;
@@ -190,14 +202,15 @@ function App() {
         {tab === 'overview' && <>
           <section className="welcome-row"><div><h2>Good to see you, {user?.name?.split(' ')[0] || 'trader'}.</h2><p>Monitor Telegram signals and keep your setup organized.</p></div><span className="live-label"><i /> Signal monitoring</span></section>
           <div className="metrics-grid"><Metric label="Signals captured" value={dashboard?.stats?.totalSignals ?? 0} note="Across your workspace" /><Metric label="Active sources" value={dashboard?.stats?.activeChannels ?? 0} note="Telegram channels" /><Metric label="Account Notes" value={dashboard?.stats?.accounts ?? 0} note="Labels and references" /><Metric label="Auto-Trading" value={settings.autoTradingEnabled ? 'On' : 'Off'} note={settings.autoTradingEnabled ? 'Eligible signals may place orders' : 'Off until you enable it'} /></div>
-          <div className="notice-banner"><strong>{settings.autoTradingEnabled ? 'Auto-Trading is on' : 'Auto-Trading is off'}</strong><span>{settings.autoTradingEnabled ? 'New eligible Telegram signals may place live orders on your selected account. You can turn this off in Risk Settings.' : 'Signals are saved for review and will not place orders until you explicitly enable Auto-Trading in Risk Settings.'}</span></div>
+          {settings.autoTradingEnabled && <div className="execution-warning" role="alert">Warning: Auto-Trading can execute live trades on your selected broker account. It is ON by default for new workspaces. Use a demo account for testing; you are responsible for any financial losses. Turn Auto-Trading off in Risk Settings to stop new orders from being submitted.</div>}
+          <div className="notice-banner"><strong>{settings.autoTradingEnabled ? 'Auto-Trading is on' : 'Auto-Trading is off'}</strong><span>{settings.autoTradingEnabled ? 'New eligible Telegram signals may place live orders on your selected account. You can turn this off in Risk Settings.' : 'Signals are saved for review only. Turn Auto-Trading on in Risk Settings to submit new eligible signals to your broker.'}</span></div>
           <section className="panel"><div className="panel-heading"><div><p className="eyebrow">LATEST ACTIVITY</p><h2>Recent signals</h2></div><button className="text-button" onClick={() => setTab('signals')}>View all</button></div><SignalTable signals={dashboard?.signals || []} compact onEmptyAction={() => setTab('telegram')} /></section>
         </>}
         {tab === 'telegram' && <TelegramConnect token={token} channels={channels} onRefresh={refresh} />}
         {tab === 'metaapi' && <MetaApiPanel token={token} />}
         {tab === 'signals' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">CAPTURED MESSAGES</p><h2>Signal history</h2></div><span className="count-badge">{signals.length}</span></div><SignalTable signals={signals} onEmptyAction={() => setTab('telegram')} /></section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">MANUAL ENTRY</p><h2>Add a signal note</h2></div></div><p className="muted">Save a message for tracking. Signal Desk may identify the symbol, direction, entry, stop, and target.</p><form className="form-stack" onSubmit={addManualSignal}><label>Signal message<textarea rows="7" value={signalText} onChange={e => setSignalText(e.target.value)} placeholder={'BUY EURUSD\nEntry: 1.0850\nSL: 1.0800\nTP: 1.0950'} required maxLength={5000} /></label><button className="button button-primary">Save signal</button></form></section></div>}
         {tab === 'accounts' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">YOUR NOTES</p><h2>Account Notes</h2></div><span className="count-badge">{accounts.length}</span></div><p className="muted">Save a label or optional reference for your own notes. To connect a trading account, open Trading Accounts.</p>{!accounts.length ? <div className="empty-state"><strong>No account notes yet</strong><span>Add a label for your own reference.</span></div> : <div className="chat-list">{accounts.map(account => <div className="chat-row" key={account.id}><div><strong>{account.label}</strong><small>{[account.broker, account.platform, account.accountReference].filter(Boolean).join(' · ') || 'Reference only'}</small></div><button className="icon-button" onClick={async () => { await request(`/api/accounts/${account.id}`, token, { method: 'DELETE' }); await refresh(); }}>Remove</button></div>)}</div>}</section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">ADD A NOTE</p><h2>Account note</h2></div></div><form className="form-stack" onSubmit={addAccount}><label>Label<input value={accountForm.label} onChange={e => setAccountForm({ ...accountForm, label: e.target.value })} placeholder="Demo MT5 account" required maxLength={100} /></label><div className="form-row"><label>Broker<input value={accountForm.broker} onChange={e => setAccountForm({ ...accountForm, broker: e.target.value })} /></label><label>Platform<input value={accountForm.platform} onChange={e => setAccountForm({ ...accountForm, platform: e.target.value })} placeholder="MT4, MT5…" /></label></div><label>Reference<input value={accountForm.accountReference} onChange={e => setAccountForm({ ...accountForm, accountReference: e.target.value })} placeholder="Optional alias" /></label><button className="button button-primary">Save note</button></form></section></div>}
-        {tab === 'settings' && <ExecutionSettings settings={settings} accounts={linkedAccounts} trades={trades} runtimeAvailable={executionRuntimeEnabled} onChange={setSettings} onSubmit={saveSettings} saving={settingsSaving} />}
+        {tab === 'settings' && <ExecutionSettings settings={settings} accounts={linkedAccounts} trades={trades} runtimeAvailable={executionRuntimeEnabled} onChange={setSettings} onSubmit={saveSettings} onToggle={toggleAutoTrading} saving={settingsSaving} />}
       </div>
       <footer className="footer">Not financial advice. Use at your own risk.</footer>
     </main>

@@ -2,7 +2,7 @@ import React from 'react';
 
 export const EXECUTION_WARNING = 'Warning: Enabling Auto-Trading will execute live trades on your connected broker account. Ensure you are using a demo account for testing. You are fully responsible for any financial losses.';
 
-export default function ExecutionSettings({ settings, accounts = [], trades = [], runtimeAvailable = false, onChange, onSubmit, saving = false }) {
+export default function ExecutionSettings({ settings, accounts = [], trades = [], runtimeAvailable = false, onChange, onSubmit, onToggle, saving = false }) {
   const connectedAccounts = accounts.filter((account) => String(account.state || '').toUpperCase() === 'DEPLOYED');
   const set = (key, value) => onChange({ ...settings, [key]: value });
 
@@ -16,7 +16,7 @@ export default function ExecutionSettings({ settings, accounts = [], trades = []
       </div>
 
       <div className="execution-warning" role="alert">{EXECUTION_WARNING}</div>
-      {!runtimeAvailable && <div className="alert alert-info" role="status">The execution worker is unavailable. Auto-Trading cannot be enabled right now.</div>}
+      {!runtimeAvailable && <div className="alert alert-info" role="status">Automatic execution is currently unavailable. You can still turn Auto-Trading off; eligible signals will not place orders while execution is unavailable.</div>}
       {runtimeAvailable && <p className="field-help execution-runtime-note">The worker runs while Signal Desk is online. If the service is offline, new signals may be missed; stale signals are never executed after it returns.</p>}
 
       <form className="form-stack execution-settings-form" onSubmit={onSubmit} aria-busy={saving}>
@@ -51,7 +51,7 @@ export default function ExecutionSettings({ settings, accounts = [], trades = []
             </option>)}
           </select>
         </label>
-        {!connectedAccounts.length && <p className="field-help">Connect an MT4/MT5 account in Trading Accounts before enabling Auto-Trading.</p>}
+        {!connectedAccounts.length && <p className="field-help">Connect and select a deployed MT4/MT5 account before any orders can be placed. Signals are not executed until an owned account is selected.</p>}
 
         <label htmlFor="lot-size-mode">Lot Size Mode
           <select id="lot-size-mode" value={settings.lotSizeMode} onChange={(event) => set('lotSizeMode', event.target.value)}>
@@ -66,8 +66,8 @@ export default function ExecutionSettings({ settings, accounts = [], trades = []
         {settings.lotSizeMode === 'risk_based' && <p className="field-help">Risk-Based sizing uses your account balance, risk percent, stop-loss distance, and the broker's current symbol tick values. If the safe size is below the broker minimum, the signal is skipped rather than rounded up.</p>}
 
         <label className="execution-toggle-row" htmlFor="auto-trading-enabled">
-          <input id="auto-trading-enabled" type="checkbox" checked={Boolean(settings.autoTradingEnabled)} disabled={!runtimeAvailable || !settings.executionAccountId || saving} onChange={(event) => set('autoTradingEnabled', event.target.checked)} />
-          <span><strong>Enable Auto-Trading</strong><small>OFF by default. When enabled, new eligible Telegram signals may place orders on the selected connected account.</small></span>
+          <input id="auto-trading-enabled" type="checkbox" checked={Boolean(settings.autoTradingEnabled)} disabled={saving || (!settings.autoTradingEnabled && !runtimeAvailable)} onChange={(event) => onToggle ? onToggle(event.target.checked) : set('autoTradingEnabled', event.target.checked)} />
+          <span><strong>Auto-Trading {settings.autoTradingEnabled ? 'ON' : 'OFF'}</strong><small>ON by default for new workspaces. This toggle saves immediately; switch it off to stop new orders from being submitted. An order already sent to the broker cannot be recalled here.</small></span>
         </label>
         <p className="field-help">The open-trade limit counts open positions and pending orders. The daily trade limit counts new broker positions opened during the current UTC day. Signals without a clear direction, symbol, or stop loss are saved for review but are not traded.</p>
         <button className="button button-primary" type="submit" disabled={saving}>{saving ? 'Saving settings…' : 'Save settings'}</button>

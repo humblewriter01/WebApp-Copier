@@ -25,6 +25,18 @@ export async function initializeDatabase() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       last_login TIMESTAMPTZ
     );
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user';
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_role_check' AND conrelid = 'users'::regclass) THEN
+        ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('user', 'admin'));
+      END IF;
+    END $$;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_status TEXT NOT NULL DEFAULT 'free';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_plan TEXT NOT NULL DEFAULT 'free';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_limits JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS suspension_reason TEXT;
+    UPDATE users SET role='admin' WHERE lower(email)='ameenujaafar432@gmail.com' AND role <> 'admin';
     CREATE TABLE IF NOT EXISTS channels (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -103,7 +115,8 @@ export async function initializeDatabase() {
     ALTER TABLE signals ADD COLUMN IF NOT EXISTS telegram_message_id TEXT;
     ALTER TABLE signals ADD COLUMN IF NOT EXISTS execution_ready BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE signals ADD COLUMN IF NOT EXISTS parse_error TEXT;
-    ALTER TABLE settings ADD COLUMN IF NOT EXISTS auto_trading_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS auto_trading_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+    ALTER TABLE settings ALTER COLUMN auto_trading_enabled SET DEFAULT TRUE;
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS lot_size_mode TEXT NOT NULL DEFAULT 'fixed';
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS fixed_lot_size NUMERIC NOT NULL DEFAULT 0.01;
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS max_daily_trades INTEGER NOT NULL DEFAULT 10;
@@ -151,10 +164,45 @@ export async function initializeDatabase() {
       expires_at TIMESTAMPTZ NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS admin_settings (
+      setting_key TEXT PRIMARY KEY,
+      setting_value JSONB NOT NULL,
+      description TEXT,
+      updated_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS promo_codes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      code TEXT NOT NULL UNIQUE CHECK (code ~ '^[A-Z0-9][A-Z0-9_-]{2,49}$'),
+      discount_type TEXT NOT NULL CHECK (discount_type IN ('percentage', 'fixed')),
+      discount_value NUMERIC NOT NULL CHECK (discount_value > 0),
+      max_uses INTEGER CHECK (max_uses IS NULL OR max_uses > 0),
+      current_uses INTEGER NOT NULL DEFAULT 0 CHECK (current_uses >= 0),
+      expires_at TIMESTAMPTZ,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT promo_codes_percentage_max CHECK (discount_type <> 'percentage' OR discount_value <= 100)
+    );
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token_hash TEXT NOT NULL UNIQUE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    ALTER TABLE admin_settings ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE promo_codes ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE password_reset_tokens ENABLE ROW LEVEL SECURITY;
     CREATE INDEX IF NOT EXISTS signals_user_created_idx ON signals(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS channels_user_enabled_idx ON channels(user_id, enabled);
     CREATE INDEX IF NOT EXISTS metaapi_accounts_user_created_idx ON metaapi_accounts(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS telegram_login_attempts_expiry_idx ON telegram_login_attempts(expires_at);
+    CREATE INDEX IF NOT EXISTS password_reset_tokens_user_expiry_idx ON password_reset_tokens(user_id, expires_at DESC);
+    CREATE INDEX IF NOT EXISTS promo_codes_active_expiry_idx ON promo_codes(active, expires_at);
     ALTER TABLE metaapi_credentials ENABLE ROW LEVEL SECURITY;
     ALTER TABLE metaapi_accounts ENABLE ROW LEVEL SECURITY;
     ALTER TABLE telegram_login_attempts ENABLE ROW LEVEL SECURITY;
