@@ -17,12 +17,12 @@ import { createMetaApiConfigurationLink, metaApiRequest, toSafeMetaApiAccount } 
 import { getTelegramErrorCode, isTelegramPasswordNeeded, shouldDiscardTelegramLogin, telegramAuthErrorPayload } from './services/telegram-auth.js';
 import { parseSignal } from './services/signal-parser.js';
 import { createMetaApiTradingAdapter } from './services/metaapi-trading.js';
-import { createExecutionEngine } from './services/execution-engine.js';
+import { createExecutionEngine, PLATFORM_PAUSE_MESSAGE } from './services/execution-engine.js';
 import { createExecutionWorker } from './services/execution-worker.js';
 import { createSupabaseAuthBridge } from './services/supabase-auth.js';
-import { createAdminAccess, normalizePromoCodeInput, normalizePromoCodeUpdate, normalizeUserUpdate, assertAllowedSelfUpdate } from './services/admin.js';
+import { createAdminAccess, normalizePromoCodeInput, normalizePromoCodeUpdate, normalizeUserUpdate, assertAllowedSelfUpdate, normalizeSubscriptionAdjustment, assertAllowedImpersonation } from './services/admin.js';
 import { createAccountCleanup } from './services/account-cleanup.js';
-import { billingConfig, verifyWebhookSignature, normalizeReference } from './services/billing.js';
+import { billingConfig, verifyWebhookSignature, normalizeReference, findPlan, FREE_PLAN } from './services/billing.js';
 import { createPaystackClient } from './services/paystack.js';
 import { createBillingService } from './services/billing-service.js';
 import { createPricingStore, normalizePricingUpdate, normalizeBillingSettings, planChargeDecision, publicPricing } from './services/pricing.js';
@@ -32,6 +32,11 @@ import {
   createInactivityService, daysInactiveSince,
   INACTIVITY_WARNING_DAYS, INACTIVITY_DELETION_DAYS, INACTIVITY_SWEEP_LIMIT,
 } from './services/inactivity.js';
+import { createAuditLogger, normalizeAuditQuery } from './services/audit.js';
+import { createPlatformControls, normalizeKillSwitchInput, KILL_SWITCH_SETTING_KEY } from './services/platform-controls.js';
+import { createSystemHealthService, normalizeHealthQuery } from './services/system-health.js';
+import { createAnnouncementService, normalizeAnnouncementDraft, normalizeAnnouncementListQuery } from './services/announcements.js';
+import { createSupportSessionService, normalizeSupportReason, buildSupportClaims, SUPPORT_SESSION_MINUTES } from './services/support-sessions.js';
 
 const app = express();
 app.set('trust proxy', 1);
@@ -118,17 +123,44 @@ function decryptSecret(value) {
 function issueToken(user, rememberMe = false) {
   return jwt.sign({ sub: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: rememberMe ? '30d' : '12h' });
 }
+
+/* A support session is signed with the same secret but a purpose claim, a one-hour life, and a
+ * random id whose hash is the only thing kept in the database. It is read-only, it can never use
+ * the admin API, and it dies the moment its row is revoked - which is why no customer password is
+ * involved and why nothing here can outlive an hour even if the browser keeps the token. */
+function issueSupportToken(claims) {
+  return jwt.sign(claims, process.env.JWT_SECRET, { expiresIn: `${SUPPORT_SESSION_MINUTES}m` });
+}
+
+/** The only writes a support session may perform: closing itself. */
+const SUPPORT_SESSION_WRITE_PATHS = new Set(['/api/auth/support/exit']);
+
 function authenticate(req, res, next) {
   const token = req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
   if (!token) return fail(res, 401, 'Sign in to continue.');
+  let payload;
   try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-    req.userId = payload.sub;
-    req.userEmail = payload.email;
-    return next();
+    payload = jwt.verify(token, process.env.JWT_SECRET);
   } catch {
     return fail(res, 401, 'Your session has expired. Please sign in again.');
   }
+  req.userId = payload.sub;
+  req.userEmail = payload.email;
+  if (String(payload.purpose || '') !== 'impersonation') return next();
+  Promise.resolve()
+    .then(() => supportSessions.redeem(payload.jti))
+    .then((session) => {
+      if (!session || String(session.userId) !== String(payload.sub)) {
+        return fail(res, 401, 'This support session is no longer active.');
+      }
+      if (!SUPPORT_SESSION_WRITE_PATHS.has(req.path) && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+        return fail(res, 403, 'Support access is read-only, so nothing in this workspace can be changed.');
+      }
+      req.impersonatedBy = session.adminId;
+      req.supportSessionId = session.id;
+      return next();
+    })
+    .catch(() => fail(res, 401, 'This support session could not be verified.'));
 }
 function publicUser(row) { return { id: row.id, name: row.name, email: row.email, role: row.role === 'admin' ? 'admin' : 'user', createdAt: row.created_at }; }
 function isAdminRole(role) { return adminAccess.isAdminRole(role); }
@@ -137,6 +169,12 @@ async function loadUserRole(userId) {
   return rows[0]?.role || null;
 }
 const requireAdmin = asyncRoute(async (req, res, next) => {
+  // A support token carries the target user's id, so the role lookup alone would let an admin
+  // impersonating another admin keep using admin tools through that session. Refuse it outright.
+  if (req.impersonatedBy) {
+    log('warn', 'Admin API denied for a support session', { userId: req.userId, adminId: req.impersonatedBy });
+    return fail(res, 403, 'Admin tools are not available while viewing another workspace.');
+  }
   const role = await loadUserRole(req.userId);
   if (!isAdminRole(role)) {
     log('warn', 'Admin endpoint denied', { userId: req.userId, role: role || 'missing' });
@@ -159,11 +197,24 @@ async function resolveExecutionToken(userId, accountId, managedByApp) {
   return getMetaApiToken(userId);
 }
 
+/* ------------------------- platform administration -------------------------
+ * The kill switch, the audit trail, the health read model, announcements, and support
+ * sessions are all built before the engine so the engine can be handed the switch as a
+ * dependency instead of knowing where it lives.
+ */
+const platformControls = createPlatformControls({ pool, logger: console });
+const auditLog = createAuditLogger({ pool, logger: console });
+const systemHealth = createSystemHealthService({ pool, controls: platformControls, runtimeEnabled: autoTradingRuntimeEnabled, logger: console });
+const announcementService = createAnnouncementService({ pool, logger: console });
+const supportSessions = createSupportSessionService({ pool, logger: console });
+
 const executionEngine = createExecutionEngine({
   pool,
   trading: tradingAdapter,
   resolveToken: resolveExecutionToken,
   runtimeEnabled: autoTradingRuntimeEnabled,
+  // Re-read per job, never cached: the point of the switch is that it bites immediately.
+  isTradingPaused: () => platformControls.isPaused(),
   breakEvenIntervalMs: Number(process.env.BREAK_EVEN_SWEEP_INTERVAL_MS) || 5_000,
   logger: console,
 });
@@ -800,6 +851,9 @@ app.get('/api/settings', authenticate, asyncRoute(async (req, res) => {
   res.set('Cache-Control', 'no-store').json({
     settings: { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 3, dailyLossLimit: 5, autoTradingEnabled: false, lotSizeMode: 'fixed', fixedLotSize: 0.01, maxDailyTrades: 10, executionAccountId: '', breakEvenEnabled: false, breakEvenTriggerPoints: 20, breakEvenOffsetPoints: 0, trailingStopEnabled: false, trailingStopDistancePoints: 10, ...(rows[0] || {}) },
     runtimeEnabled: autoTradingRuntimeEnabled,
+    // The user's own toggle being on is not the same as orders being possible: if the platform
+    // switch is engaged, say so here instead of letting the panel imply their setting is at fault.
+    executionPaused: await platformControls.read().then((state) => ({ paused: state.state !== 'live', state: state.state, reason: state.reason })),
   });
 }));
 app.put('/api/settings', authenticate, asyncRoute(async (req, res) => {
@@ -995,8 +1049,12 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 const adminUserColumns = `u.id,u.name,u.email,u.role,u.subscription_status AS "subscriptionStatus",
   u.subscription_plan AS "subscriptionPlan",u.is_suspended AS "isSuspended",
   u.suspension_reason AS "suspensionReason",u.created_at AS "createdAt",u.last_login AS "lastLogin",
+  u.last_active_at AS "lastActiveAt",
   (u.supabase_user_id IS NOT NULL) AS "authLinked",
-  (SELECT COUNT(*)::int FROM signals s WHERE s.user_id=u.id) AS "signalCount"`;
+  (SELECT COUNT(*)::int FROM signals s WHERE s.user_id=u.id) AS "signalCount",
+  (SELECT s.current_period_end FROM subscriptions s WHERE s.user_id=u.id) AS "periodEnd",
+  (SELECT s.status FROM subscriptions s WHERE s.user_id=u.id) AS "subscriptionRowStatus",
+  (SELECT s.provider_subscription_code FROM subscriptions s WHERE s.user_id=u.id) IS NOT NULL AS "hasProviderSubscription"`;
 const promoCodeColumns = `id,code,discount_type AS "discountType",discount_value AS "discountValue",
   max_uses AS "maxUses",current_uses AS "currentUses",expires_at AS "expiresAt",active,
   created_at AS "createdAt",updated_at AS "updatedAt"`;
@@ -1077,8 +1135,28 @@ app.patch('/api/admin/users/:id', authenticate, requireAdmin, asyncRoute(async (
   );
   if (!rows[0]) return fail(res, 404, 'That user could not be found.');
   const { rows: updatedRows } = await pool.query(`SELECT ${adminUserColumns} FROM users u WHERE u.id=$1`, [targetId]);
+  const updated = updatedRows[0] || {};
+  // An account that just lost access also loses anyone looking at it through support.
+  let revokedSessions = 0;
+  if (update.isSuspended === true) {
+    revokedSessions = (await supportSessions.revokeForUser(targetId).catch(() => ({ revoked: 0 }))).revoked || 0;
+  }
+  const changes = [];
+  if (update.role !== undefined) changes.push(`role ${update.role}`);
+  if (update.isSuspended === true) changes.push(`suspended (${update.suspensionReason})`);
+  if (update.isSuspended === false) changes.push('suspension lifted');
+  if (update.isSuspended === undefined && update.suspensionReason !== undefined) changes.push(`suspension reason updated (${update.suspensionReason || 'cleared'})`);
+  await auditLog.record({
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+    action: update.isSuspended === true ? 'user.suspend' : update.isSuspended === false ? 'user.unsuspend' : update.role !== undefined ? 'user.role' : 'user.update',
+    targetType: 'user',
+    targetId,
+    summary: `${updated.name || 'Account'} <${updated.email || 'unknown'}>: ${changes.join(', ') || 'no visible change'}.`,
+    metadata: { ...update, revokedSupportSessions: revokedSessions || undefined },
+  });
   log('info', 'Admin updated user', { actorId: req.userId, targetId, role: update.role, isSuspended: update.isSuspended });
-  res.set('Cache-Control', 'no-store').json({ user: updatedRows[0] });
+  res.set('Cache-Control', 'no-store').json({ user: updated, ...(revokedSessions ? { notice: `${revokedSessions} support session(s) on that workspace were closed.` } : {}) });
 }));
 
 app.get('/api/admin/promo-codes', authenticate, requireAdmin, asyncRoute(async (_req, res) => {
@@ -1096,6 +1174,15 @@ app.post('/api/admin/promo-codes', authenticate, requireAdmin, asyncRoute(async 
        VALUES($1,$2,$3,$4,$5,$6) RETURNING ${promoCodeColumns}`,
       [input.code, input.discountType, input.discountValue, input.maxUses, input.expiresAt, req.userId],
     );
+    await auditLog.record({
+      actorId: req.userId,
+      actorEmail: req.userEmail,
+      action: 'promo_code.create',
+      targetType: 'promo_code',
+      targetId: rows[0].id,
+      summary: `Created promo code ${input.code} for ${describeDiscount(input)}.`,
+      metadata: { ...input },
+    });
     log('info', 'Admin created promo code', { actorId: req.userId, promoCodeId: rows[0].id, discountType: input.discountType });
     res.set('Cache-Control', 'no-store').status(201).json({ promoCode: rows[0] });
   } catch (error) {
@@ -1123,6 +1210,15 @@ app.patch('/api/admin/promo-codes/:id', authenticate, requireAdmin, asyncRoute(a
     values,
   );
   if (!rows[0]) return fail(res, 404, 'That promo code could not be found.');
+  await auditLog.record({
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+    action: 'promo_code.update',
+    targetType: 'promo_code',
+    targetId: promoCodeId,
+    summary: `Updated promo code ${rows[0].code}: ${describePromoUpdate(update)}.`,
+    metadata: { ...update },
+  });
   log('info', 'Admin updated promo code', { actorId: req.userId, promoCodeId, active: update.active });
   res.set('Cache-Control', 'no-store').json({ promoCode: rows[0] });
 }));
@@ -1130,8 +1226,18 @@ app.patch('/api/admin/promo-codes/:id', authenticate, requireAdmin, asyncRoute(a
 app.delete('/api/admin/promo-codes/:id', authenticate, requireAdmin, asyncRoute(async (req, res) => {
   const promoCodeId = String(req.params.id || '').trim();
   if (!UUID_PATTERN.test(promoCodeId)) return fail(res, 400, 'Choose a valid promo code.');
-  const result = await pool.query('DELETE FROM promo_codes WHERE id=$1', [promoCodeId]);
-  if (!result.rowCount) return fail(res, 404, 'That promo code could not be found.');
+  const { rows: deletedRows } = await pool.query('DELETE FROM promo_codes WHERE id=$1 RETURNING code', [promoCodeId]);
+  if (!deletedRows[0]) return fail(res, 404, 'That promo code could not be found.');
+  const deletedCode = deletedRows[0].code;
+  await auditLog.record({
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+    action: 'promo_code.delete',
+    targetType: 'promo_code',
+    targetId: promoCodeId,
+    summary: `Removed the ${deletedCode ? `“${deletedCode}” ` : ''}promo code.`,
+    metadata: { promoCodeId },
+  });
   log('info', 'Admin deleted promo code', { actorId: req.userId, promoCodeId });
   res.json({ ok: true });
 }));
@@ -1142,6 +1248,28 @@ app.delete('/api/admin/promo-codes/:id', authenticate, requireAdmin, asyncRoute(
  * site advertises. A sync problem is reported, never hidden, and never blocks
  * saving the price.
  */
+/** Money for audit summaries only: minor units are the stored truth, the label is for humans. */
+function describeMoney(amountMinor, currency = 'NGN') {
+  if (amountMinor === null || amountMinor === undefined || amountMinor === '') return 'not priced';
+  const value = Number(amountMinor) / 100;
+  return `${value.toLocaleString('en-NG', { maximumFractionDigits: 2 })} ${currency}`.trim();
+}
+
+function describeDiscount(input = {}) {
+  const discount = input.discountType === 'percentage' ? `${Number(input.discountValue)}% off` : `${describeMoney(Math.round(Number(input.discountValue) * 100))} off`;
+  const uses = input.maxUses ? ` up to ${input.maxUses} time${Number(input.maxUses) === 1 ? '' : 's'}` : ' with no usage cap';
+  const expiry = input.expiresAt ? `, expiring ${new Date(input.expiresAt).toISOString().slice(0, 10)}` : ', with no expiry';
+  return `${discount}${uses}${expiry}`;
+}
+
+function describePromoUpdate(update = {}) {
+  const parts = [];
+  if (update.active !== undefined) parts.push(update.active ? 'reactivated' : 'deactivated');
+  if (update.maxUses !== undefined) parts.push(`usage cap ${update.maxUses === null ? 'removed' : update.maxUses}`);
+  if (update.expiresAt !== undefined) parts.push(`expiry ${update.expiresAt ? new Date(update.expiresAt).toISOString().slice(0, 16).replace('T', ' ') : 'removed'}`);
+  return parts.join(', ') || 'nothing changed';
+}
+
 async function adminPricingPayload() {
   const snapshot = await pricingStore.snapshot();
   let subscribers = [];
@@ -1210,6 +1338,7 @@ app.put('/api/admin/pricing', authenticate, requireAdmin, asyncRoute(async (req,
     return fail(res, error.status || 400, error.userMessage || error.message);
   }
 
+  const priceBefore = new Map((await adminPricingPayload()).plans.map((plan) => [plan.key, plan.amountMinor]));
   const saved = [];
   for (const entry of update.entries) {
     const result = await pricingStore.savePlanPrice({
@@ -1230,6 +1359,25 @@ app.put('/api/admin/pricing', authenticate, requireAdmin, asyncRoute(async (req,
     syncs.push(await planSynchronizer.syncPlan({ planKey, actorId: req.userId }));
   }
   const failed = syncs.filter((sync) => !sync.usable);
+  const priceChanges = update.entries.map((entry) => {
+    const from = describeMoney(priceBefore.get(entry.planKey), paystackConfig.currency);
+    const to = entry.amountMinor === null || entry.amountMinor === undefined ? 'cleared (environment price)' : describeMoney(entry.amountMinor, paystackConfig.currency);
+    return `${entry.planKey}: ${from} → ${to}`;
+  });
+  await auditLog.record({
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+    action: 'pricing.update',
+    targetType: 'plan',
+    targetId: priceChanges.length === 1 ? update.entries[0].planKey : null,
+    summary: `Changed pricing - ${priceChanges.join('; ') || 'billing settings only'}.${update.note ? ` Note: ${update.note}` : ''}`,
+    metadata: {
+      plans: update.entries.map((entry) => ({ planKey: entry.planKey, beforeMinor: priceBefore.get(entry.planKey) ?? null, afterMinor: entry.amountMinor ?? null })),
+      note: update.note || null,
+      billing: update.billing || null,
+      syncStatuses: syncs.map((item) => `${item.planKey}:${item.status}`),
+    },
+  });
   log('info', 'Admin updated pricing', {
     actorId: req.userId,
     plans: saved.map((item) => ({ planKey: item.planKey, amountMinor: item.amountMinor ?? null, cleared: Boolean(item.cleared) })),
@@ -1262,6 +1410,14 @@ app.post('/api/admin/pricing/sync', authenticate, requireAdmin, asyncRoute(async
   for (const planKey of requested) {
     syncs.push(await planSynchronizer.syncPlan({ planKey, actorId: req.userId }));
   }
+  await auditLog.record({
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+    action: 'pricing.sync',
+    targetType: 'plan',
+    summary: `Re-synced Paystack plans for ${requested.join(', ')} (${syncs.map((item) => `${item.planKey}:${item.status}`).join(', ')}).`,
+    metadata: { plans: [...requested], billingSaved: Boolean(billing) },
+  });
   log('info', 'Admin re-synced Paystack plans', { actorId: req.userId, results: syncs.map((item) => `${item.planKey}:${item.status}`) });
   res.set('Cache-Control', 'no-store').json({ pricing: await adminPricingPayload(), syncs, billingSaved: Boolean(billing) });
 }));
@@ -1295,6 +1451,395 @@ app.get('/api/admin/billing', authenticate, requireAdmin, asyncRoute(async (_req
     subscriptions: subscriptions.rows,
     configured: paystackConfig.configured,
   });
+}));
+
+/* --------------------- Admin: system health and the kill switch ---------------------
+ * The health read model reads the failure records the platform already keeps (trades, jobs,
+ * stop moves, parsed signals), and the switch that stops every workspace from trading. Both
+ * halves are needed together: an operator looking at a pile of MetaAPI errors needs the button
+ * that makes it stop right now, in the same screen.
+ */
+app.get('/api/admin/health', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  res.set('Cache-Control', 'no-store').json(await systemHealth.snapshot(normalizeHealthQuery(req.query || {})));
+}));
+
+app.get('/api/admin/execution-switch', authenticate, requireAdmin, asyncRoute(async (_req, res) => {
+  const state = await platformControls.read();
+  res.set('Cache-Control', 'no-store').json({
+    switch: state,
+    runtimeEnabled: autoTradingRuntimeEnabled,
+    pauseMessage: PLATFORM_PAUSE_MESSAGE,
+    settingKey: KILL_SWITCH_SETTING_KEY,
+  });
+}));
+
+app.put('/api/admin/execution-switch', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  let input;
+  try { input = normalizeKillSwitchInput(req.body || {}); }
+  catch (error) { return fail(res, error.status || 400, error.message); }
+  const state = await platformControls.setPaused({ paused: input.paused, reason: input.reason, actorId: req.userId });
+  await auditLog.record({
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+    action: input.paused ? 'execution.pause' : 'execution.resume',
+    targetType: 'platform',
+    targetId: KILL_SWITCH_SETTING_KEY,
+    summary: input.paused
+      ? `Paused automatic execution for every workspace. Reason: ${input.reason}`
+      : 'Resumed automatic execution for every workspace.',
+    metadata: { state: state.state, reason: input.reason },
+  });
+  res.set('Cache-Control', 'no-store').json({
+    switch: state,
+    runtimeEnabled: autoTradingRuntimeEnabled,
+    notice: input.paused
+      ? 'The engine reads this switch before every order, so new trades stop on the next job claim. Open positions keep the stops they already have.'
+      : 'Eligible workspaces can execute again. Signals skipped while the switch was engaged are not replayed.',
+  });
+}));
+
+/* ----------------------------- Admin: audit trail -----------------------------
+ * Read-only from here: the only writer is the record() call each admin mutation makes, and there
+ * is deliberately no route that edits or removes an entry.
+ */
+app.get('/api/admin/audit-logs', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  let query;
+  try { query = normalizeAuditQuery(req.query || {}); }
+  catch (error) { return fail(res, error.status || 400, error.message); }
+  res.set('Cache-Control', 'no-store').json(await auditLog.list(query));
+}));
+
+/* --------------------------- Admin: announcements --------------------------- */
+app.get('/api/admin/announcements', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  let query;
+  try { query = normalizeAnnouncementListQuery(req.query || {}); }
+  catch (error) { return fail(res, error.status || 400, error.message); }
+  res.set('Cache-Control', 'no-store').json(await announcementService.list(query));
+}));
+
+app.post('/api/admin/announcements', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  let draft;
+  try { draft = normalizeAnnouncementDraft(req.body || {}); }
+  catch (error) { return fail(res, error.status || 400, error.message); }
+  let announcement;
+  try {
+    announcement = await announcementService.publish({ draft, actorId: req.userId });
+  } catch (error) {
+    if (error.code === '23514') return fail(res, 400, 'Those dates do not fit together, so the announcement was not published.');
+    throw error;
+  }
+  await auditLog.record({
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+    action: 'announcement.publish',
+    targetType: 'announcement',
+    targetId: announcement?.id || null,
+    summary: `Published a ${announcement?.level || draft.level} announcement: ${draft.message}`,
+    metadata: { level: draft.level, active: draft.active, startsAt: draft.startsAt, endsAt: draft.endsAt },
+  });
+  res.set('Cache-Control', 'no-store').status(201).json({
+    announcement,
+    notice: draft.active ? 'The banner is live on every dashboard now.' : 'Saved as inactive - nothing is displayed yet.',
+  });
+}));
+
+app.patch('/api/admin/announcements/:id', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const id = String(req.params.id || '').trim();
+  if (!UUID_PATTERN.test(id)) return fail(res, 400, 'Choose a valid announcement.');
+  let draft;
+  try { draft = normalizeAnnouncementDraft(req.body || {}, { partial: true }); }
+  catch (error) { return fail(res, error.status || 400, error.message); }
+  let announcement;
+  try {
+    announcement = await announcementService.update({ id, draft });
+  } catch (error) {
+    if (error.code === '23514') return fail(res, 400, 'Those dates do not fit the existing window, so nothing was changed.');
+    throw error;
+  }
+  if (!announcement) return fail(res, 404, 'That announcement could not be found, or nothing needed changing.');
+  await auditLog.record({
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+    action: 'announcement.update',
+    targetType: 'announcement',
+    targetId: id,
+    summary: `Changed an announcement (${Object.keys(draft).filter((key) => draft[key] !== undefined).join(', ')}).`,
+    metadata: { changed: Object.fromEntries(Object.entries(draft).filter(([, value]) => value !== undefined)) },
+  });
+  res.set('Cache-Control', 'no-store').json({ announcement });
+}));
+
+app.delete('/api/admin/announcements/:id', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const id = String(req.params.id || '').trim();
+  if (!UUID_PATTERN.test(id)) return fail(res, 400, 'Choose a valid announcement.');
+  const announcement = await announcementService.retire({ id });
+  if (!announcement) return fail(res, 404, 'That announcement is already retired.');
+  await auditLog.record({
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+    action: 'announcement.retire',
+    targetType: 'announcement',
+    targetId: id,
+    summary: `Retired the announcement: ${announcement.message}`,
+    metadata: { message: announcement.message },
+  });
+  res.set('Cache-Control', 'no-store').json({ announcement, notice: 'Retired - it no longer appears on dashboards, and the record stays for audit.' });
+}));
+
+/* ---------------------------- Admin: support access ----------------------------
+ * A support session is a one-hour, read-only token minted by an administrator. It never reads,
+ * resets, or references the customer's password, and closing it revokes the token server-side.
+ */
+app.post('/api/admin/users/:id/impersonate', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const targetId = String(req.params.id || '').trim();
+  if (!UUID_PATTERN.test(targetId)) return fail(res, 400, 'Choose a valid user account.');
+  let reason;
+  try { reason = normalizeSupportReason(req.body?.reason); }
+  catch (error) { return fail(res, error.status || 400, error.message); }
+
+  const { rows } = await pool.query(`SELECT ${adminUserColumns} FROM users u WHERE u.id=$1 LIMIT 1`, [targetId]);
+  const target = rows[0];
+  try { assertAllowedImpersonation({ actorId: req.userId, target }); }
+  catch (error) { return fail(res, error.status || 400, error.message); }
+
+  const session = await supportSessions.start({ adminId: req.userId, userId: targetId, reason });
+  let token;
+  try {
+    token = issueSupportToken(buildSupportClaims({
+      sessionId: session.sessionId,
+      jti: session.jti,
+      adminId: req.userId,
+      adminEmail: req.userEmail,
+      userId: targetId,
+      userEmail: target.email,
+    }));
+  } catch (error) {
+    await supportSessions.stop({ sessionId: session.sessionId }).catch(() => {});
+    log('error', 'Support session token could not be signed', { code: error.code || 'SUPPORT_TOKEN_FAILED' });
+    return fail(res, 500, 'Support access is not available on this server right now.');
+  }
+  await auditLog.record({
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+    action: 'impersonation.start',
+    targetType: 'user',
+    targetId,
+    summary: `Opened a ${session.ttlMinutes}-minute read-only support session on ${target.email}. Reason: ${reason}`,
+    metadata: { sessionId: session.sessionId, reason, expiresAt: session.expiresAt },
+  });
+  log('warn', 'Admin opened a support session', { actorId: req.userId, targetId, sessionId: session.sessionId });
+  res.set('Cache-Control', 'no-store').status(201).json({
+    token,
+    sessionId: session.sessionId,
+    expiresAt: session.expiresAt,
+    minutes: session.ttlMinutes,
+    readOnly: true,
+    user: { id: target.id, name: target.name, email: target.email },
+    notice: 'Read-only support view: signals, settings, and account state as this workspace sees them, with no ability to change anything.',
+  });
+}));
+
+app.get('/api/admin/support-sessions', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const rawLimit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 25));
+  const rawOffset = Math.max(0, Number.parseInt(req.query.offset, 10) || 0);
+  res.set('Cache-Control', 'no-store').json(await supportSessions.list({ limit: rawLimit, offset: rawOffset }));
+}));
+
+app.post('/api/admin/support/stop', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const sessionId = String(req.body?.sessionId || '').trim();
+  if (!UUID_PATTERN.test(sessionId)) return fail(res, 400, 'Choose a support session to close.');
+  const result = await supportSessions.stop({ sessionId, adminId: req.userId });
+  if (!result.revoked) return fail(res, 404, 'That support session is already closed.');
+  await auditLog.record({
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+    action: 'impersonation.stop',
+    targetType: 'support_session',
+    targetId: sessionId,
+    summary: 'Closed a support session early.',
+    metadata: { sessionId },
+  });
+  res.set('Cache-Control', 'no-store').json({ ok: true, sessionId });
+}));
+
+/**
+ * Lets the person holding the support token close their own session without needing the admin
+ * token again - it is the one write a support session is allowed to perform, and it can only
+ * revoke the session it is already inside.
+ */
+app.post('/api/auth/support/exit', authenticate, asyncRoute(async (req, res) => {
+  if (!req.supportSessionId) return fail(res, 400, 'This is not a support session.');
+  const result = await supportSessions.stop({ sessionId: req.supportSessionId, adminId: req.impersonatedBy });
+  res.set('Cache-Control', 'no-store').json({ ok: true, revoked: result.revoked });
+}));
+
+/* --------------------------- Admin: manual adjustments ---------------------------
+ * Support needs to hand out a plan or buy time on an existing one without touching Paystack.
+ * `users` carries the plan the product enforces, `subscriptions` carries the period the expiry
+ * sweeps read, so both are written together inside one transaction and the response always
+ * reports the provider situation instead of implying this cancels a real subscription.
+ */
+const PLAN_PERIOD_INTERVALS = Object.freeze({
+  daily: '1 day', weekly: '7 days', monthly: '1 month', quarterly: '3 months', biannually: '6 months', annually: '1 year',
+});
+const MANUAL_SUBSCRIPTION_ACTIONS = Object.freeze({ free: 'subscription.clear', grant: 'subscription.grant', extend: 'subscription.extend' });
+
+function planPeriodInterval(interval) {
+  return PLAN_PERIOD_INTERVALS[String(interval || '').trim().toLowerCase()] || '1 month';
+}
+
+function planDisplayName(plan) {
+  return String(plan?.name || plan?.key || 'the plan');
+}
+
+function dateLabel(value) {
+  if (!value) return 'no end date';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? 'no end date' : date.toISOString().slice(0, 10);
+}
+
+app.patch('/api/admin/users/:id/subscription', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const targetId = String(req.params.id || '').trim();
+  if (!UUID_PATTERN.test(targetId)) return fail(res, 400, 'Choose a valid user account.');
+  let adjustment;
+  try { adjustment = normalizeSubscriptionAdjustment(req.body || {}, { plans: paystackConfig.plans }); }
+  catch (error) { return fail(res, error.status || 400, error.message); }
+
+  const { rows: targetRows } = await pool.query(`SELECT ${adminUserColumns} FROM users u WHERE u.id=$1 LIMIT 1`, [targetId]);
+  const target = targetRows[0];
+  if (!target) return fail(res, 404, 'That user could not be found.');
+  const plan = adjustment.planKey && adjustment.planKey !== 'free' ? findPlan(paystackConfig, adjustment.planKey) : null;
+  if (adjustment.planKey && adjustment.planKey !== 'free' && !plan) {
+    return fail(res, 400, 'That plan is not available in the live catalogue.');
+  }
+  const extending = adjustment.days !== null || Boolean(adjustment.endsAt);
+  const { rows: existingRows } = await pool.query(
+    'SELECT id,plan_key AS "planKey",status,current_period_end AS "periodEnd",provider_subscription_code AS "providerSubscriptionCode" FROM subscriptions WHERE user_id=$1 LIMIT 1',
+    [targetId],
+  );
+  const existing = existingRows[0] || null;
+  if (!adjustment.planKey && !existing) {
+    return fail(res, 409, 'That workspace has no subscription record to extend yet, so there is no expiry date to move. Grant a plan first.');
+  }
+
+  const entries = [];
+  let periodEnd = existing?.periodEnd || null;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    if (adjustment.planKey === 'free') {
+      await client.query(
+        "UPDATE users SET subscription_status='free',subscription_plan='free',plan_limits=$2 WHERE id=$1",
+        [targetId, JSON.stringify(FREE_PLAN.limits)],
+      );
+      await client.query(
+        "UPDATE subscriptions SET plan_key='free',status='free',current_period_end=NULL,cancel_at_period_end=FALSE,updated_at=NOW() WHERE user_id=$1",
+        [targetId],
+      );
+      entries.push({
+        action: MANUAL_SUBSCRIPTION_ACTIONS.free,
+        summary: `Moved ${target.email} to Free, ending the ${target.subscriptionPlan || 'paid'} plan. Reason: ${adjustment.reason}`,
+        metadata: { previousPlan: target.subscriptionPlan, reason: adjustment.reason },
+      });
+    } else if (plan) {
+      // A grant with an explicit period honours that period instead of the plan's own interval,
+      // so "Pro for 14 days" means fourteen days and not a month plus two weeks.
+      const periodSql = adjustment.endsAt ? '$5::timestamptz' : 'NOW() + ($4::text)::interval';
+      await client.query(
+        "UPDATE users SET subscription_status='active',subscription_plan=$2,plan_limits=$3 WHERE id=$1",
+        [targetId, plan.key, JSON.stringify(plan.limits || {})],
+      );
+      const { rows: upserted } = await client.query(
+        `INSERT INTO subscriptions(user_id,plan_key,status,interval,current_period_end,cancel_at_period_end,started_at,provider,updated_at)
+         VALUES($1,$2,'active',$3,${periodSql},FALSE,NOW(),'manual',NOW())
+         ON CONFLICT(user_id) DO UPDATE SET plan_key=EXCLUDED.plan_key,status='active',interval=EXCLUDED.interval,
+           current_period_end=GREATEST(COALESCE(subscriptions.current_period_end,NOW()),${periodSql}),
+           cancel_at_period_end=FALSE,started_at=COALESCE(subscriptions.started_at,NOW()),canceled_at=NULL,updated_at=NOW()
+         RETURNING current_period_end AS "periodEnd"`,
+        [targetId, plan.key, paystackConfig.interval || 'monthly', adjustment.days ? `${adjustment.days} days` : planPeriodInterval(paystackConfig.interval), adjustment.endsAt],
+      );
+      periodEnd = upserted[0]?.periodEnd || periodEnd;
+      entries.push({
+        action: MANUAL_SUBSCRIPTION_ACTIONS.grant,
+        summary: `Granted ${planDisplayName(plan)} to ${target.email} for free until ${dateLabel(periodEnd)}. Reason: ${adjustment.reason}`,
+        metadata: { previousPlan: target.subscriptionPlan, planKey: plan.key, days: adjustment.days, endsAt: adjustment.endsAt, reason: adjustment.reason, limits: plan.limits || null },
+      });
+    }
+    if (extending && !plan) {
+      const assignment = adjustment.endsAt
+        ? 'current_period_end=$2::timestamptz'
+        : `current_period_end=GREATEST(COALESCE(current_period_end,NOW()),NOW()) + ($2::int * INTERVAL '1 day')`;
+      const { rows: extended } = await client.query(
+        `UPDATE subscriptions SET ${assignment},
+           status=CASE WHEN status IN ('canceled','free') THEN 'non_renewing' ELSE status END,
+           cancel_at_period_end=CASE WHEN status IN ('canceled','free') THEN TRUE ELSE cancel_at_period_end END,
+           updated_at=NOW()
+         WHERE user_id=$1
+         RETURNING current_period_end AS "periodEnd",status,cancel_at_period_end AS "cancelAtPeriodEnd"`,
+        [targetId, adjustment.endsAt || adjustment.days],
+      );
+      periodEnd = extended[0]?.periodEnd || periodEnd;
+      entries.push({
+        action: MANUAL_SUBSCRIPTION_ACTIONS.extend,
+        summary: `Extended the subscription of ${target.email} ${adjustment.endsAt ? `to ${dateLabel(periodEnd)}` : `by ${adjustment.days} day${adjustment.days === 1 ? '' : 's'}, now ${dateLabel(periodEnd)}`}. Reason: ${adjustment.reason}`,
+        metadata: { days: adjustment.days, endsAt: adjustment.endsAt, reason: adjustment.reason, periodEnd: periodEnd || null },
+      });
+    }
+    // The mirror on `users` is what the product enforces, so it is always re-derived from the
+    // subscription row rather than written twice from two different ideas of the truth.
+    const { rows: syncedRows } = await client.query(
+      'SELECT plan_key AS "planKey",status,current_period_end AS "periodEnd",cancel_at_period_end AS "cancelAtPeriodEnd",interval FROM subscriptions WHERE user_id=$1 LIMIT 1',
+      [targetId],
+    );
+    const synced = syncedRows[0] || null;
+    if (synced) {
+      const limits = findPlan(paystackConfig, synced.planKey)?.limits || FREE_PLAN.limits;
+      await client.query('UPDATE users SET subscription_status=$2,subscription_plan=$3,plan_limits=$4 WHERE id=$1', [targetId, synced.status, synced.planKey, JSON.stringify(limits)]);
+      periodEnd = synced.periodEnd;
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+  // Only after the commit: an audit row describes what actually happened, and a failed audit
+  // write must never look like it could roll the adjustment back.
+  for (const entry of entries) {
+    await auditLog.record({ actorId: req.userId, actorEmail: req.userEmail, targetType: 'user', targetId, ...entry });
+  }
+
+  const { rows: updatedRows } = await pool.query(`SELECT ${adminUserColumns} FROM users u WHERE u.id=$1`, [targetId]);
+  log('info', 'Admin adjusted a subscription manually', { actorId: req.userId, targetId, planKey: adjustment.planKey, days: adjustment.days });
+  res.set('Cache-Control', 'no-store').json({
+    user: updatedRows[0] || target,
+    subscription: {
+      planKey: updatedRows[0]?.subscriptionPlan || null,
+      status: updatedRows[0]?.subscriptionStatus || null,
+      periodEnd: periodEnd || null,
+    },
+    auditEntries: entries.length,
+    notice: existing?.providerSubscriptionCode
+      ? 'Paystack still bills on its own schedule: this moved the expiry Signal Desk enforces, not the gateway plan. Cancel or resume the renewal in Payments if the charge should stop.'
+      : 'Saved. No gateway charge was created by this adjustment.',
+  });
+}));
+
+/* ------------------------- User-facing: announcement banner -------------------------
+ * The dashboard asks for its own view, so a dismissed banner never comes back and a hidden one is
+ * simply absent. A read failure yields an empty list rather than an error the user cannot act on.
+ */
+app.get('/api/announcements/active', authenticate, asyncRoute(async (req, res) => {
+  const announcements = await announcementService.activeFor(req.userId).catch(() => null);
+  res.set('Cache-Control', 'no-store').json({ announcements: announcements || [], unavailable: announcements === null });
+}));
+
+app.post('/api/announcements/:id/dismiss', authenticate, asyncRoute(async (req, res) => {
+  const id = String(req.params.id || '').trim();
+  if (!UUID_PATTERN.test(id)) return fail(res, 400, 'Choose a valid announcement.');
+  const result = await announcementService.dismiss({ userId: req.userId, id });
+  res.set('Cache-Control', 'no-store').json({ ok: true, dismissed: true, recorded: result.recorded });
 }));
 
 app.get('/api/telegram/status', authenticate, asyncRoute(async (req, res) => {

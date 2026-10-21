@@ -333,6 +333,81 @@ export async function initializeDatabase() {
     ALTER TABLE metaapi_credentials ENABLE ROW LEVEL SECURITY;
     ALTER TABLE metaapi_accounts ENABLE ROW LEVEL SECURITY;
     ALTER TABLE telegram_login_attempts ENABLE ROW LEVEL SECURITY;
+    /* The Starter tier is purchasable, so its plan key has to survive the subscription
+     * mirror; the check predates the tier and would reject the row during webhook
+     * activation. Replacing the constraint is idempotent and never loses data. */
+    DO $$ BEGIN
+      IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'subscriptions_plan_check' AND conrelid = 'subscriptions'::regclass) THEN
+        ALTER TABLE subscriptions DROP CONSTRAINT subscriptions_plan_check;
+      END IF;
+    END $$;
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'subscriptions_plan_check' AND conrelid = 'subscriptions'::regclass) THEN
+        ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_plan_check CHECK (plan_key IN ('free', 'starter', 'pro', 'premium'));
+      END IF;
+    END $$;
+    /* ---------------- platform administration ---------------- */
+    /* Every administrator mutation appends one row here: the action, the admin's email as it
+     * was at the time (denormalised on purpose - an audit trail must not change when the
+     * account behind it is renamed or deleted), and the timestamp. Metadata is scrubbed of
+     * credential-shaped keys before it is stored. Nothing in the app deletes these rows. */
+    CREATE TABLE IF NOT EXISTS admin_audit_logs (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      actor_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      actor_email TEXT NOT NULL,
+      action TEXT NOT NULL,
+      target_type TEXT,
+      target_id TEXT,
+      summary TEXT NOT NULL,
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS admin_audit_logs_created_idx ON admin_audit_logs(created_at DESC);
+    CREATE INDEX IF NOT EXISTS admin_audit_logs_action_idx ON admin_audit_logs(action,created_at DESC);
+    CREATE INDEX IF NOT EXISTS admin_audit_logs_actor_idx ON admin_audit_logs(actor_id,created_at DESC);
+    ALTER TABLE admin_audit_logs ENABLE ROW LEVEL SECURITY;
+    /* One global banner at a time is the intent, but several rows may be scheduled, so the
+     * user-facing query picks the newest live one and dismissal is stored per user. */
+    CREATE TABLE IF NOT EXISTS announcements (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      message TEXT NOT NULL CHECK (char_length(message) BETWEEN 4 AND 500),
+      level TEXT NOT NULL DEFAULT 'info',
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      starts_at TIMESTAMPTZ,
+      ends_at TIMESTAMPTZ,
+      created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT announcements_level_check CHECK (level IN ('info', 'warning', 'critical')),
+      CONSTRAINT announcements_window_check CHECK (ends_at IS NULL OR starts_at IS NULL OR ends_at > starts_at)
+    );
+    CREATE INDEX IF NOT EXISTS announcements_active_idx ON announcements(active,created_at DESC);
+    ALTER TABLE announcements ENABLE ROW LEVEL SECURITY;
+    CREATE TABLE IF NOT EXISTS announcement_dismissals (
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      announcement_id UUID NOT NULL REFERENCES announcements(id) ON DELETE CASCADE,
+      dismissed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY(user_id,announcement_id)
+    );
+    ALTER TABLE announcement_dismissals ENABLE ROW LEVEL SECURITY;
+    /* Support ("impersonation") sessions. Only the SHA-256 hash of the token identifier is
+     * stored, never the token itself, so the database cannot be used to replay a session;
+     * revoking the row cuts a live token off immediately, and the row also carries the hard
+     * one-hour expiry independently of the signed token. */
+    CREATE TABLE IF NOT EXISTS support_sessions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      token_hash TEXT NOT NULL UNIQUE,
+      admin_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      reason TEXT,
+      revoked_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL,
+      CONSTRAINT support_sessions_expiry_after_creation CHECK (expires_at > created_at)
+    );
+    CREATE INDEX IF NOT EXISTS support_sessions_user_idx ON support_sessions(user_id,created_at DESC);
+    CREATE INDEX IF NOT EXISTS support_sessions_live_idx ON support_sessions(expires_at) WHERE revoked_at IS NULL;
+    ALTER TABLE support_sessions ENABLE ROW LEVEL SECURITY;
   `);
   const adminAccess = createAdminAccess();
   if (adminAccess.emails.length) {

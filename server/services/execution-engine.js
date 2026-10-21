@@ -135,6 +135,9 @@ const BREAK_EVEN_DEFER_TEXT = /(?:invalid|too small) stops|too close|stops level
  * zero would ask the broker to park a stop on the live price, and an absurd value is refused
  * rather than clamped, because a clamped number is a number the user never chose.
  */
+/** What the user and the admin panel are told when the platform switch is engaged. */
+export const PLATFORM_PAUSE_MESSAGE = 'Automatic execution is paused by Signal Desk. New orders are not being submitted right now.';
+
 export const TRAILING_MIN_DISTANCE_POINTS = 1;
 export const TRAILING_MAX_DISTANCE_POINTS = 100_000;
 
@@ -361,9 +364,24 @@ export function classifyBreakEvenFailure(error) {
   return { status: 'failed', retry: true, message: message || 'The broker rejected the stop-loss change.' };
 }
 
-export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnabled = false, now = () => Date.now(), breakEvenIntervalMs = 5_000, breakEvenMaxAttempts = BREAK_EVEN_MAX_ATTEMPTS, logger = console } = {}) {
+export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnabled = false, isTradingPaused = async () => false, now = () => Date.now(), breakEvenIntervalMs = 5_000, breakEvenMaxAttempts = BREAK_EVEN_MAX_ATTEMPTS, logger = console } = {}) {
   if (!pool?.query || !trading?.getAccountState || !trading?.createMarketOrder || typeof resolveToken !== 'function') {
     throw new TypeError('Execution engine dependencies are incomplete.');
+  }
+
+  /**
+   * The platform kill switch, asked again on every call rather than cached. It is a database
+   * read because only a database read can be felt by every worker process the moment an
+   * administrator flips it; a process flag would need a deploy. Anything other than a clear
+   * "not paused" answer is treated as paused, including a failing dependency.
+   */
+  async function tradingPaused() {
+    try {
+      return (await isTradingPaused()) !== false;
+    } catch (error) {
+      logger?.error?.(JSON.stringify({ level: 'error', message: 'The platform auto-trading switch could not be read; execution stays blocked', error: safeText(error?.message || error) }));
+      return true;
+    }
   }
 
   let lastBaselineSweep = 0;
@@ -445,6 +463,9 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
       const item = rows[0];
       if (!item) return stop(job, 'skipped', 'Execution settings, signal, or selected account are unavailable.');
       if (!runtimeEnabled) return stop(job, 'skipped', 'Automatic execution is unavailable on this service.');
+      // Checked before any work on the order: while the platform switch is engaged no workspace
+      // can trade, and the signal is skipped rather than executed or lost in the queue.
+      if (await tradingPaused()) return stop(job, 'skipped', PLATFORM_PAUSE_MESSAGE);
       if (item.auto_trading_enabled !== true) return stop(job, 'skipped', 'Auto-Trading is off.');
       if (item.source !== 'telegram' || item.execution_ready !== true) return stop(job, 'skipped', item.parse_error || 'This message is not eligible for automatic execution.');
       // Free is signal review only: no plan, no execution. This is also what makes the
@@ -527,6 +548,10 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
       if (latestSettings[0]?.autoTradingEnabled !== true || latestSettings[0]?.executionAccountId !== item.metaapi_account_id) {
         return stop(job, 'skipped', 'Auto-Trading was turned off or the selected account changed before order submission.');
       }
+      // Asked again immediately before the trade is recorded and the order is sent: everything
+      // above this point reads broker state and can take seconds, which is long enough for an
+      // administrator to engage the switch mid-job.
+      if (await tradingPaused()) return stop(job, 'skipped', `${PLATFORM_PAUSE_MESSAGE} The order was stopped before it reached the broker.`);
       const clientId = `SD${String(job.id).replaceAll('-', '').slice(0, 24)}`;
       const { rows: tradeRows } = await pool.query(
         `INSERT INTO trades(user_id,signal_id,execution_job_id,metaapi_account_id,symbol,side,quantity,entry_price,stop_loss,take_profit,status,client_id)

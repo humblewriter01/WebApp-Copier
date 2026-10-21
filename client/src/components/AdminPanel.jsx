@@ -1,11 +1,22 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { request } from '../lib/api.js';
+import { healthCheckTone, killSwitchView } from '../lib/platform-view.js';
 
 const PAGE_SIZE = 25;
 const SECTIONS = [
   { key: 'overview', label: 'Users & activity' },
+  { key: 'health', label: 'System health' },
   { key: 'pricing', label: 'Pricing & Plans' },
   { key: 'billing', label: 'Payments' },
+  { key: 'announcements', label: 'Announcements' },
+  { key: 'audit', label: 'Audit log' },
+];
+const HEALTH_WINDOWS = [
+  { hours: 1, label: 'last hour' },
+  { hours: 6, label: 'last 6 hours' },
+  { hours: 24, label: 'last 24 hours' },
+  { hours: 72, label: 'last 3 days' },
+  { hours: 168, label: 'last 7 days' },
 ];
 const SYNC_COPY = {
   synced: 'Saved in Paystack',
@@ -49,7 +60,7 @@ function syncCopy(status) {
   return SYNC_COPY[status] || 'Not synced yet';
 }
 
-export default function AdminPanel({ token, currentUser }) {
+export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const [stats, setStats] = useState(null);
   const [section, setSection] = useState('overview');
   const [users, setUsers] = useState([]);
@@ -70,6 +81,22 @@ export default function AdminPanel({ token, currentUser }) {
   const [savingPricing, setSavingPricing] = useState(false);
   const [syncingPlans, setSyncingPlans] = useState(false);
   const [busyUser, setBusyUser] = useState('');
+  const [health, setHealth] = useState(null);
+  const [healthHours, setHealthHours] = useState(24);
+  const [switchBusy, setSwitchBusy] = useState(false);
+  const [switchReason, setSwitchReason] = useState('');
+  const [announcements, setAnnouncements] = useState([]);
+  const [announcementForm, setAnnouncementForm] = useState({ message: '', level: 'info', startsAt: '', endsAt: '' });
+  const [announcementEditing, setAnnouncementEditing] = useState({ id: '', message: '' });
+  const [savingAnnouncement, setSavingAnnouncement] = useState(false);
+  const [audit, setAudit] = useState({ entries: [], total: 0, totalEntries: 0, actions: [] });
+  const [auditAction, setAuditAction] = useState('');
+  const [auditSearchInput, setAuditSearchInput] = useState('');
+  const [auditSearch, setAuditSearch] = useState('');
+  const [auditOffset, setAuditOffset] = useState(0);
+  const [supportFor, setSupportFor] = useState({ userId: '', reason: '' });
+  const [supportBusy, setSupportBusy] = useState('');
+  const [adjustFor, setAdjustFor] = useState(null);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
 
@@ -108,18 +135,55 @@ export default function AdminPanel({ token, currentUser }) {
     return data;
   }, [token]);
 
+  const loadHealth = useCallback(async (hours) => {
+    const windowHours = Number(hours) || 24;
+    const data = await request(`/api/admin/health?hours=${encodeURIComponent(String(windowHours))}&limit=25`, token);
+    setHealth(data);
+  }, [token]);
+
+  const loadAnnouncements = useCallback(async () => {
+    const data = await request('/api/admin/announcements?limit=50', token);
+    setAnnouncements(data.announcements || []);
+  }, [token]);
+
+  const loadAudit = useCallback(async ({ action = '', search = '', offset = 0 } = {}) => {
+    const query = new URLSearchParams({ limit: '25', offset: String(offset) });
+    if (action) query.set('action', action);
+    if (search) query.set('search', search);
+    const data = await request(`/api/admin/audit-logs?${query.toString()}`, token);
+    setAudit({ entries: data.entries || [], total: data.total || 0, totalEntries: data.totalEntries || 0, actions: data.actions || [] });
+  }, [token]);
+
   const loadEverything = useCallback(async (nextSearch = search, nextOffset = offset) => {
     setError('');
     try {
-      await Promise.all([loadOverview(), loadUsers(nextSearch, nextOffset), loadPromoCodes(), loadBilling(), loadPricing()]);
+      await Promise.all([
+        loadOverview(), loadUsers(nextSearch, nextOffset), loadPromoCodes(), loadBilling(), loadPricing(), loadAnnouncements(),
+      ]);
     } catch (loadError) {
       setError(loadError.message);
     } finally {
       setLoading(false);
     }
-  }, [loadOverview, loadUsers, loadPromoCodes, loadBilling, loadPricing, search, offset]);
+  }, [loadOverview, loadUsers, loadPromoCodes, loadBilling, loadPricing, loadAnnouncements, search, offset]);
 
   useEffect(() => { loadEverything(); }, [loadEverything]);
+
+  /* Health and the audit log read their own data when their tab is opened; audit filters and pages
+   * fetch explicitly, while the health window is a dependency of its effect. Folding either into
+   * loadEverything would have meant every keystroke in the audit search box re-running the panel's
+   * whole refresh, because a useCallback identity changes with the state its defaults read. */
+  useEffect(() => {
+    if (loading || section !== 'health') return;
+    loadHealth(healthHours).catch((healthError) => setError(healthError.message));
+  }, [loading, section, loadHealth, healthHours]);
+
+  useEffect(() => {
+    if (loading || section !== 'audit') return;
+    loadAudit({ action: auditAction, search: auditSearch, offset: auditOffset }).catch((auditError) => setError(auditError.message));
+  // Deliberately only on open: changeHealthWindow, applyAuditFilter and changeAuditPage fetch with
+  // the values they were handed, so the request and the state change happen exactly once each.
+  }, [loading, section, loadAudit]);
 
   const applySearch = async (event) => {
     event.preventDefault();
@@ -168,6 +232,201 @@ export default function AdminPanel({ token, currentUser }) {
     await updateUser(user.id, { isSuspended: true, suspensionReason: reason }, `${user.name} has been suspended.`);
   };
   const liftSuspension = (user) => updateUser(user.id, { isSuspended: false }, `${user.name} can sign in again.`);
+
+  /* --------------------------- system health & kill switch ---------------------------
+   * The panel never decides what a state means: the server sends a headline and a sentence per
+   * check, so an unreadable section reads as "Unknown" here instead of quietly looking fine.
+   */
+  const changeHealthWindow = (hours) => {
+    // Recording the window is enough: the section's effect refetches when it changes, so the
+    // select cannot end up with a request that disagrees with what the dropdown says.
+    setError('');
+    setHealthHours(hours);
+  };
+
+  const setSwitch = async (paused) => {
+    const reason = switchReason.trim();
+    if (paused && reason.length < 3) {
+      setError('Add a short reason for the pause - every workspace that asks why will read it.');
+      return;
+    }
+    setSwitchBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      const data = await request('/api/admin/execution-switch', token, { method: 'PUT', body: { paused, ...(reason ? { reason } : {}) } });
+      setNotice(data.notice || (paused ? 'Automatic execution is paused.' : 'Automatic execution is live again.'));
+      setSwitchReason('');
+      // The state shown after a toggle is read back from the server, never assumed from the
+      // button that was pressed - the write and the read are separate facts.
+      await Promise.all([loadHealth(healthHours), loadAudit({ action: auditAction, search: auditSearch, offset: auditOffset })]);
+    } catch (switchError) {
+      setError(switchError.message);
+    } finally {
+      setSwitchBusy(false);
+    }
+  };
+
+  /* ------------------------------- announcements ------------------------------- */
+  const publishAnnouncement = async (event) => {
+    event.preventDefault();
+    const message = announcementForm.message.trim();
+    if (message.length < 4) {
+      setError('Write at least 4 characters for the announcement.');
+      return;
+    }
+    setSavingAnnouncement(true);
+    setError('');
+    setNotice('');
+    try {
+      const body = { message, level: announcementForm.level };
+      if (announcementForm.startsAt) body.startsAt = new Date(announcementForm.startsAt).toISOString();
+      if (announcementForm.endsAt) body.endsAt = new Date(announcementForm.endsAt).toISOString();
+      const data = await request('/api/admin/announcements', token, { method: 'POST', body });
+      setNotice(data.notice || 'Announcement saved.');
+      setAnnouncementForm({ message: '', level: 'info', startsAt: '', endsAt: '' });
+      await Promise.all([loadAnnouncements(), loadAudit({ action: auditAction, search: auditSearch, offset: auditOffset })]);
+    } catch (publishError) {
+      setError(publishError.message);
+    } finally {
+      setSavingAnnouncement(false);
+    }
+  };
+
+  const retireAnnouncement = async (item) => {
+    setError('');
+    setNotice('');
+    try {
+      const data = await request(`/api/admin/announcements/${item.id}`, token, { method: 'DELETE' });
+      setNotice(data.notice || 'Announcement retired.');
+      await Promise.all([loadAnnouncements(), loadAudit({ action: auditAction, search: auditSearch, offset: auditOffset })]);
+    } catch (retireError) {
+      setError(retireError.message);
+    }
+  };
+
+  const saveAnnouncementMessage = async (item) => {
+    const message = announcementEditing.message.trim();
+    if (message.length < 4) {
+      setError('Write at least 4 characters for the announcement.');
+      return;
+    }
+    setError('');
+    try {
+      await request(`/api/admin/announcements/${item.id}`, token, { method: 'PATCH', body: { message } });
+      setNotice('Announcement updated.');
+      setAnnouncementEditing({ id: '', message: '' });
+      await Promise.all([loadAnnouncements(), loadAudit({ action: auditAction, search: auditSearch, offset: auditOffset })]);
+    } catch (editError) {
+      setError(editError.message);
+    }
+  };
+
+  /* --------------------------------- audit log --------------------------------- */
+  const applyAuditFilter = async (nextAction, nextSearch) => {
+    setAuditAction(nextAction);
+    setAuditSearch(nextSearch);
+    setAuditOffset(0);
+    setError('');
+    try {
+      await loadAudit({ action: nextAction, search: nextSearch, offset: 0 });
+    } catch (auditError) {
+      setError(auditError.message);
+    }
+  };
+
+  const changeAuditPage = async (direction) => {
+    const nextOffset = Math.max(0, auditOffset + direction * PAGE_SIZE);
+    if (nextOffset === auditOffset) return;
+    setAuditOffset(nextOffset);
+    try {
+      await loadAudit({ action: auditAction, search: auditSearch, offset: nextOffset });
+    } catch (auditError) {
+      setError(auditError.message);
+    }
+  };
+
+  /* ---------------------- support access and manual adjustments ---------------------- */
+  const openSupportAccess = (user) => {
+    setError('');
+    setNotice('');
+    setSupportFor({ userId: user.id, reason: '' });
+  };
+  const closeSupportAccessForm = () => setSupportFor({ userId: '', reason: '' });
+
+  const startImpersonation = async (user) => {
+    const reason = supportFor.reason.trim();
+    if (reason.length < 3) {
+      setError('Say why you need support access - it is written to the audit log.');
+      return;
+    }
+    setSupportBusy(user.id);
+    setError('');
+    setNotice('');
+    try {
+      const data = await request(`/api/admin/users/${user.id}/impersonate`, token, { method: 'POST', body: { reason } });
+      setSupportFor({ userId: '', reason: '' });
+      setNotice(data.notice || 'Support view opened.');
+      await loadAudit({ action: auditAction, search: auditSearch, offset: auditOffset });
+      onImpersonate?.(data);
+    } catch (supportError) {
+      setError(supportError.message);
+    } finally {
+      setSupportBusy('');
+    }
+  };
+
+  const openAdjustment = (user) => {
+    setError('');
+    setNotice('');
+    setAdjustFor({
+      userId: user.id,
+      plan: '',
+      days: '',
+      endsAt: '',
+      reason: '',
+      currentPlan: user.subscriptionPlan || 'free',
+      currentStatus: user.subscriptionStatus || 'free',
+      periodEnd: user.periodEnd || null,
+      hasProviderSubscription: user.hasProviderSubscription === true,
+    });
+  };
+  const cancelAdjustment = () => setAdjustFor(null);
+
+  const saveAdjustment = async (user) => {
+    const form = adjustFor?.userId === user.id ? adjustFor : null;
+    if (!form) return;
+    const reason = form.reason.trim();
+    if (reason.length < 5) {
+      setError('Add a short reason for this adjustment (at least 5 characters).');
+      return;
+    }
+    if (!form.plan && !form.days && !form.endsAt) {
+      setError('Choose a plan to grant, days to add, or an expiry date.');
+      return;
+    }
+    if (form.plan === 'free' && (form.days || form.endsAt)) {
+      setError('Moving an account to Free already ends its paid period - clear the days or the date.');
+      return;
+    }
+    const body = { reason };
+    if (form.plan) body.plan = form.plan;
+    if (form.days) body.days = Number(form.days);
+    if (form.endsAt) body.endsAt = new Date(form.endsAt).toISOString();
+    setBusyUser(user.id);
+    setError('');
+    setNotice('');
+    try {
+      const data = await request(`/api/admin/users/${user.id}/subscription`, token, { method: 'PATCH', body });
+      setNotice(data.notice || 'Subscription adjusted.');
+      setAdjustFor(null);
+      await Promise.all([loadUsers(), loadOverview(), loadBilling(), loadAudit({ action: auditAction, search: auditSearch, offset: auditOffset })]);
+    } catch (adjustError) {
+      setError(adjustError.message);
+    } finally {
+      setBusyUser('');
+    }
+  };
 
   /* ------------------------------ pricing ------------------------------ */
   const changedPlans = () => {
@@ -344,6 +603,8 @@ export default function AdminPanel({ token, currentUser }) {
 
   const currencyCode = pricing?.currency || billing?.summary?.currency || 'NGN';
   const pendingChanges = Object.keys(changedPlans()).length;
+  // Never inferred from the button that was pressed, and never "Live" while the read is missing.
+  const killSwitch = killSwitchView(health);
 
   return <>
     {error && <div className="alert alert-error global-alert" role="alert">{error}<button className="alert-close" type="button" onClick={() => setError('')}>×</button></div>}
@@ -398,7 +659,10 @@ export default function AdminPanel({ token, currentUser }) {
                   const isSelf = user.id === currentUser?.id;
                   const isSuspended = user.isSuspended === true;
                   const busy = busyUser === user.id;
-                  return <tr key={user.id} className={isSuspended ? 'admin-row-suspended' : undefined}>
+                  const supporting = supportFor.userId === user.id;
+                  const adjusting = adjustFor?.userId === user.id;
+                  return <React.Fragment key={user.id}>
+                  <tr className={isSuspended ? 'admin-row-suspended' : undefined}>
                     <td data-label="User">
                       <strong>{user.name}{isSelf ? ' (you)' : ''}</strong>
                       <small>{user.email}</small>
@@ -415,16 +679,72 @@ export default function AdminPanel({ token, currentUser }) {
                         <option value="admin">Admin</option>
                       </select>
                     </td>
-                    <td data-label="Status"><StatusBadge suspended={isSuspended} plan={user.subscriptionPlan} /></td>
+                    <td data-label="Status">
+                      <StatusBadge suspended={isSuspended} plan={user.subscriptionPlan} />
+                      <small>{user.subscriptionStatus && user.subscriptionStatus !== 'active' ? `${user.subscriptionStatus} · ` : ''}{user.periodEnd ? `paid until ${formatDate(user.periodEnd)}` : 'no paid period'}</small>
+                      {user.hasProviderSubscription ? <small className="admin-reason">Renews through Paystack</small> : null}
+                    </td>
                     <td data-label="Joined">{formatDate(user.createdAt)}</td>
                     <td data-label="Last sign-in">{formatDateTime(user.lastLogin)}</td>
                     <td data-label="Signals">{user.signalCount ?? 0}</td>
                     <td data-label="Actions">
-                      {isSelf ? <span className="muted">—</span> : isSuspended
-                        ? <button type="button" className="button button-secondary button-small" disabled={busy} onClick={() => liftSuspension(user)}>{busy ? 'Saving…' : 'Restore access'}</button>
-                        : <button type="button" className="button button-danger button-small" disabled={busy} onClick={() => startSuspension(user)}>Suspend</button>}
+                      <div className="admin-row-actions">
+                        {isSelf ? <span className="muted">—</span> : isSuspended
+                          ? <button type="button" className="button button-secondary button-small" disabled={busy} onClick={() => liftSuspension(user)}>{busy ? 'Saving…' : 'Restore access'}</button>
+                          : <button type="button" className="button button-danger button-small" disabled={busy} onClick={() => startSuspension(user)}>Suspend</button>}
+                        <button type="button" className="button button-secondary button-small" disabled={busy || isSelf || supporting || adjusting} onClick={() => (supporting ? closeSupportAccessForm() : openSupportAccess(user))}>{supporting ? 'Cancel' : 'Impersonate'}</button>
+                        <button type="button" className="button button-secondary button-small" disabled={busy || adjusting} onClick={() => (adjusting ? cancelAdjustment() : openAdjustment(user))}>{adjusting ? 'Cancel' : 'Adjust plan'}</button>
+                      </div>
                     </td>
-                  </tr>;
+                  </tr>
+                  {supporting && <tr className="admin-tools-row">
+                    <td colSpan={7}>
+                      <form className="admin-support-form" onSubmit={(event) => { event.preventDefault(); startImpersonation(user); }}>
+                        <strong>Open a one-hour read-only support session</strong>
+                        <p className="muted">You will see this workspace exactly as {user.name} does - signals, settings, accounts, and notices. Their password is never read or changed, nothing here can be written, admin tools stay unavailable, and the session ends by itself in one hour.</p>
+                        <label>Why do you need this? (written to the audit log)
+                          <input value={supportFor.reason} onChange={(event) => setSupportFor({ ...supportFor, reason: event.target.value })} maxLength={200} required placeholder="For example: investigating a signal that did not execute on 3 Mar" />
+                        </label>
+                        <div className="button-row">
+                          <button type="submit" className="button button-primary" disabled={supportBusy === user.id}>{supportBusy === user.id ? 'Opening…' : 'Open support view'}</button>
+                          <button type="button" className="button button-secondary" onClick={closeSupportAccessForm}>Cancel</button>
+                        </div>
+                      </form>
+                    </td>
+                  </tr>}
+                  {adjusting && <tr className="admin-tools-row">
+                    <td colSpan={7}>
+                      <form className="admin-adjust-form" onSubmit={(event) => { event.preventDefault(); saveAdjustment(user); }}>
+                        <strong>Manual adjustment for {user.name}</strong>
+                        <p className="muted">Currently {adjustFor.currentPlan} ({adjustFor.currentStatus}), {adjustFor.periodEnd ? `paid until ${formatDate(adjustFor.periodEnd)}` : 'no paid period'}. {adjustFor.hasProviderSubscription ? 'This workspace renews through Paystack, so a gateway subscription keeps billing on its own schedule until it is cancelled there.' : 'No gateway subscription is attached to this workspace.'}</p>
+                        <div className="form-row">
+                          <label>Grant plan for free
+                            <select value={adjustFor.plan} onChange={(event) => setAdjustFor({ ...adjustFor, plan: event.target.value })} aria-label={`Plan to grant to ${user.name}`}>
+                              <option value="">Leave the plan as it is</option>
+                              <option value="starter">Starter</option>
+                              <option value="pro">Pro</option>
+                              <option value="premium">Premium</option>
+                              <option value="free">Free (remove the paid plan)</option>
+                            </select>
+                          </label>
+                          <label>Add days
+                            <input type="number" min="1" max="365" step="1" value={adjustFor.days} onChange={(event) => setAdjustFor({ ...adjustFor, days: event.target.value })} placeholder="14" disabled={adjustFor.plan === 'free'} />
+                          </label>
+                          <label>Or set an expiry date
+                            <input type="date" value={adjustFor.endsAt} onChange={(event) => setAdjustFor({ ...adjustFor, endsAt: event.target.value })} disabled={adjustFor.plan === 'free' || Boolean(adjustFor.days)} />
+                          </label>
+                        </div>
+                        <label>Reason (written to the audit log)
+                          <input value={adjustFor.reason} onChange={(event) => setAdjustFor({ ...adjustFor, reason: event.target.value })} maxLength={200} required placeholder="For example: goodwill after the MetaAPI outage on 2 March" />
+                        </label>
+                        <div className="button-row">
+                          <button type="submit" className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save adjustment'}</button>
+                          <button type="button" className="button button-secondary" onClick={cancelAdjustment}>Cancel</button>
+                        </div>
+                      </form>
+                    </td>
+                  </tr>}
+                  </React.Fragment>;
                 })}
               </tbody>
             </table>
@@ -650,6 +970,194 @@ export default function AdminPanel({ token, currentUser }) {
             </tbody>
           </table>
         </div>}
+      </section>
+    </div>}
+    {section === 'health' && <div id="admin-section-health" role="tabpanel" aria-labelledby="admin-tab-health">
+      <section className="panel admin-panel kill-switch-panel">
+        <div className="panel-heading">
+          <div><p className="eyebrow">PLATFORM SAFETY</p><h2>Global auto-trading kill switch</h2></div>
+          <span className={`badge ${killSwitch.state === 'live' ? 'badge-buy' : killSwitch.state === 'paused' ? 'badge-suspended' : 'badge-unknown'}`}>{killSwitch.label}</span>
+        </div>
+        <p className="muted">Off means no workspace can place a new automatic order. The execution engine reads this switch again before every trade, so it bites on the next job without a restart. Positions that are already open keep the stops they have - and break-even or trailing protection keeps moving, because taking a safety net away mid-incident is the opposite of what a pause is for.</p>
+        {!health ? <div className="loading-shell inline-loading"><div className="spinner" /><span>{killSwitch.headline}</span></div> : <>
+          <div className={`kill-switch-state tone-${healthCheckTone(killSwitch.state)}`}>
+            <strong>{killSwitch.headline}</strong>
+            {killSwitch.detail ? <p>{killSwitch.detail}</p> : null}
+            {killSwitch.paused && killSwitch.reason ? <p className="kill-switch-reason">Reason shown to workspaces: {killSwitch.reason}</p> : null}
+            {killSwitch.updatedAt ? <p className="muted">{killSwitch.updatedBy ? `Last set by ${killSwitch.updatedBy} · ` : 'Last set '}{formatDateTime(killSwitch.updatedAt)}</p> : null}
+          </div>
+          <form className="kill-switch-controls" onSubmit={(event) => { event.preventDefault(); setSwitch(!killSwitch.paused); }}>
+            <label htmlFor="kill-switch-reason">Reason (required when pausing; shown to affected workspaces and stored in the audit log)</label>
+            <input id="kill-switch-reason" value={switchReason} onChange={(event) => setSwitchReason(event.target.value)} maxLength={300} placeholder="For example: MetaAPI incident MT5-2291 - orders rejected until the broker is healthy" />
+            <div className="button-row">
+              <button type="submit" className={`button ${killSwitch.paused ? 'button-primary' : 'button-danger'}`} disabled={switchBusy || !killSwitch.ready}>
+                {switchBusy ? 'Saving…' : killSwitch.paused ? 'Resume automatic execution' : 'Pause execution for everyone'}
+              </button>
+            </div>
+            <p className="muted">{switchBusy ? 'The engine picks the change up on its next job.' : 'The state above is read back from the server, never assumed from this button.'}</p>
+          </form>
+          {health.runtimeEnabled === false ? <div className="alert alert-error" role="alert">This deployment also has AUTO_TRADING_RUNTIME_ENABLED off, so no orders are placed here at all - the switch is not the reason signals are not executing.</div> : null}
+        </>}
+      </section>
+
+      <section className="panel admin-panel health-panel">
+        <div className="panel-heading">
+          <div><p className="eyebrow">LATEST SYSTEM ERRORS</p><h2>MetaAPI and Telegram checks</h2></div>
+          <label className="health-window">Window
+            <select value={healthHours} onChange={(event) => changeHealthWindow(Number(event.target.value))} aria-label="Error window">
+              {HEALTH_WINDOWS.map((entry) => <option key={entry.hours} value={entry.hours}>{entry.label}</option>)}
+            </select>
+          </label>
+        </div>
+        {!health ? <div className="loading-shell inline-loading"><div className="spinner" /><span>Reading the platform state…</span></div> : <>
+          <ul className="health-checks">
+            {(health.checks || []).map((check) => <li key={check.key} className={`health-check tone-${healthCheckTone(check.state)}`}>
+              <span className="health-check-dot" aria-hidden="true" />
+              <div><strong>{check.label}</strong><span className="health-check-headline">{check.headline}</span><p>{check.detail}</p></div>
+            </li>)}
+          </ul>
+          <div className="health-queue">
+            <div><span>Queued jobs</span><strong>{health.queue ? health.queue.queuedJobs : '—'}</strong></div>
+            <div><span>In flight</span><strong>{health.queue ? health.queue.processingJobs : '—'}</strong></div>
+            <div><span>Dead jobs</span><strong>{health.queue ? health.queue.deadJobs : '—'}</strong></div>
+            <div><span>Orders filled in window</span><strong>{health.queue ? health.queue.executedTrades : '—'}</strong></div>
+            <div><span>Auto-trading workspaces</span><strong>{health.queue ? health.queue.autoTradingWorkspaces : '—'}</strong></div>
+            <div><span>Last claim</span><strong>{health.queue?.lastClaimAt ? formatDateTime(health.queue.lastClaimAt) : 'Never'}</strong></div>
+          </div>
+
+          <h3>Latest errors</h3>
+          {health.errorsAvailable === false ? <div className="alert alert-error" role="alert">Recent errors could not be read from the database right now, so this list is empty because it is unknown - not because nothing went wrong.</div> : !health.errors.length ? <div className="empty-state"><strong>No errors recorded</strong><span>Nothing from MetaAPI execution, stop moves, or Telegram parsing inside {HEALTH_WINDOWS.find((entry) => entry.hours === healthHours)?.label || 'this window'}.</span></div> : <div className="admin-table-wrap">
+            <table className="admin-table health-table">
+              <caption className="sr-only">Recent MetaAPI execution and Telegram parsing errors</caption>
+              <thead><tr><th scope="col">When</th><th scope="col">Source</th><th scope="col">Workspace</th><th scope="col">Instrument</th><th scope="col">Account</th><th scope="col">What happened</th></tr></thead>
+              <tbody>
+                {health.errors.map((error, index) => <tr key={`${error.kind}-${error.occurredAt}-${index}`}>
+                  <td data-label="When">{formatDateTime(error.occurredAt)}</td>
+                  <td data-label="Source"><span className={`badge health-kind-${error.kind}`}>{error.kindLabel}</span></td>
+                  <td data-label="Workspace"><strong>{error.email}</strong>{error.name ? <small>{error.name}</small> : null}</td>
+                  <td data-label="Instrument">{[error.symbol, error.side].filter(Boolean).join(' · ') || '—'}</td>
+                  <td data-label="Account">{error.accountId || '—'}</td>
+                  <td data-label="What happened"><code className="health-message">{error.message}</code>{error.status ? <small>status: {error.status}</small> : null}</td>
+                </tr>)}
+              </tbody>
+            </table>
+          </div>}
+          {health.errors.length && health.errorsTruncated ? <p className="muted">Newest 25 only - widen the window to see further back.</p> : null}
+          <p className="muted">
+            Read at {formatDateTime(health.generatedAt)}.{' '}
+            {health.counts?.available === false ? 'Error counts could not be read.' : Object.keys(health.counts || {}).filter((key) => key !== 'available' && key !== 'windowHours').map((key) => `${(health.counts[key] || {}).count || 0} ${key.replace(/_/g, ' ')}`).join(' · ') || 'no errors in this window.'}
+          </p>
+        </>}
+      </section>
+    </div>}
+
+    {section === 'announcements' && <div id="admin-section-announcements" role="tabpanel" aria-labelledby="admin-tab-announcements">
+      <section className="panel admin-panel">
+        <div className="panel-heading">
+          <div><p className="eyebrow">EVERY DASHBOARD</p><h2>System announcements</h2></div>
+          <span className="count-badge">{announcements.length}</span>
+        </div>
+        <p className="muted">A banner appears at the top of the dashboard for signed-in users. Dismissing is per user, so a maintenance notice that one trader closed stays closed on their other devices and does not hide itself for everybody else.</p>
+        <form className="announcement-form" onSubmit={publishAnnouncement}>
+          <label>Message
+            <textarea rows="3" value={announcementForm.message} onChange={(event) => setAnnouncementForm({ ...announcementForm, message: event.target.value })} maxLength={500} required placeholder="Scheduled maintenance on Sunday at 2 AM - orders and stop moves pause for about 20 minutes." />
+          </label>
+          <div className="form-row">
+            <label>Severity
+              <select value={announcementForm.level} onChange={(event) => setAnnouncementForm({ ...announcementForm, level: event.target.value })}>
+                <option value="info">Info - quiet banner</option>
+                <option value="warning">Warning - amber banner</option>
+                <option value="critical">Critical - red banner, announced to screen readers</option>
+              </select>
+            </label>
+            <label>Starts (optional)
+              <input type="datetime-local" value={announcementForm.startsAt} onChange={(event) => setAnnouncementForm({ ...announcementForm, startsAt: event.target.value })} />
+            </label>
+            <label>Ends (optional)
+              <input type="datetime-local" value={announcementForm.endsAt} onChange={(event) => setAnnouncementForm({ ...announcementForm, endsAt: event.target.value })} />
+            </label>
+          </div>
+          <div className="button-row">
+            <button type="submit" className="button button-primary" disabled={savingAnnouncement}>{savingAnnouncement ? 'Publishing…' : 'Publish banner'}</button>
+            <button type="button" className="button button-secondary" onClick={() => setAnnouncementForm({ message: '', level: 'info', startsAt: '', endsAt: '' })}>Clear</button>
+          </div>
+        </form>
+      </section>
+
+      <section className="panel admin-panel">
+        <div className="panel-heading"><div><p className="eyebrow">PUBLISHED</p><h2>Banner history</h2></div></div>
+        {!announcements.length ? <div className="empty-state"><strong>No announcements yet</strong><span>Publish one to put a banner on every dashboard.</span></div> : <div className="chat-list">
+          {announcements.map((item) => <div className="announcement-row" key={item.id}>
+            <div className="announcement-row-main">
+              <strong>{item.message}</strong>
+              <small>
+                <span className={`badge ${item.state === 'live' ? 'badge-buy' : item.state === 'scheduled' ? '' : 'badge-suspended'}`}>{item.state}</span>
+                {` · ${item.level} · `}
+                {item.startsAt ? `from ${formatDateTime(item.startsAt)}` : 'now'}
+                {item.endsAt ? ` until ${formatDateTime(item.endsAt)}` : ''}
+                {` · ${item.dismissalCount || 0} user${item.dismissalCount === 1 ? '' : 's'} dismissed it`}
+                {item.createdByEmail ? ` · published by ${item.createdByEmail}` : ''}
+              </small>
+              {announcementEditing.id === item.id ? <div className="announcement-edit">
+                <label>Correct the message
+                  <textarea rows="2" value={announcementEditing.message} onChange={(event) => setAnnouncementEditing({ ...announcementEditing, message: event.target.value })} maxLength={500} />
+                </label>
+                <div className="button-row">
+                  <button type="button" className="button button-primary button-small" onClick={() => saveAnnouncementMessage(item)}>Save</button>
+                  <button type="button" className="button button-secondary button-small" onClick={() => setAnnouncementEditing({ id: '', message: '' })}>Cancel</button>
+                </div>
+              </div> : null}
+            </div>
+            <div className="button-row">
+              {announcementEditing.id !== item.id ? <button type="button" className="button button-secondary button-small" onClick={() => setAnnouncementEditing({ id: item.id, message: item.message })}>Edit</button> : null}
+              {item.state !== 'retired' ? <button type="button" className="button button-danger button-small" onClick={() => retireAnnouncement(item)}>Retire</button> : <span className="muted">Retired</span>}
+            </div>
+          </div>)}
+        </div>}
+      </section>
+    </div>}
+
+    {section === 'audit' && <div id="admin-section-audit" role="tabpanel" aria-labelledby="admin-tab-audit">
+      <section className="panel admin-panel audit-panel">
+        <div className="panel-heading">
+          <div><p className="eyebrow">WHO DID WHAT</p><h2>Administrator audit log</h2></div>
+          <span className="count-badge">{audit.total}</span>
+        </div>
+        <p className="muted">Every price change, promo code edit, suspension, manual subscription adjustment, kill-switch movement, announcement, and support session is written here with the admin's email address and the timestamp. Entries are never edited or deleted by the application.</p>
+        <form className="admin-search" role="search" onSubmit={(event) => { event.preventDefault(); applyAuditFilter(auditAction, auditSearchInput.trim()); }}>
+          <label htmlFor="audit-search" className="sr-only">Search the audit log by admin email or summary</label>
+          <input id="audit-search" type="search" value={auditSearchInput} onChange={(event) => setAuditSearchInput(event.target.value)} placeholder="Search by admin email or wording" maxLength={100} />
+          <select value={auditAction} onChange={(event) => applyAuditFilter(event.target.value, auditSearch)} aria-label="Filter by action">
+            <option value="">All actions</option>
+            {(audit.actions || []).map((action) => <option key={action.key} value={action.key}>{action.label}</option>)}
+          </select>
+          <button type="submit" className="button button-primary button-small">Search</button>
+          {auditSearch || auditAction ? <button type="button" className="button button-secondary button-small" onClick={() => { setAuditSearchInput(''); applyAuditFilter('', ''); }}>Clear</button> : null}
+        </form>
+        {!audit.entries.length ? <div className="empty-state"><strong>No audit entries yet</strong><span>{auditSearch || auditAction ? 'No entries match that filter.' : 'Administrator changes will appear here.'}</span></div> : <>
+          <div className="admin-table-wrap">
+            <table className="admin-table audit-table">
+              <caption className="sr-only">Administrator actions with the admin email and timestamp</caption>
+              <thead><tr><th scope="col">When</th><th scope="col">Admin</th><th scope="col">Action</th><th scope="col">What happened</th></tr></thead>
+              <tbody>
+                {audit.entries.map((entry) => <tr key={entry.id}>
+                  <td data-label="When">{formatDateTime(entry.createdAt)}</td>
+                  <td data-label="Admin"><strong>{entry.actorEmail}</strong>{entry.targetId ? <small>{entry.targetType || 'target'}: {entry.targetId}</small> : null}</td>
+                  <td data-label="Action"><span className={`badge audit-action-${entry.action.replace(/\./g, '-')}`}>{entry.action}</span></td>
+                  <td data-label="What happened">
+                    <p className="audit-summary">{entry.summary}</p>
+                    {entry.metadata && Object.keys(entry.metadata).length ? <details className="audit-meta"><summary>Details</summary><pre>{JSON.stringify(entry.metadata, null, 2)}</pre></details> : null}
+                  </td>
+                </tr>)}
+              </tbody>
+            </table>
+          </div>
+          <div className="admin-pagination">
+            <button type="button" className="button button-secondary button-small" onClick={() => changeAuditPage(-1)} disabled={auditOffset === 0}>Previous</button>
+            <span className="muted">Showing {audit.entries.length ? auditOffset + 1 : 0}–{auditOffset + audit.entries.length} of {audit.total} matching ({audit.totalEntries} entries in total)</span>
+            <button type="button" className="button button-secondary button-small" onClick={() => changeAuditPage(1)} disabled={auditOffset + audit.entries.length >= audit.total}>Next</button>
+          </div>
+        </>}
       </section>
     </div>}
   </>;

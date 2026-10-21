@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  assertAllowedImpersonation,
   assertAllowedSelfUpdate,
+  normalizeSubscriptionAdjustment,
   createAdminAccess,
   normalizePromoCodeInput,
   normalizePromoCodeUpdate,
@@ -69,4 +71,42 @@ test('an admin cannot demote or suspend themselves', () => {
   assert.throws(() => assertAllowedSelfUpdate({ actorId: 'a1', targetId: 'a1', update: { role: 'user' } }), /own admin access/);
   assert.throws(() => assertAllowedSelfUpdate({ actorId: 'a1', targetId: 'a1', update: { isSuspended: true } }), /suspend your own/);
   assert.doesNotThrow(() => assertAllowedSelfUpdate({ actorId: 'a1', targetId: 'a1', update: { role: 'admin' } }));
+});
+
+/* --------------------- manual subscription adjustments --------------------- */
+const CATALOGUE = [{ key: 'starter', name: 'Starter' }, { key: 'pro', name: 'Pro' }, { key: 'premium', name: 'Premium' }];
+
+test('a manual adjustment accepts a plan, a period, or an exact date, and always a reason', () => {
+  assert.deepEqual(normalizeSubscriptionAdjustment({ plan: ' PRO ', reason: 'Outage credit' }, { plans: CATALOGUE }), {
+    planKey: 'pro', days: null, endsAt: null, reason: 'Outage credit',
+  });
+  assert.equal(normalizeSubscriptionAdjustment({ days: '14', reason: 'Trial after refund' }, { plans: CATALOGUE }).days, 14);
+  assert.equal(normalizeSubscriptionAdjustment({ plan: 'free', reason: 'Refunded in full' }, { plans: CATALOGUE }).planKey, 'free');
+  assert.equal(normalizeSubscriptionAdjustment({ endsAt: '2099-01-01T00:00:00.000Z', reason: 'Promised date' }, { plans: CATALOGUE }).endsAt, '2099-01-01T00:00:00.000Z');
+});
+
+test('a manual adjustment cannot be vague, contradictory, or endless', () => {
+  assert.throws(() => normalizeSubscriptionAdjustment({ plan: 'pro' }, { plans: CATALOGUE }), /reason for this adjustment/);
+  assert.throws(() => normalizeSubscriptionAdjustment({ reason: 'ok' }, { plans: CATALOGUE }), /reason for this adjustment/);
+  assert.throws(() => normalizeSubscriptionAdjustment({ reason: 'a valid reason' }, { plans: CATALOGUE }), /plan to grant/);
+  assert.throws(() => normalizeSubscriptionAdjustment({ plan: 'founder', reason: 'legacy friend' }, { plans: CATALOGUE }), /free, starter, pro, premium/);
+  assert.throws(() => normalizeSubscriptionAdjustment({ days: 0, reason: 'nothing really' }, { plans: CATALOGUE }), /1 to 365 whole days/);
+  assert.throws(() => normalizeSubscriptionAdjustment({ days: 2.5, reason: 'nothing really' }, { plans: CATALOGUE }), /1 to 365 whole days/);
+  assert.throws(() => normalizeSubscriptionAdjustment({ days: 400, reason: 'nothing really' }, { plans: CATALOGUE }), /1 to 365 whole days/);
+  assert.throws(() => normalizeSubscriptionAdjustment({ days: 7, endsAt: '2099-01-01T00:00:00.000Z', reason: 'belt and braces' }, { plans: CATALOGUE }), /either a number of days or an expiry date/);
+  assert.throws(() => normalizeSubscriptionAdjustment({ endsAt: '2000-01-01', reason: 'backdated favour' }, { plans: CATALOGUE }), /in the future/);
+  assert.throws(() => normalizeSubscriptionAdjustment({ endsAt: 'not a date', reason: 'backdated favour' }, { plans: CATALOGUE }), /not readable/);
+});
+
+test('support access is refused for the accounts where it would mislead', () => {
+  const target = { id: 'user-2', email: 'trader@example.com', isSuspended: false };
+  assert.equal(assertAllowedImpersonation({ actorId: 'admin-1', target }), undefined);
+  assert.throws(() => assertAllowedImpersonation({ actorId: 'admin-1', target: undefined }), /could not be found/);
+  assert.throws(() => assertAllowedImpersonation({ actorId: 'admin-1', target: { ...target, id: 'admin-1' } }), /your own account/);
+  assert.throws(() => assertAllowedImpersonation({ actorId: 'admin-1', target: { ...target, isSuspended: true } }), /suspended/);
+  try {
+    assertAllowedImpersonation({ actorId: 'admin-1', target: { ...target, isSuspended: true } });
+  } catch (error) {
+    assert.equal(error.status, 409, 'a refusal the panel can show without a guess');
+  }
 });

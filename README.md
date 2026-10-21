@@ -214,8 +214,64 @@ The panel provides:
 - User management table: search by name or email, change role, suspend with a required reason, and restore access. An admin cannot demote or suspend their own account.
 - Pricing & Plans: the active Starter, Pro, and Premium prices, how many subscribers a change would affect, whether each plan's Paystack plan is in sync (with its `PLN_…` code and last error), the per-plan price history, the two recurring-billing switches, a "Re-sync all plans with Paystack" action, and the promo-code creator: code, percentage or fixed discount, optional maximum uses, and optional expiry. Existing codes can be paused, re-activated, or deleted. Codes are applied at Paystack checkout, and their `current_uses` increment only after a verified payment.
 - Billing activity: active subscriptions, successful and pending payments, gross collected, discounts given, and the latest customer transactions.
+- System health: the platform switch, the execution queue, and the newest MetaAPI and Telegram errors, with the **global auto-trading kill switch** at the top of the tab.
+- Announcements: publish, correct, schedule, and retire the dashboard banner every signed-in user sees.
+- Audit log: who did what, with the admin's email address and the timestamp, filterable by action and searchable by address or wording.
 
-Suspension blocks new sign-ins with the stored reason. Existing JWT sessions on other devices remain valid until they expire (12 hours, or 30 days with "keep me signed in"), so revoke a role or suspend an account knowing that short window.
+Suspension blocks new sign-ins with the stored reason. Existing JWT sessions on other devices remain valid until they expire (12 hours, or 30 days with "keep me signed in"), so revoke a role or suspend an account knowing that short window. Suspending an account also closes any open support session on it.
+
+### Global auto-trading kill switch
+
+`AUTO_TRADING_RUNTIME_ENABLED` is read once when the process boots, so it can stop execution but it cannot be flipped while the service is running. The kill switch is the runtime half of that decision: it lives in `admin_settings` under `auto_trading_kill_switch`, and `processJob()` reads it from the database before it touches the broker and again immediately before it records a trade and sends the order. Turning it off therefore stops new trades for every workspace on the next job - no deploy, no restart - and the trade is never half-submitted.
+
+While it is engaged, eligible signals are skipped with the reason recorded on the job, so the user can read why in their own activity list. A database read that fails, or a stored value that cannot be understood, is treated as paused rather than as permission.
+
+Two things deliberately keep running, and both are stated in the panel rather than left to inference:
+
+- **Protective stop moves.** Break-even and trailing-stop updates continue, because removing a stop an open position already has in the middle of an incident increases risk. `settings.auto_trading_enabled` remains the switch that stops all broker writes for one workspace.
+- **Signal capture and review.** Telegram messages are still parsed and stored; the pause is about orders, not about data.
+
+Releasing the switch does not replay what the pause skipped - signals older than two minutes are refused by the freshness rule regardless.
+
+### System health and monitoring
+
+`GET /api/admin/health?hours=24&limit=25` reads the failure records the platform already writes, rather than a second copy of them: MetaAPI order outcomes on `trades` (`rejected`/`unknown` with an error message) and `execution_jobs` (`failed`/`unknown`, skipping a row whose trade already carries the failure so one incident is not listed twice), stop-move outcomes on `break_even_moves`, and Telegram parsing refusals on `signals.parse_error`. That means the tab is useful for incidents recorded before it existed, and there is no error table that can drift from the truth. The console log is not part of it: a server log is not queryable and gets rotated away.
+
+The response also carries `checks` - one label, headline, and sentence per area (switch, runtime, queue, and each error source). The wording is produced server-side so the panel cannot invent a reassuring sentence, and a section that could not be read reports `unknown`: it is never coloured as healthy. `errorsAvailable` distinguishes "nothing went wrong in this window" from "this could not be read".
+
+### Support access (impersonation)
+
+Each row in the user table has **Impersonate**, which opens a **one-hour read-only support session** on that workspace. The administrator supplies a reason; it is stored in the audit log. The session is a separate JWT carrying `purpose: 'impersonation'`, `sub` (the customer), and `act` (the admin); the customer's password is never read, reset, referenced, or needed, and nothing about them is written.
+
+The server enforces what the banner promises:
+
+- **One hour, twice over.** The signature expires in 60 minutes, and `support_sessions.expires_at` carries its own expiry, so neither can outlive the other.
+- **Revocable.** Only a SHA-256 hash of a random session id is stored. Closing the session - from the banner or `POST /api/admin/support/stop` - revokes the row and the token stops working on the next request.
+- **Read-only.** Every non-`GET` request with a support token is refused with 403, so nothing in the customer's workspace can be changed by accident; the only permitted write is the session closing itself (`POST /api/auth/support/exit`).
+- **Not an admin path.** `requireAdmin` rejects any request carrying a support session, even when the account being viewed is itself an administrator.
+- **Visible.** The browser holds the token in `sessionStorage` (so it dies with the tab), and the dashboard renders a bar naming the workspace being viewed with an **Exit support view** action.
+
+### Manual adjustments
+
+`PATCH /api/admin/users/:id/subscription` grants a plan, extends the expiry, or both, with a mandatory reason:
+
+- `plan` (`free`, `starter`, `pro`, `premium`) writes `users.subscription_plan`, `subscription_status`, and a `plan_limits` snapshot, and upserts the matching `subscriptions` row. Granting with `days` or `endsAt` honours that period instead of adding it on top of the plan interval, so "Pro for 14 days" means fourteen days.
+- `days` (1-365) or `endsAt` moves `subscriptions.current_period_end` from the later of now and the current end, so extending never shortens a paid period. A `canceled` or expired row is revived as `non_renewing` with `cancel_at_period_end` set - paid to the new date, but not silently re-subscribed.
+- Moving an account to `free` clears the paid plan and its period in one step.
+
+Paystack is not touched: the response says so, and says so again when a gateway subscription is attached, because that renewal keeps its own schedule until it is cancelled in Payments. Every adjustment is written to `admin_audit_logs` (`subscription.grant`, `subscription.extend`, `subscription.clear`).
+
+### Announcements
+
+`announcements` rows carry the message, a severity (`info`, `warning`, `critical`), an optional start and end window, and an active flag. A user's dashboard shows up to three live banners at the top of the workspace through `GET /api/announcements/active`, and dismissal is stored per user in `announcement_dismissals` - dismissing on one device does not dismiss it for anybody else, and it does not come back on reload. Retiring an announcement keeps the row (with its dismissal counts and audit trail) instead of deleting it. Severity only changes presentation, except `critical`, which is announced to screen readers as an alert.
+
+### Audit trail
+
+Every administrator mutation appends to `admin_audit_logs`: `pricing.update`, `pricing.sync`, `promo_code.create/update/delete`, `user.update`, `user.role`, `user.suspend`, `user.unsuspend`, `subscription.grant/extend/clear`, `execution.pause`, `execution.resume`, `announcement.publish/update/retire`, `impersonation.start`, and `impersonation.stop`. Each row holds the action, a plain-language summary, the target, the admin's email **as it was at the time** (denormalised on purpose, so renaming or deleting an account cannot rewrite history), scrubbed metadata, and the timestamp.
+
+There is no update or delete path for these rows, and metadata is stripped of credential-shaped keys and values before it is stored because the panel renders it in a browser. A failed audit write is logged as an error but never turns a successful admin action into an HTTP 500 - the alternative is an admin who cannot tell whether the price was saved.
+
+Fixing the catalogue exposed one latent schema bug: `subscriptions.plan_key` still checked `('free','pro','premium')` after Starter became purchasable, which would have rejected the row written when a Starter payment was verified. The constraint is now re-created idempotently to include `starter`.
 
 ## Backend environment variables
 
@@ -236,7 +292,7 @@ Suspension blocks new sign-ins with the stored reason. Existing JWT sessions on 
 | `PAYSTACK_CURRENCY` | No | Billing currency; defaults to `NGN` |
 | `PAYSTACK_PLAN_STARTER_AMOUNT` / `PAYSTACK_PLAN_PRO_AMOUNT` / `PAYSTACK_PLAN_PREMIUM_AMOUNT` | No | Fallback plan prices in kobo; the Admin Panel can override them at runtime |
 | `PAYSTACK_PLAN_INTERVAL` | No | Interval for Paystack plans; defaults to `monthly` |
-| `AUTO_TRADING_RUNTIME_ENABLED` | No | `true` enables the MetaAPI execution runtime (orders and break-even stop moves) |
+| `AUTO_TRADING_RUNTIME_ENABLED` | No | `true` enables the MetaAPI execution runtime (orders and break-even stop moves). It is read at boot and cannot change while the process runs - the Admin Panel's global kill switch is the runtime control, and it sits above this flag rather than replacing it |
 | `BREAK_EVEN_SWEEP_INTERVAL_MS` | No | Milliseconds between break-even sweeps; defaults to `5000` and never runs faster than every `1000` |
 | `INACTIVITY_CLEANUP_ENABLED` | No | `false` stops the idle-account sweep entirely; defaults to `true` |
 | `INACTIVITY_WARNING_DAYS` / `INACTIVITY_DELETION_DAYS` | No | Idle-account thresholds in days; default to `25` and `30`, and a pair where deletion does not come after the warning falls back to both defaults |
@@ -270,6 +326,12 @@ The static site is served over HTTPS and includes a linked web app manifest, 192
 - `GET /api/admin/overview`, `GET /api/admin/users`, `PATCH /api/admin/users/:id`
 - `GET/POST /api/admin/promo-codes`, `PATCH/DELETE /api/admin/promo-codes/:id`, `GET /api/admin/billing`
 - `GET/PUT /api/admin/pricing`, `POST /api/admin/pricing/sync` – admin-only plan prices, recurring-billing settings, and Paystack Plan Code synchronisation
+- `GET /api/admin/health`, `GET/PUT /api/admin/execution-switch` – recent MetaAPI and Telegram errors with queue state, and the global auto-trading kill switch
+- `GET /api/admin/audit-logs` – the append-only administrator audit trail (filter by action, search by admin email or wording)
+- `GET/POST /api/admin/announcements`, `PATCH/DELETE /api/admin/announcements/:id` – banner administration (`DELETE` retires; it does not delete)
+- `POST /api/admin/users/:id/impersonate`, `GET /api/admin/support-sessions`, `POST /api/admin/support/stop` – one-hour read-only support access; `POST /api/auth/support/exit` closes the caller's own session
+- `PATCH /api/admin/users/:id/subscription` – manual plan grant, expiry extension, or removal, with a mandatory reason
+- `GET /api/announcements/active`, `POST /api/announcements/:id/dismiss` – the dashboard banner and its per-user dismissal
 - `GET /api/billing/plans` – public plan catalogue
 - `GET /api/billing/subscription`, `GET /api/billing/quote`, `POST /api/billing/checkout`, `GET /api/billing/verify`, `POST /api/billing/cancel`, `POST /api/billing/resume`
 - `POST /api/billing/webhook` – Paystack callback, authenticated by signature only
@@ -277,7 +339,7 @@ The static site is served over HTTPS and includes a linked web app manifest, 192
 - `GET/POST /api/channels`, `DELETE /api/channels/:id`
 - `GET/POST /api/signals`
 - `GET/POST /api/accounts`, `DELETE /api/accounts/:id`
-- `GET/PUT /api/settings` – risk limits, lot sizing, selected execution account, and break-even trigger/offset
+- `GET/PUT /api/settings` – risk limits, lot sizing, selected execution account, break-even trigger/offset, and trailing distance; `GET` also reports the platform's own execution switch so the panel can explain a pause instead of leaving a user to hunt for a toggle that is already on
 - `GET /api/trades` – execution activity, including the break-even outcome for each position
 - `GET /api/metaapi/provisioning-status`, `GET /api/metaapi/linked-accounts` (each account also carries its idle age and warning state, plus the workspace's inactivity policy), `POST /api/metaapi/provisioned-accounts`, `POST /api/metaapi/provisioned-accounts/:accountId/configuration-link`, `POST /api/metaapi/provisioned-accounts/:accountId/refresh`, `DELETE /api/metaapi/accounts/:accountId`
 - `GET /api/telegram/status`, `POST /api/telegram/request-code`, `POST /api/telegram/verify-code`, `POST /api/telegram/verify-password`, `GET /api/telegram/chats`, `POST /api/telegram/disconnect`

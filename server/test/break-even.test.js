@@ -656,3 +656,15 @@ test('a trail reads the quote, the position, and the spec from one account read'
   const insert = moveInsert(harness.pool);
   assert.equal(insert, undefined, 'a wait writes nothing at all');
 });
+
+/* A platform-wide pause is an emergency brake on *new* exposure. Positions that are already open
+ * keep their protection, because taking a safety net away in the middle of an incident is the
+ * opposite of what a pause is for - so the sweep deliberately never consults the switch. */
+test('a platform pause stops new orders but never stops protective stop moves', async () => {
+  let asked = 0;
+  const harness = buildEngine({ engine: { isTradingPaused: async () => { asked += 1; return true; } } });
+  const result = await harness.engine.sweepBreakEven();
+  assert.deepEqual({ attempted: result.attempted, moved: result.moved }, { attempted: 1, moved: 1 });
+  assert.equal(harness.trading.calls.some((call) => call.method === 'modifyPosition'), true);
+  assert.equal(asked, 0, 'the sweep does not even ask');
+});
