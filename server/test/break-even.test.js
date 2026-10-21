@@ -240,7 +240,9 @@ test('the candidate query is the guard: opt-in settings, an eligible account, an
   assert.match(sql, /m\.status IN \('deferred','failed'\)/, 'a terminal result is never retried');
   assert.match(sql, /m\.attempt_count < \$2/);
   assert.match(sql, /m\.next_attempt_at IS NULL OR m\.next_attempt_at <= NOW\(\)/);
-  assert.deepEqual(params, [String(30), BREAK_EVEN_MAX_ATTEMPTS, 20]);
+  assert.match(sql, /JOIN users u ON u\.id=t\.user_id/);
+  assert.match(sql, /u\.subscription_status = ANY\(\$4::text\[\]\)/, 'automation, including stop protection, requires a paid plan');
+  assert.deepEqual(params, [String(30), BREAK_EVEN_MAX_ATTEMPTS, 20, ['active', 'non_renewing']]);
 });
 
 test('a second sweep inside the interval does no work at all', async () => {

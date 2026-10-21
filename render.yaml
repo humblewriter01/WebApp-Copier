@@ -39,17 +39,29 @@ services:
         value: "true"
       - key: BREAK_EVEN_SWEEP_INTERVAL_MS
         value: "5000"
+      # Idle MetaAPI account cleanup: warn on day 25, delete on day 30. Accounts are
+      # never slept or undeployed, only deleted once nobody is using them; paid
+      # subscribers and accounts with open positions are skipped.
+      - key: INACTIVITY_CLEANUP_ENABLED
+        value: "true"
+      - key: INACTIVITY_WARNING_DAYS
+        value: "25"
+      - key: INACTIVITY_DELETION_DAYS
+        value: "30"
       - key: PAYSTACK_SECRET_KEY
         sync: false
       - key: PAYSTACK_CURRENCY
         value: NGN
-      # Fallback prices only: the active Pro/Premium prices are stored in the
+      # Fallback prices only: the active Starter/Pro/Premium prices are stored in the
       # admin_settings table and managed from Admin Panel -> Pricing & Plans, which
       # also re-syncs the matching Paystack Plan Code so renewals use the new amount.
+      # These defaults are priced against the per-account cost MetaAPI bills.
+      - key: PAYSTACK_PLAN_STARTER_AMOUNT
+        value: "6000000"
       - key: PAYSTACK_PLAN_PRO_AMOUNT
-        value: "250000"
+        value: "10500000"
       - key: PAYSTACK_PLAN_PREMIUM_AMOUNT
-        value: "600000"
+        value: "15000000"
       - key: PAYSTACK_PLAN_INTERVAL
         value: monthly
   - type: web

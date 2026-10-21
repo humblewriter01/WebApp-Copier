@@ -30,10 +30,26 @@ test('plans expose defaults, overrides, and never leak the secret key', () => {
   assert.equal(config.configured, true);
 
   const plans = publicPlans(config);
-  assert.equal(plans.length, 2);
-  assert.equal(plans[0].amount, 1500);
+  assert.deepEqual(plans.map((plan) => plan.key), ['starter', 'pro', 'premium']);
+  assert.deepEqual(plans.map((plan) => plan.amountMinor), [6_000_000, 150_000, 15_000_000]);
+  assert.equal(plans[2].amount, 150_000);
   assert.equal(JSON.stringify(plans).includes('sk_test_secret'), false);
   assert.equal(JSON.stringify(plans).includes('pk_test_public'), false);
+});
+
+test('the catalogue is one free tier and three paid tiers priced against MetaAPI cost', () => {
+  assert.deepEqual(Object.keys(PLAN_DEFINITIONS), ['starter', 'pro', 'premium']);
+  assert.deepEqual(
+    Object.fromEntries(Object.values(PLAN_DEFINITIONS).map((plan) => [plan.key, [plan.defaultAmountMinor, plan.limits.maxTradingAccounts, plan.limits.maxTelegramChannels, plan.limits.maxDailySignals]])),
+    {
+      starter: [6_000_000, 1, 10, 200],
+      pro: [10_500_000, 3, 50, 500],
+      premium: [15_000_000, 5, 100, 2000],
+    },
+  );
+  assert.equal(FREE_PLAN.limits.maxTradingAccounts, 0, 'Free must not be able to connect an account to execute on');
+  assert.equal(FREE_PLAN.limits.maxTelegramChannels, 1);
+  assert.equal(FREE_PLAN.limits.maxDailySignals, 50);
 });
 
 test('an unconfigured workspace reports no payment support', () => {
@@ -109,19 +125,37 @@ test('transaction payloads are reduced to safe fields', () => {
 
 test('plan limits fall back to free for inactive subscriptions', () => {
   assert.deepEqual(planLimitsFor({ subscription_status: 'free', subscription_plan: 'free' }), FREE_PLAN.limits);
+  assert.deepEqual(planLimitsFor({ subscription_status: 'active', subscription_plan: 'starter' }), PLAN_DEFINITIONS.starter.limits);
   assert.deepEqual(planLimitsFor({ subscription_status: 'active', subscription_plan: 'pro' }), PLAN_DEFINITIONS.pro.limits);
+  assert.deepEqual(planLimitsFor({ subscription_status: 'non_renewing', subscription_plan: 'premium' }), PLAN_DEFINITIONS.premium.limits);
   assert.deepEqual(planLimitsFor({ subscription_status: 'canceled', subscription_plan: 'premium' }), FREE_PLAN.limits);
-  assert.equal(planLimitsFor({ subscription_status: 'active', subscription_plan: 'premium', plan_limits: { maxTradingAccounts: 99, unexpected: 5 } }).maxTradingAccounts, 99);
+  assert.deepEqual(planLimitsFor({ subscription_status: 'expired', subscription_plan: 'premium' }), FREE_PLAN.limits);
+});
+
+test('the deployed tier outranks a stale purchase snapshot', () => {
+  // Re-pricing or re-limiting a plan must not leave existing subscribers on allowances
+  // the catalogue no longer advertises. A stored snapshot still carries a retired plan
+  // key, so a purchase is never reduced to free by an unrelated catalogue edit.
+  assert.equal(planLimitsFor({ subscription_status: 'active', subscription_plan: 'premium', plan_limits: { maxTradingAccounts: 99 } }).maxTradingAccounts, 5);
+  assert.equal(planLimitsFor({ subscription_status: 'active', subscription_plan: 'legacy', plan_limits: { maxTradingAccounts: 99 } }).maxTradingAccounts, 99);
   assert.equal(planLimitsFor({ subscription_status: 'active', subscription_plan: 'premium', plan_limits: { unexpected: 5 } }).maxTradingAccounts, PLAN_DEFINITIONS.premium.limits.maxTradingAccounts);
+  // Zero is a limit, not "unset", and must survive a stored snapshot.
+  assert.equal(planLimitsFor({ subscription_status: 'active', subscription_plan: 'legacy', plan_limits: { maxTradingAccounts: 0 } }).maxTradingAccounts, 0);
 });
 
 test('plan limit errors describe the allowance and request an upgrade', () => {
-  const error = buildLimitError({ limitKey: 'maxTradingAccounts', limit: 1, planKey: 'free' });
+  const error = buildLimitError({ limitKey: 'maxTradingAccounts', limit: 1, planKey: 'starter' });
   assert.equal(error.status, 402);
   assert.equal(error.code, 'PLAN_LIMIT_REACHED');
   assert.equal(error.upgradeRequired, true);
-  assert.match(error.message, /1 connected trading accounts/);
-  assert.match(error.message, /Upgrade/);
+  assert.equal(error.message, 'Your Starter plan allows 1 connected trading accounts. Upgrade your plan to add more.');
+});
+
+test('a limit of zero is announced as not included rather than zero allowance', () => {
+  const error = buildLimitError({ limitKey: 'maxTradingAccounts', limit: 0, planKey: 'free' });
+  assert.equal(error.status, 402);
+  assert.equal(error.upgradeRequired, true);
+  assert.equal(error.message, 'The Free plan does not include connected trading accounts. Upgrade to Starter or higher to add one.');
 });
 
 test('billing intervals convert to durations', () => {

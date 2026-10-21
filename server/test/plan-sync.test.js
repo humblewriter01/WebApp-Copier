@@ -254,6 +254,7 @@ test('syncAll walks every configured plan exactly once', async () => {
     fetchPlan: ({ idOrCode }) => providerPlan({ planCode: idOrCode, amountMinor: amounts.get(idOrCode) ?? 0 }),
   });
   const plans = new Map([
+    ['starter', proPlan({ key: 'starter', name: 'Starter', amountMinor: 60_000, description: 'One automated account.' })],
     ['pro', proPlan()],
     ['premium', proPlan({ key: 'premium', name: 'Premium', amountMinor: 600_000 })],
   ]);
@@ -264,9 +265,13 @@ test('syncAll walks every configured plan exactly once', async () => {
     logger: silentLogger,
   });
   const results = await sync.syncAll({});
-  assert.deepEqual(results.map((result) => result.planKey), ['pro', 'premium']);
-  assert.deepEqual(paystack.calls.filter((call) => call.name === 'createPlan').map((call) => call.args.amountMinor), [300_000, 600_000]);
-  assert.deepEqual(results.map((result) => result.status), ['synced', 'synced'], 'each plan is verified against its own price');
+  // Three paid tiers, one provider plan each, and no free plan to push.
+  assert.deepEqual(results.map((result) => result.planKey), ['starter', 'pro', 'premium']);
+  assert.deepEqual(paystack.calls.filter((call) => call.name === 'createPlan').map((call) => call.args.amountMinor), [60_000, 300_000, 600_000]);
+  assert.deepEqual(paystack.calls.filter((call) => call.name === 'createPlan').map((call) => call.args.name), [
+    'Signal Desk Starter (monthly)', 'Signal Desk Pro (monthly)', 'Signal Desk Premium (monthly)',
+  ], 'each tier gets its own Paystack plan name');
+  assert.deepEqual(results.map((result) => result.status), ['synced', 'synced', 'synced'], 'each plan is verified against its own price');
   const subset = await sync.syncAll({ planKeys: ['premium'] });
   assert.deepEqual(subset.map((result) => result.planKey), ['premium']);
 });
@@ -358,4 +363,20 @@ test('an unconfigured client refuses plan and subscription calls before any netw
   await assert.rejects(client.fetchPlan('PLN_1'), /not configured/i);
   await assert.rejects(client.disableSubscription('SUB_1'), /not configured/i);
   assert.equal(fetched, 0);
+});
+
+test('the synced plan list comes from the catalogue, not a hard-coded pair', async () => {
+  const keys = (config.plans || []).map((plan) => plan.key);
+  assert.deepEqual(keys, ['starter', 'pro', 'premium'], 'billing.js is the single source of truth');
+  const paystack = fakePaystack({ createPlan: (input) => providerPlan({ planCode: `PLN_${input.name}`, name: input.name, amountMinor: input.amountMinor }), fetchPlan: ({ idOrCode }) => providerPlan({ planCode: idOrCode }) });
+  const sync = createPlanSynchronizer({
+    paystack,
+    pricing: { async planFor(key) { const plan = config.plans.find((entry) => entry.key === String(key)); return plan ? proPlan({ key: plan.key, name: plan.name, amountMinor: plan.amountMinor }) : null; }, async recordPlanSync() { return null; } },
+    config,
+    logger: silentLogger,
+  });
+  const results = await sync.syncAll({});
+  assert.equal(results.length, keys.length);
+  assert.deepEqual(results.map((result) => result.planKey), keys);
+  assert.deepEqual(results.map((result) => result.amountMinor), config.plans.map((plan) => plan.amountMinor));
 });

@@ -1,6 +1,23 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { request } from '../lib/api.js';
 
+/** Cheapest to most expensive, used to offer the next step up rather than a fixed plan. */
+export const PLAN_ORDER = Object.freeze(['free', 'starter', 'pro', 'premium']);
+
+export function nextPlanKey(current, plans = []) {
+  const keys = (plans || []).map((plan) => plan.key);
+  const rank = (key) => PLAN_ORDER.indexOf(String(key || 'free'));
+  const from = rank(current);
+  return keys.filter((key) => rank(key) > (from === -1 ? -1 : from))[0] || keys[keys.length - 1] || PLAN_ORDER[1];
+}
+
+/** Zero is a real allowance on Free, and "0 trading accounts" reads like a bug. */
+function accountAllowance(limit) {
+  const value = Number(limit);
+  if (!Number.isFinite(value)) return '1 trading account';
+  return value === 0 ? 'No trading accounts' : `${value} trading account${value === 1 ? '' : 's'}`;
+}
+
 function formatMoney(amountMinor, currency = 'NGN') {
   const value = Number(amountMinor || 0) / 100;
   try {
@@ -32,7 +49,7 @@ export default function BillingPage({ token }) {
   const [promoCode, setPromoCode] = useState('');
   const [quote, setQuote] = useState(null);
   const [quoteError, setQuoteError] = useState('');
-  const [selectedPlan, setSelectedPlan] = useState('pro');
+  const [selectedPlan, setSelectedPlan] = useState('starter');
   const [busy, setBusy] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -47,8 +64,10 @@ export default function BillingPage({ token }) {
       ]);
       setPlans(plansData.plans || []);
       setData(subscriptionData);
+      // Offer the next tier up, so a free user is shown Starter rather than the top plan.
       const current = subscriptionData?.subscription?.plan;
-      setSelectedPlan(current === 'pro' ? 'premium' : 'pro');
+      const next = nextPlanKey(current, plansData.plans || []);
+      if (next) setSelectedPlan(next);
     } catch (loadError) {
       setError(loadError.message);
     } finally {
@@ -138,13 +157,13 @@ export default function BillingPage({ token }) {
           <strong className="billing-plan-name">{subscription?.planName || 'Free'}</strong>
           <p className="muted">
             {currentPlan === 'free'
-              ? 'Core signal capture and review. Upgrade to add more trading accounts and channels.'
+              ? 'Signal capture and review only. Automated execution and trading accounts need a paid plan.'
               : `Renews ${subscription?.cancelAtPeriodEnd ? 'until' : 'every period ending'} ${formatDate(subscription?.currentPeriodEnd)}.`}
           </p>
         </div>
         <div className="billing-limit-list">
-          <span>{data?.limits?.maxTradingAccounts ?? 1} trading accounts</span>
-          <span>{data?.limits?.maxTelegramChannels ?? 3} Telegram channels</span>
+          <span>{accountAllowance(data?.limits?.maxTradingAccounts)}</span>
+          <span>{data?.limits?.maxTelegramChannels ?? 1} Telegram channels</span>
         </div>
       </div>
       {currentPlan !== 'free' && <div className="button-row billing-actions">
@@ -159,9 +178,9 @@ export default function BillingPage({ token }) {
       <div className="panel-heading"><div><p className="eyebrow">PLANS</p><h2 id="plans-title">Choose a plan</h2></div></div>
       <div className="billing-plan-grid">
         <article className={`billing-plan-card ${currentPlan === 'free' ? 'current' : ''}`}>
-          <header><h3>Free</h3><p>Start monitoring signals.</p></header>
+          <header><h3>Free</h3><p>Monitor signals without automating a broker account.</p></header>
           <p className="billing-price">{formatMoney(0, currency)}<span>/month</span></p>
-          <ul><li>1 trading account</li><li>3 Telegram channels</li><li>Signal capture and review</li></ul>
+          <ul><li className="billing-plan-absent">No trading accounts</li><li>1 Telegram channel</li><li>50 signals per day</li><li className="billing-plan-absent">No automated execution</li></ul>
           <button type="button" className="button button-secondary" disabled>{currentPlan === 'free' ? 'Current plan' : 'Included'}</button>
         </article>
         {plans.map((plan) => {

@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { countSignalEntryDeals as countDailySignalEntryDeals, resolveBrokerSymbol } from './signal-parser.js';
+import { isPaidSubscriber, PAID_STATUSES } from './plan-limits.js';
 
 const MAX_SIGNAL_AGE_MS = 120_000;
 const UTC_DAY_MS = 24 * 60 * 60 * 1000;
@@ -329,10 +330,12 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
                 s.execution_ready,s.parse_error,
                 st.auto_trading_enabled,st.lot_size_mode,st.fixed_lot_size,st.risk_percent,st.max_open_positions,
                 st.max_daily_trades,st.daily_loss_limit,st.execution_account_id,
-                ma.metaapi_account_id,ma.managed_by_app,ma.state AS account_state
+                ma.metaapi_account_id,ma.managed_by_app,ma.state AS account_state,
+                u.subscription_status,u.subscription_plan
          FROM execution_jobs ej
          JOIN signals s ON s.id=ej.signal_id AND s.user_id=ej.user_id
          JOIN settings st ON st.user_id=ej.user_id
+         JOIN users u ON u.id=ej.user_id
          LEFT JOIN metaapi_accounts ma ON ma.user_id=ej.user_id AND ma.metaapi_account_id=st.execution_account_id
          WHERE ej.id=$1 AND ej.user_id=$2 LIMIT 1`,
         [job.id, job.user_id],
@@ -342,6 +345,12 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
       if (!runtimeEnabled) return stop(job, 'skipped', 'Automatic execution is unavailable on this service.');
       if (item.auto_trading_enabled !== true) return stop(job, 'skipped', 'Auto-Trading is off.');
       if (item.source !== 'telegram' || item.execution_ready !== true) return stop(job, 'skipped', item.parse_error || 'This message is not eligible for automatic execution.');
+      // Free is signal review only: no plan, no execution. This is also what makes the
+      // free tier's zero trading-account limit mean something, because a link that
+      // predates the change can still be selected but can no longer trade.
+      if (!isPaidSubscriber({ subscription_status: item.subscription_status })) {
+        return stop(job, 'skipped', 'Automatic execution needs a paid plan, so this signal was saved for review only.');
+      }
       const createdAt = new Date(item.signal_created_at).getTime();
       if (!Number.isFinite(createdAt) || now() - createdAt > MAX_SIGNAL_AGE_MS || now() < createdAt - 30_000) return stop(job, 'expired', 'This signal was too old to execute safely.');
       if (!item.execution_account_id || item.execution_account_id !== item.metaapi_account_id) return stop(job, 'skipped', 'Select an owned connected trading account in Execution Settings.');
@@ -441,6 +450,9 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
         [providerResponse, result?.orderId ? String(result.orderId) : null, result?.positionId ? String(result.positionId) : null, tradeId, job.user_id],
       );
       await updateJob(job.id, job.user_id, 'executed', null);
+      // Executing for a user counts as activity, so an account that is trading is never
+      // swept up by the inactivity policy.
+      await pool.query('UPDATE users SET last_active_at=NOW() WHERE id=$1', [job.user_id]).catch(() => {});
       return { status: 'executed', tradeId, providerResponse };
     } catch (error) {
       const message = safeText(error?.message || error, [token]);
@@ -466,12 +478,14 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
               ma.managed_by_app
        FROM trades t
        JOIN settings s ON s.user_id=t.user_id
+       JOIN users u ON u.id=t.user_id
        JOIN metaapi_accounts ma ON ma.user_id=t.user_id AND ma.metaapi_account_id=t.metaapi_account_id
        LEFT JOIN break_even_moves m
          ON m.user_id=t.user_id AND m.metaapi_account_id=t.metaapi_account_id AND m.broker_position_id=t.broker_position_id
        WHERE t.status='executed' AND t.broker_position_id IS NOT NULL
          AND s.break_even_enabled=TRUE AND s.auto_trading_enabled=TRUE AND s.execution_account_id=t.metaapi_account_id
          AND UPPER(COALESCE(ma.state,''))='DEPLOYED'
+         AND u.subscription_status = ANY($4::text[])
          AND t.created_at >= NOW() - ($1::text || ' days')::interval
          AND (m.id IS NULL
               OR (m.status IN ('deferred','failed')
@@ -479,7 +493,7 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
                   AND (m.next_attempt_at IS NULL OR m.next_attempt_at <= NOW())))
        ORDER BY t.created_at ASC
        LIMIT $3`,
-      [String(BREAK_EVEN_TRACKING_DAYS), Number(breakEvenMaxAttempts) || BREAK_EVEN_MAX_ATTEMPTS, BREAK_EVEN_SWEEP_LIMIT],
+      [String(BREAK_EVEN_TRACKING_DAYS), Number(breakEvenMaxAttempts) || BREAK_EVEN_MAX_ATTEMPTS, BREAK_EVEN_SWEEP_LIMIT, [...PAID_STATUSES]],
     );
     return rows;
   }

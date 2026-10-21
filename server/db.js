@@ -194,6 +194,33 @@ export async function initializeDatabase() {
     );
     CREATE INDEX IF NOT EXISTS break_even_moves_retry_idx ON break_even_moves(status, next_attempt_at);
     ALTER TABLE break_even_moves ENABLE ROW LEVEL SECURITY;
+    /* Inactivity cleanup for MetaAPI accounts the workspace pays for. */
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ;
+    UPDATE users SET last_active_at = COALESCE(last_login, created_at, NOW()) WHERE last_active_at IS NULL;
+    ALTER TABLE metaapi_accounts ADD COLUMN IF NOT EXISTS inactivity_status TEXT NOT NULL DEFAULT 'none';
+    ALTER TABLE metaapi_accounts ADD COLUMN IF NOT EXISTS inactivity_for TIMESTAMPTZ;
+    ALTER TABLE metaapi_accounts ADD COLUMN IF NOT EXISTS inactivity_checked_at TIMESTAMPTZ;
+    ALTER TABLE metaapi_accounts ADD COLUMN IF NOT EXISTS inactivity_reason TEXT;
+    ALTER TABLE metaapi_accounts ADD COLUMN IF NOT EXISTS inactivity_attempts INTEGER NOT NULL DEFAULT 0;
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'metaapi_accounts_inactivity_status_check' AND conrelid = 'metaapi_accounts'::regclass) THEN
+        ALTER TABLE metaapi_accounts ADD CONSTRAINT metaapi_accounts_inactivity_status_check CHECK (inactivity_status IN ('none', 'warned', 'deferred', 'failed'));
+      END IF;
+    END $$;
+    CREATE INDEX IF NOT EXISTS metaapi_accounts_inactivity_idx ON metaapi_accounts(inactivity_status, inactivity_checked_at) WHERE managed_by_app = TRUE;
+    CREATE TABLE IF NOT EXISTS account_activity_notices (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      metaapi_account_id TEXT,
+      kind TEXT NOT NULL,
+      days_inactive INTEGER NOT NULL DEFAULT 0,
+      account_name TEXT,
+      message TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT account_activity_notices_kind_check CHECK (kind IN ('warning', 'deferred', 'deleted', 'failed'))
+    );
+    CREATE INDEX IF NOT EXISTS account_activity_notices_user_idx ON account_activity_notices(user_id, created_at DESC);
+    ALTER TABLE account_activity_notices ENABLE ROW LEVEL SECURITY;
     CREATE TABLE IF NOT EXISTS telegram_login_attempts (
       user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       encrypted_state TEXT NOT NULL,

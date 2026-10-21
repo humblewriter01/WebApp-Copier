@@ -9,6 +9,33 @@ function accountStateLabel(state) {
   return normalized.toLowerCase().replaceAll('_', ' ').replace(/^./, (character) => character.toUpperCase());
 }
 
+/**
+ * Idle-state copy for accounts Signal Desk pays for. A user with a paid plan is never
+ * warned, because their accounts are exempt from the inactivity deletion.
+ */
+export function idleWarnings({ accounts = [], inactivity = null } = {}) {
+  if (!inactivity || inactivity.exempt) return [];
+  const deletionDays = Number(inactivity.deletionDays) || 30;
+  return accounts
+    .filter((account) => account.managedByApp && (account.inactivityStatus === 'warned' || account.inactivityStatus === 'deferred'))
+    .map((account) => {
+      const name = account.name || account.login || 'Trading account';
+      const days = Number(account.daysInactive || 0);
+      if (account.inactivityStatus === 'deferred') {
+        return {
+          id: account.metaApiAccountId,
+          tone: 'info',
+          text: `"${name}" has been idle for ${days} days but was not deleted. ${account.inactivityReason || 'Close any open positions and remove it yourself when you are ready.'}`,
+        };
+      }
+      return {
+        id: account.metaApiAccountId,
+        tone: 'alert',
+        text: `"${name}" has been inactive for ${days} days and will be permanently deleted in ${Math.max(1, deletionDays - days)} days. Sign in or run a trade to keep it.`,
+      };
+    });
+}
+
 export default function MetaApiPanel({ token }) {
   const [available, setAvailable] = useState(false);
   const [accounts, setAccounts] = useState([]);
@@ -18,6 +45,7 @@ export default function MetaApiPanel({ token }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [inactivity, setInactivity] = useState(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -29,6 +57,7 @@ export default function MetaApiPanel({ token }) {
       ]);
       setAvailable(Boolean(status.available));
       setAccounts(linked.accounts || []);
+      setInactivity(linked.inactivity || null);
     } catch (requestError) {
       setError(requestError.message || 'We could not load your trading accounts. Please try again.');
     } finally {
@@ -126,6 +155,7 @@ export default function MetaApiPanel({ token }) {
   };
 
   const provisionedAccounts = accounts.filter((account) => account.managedByApp);
+  const warnings = idleWarnings({ accounts, inactivity });
   const previouslyLinkedAccounts = accounts.filter((account) => !account.managedByApp);
 
   return <div className="panel-grid">
@@ -151,6 +181,11 @@ export default function MetaApiPanel({ token }) {
         <small className="field-help">Use the exact server name shown by your broker. For monitoring, choose an investor/read-only password on MetaAPI if your broker offers one.</small>
         <button className="button button-primary" type="submit" disabled={busy || loading || !form.name.trim() || !form.server.trim()}>{busy ? 'Preparing secure setup…' : 'Create secure setup link'}</button>
       </form> : <div className="empty-state compact-empty"><strong>Account setup is not available yet</strong><span>Please ask the workspace owner to finish setting up account connections.</span></div>}
+      <p className="field-help account-idle-policy">
+        Idle accounts are cleaned up automatically: if nobody signs in or trades for {inactivity?.deletionDays || 30} days, an account created here is deleted from MetaAPI so
+        it stops being billed, with a warning here on day {inactivity?.warningDays || 25}. Accounts with an open position are left for you to close, and a paid plan is never
+        swept. Sign in, save execution settings, or execute a signal to reset the clock.
+      </p>
       <div className="note-box">Adding an account does not place a trade by itself. Auto-Trading is ON by default for new workspaces; after you select a deployed account, new eligible Telegram signals may place orders. Turn it off in Risk Settings to stop new orders. MetaAPI usage limits or charges may apply when a trading account is connected.</div>
     </section>
 
@@ -177,6 +212,11 @@ export default function MetaApiPanel({ token }) {
           <div><strong>{account.name || account.login || 'Trading account'}</strong><small>{[account.platform?.toUpperCase(), account.login && `Login ${account.login}`, account.state && accountStateLabel(account.state), 'Previously connected'].filter(Boolean).join(' · ')}</small></div>
           <div className="account-actions"><button type="button" className="icon-button" disabled={busy} onClick={() => removeAccount(account)}>Unlink</button></div>
         </div>)}
+      </div>}
+      {warnings.length > 0 && <div className="idle-warning-card" role="alert" aria-live="assertive">
+        <strong>{warnings.length === 1 ? 'An idle trading account is scheduled for deletion' : `${warnings.length} idle trading accounts are scheduled for deletion`}</strong>
+        <ul>{warnings.map((warning) => <li key={warning.id}>{warning.text}</li>)}</ul>
+        <p>Log in to Signal Desk or execute a trade to keep the account. Accounts that are removed cannot be recovered, and your broker account itself is not touched.</p>
       </div>}
       {(error || notice) && <div className={`alert ${error ? 'alert-error' : 'alert-success'}`} role={error ? 'alert' : 'status'} aria-live="polite">{error || notice}</div>}
       <p className="field-help account-retention-note">Removing an account you created here deletes it from MetaAPI as well, so provider billing for it stops. Your broker account, open positions, and orders already sent are not affected. Accounts you added with your own MetaAPI token are only unlinked.</p>

@@ -1,36 +1,53 @@
 import crypto from 'node:crypto';
 
 /**
- * Paystack billing plans.
+ * Paystack billing plans: one free tier plus three paid tiers.
  *
- * Prices are configured with environment variables so the deployed amounts can
- * change without a code change: `PAYSTACK_PLAN_<KEY>_AMOUNT` overrides the amount
- * in the smallest currency unit (kobo for NGN). Checkout is a verified one-time
- * Paystack charge; Signal Desk tracks the paid period and asks the user to renew
- * when it ends, so no Paystack plan code is required.
+ * `defaultAmountMinor` is only the deployed default. The active price for each paid
+ * plan lives in `admin_settings` and is managed from Admin Panel -> Pricing & Plans,
+ * which also keeps the matching Paystack Plan Code in step so renewals use the saved
+ * price. `PAYSTACK_PLAN_<KEY>_AMOUNT` overrides the fallback in the smallest currency
+ * unit (kobo for NGN).
+ *
+ * Limits are the deployed truth for a tier: `users.plan_limits` keeps the snapshot that
+ * was purchased, and `plan-limits.js` lets the definition below win, so re-pricing a
+ * tier does not silently leave old subscribers with limits nobody advertises any more.
  */
 export const PLAN_DEFINITIONS = Object.freeze({
+  starter: Object.freeze({
+    key: 'starter',
+    name: 'Starter',
+    description: 'One automated trading account with room for the channels you actually follow.',
+    defaultAmountMinor: 6_000_000,
+    limits: Object.freeze({ maxTradingAccounts: 1, maxTelegramChannels: 10, maxDailySignals: 200 }),
+  }),
   pro: Object.freeze({
     key: 'pro',
     name: 'Pro',
-    description: 'Higher limits for active traders with automated execution.',
-    defaultAmountMinor: 250_000,
-    limits: Object.freeze({ maxTradingAccounts: 5, maxTelegramChannels: 25, maxDailySignals: 500 }),
+    description: 'A few accounts and busier channels for active traders who automate.',
+    defaultAmountMinor: 10_500_000,
+    limits: Object.freeze({ maxTradingAccounts: 3, maxTelegramChannels: 50, maxDailySignals: 500 }),
   }),
   premium: Object.freeze({
     key: 'premium',
     name: 'Premium',
-    description: 'The highest limits for running multiple accounts and busy channels.',
-    defaultAmountMinor: 600_000,
-    limits: Object.freeze({ maxTradingAccounts: 15, maxTelegramChannels: 100, maxDailySignals: 2000 }),
+    description: 'The highest limits for running several accounts and busy channels.',
+    defaultAmountMinor: 15_000_000,
+    limits: Object.freeze({ maxTradingAccounts: 5, maxTelegramChannels: 100, maxDailySignals: 2000 }),
   }),
 });
 
+/**
+ * The free tier reads signals only. `maxTradingAccounts: 0` is deliberate and is a
+ * real limit, not "unset": nobody can connect a trading account on Free, so there is
+ * nothing for Auto-Trading to execute on. Accounts linked while a paid plan was active
+ * stay connected and usable for review; only new links are refused.
+ */
 export const FREE_PLAN = Object.freeze({
   key: 'free',
   name: 'Free',
-  description: 'Core signal capture, review, and execution controls.',
-  limits: Object.freeze({ maxTradingAccounts: 1, maxTelegramChannels: 3, maxDailySignals: 50 }),
+  description: 'Signal capture and review, with no automated execution.',
+  limits: Object.freeze({ maxTradingAccounts: 0, maxTelegramChannels: 1, maxDailySignals: 50 }),
 });
 
 export const DEFAULT_CURRENCY = 'NGN';

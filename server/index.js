@@ -27,7 +27,11 @@ import { createPaystackClient } from './services/paystack.js';
 import { createBillingService } from './services/billing-service.js';
 import { createPricingStore, normalizePricingUpdate, normalizeBillingSettings, planChargeDecision, publicPricing } from './services/pricing.js';
 import { createPlanSynchronizer } from './services/plan-sync.js';
-import { planLimitsFor, buildLimitError } from './services/plan-limits.js';
+import { planLimitsFor, buildLimitError, isPaidSubscriber } from './services/plan-limits.js';
+import {
+  createInactivityService, daysInactiveSince,
+  INACTIVITY_WARNING_DAYS, INACTIVITY_DELETION_DAYS, INACTIVITY_SWEEP_LIMIT,
+} from './services/inactivity.js';
 
 const app = express();
 app.set('trust proxy', 1);
@@ -164,6 +168,41 @@ const executionEngine = createExecutionEngine({
   logger: console,
 });
 const executionWorker = createExecutionWorker({ pool, engine: executionEngine, logger: console });
+
+/* Abandoned MetaAPI accounts keep billing the workspace forever, so idle ones are
+ * warned about on day 25 and deleted on day 30. Accounts stay deployed the whole time
+ * (execution must never wait for a wake-up); only genuinely unused accounts go. */
+function readInactivityConfig(env = process.env) {
+  const enabled = String(env.INACTIVITY_CLEANUP_ENABLED ?? 'true').trim().toLowerCase() !== 'false';
+  let warningDays = Math.max(1, Number(env.INACTIVITY_WARNING_DAYS) || INACTIVITY_WARNING_DAYS);
+  let deletionDays = Math.max(2, Number(env.INACTIVITY_DELETION_DAYS) || INACTIVITY_DELETION_DAYS);
+  // Warning after the deletion date would promise a countdown that has already run out,
+  // so a misconfigured pair falls back to the shipped policy rather than trusting it.
+  if (deletionDays <= warningDays) {
+    log('warn', 'INACTIVITY_DELETION_DAYS must be greater than INACTIVITY_WARNING_DAYS; using the default policy', { warningDays, deletionDays });
+    warningDays = INACTIVITY_WARNING_DAYS;
+    deletionDays = INACTIVITY_DELETION_DAYS;
+  }
+  const sweepLimit = Math.max(1, Number(env.INACTIVITY_SWEEP_LIMIT) || INACTIVITY_SWEEP_LIMIT);
+  return Object.freeze({ enabled, warningDays, deletionDays, sweepLimit });
+}
+const inactivityConfig = readInactivityConfig();
+const inactivityService = createInactivityService({
+  pool,
+  trading: tradingAdapter,
+  accountCleanup,
+  // Only workspace-provisioned accounts are eligible, and those are always billed to
+  // the server's provisioning token, which is the only token this sweep may use.
+  resolveToken: async () => getMetaApiProvisioningToken(),
+  warningDays: inactivityConfig.warningDays,
+  deletionDays: inactivityConfig.deletionDays,
+  sweepLimit: inactivityConfig.sweepLimit,
+  logger: {
+    info: (message, extra = {}) => log('info', message, extra),
+    warn: (message, extra = {}) => log('warn', message, extra),
+    error: (message, extra = {}) => log('error', message, extra),
+  },
+});
 
 async function saveSignal(userId, message, channel = {}) {
   const parsed = parseSignal(message);
@@ -353,7 +392,8 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
       suspensionReason: String(rows[0].suspension_reason || '').slice(0, 200) || null,
     });
   }
-  await pool.query('UPDATE users SET last_login=NOW() WHERE id=$1', [rows[0].id]);
+  // Signing in also keeps the workspace's MetaAPI accounts, so activity is recorded here.
+  await pool.query('UPDATE users SET last_login=NOW(),last_active_at=NOW() WHERE id=$1', [rows[0].id]);
   const user = publicUser(rows[0]);
   res.json({ token: issueToken(user, req.body.rememberMe === true), user });
 }));
@@ -589,12 +629,29 @@ app.get('/api/metaapi/accounts', authenticate, asyncRoute(async (req, res) => {
 }));
 app.get('/api/metaapi/linked-accounts', authenticate, asyncRoute(async (req, res) => {
   const { rows } = await pool.query(
-    `SELECT id,metaapi_account_id AS "metaApiAccountId",login,name,platform,state,server,
-       managed_by_app AS "managedByApp",created_at AS "createdAt"
-     FROM metaapi_accounts WHERE user_id=$1 ORDER BY created_at DESC`,
+    `SELECT ma.id,ma.metaapi_account_id AS "metaApiAccountId",ma.login,ma.name,ma.platform,ma.state,ma.server,
+       ma.managed_by_app AS "managedByApp",ma.created_at AS "createdAt",
+       ma.inactivity_status AS "inactivityStatus",ma.inactivity_reason AS "inactivityReason",
+       COALESCE(u.last_active_at,u.last_login,u.created_at) AS "lastActiveAt"
+     FROM metaapi_accounts ma JOIN users u ON u.id=ma.user_id
+     WHERE ma.user_id=$1 ORDER BY ma.created_at DESC`,
     [req.userId],
   );
-  res.json({ accounts: rows });
+  const activity = await inactivityService.statusFor(req.userId);
+  res.json({
+    accounts: rows.map((account) => ({
+      ...account,
+      daysInactive: account.managedByApp ? daysInactiveSince(account.lastActiveAt) : null,
+    })),
+    inactivity: {
+      warningDays: activity.warningDays,
+      deletionDays: activity.deletionDays,
+      lastActiveAt: activity.lastActiveAt,
+      daysInactive: activity.daysInactive,
+      exempt: activity.exempt,
+      notices: activity.notices,
+    },
+  });
 }));
 app.post('/api/metaapi/provisioned-accounts', authenticate, asyncRoute(async (req, res) => {
   const apiToken = getMetaApiProvisioningToken();
@@ -769,6 +826,19 @@ app.put('/api/settings', authenticate, asyncRoute(async (req, res) => {
   if (!Number.isInteger(breakEvenTriggerPoints) || breakEvenTriggerPoints < 1 || breakEvenTriggerPoints > 100_000) return fail(res, 400, 'The break-even trigger must be between 1 and 100000 points.');
   if (!Number.isInteger(breakEvenOffsetPoints) || breakEvenOffsetPoints < 0 || breakEvenOffsetPoints > 10_000) return fail(res, 400, 'The break-even offset must be between 0 and 10000 points.');
   if (breakEvenEnabled && !autoTradingRuntimeEnabled) return fail(res, 409, 'Break-even stop moves need the execution runtime, which is unavailable on this service right now.');
+  if (autoTradingEnabled || breakEvenEnabled) {
+    // Free is review-only. Tying the switches to a paid plan is what makes the free
+    // tier's zero trading-account limit meaningful, including for workspaces that
+    // connected an account under the old limits.
+    const { rows: planRows } = await pool.query('SELECT subscription_status FROM users WHERE id=$1 LIMIT 1', [req.userId]);
+    if (!isPaidSubscriber(planRows[0] || {})) {
+      const error = new Error('Automatic execution needs a paid plan. Upgrade to Starter or higher to switch Auto-Trading on.');
+      error.status = 402;
+      error.code = 'PLAN_REQUIRED';
+      error.upgradeRequired = true;
+      throw error;
+    }
+  }
   let ownedAccount = null;
   if (executionAccountId) {
     const { rows: accountRows } = await pool.query(
@@ -791,6 +861,8 @@ app.put('/api/settings', authenticate, asyncRoute(async (req, res) => {
      RETURNING risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",lot_size_mode AS "lotSizeMode",fixed_lot_size AS "fixedLotSize",max_daily_trades AS "maxDailyTrades",execution_account_id AS "executionAccountId",break_even_enabled AS "breakEvenEnabled",break_even_trigger_points AS "breakEvenTriggerPoints",break_even_offset_points AS "breakEvenOffsetPoints"`,
     [req.userId, riskMode, riskPercent, maxOpenPositions, dailyLossLimit, autoTradingEnabled, lotSizeMode, fixedLotSize, maxDailyTrades, executionAccountId || null, breakEvenEnabled, breakEvenTriggerPoints, breakEvenOffsetPoints],
   );
+  // Saving execution settings counts as activity for the inactivity policy.
+  await inactivityService.touchQuietly(req.userId);
   res.set('Cache-Control', 'no-store').json({ settings: rows[0], runtimeEnabled: autoTradingRuntimeEnabled });
 }));
 app.get('/api/trades', authenticate, asyncRoute(async (req, res) => {
@@ -1475,6 +1547,19 @@ async function start() {
     void billingService.expireDueSubscriptions().catch((error) => log('warn', 'Subscription expiry sweep failed', { code: error.code || 'SUBSCRIPTION_SWEEP_FAILED' }));
   }, 60 * 60 * 1000);
   billingSweep.unref?.();
+  // Every six hours rather than once a day, because a free Render service sleeps: the
+  // policy is driven by each user's last activity, so waking up late still acts correctly.
+  if (inactivityConfig.enabled) {
+    const runInactivitySweep = () => inactivityService.sweepOnce().then((summary) => {
+      if (summary.warned || summary.deleted || summary.deferred || summary.failed) log('info', 'Inactivity sweep finished', summary);
+      return summary;
+    }).catch((error) => log('warn', 'Inactivity sweep failed', { code: error?.code || 'INACTIVITY_SWEEP_FAILED' }));
+    void runInactivitySweep();
+    const inactivitySweep = setInterval(() => { void runInactivitySweep(); }, 6 * 60 * 60 * 1000);
+    inactivitySweep.unref?.();
+  } else {
+    log('warn', 'Idle MetaAPI account cleanup is disabled by configuration; provisioned accounts will accumulate', {});
+  }
   httpServer.listen(PORT, '0.0.0.0', () => log('info', 'Server listening', { port: PORT }));
   const { rows: telegramUsers } = await pool.query('SELECT id FROM users WHERE telegram_connected=TRUE AND telegram_session IS NOT NULL');
   for (const row of telegramUsers) {

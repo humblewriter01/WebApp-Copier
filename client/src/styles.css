@@ -298,3 +298,10 @@ button,input,textarea,select{touch-action:manipulation}
 .execution-breakeven-failed{background:#fff7e6;color:#8a5a00}
 .execution-breakeven-unknown{background:#fff0ed;color:#a43f35}
 .execution-settings-panel .form-row small,.execution-settings-panel label small{display:block;margin-top:5px;font-size:11px;color:#5f6d80;line-height:1.45;font-weight:500}
+.account-idle-policy{display:block;margin-top:10px;font-size:12px;color:#5f6d80;line-height:1.5}
+.idle-warning-card{margin-top:14px;padding:12px 14px;border:1px solid #f0c9a6;border-left:4px solid #c2661f;border-radius:10px;background:#fff7ed;color:#7a3d0d}
+.idle-warning-card strong{display:block;font-size:13px;margin-bottom:6px}
+.idle-warning-card ul{margin:0;padding-left:18px;display:grid;gap:4px}
+.idle-warning-card li{font-size:12.5px;line-height:1.5}
+.idle-warning-card p{margin:8px 0 0;font-size:12px;line-height:1.5;color:#8a5a2b}
+.billing-plan-card ul li.billing-plan-absent{color:#8a5a55}

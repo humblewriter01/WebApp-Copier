@@ -465,8 +465,10 @@ export default function AdminPanel({ token, currentUser }) {
           <span className={`status-pill ${pricing?.configured ? 'online' : ''}`}>{pricing?.configured ? 'Paystack connected' : 'Paystack not configured'}</span>
         </div>
         <p className="muted">
-          Prices are saved in the workspace database and are what the Billing page shows and charges. Leaving a plan without a saved price falls back to the deployed default
-          ({currencyCode === 'NGN' ? 'PAYSTACK_PLAN_PRO_AMOUNT' : 'PAYSTACK_PLAN_*_AMOUNT'}). Saving a price also creates or updates the matching Paystack plan, so recurring charges follow you here.
+          Prices are saved in the workspace database and are what the Billing page shows and charges. Leaving a plan without a saved price falls back to its deployed default
+          (PAYSTACK_PLAN_{'{'}STARTER|PRO|PREMIUM{'}'}_AMOUNT). Saving a price also creates or updates the matching Paystack plan, so recurring charges follow you here.
+          Limits and the free tier live in the deployed catalogue (server/services/billing.js): Free is signal review with no trading accounts, and a saved price applies to
+          existing subscribers as soon as their next charge.
         </p>
 
         {!pricing?.plans?.length ? <div className="empty-state"><strong>No paid plans available</strong><span>Set a Paystack secret key to enable plan pricing.</span></div> : <form className="pricing-plans" onSubmit={savePricing}>
