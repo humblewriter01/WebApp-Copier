@@ -184,7 +184,9 @@ export default function MetaApiPanel({ token }) {
       <p className="field-help account-idle-policy">
         Idle accounts are cleaned up automatically: if nobody signs in or trades for {inactivity?.deletionDays || 30} days, an account created here is deleted from MetaAPI so
         it stops being billed, with a warning here on day {inactivity?.warningDays || 25}. Accounts with an open position are left for you to close, and a paid plan is never
-        swept. Sign in, save execution settings, or execute a signal to reset the clock.
+        swept. {inactivity?.exempt
+          ? 'This workspace is exempt, so no account here is scheduled for deletion.'
+          : 'Sign in, save execution settings, or execute a signal to reset the clock.'}
       </p>
       <div className="note-box">Adding an account does not place a trade by itself. Auto-Trading is ON by default for new workspaces; after you select a deployed account, new eligible Telegram signals may place orders. Turn it off in Risk Settings to stop new orders. MetaAPI usage limits or charges may apply when a trading account is connected.</div>
     </section>

@@ -1,4 +1,4 @@
-import { isPaidSubscriber } from './plan-limits.js';
+import { isPaidSubscriber, PAID_STATUSES } from './plan-limits.js';
 
 /**
  * 30-day inactivity cleanup for MetaAPI accounts this workspace pays for.
@@ -12,9 +12,10 @@ import { isPaidSubscriber } from './plan-limits.js';
  * timestamp rather than from a calendar schedule, a service that was asleep or restarted
  * simply catches up on its next sweep instead of missing a day.
  *
- * Deleting a broker account can strand a trade, so two rules outrank the schedule:
- * a paying subscriber is never touched, and an account that is still carrying an open
- * position or pending order is left alone and retried. Both are recorded, not silent.
+ * Deleting a broker account can strand a trade, so three rules outrank the schedule: a
+ * paying subscriber is never touched, an account still carrying an open position or
+ * pending order is left alone and retried, and an admin is never swept at all so the
+ * operator's own test accounts survive. All of it is recorded, never silent.
  */
 export const INACTIVITY_WARNING_DAYS = 25;
 export const INACTIVITY_DELETION_DAYS = 30;
@@ -42,10 +43,30 @@ export function warningText({ accountName, daysInactive, warningDays = INACTIVIT
     .replace('{remaining}', String(remaining));
 }
 
+/**
+ * Workspace administrators are exempt from the whole policy, not just deletion: an
+ * operator running the app must never watch their own demo account disappear, and a
+ * warning that will never be acted on is noise rather than information.
+ */
+export function isAdmin(user) {
+  return String(user?.role ?? '').trim().toLowerCase() === 'admin';
+}
+
 export function daysInactiveSince(timestamp, now = Date.now()) {
   const at = Date.parse(timestamp instanceof Date ? timestamp.toISOString() : String(timestamp || ''));
   if (!Number.isFinite(at)) return 0;
   return Math.max(0, Math.floor((now - at) / DAY_MS));
+}
+
+/**
+ * Who the policy never applies to, in precedence order. Checked before the sweep does
+ * any provider work, because an exempt account must not even cost a state read.
+ */
+export function inactivityExemption({ admin = false, subscribed = false, suspended = false } = {}) {
+  if (admin) return 'admin';
+  if (subscribed) return 'active-subscription';
+  if (suspended) return 'suspended';
+  return null;
 }
 
 /**
@@ -58,6 +79,7 @@ export function inactivityDecision({
   accountState = null,
   subscribed = false,
   suspended = false,
+  admin = false,
   alreadyWarned = false,
   gaveUp = false,
   retryBlocked = false,
@@ -67,8 +89,8 @@ export function inactivityDecision({
   maxAttempts = INACTIVITY_MAX_ATTEMPTS,
   attempts = 0,
 } = {}) {
-  if (subscribed) return { action: 'skip', reason: 'active-subscription' };
-  if (suspended) return { action: 'skip', reason: 'suspended' };
+  const exemption = inactivityExemption({ admin, subscribed, suspended });
+  if (exemption) return { action: 'skip', reason: exemption };
   if (daysInactive < warningDays) return { action: 'skip', reason: 'not-due' };
   if (daysInactive < deletionDays) {
     return alreadyWarned ? { action: 'skip', reason: 'already-warned' } : { action: 'warn' };
@@ -130,15 +152,18 @@ export function createInactivityService({
     const { rows } = await pool.query(
       `SELECT ma.id AS account_row_id,ma.user_id,ma.metaapi_account_id,ma.name,ma.login,ma.platform,ma.state,
               ma.inactivity_status,ma.inactivity_for,ma.inactivity_checked_at,ma.inactivity_reason,ma.inactivity_attempts,
-              u.email,u.name AS user_name,u.subscription_status,u.subscription_plan,u.is_suspended,
+              u.email,u.name AS user_name,u.role,u.subscription_status,u.subscription_plan,u.is_suspended,
               COALESCE(u.last_active_at,u.last_login,u.created_at) AS last_active_at
        FROM metaapi_accounts ma
        JOIN users u ON u.id=ma.user_id
        WHERE ma.managed_by_app=TRUE
+         AND u.role <> 'admin'
+         AND u.is_suspended = FALSE
+         AND NOT (u.subscription_status = ANY($2::text[]))
          AND COALESCE(u.last_active_at,u.last_login,u.created_at) < NOW() - ($1::text || ' days')::interval
        ORDER BY COALESCE(u.last_active_at,u.last_login,u.created_at) ASC,ma.created_at ASC
-       LIMIT $2`,
-      [String(warningDays), sweepLimit],
+       LIMIT $3`,
+      [String(warningDays), [...PAID_STATUSES], sweepLimit],
     );
     return rows;
   }
@@ -180,7 +205,7 @@ export function createInactivityService({
   }
 
   async function sweepOnce() {
-    const summary = { scanned: 0, warned: 0, deferred: 0, deleted: 0, failed: 0, skippedSubscribed: 0, skippedSuspended: 0, skippedOther: 0 };
+    const summary = { scanned: 0, warned: 0, deferred: 0, deleted: 0, failed: 0, skippedSubscribed: 0, skippedSuspended: 0, skippedAdmin: 0, skippedOther: 0 };
     let rows;
     try {
       rows = await candidates();
@@ -197,16 +222,22 @@ export function createInactivityService({
       const warnedMs = Date.parse(row.inactivity_for instanceof Date ? row.inactivity_for.toISOString() : String(row.inactivity_for || ''));
       const checkedMs = Date.parse(row.inactivity_checked_at instanceof Date ? row.inactivity_checked_at.toISOString() : String(row.inactivity_checked_at || ''));
       const retryBlocked = Number.isFinite(checkedMs) && (now() - checkedMs) < retryHours * 3_600_000;
+      const flags = {
+        admin: isAdmin(row),
+        subscribed: isPaidSubscriber({ subscription_status: row.subscription_status }),
+        suspended: row.is_suspended === true,
+      };
       let positions = null;
-      if (daysInactive >= deletionDays) {
+      if (!inactivityExemption(flags) && daysInactive >= deletionDays) {
         const token = typeof resolveToken === 'function' ? await resolveToken(row).catch(() => null) : null;
         positions = await positionState({ token, accountId: row.metaapi_account_id });
       }
       const decision = inactivityDecision({
         daysInactive,
         accountState: row.state,
-        subscribed: isPaidSubscriber({ subscription_status: row.subscription_status }),
-        suspended: row.is_suspended === true,
+        subscribed: flags.subscribed,
+        suspended: flags.suspended,
+        admin: flags.admin,
         alreadyWarned: row.inactivity_status === 'warned' && warnedMs === lastActiveMs,
         gaveUp: row.inactivity_status === 'failed',
         retryBlocked,
@@ -218,7 +249,8 @@ export function createInactivityService({
       });
 
       if (decision.action === 'skip') {
-        if (decision.reason === 'active-subscription') summary.skippedSubscribed += 1;
+        if (decision.reason === 'admin') summary.skippedAdmin += 1;
+        else if (decision.reason === 'active-subscription') summary.skippedSubscribed += 1;
         else if (decision.reason === 'suspended') summary.skippedSuspended += 1;
         else summary.skippedOther += 1;
         continue;
@@ -298,7 +330,7 @@ export function createInactivityService({
   /** Per-account idle state for the Trading Accounts page, including the exemption. */
   async function statusFor(userId) {
     const { rows } = await pool.query(
-      `SELECT COALESCE(last_active_at,last_login,created_at) AS "lastActiveAt",subscription_status AS "subscriptionStatus"
+      `SELECT COALESCE(last_active_at,last_login,created_at) AS "lastActiveAt",subscription_status AS "subscriptionStatus",role
        FROM users WHERE id=$1 LIMIT 1`,
       [userId],
     );
@@ -315,7 +347,8 @@ export function createInactivityService({
       daysInactive: user ? daysInactiveSince(user.lastActiveAt, now()) : 0,
       warningDays,
       deletionDays,
-      exempt: isPaidSubscriber({ subscription_status: user?.subscriptionStatus }),
+      // `exempt` is "this workspace is never swept", so the page can promise the right thing.
+      exempt: isAdmin(user) || isPaidSubscriber({ subscriptionStatus: user?.subscriptionStatus }),
       notices,
     };
   }

@@ -5,6 +5,7 @@ import {
   daysInactiveSince,
   inactivityDecision,
   warningText,
+  isAdmin,
   INACTIVITY_WARNING_DAYS,
   INACTIVITY_DELETION_DAYS,
   INACTIVITY_RETRY_HOURS,
@@ -163,6 +164,42 @@ test('repeated provider failures are paced, then reported instead of looping for
   assert.equal(INACTIVITY_RETRY_HOURS, 12);
 });
 
+test('an admin is never swept, warned, or deleted', () => {
+  const exempt = { action: 'skip', reason: 'admin' };
+  // Day 25 and day 30 alike, and the exemption outranks every other input, including a
+  // position that would only defer the deletion anyway.
+  assert.deepEqual(inactivityDecision({ daysInactive: 25, admin: true }), exempt);
+  assert.deepEqual(inactivityDecision({ daysInactive: 30, admin: true, positionState: { readable: true, openPositions: 0 } }), exempt);
+  assert.deepEqual(inactivityDecision({ daysInactive: 400, admin: true, subscribed: false }), exempt);
+  assert.equal(isAdmin({ role: 'admin' }), true);
+  assert.equal(isAdmin({ role: 'user' }), false);
+  assert.equal(isAdmin({}), false, 'a missing role is never treated as an admin');
+});
+
+test('the sweep skips an admin account silently and never touches MetaAPI', async () => {
+  const db = fakeDb({ candidates: [account({ role: 'admin' })] });
+  const cleanup = fakeCleanup();
+  const trading = fakeTrading(openPositions);
+  const result = await service({ db, cleanup, trading }).sweepOnce();
+  assert.deepEqual({ deleted: result.deleted, warned: result.warned, deferred: result.deferred, skippedAdmin: result.skippedAdmin }, { deleted: 0, warned: 0, deferred: 0, skippedAdmin: 1 });
+  assert.equal(cleanup.calls.length, 0);
+  assert.equal(trading.calls.length, 0, 'not even a position read for an exempt account');
+  assert.equal(db.rows.notices.length, 0);
+  assert.equal(db.rows.deleted.length, 0);
+  assert.equal(db.rows.accountUpdates.length, 0, 'no bookkeeping written for an account that is exempt');
+});
+
+test('the candidate query never lets an exempt user occupy a sweep slot', async () => {
+  const db = fakeDb({ candidates: [] });
+  await service({ db }).sweepOnce();
+  const { sql, params } = db.calls.find(({ sql: text }) => sql2(text));
+  function sql2(text) { return text.includes('FROM metaapi_accounts ma'); }
+  assert.match(sql, /u\.role <> 'admin'/, 'admins are filtered in SQL as well as in the decision');
+  assert.match(sql, /u\.is_suspended = FALSE/);
+  assert.match(sql, /NOT \(u\.subscription_status = ANY\(\$2::text\[\]\)\)/);
+  assert.deepEqual(params, ['25', ['active', 'non_renewing'], 25]);
+});
+
 test('the sweep warns day-25 accounts and records the notice once', async () => {
   const db = fakeDb({ candidates: [account({ last_active_at: daysAgo(25) })] });
   const cleanup = fakeCleanup();
@@ -263,7 +300,7 @@ test('subscribers are skipped without a notice, and the account is left alone', 
 
 test('the sweep survives a broken candidate query and an empty table', async () => {
   const result = await service({ db: { async query() { throw Object.assign(new Error('down'), { code: '57P01' }); } } }).sweepOnce();
-  assert.deepEqual(result, { scanned: 0, warned: 0, deferred: 0, deleted: 0, failed: 0, skippedSubscribed: 0, skippedSuspended: 0, skippedOther: 0, reason: 'candidates-unavailable' });
+  assert.deepEqual(result, { scanned: 0, warned: 0, deferred: 0, deleted: 0, failed: 0, skippedSubscribed: 0, skippedSuspended: 0, skippedAdmin: 0, skippedOther: 0, reason: 'candidates-unavailable' });
   const empty = await service({ db: fakeDb() }).sweepOnce();
   assert.equal(empty.scanned, 0);
 });
@@ -313,6 +350,8 @@ test('the Trading Accounts page gets the idle state, exemption, and notices', as
 
   const paid = service({ db: fakeDb({ user: { lastActiveAt: daysAgo(80), subscriptionStatus: 'active' } }) });
   assert.equal((await paid.statusFor('user-1')).exempt, true, 'the banner must not threaten a subscriber');
+  const admin = service({ db: fakeDb({ user: { lastActiveAt: daysAgo(80), subscriptionStatus: 'free', role: 'admin' } }) });
+  assert.equal((await admin.statusFor('user-1')).exempt, true, 'an admin sees the policy as not applying to them');
 });
 
 test('the thresholds are configuration, not constants baked into behaviour', async () => {
@@ -332,7 +371,7 @@ test('the thresholds are configuration, not constants baked into behaviour', asy
   // The candidate query is bounded by the warning threshold, so a longer policy cannot
   // quietly delete without ever having warned.
   const scanned = db.calls.find(({ sql }) => sql.includes('FROM metaapi_accounts ma'));
-  assert.deepEqual(scanned.params, ['3', 25]);
+  assert.deepEqual(scanned.params, ['3', ['active', 'non_renewing'], 25]);
 });
 
 test('the service refuses to run without a database', () => {

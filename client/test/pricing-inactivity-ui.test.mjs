@@ -98,6 +98,10 @@ test('the trading accounts page states the deletion policy near the add-account 
   assert.match(sources.accounts, /inactivity\?\.deletionDays \|\| 30/);
   assert.match(sources.accounts, /inactivity\?\.warningDays \|\| 25/);
   assert.match(sources.accounts, /paid plan is never\s*\n?\s*swept/);
+  // An exempt workspace (paid plan or administrator) is told so, instead of being shown a
+  // deletion promise that does not apply to it.
+  assert.match(sources.accounts, /inactivity\?\.exempt/);
+  assert.match(sources.accounts, /This workspace is exempt, so no account here is scheduled for deletion\./);
 });
 
 test('the rendered panel keeps its add-account form and policy note together', () => {
