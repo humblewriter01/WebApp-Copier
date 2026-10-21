@@ -160,6 +160,8 @@ const executionEngine = createExecutionEngine({
   trading: tradingAdapter,
   resolveToken: resolveExecutionToken,
   runtimeEnabled: autoTradingRuntimeEnabled,
+  breakEvenIntervalMs: Number(process.env.BREAK_EVEN_SWEEP_INTERVAL_MS) || 5_000,
+  logger: console,
 });
 const executionWorker = createExecutionWorker({ pool, engine: executionEngine, logger: console });
 
@@ -737,9 +739,9 @@ app.delete('/api/metaapi/accounts/:accountId', authenticate, asyncRoute(async (r
 }));
 
 app.get('/api/settings', authenticate, asyncRoute(async (req, res) => {
-  const { rows } = await pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",lot_size_mode AS "lotSizeMode",fixed_lot_size AS "fixedLotSize",max_daily_trades AS "maxDailyTrades",execution_account_id AS "executionAccountId" FROM settings WHERE user_id=$1', [req.userId]);
+  const { rows } = await pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",lot_size_mode AS "lotSizeMode",fixed_lot_size AS "fixedLotSize",max_daily_trades AS "maxDailyTrades",execution_account_id AS "executionAccountId",break_even_enabled AS "breakEvenEnabled",break_even_trigger_points AS "breakEvenTriggerPoints",break_even_offset_points AS "breakEvenOffsetPoints" FROM settings WHERE user_id=$1', [req.userId]);
   res.set('Cache-Control', 'no-store').json({
-    settings: { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 3, dailyLossLimit: 5, autoTradingEnabled: false, lotSizeMode: 'fixed', fixedLotSize: 0.01, maxDailyTrades: 10, executionAccountId: '', ...(rows[0] || {}) },
+    settings: { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 3, dailyLossLimit: 5, autoTradingEnabled: false, lotSizeMode: 'fixed', fixedLotSize: 0.01, maxDailyTrades: 10, executionAccountId: '', breakEvenEnabled: false, breakEvenTriggerPoints: 20, breakEvenOffsetPoints: 0, ...(rows[0] || {}) },
     runtimeEnabled: autoTradingRuntimeEnabled,
   });
 }));
@@ -754,6 +756,9 @@ app.put('/api/settings', authenticate, asyncRoute(async (req, res) => {
   const lotSizeMode = req.body.lotSizeMode === 'risk_based' ? 'risk_based' : req.body.lotSizeMode === 'fixed' ? 'fixed' : null;
   const autoTradingEnabled = req.body.autoTradingEnabled === true;
   const executionAccountId = typeof req.body.executionAccountId === 'string' ? req.body.executionAccountId.trim() : '';
+  const breakEvenEnabled = req.body.breakEvenEnabled === true;
+  const breakEvenTriggerPoints = Math.trunc(numeric(req.body.breakEvenTriggerPoints, 20));
+  const breakEvenOffsetPoints = Math.trunc(numeric(req.body.breakEvenOffsetPoints, 0));
   if (!lotSizeMode) return fail(res, 400, 'Choose a valid lot size mode.');
   if (!Number.isFinite(riskPercent) || riskPercent < 0.1 || riskPercent > 5) return fail(res, 400, 'Risk percent must be between 0.1 and 5.');
   if (!Number.isInteger(maxOpenPositions) || maxOpenPositions < 1 || maxOpenPositions > 50) return fail(res, 400, 'Maximum open trades must be between 1 and 50.');
@@ -761,6 +766,9 @@ app.put('/api/settings', authenticate, asyncRoute(async (req, res) => {
   if (!Number.isInteger(maxDailyTrades) || maxDailyTrades < 1 || maxDailyTrades > 100) return fail(res, 400, 'Maximum daily trades must be between 1 and 100.');
   if (!Number.isFinite(fixedLotSize) || fixedLotSize < 0.01 || fixedLotSize > 100) return fail(res, 400, 'Fixed lot size must be between 0.01 and 100.');
   if (autoTradingEnabled && !autoTradingRuntimeEnabled) return fail(res, 409, 'Auto-Trading is not available on this service right now.');
+  if (!Number.isInteger(breakEvenTriggerPoints) || breakEvenTriggerPoints < 1 || breakEvenTriggerPoints > 100_000) return fail(res, 400, 'The break-even trigger must be between 1 and 100000 points.');
+  if (!Number.isInteger(breakEvenOffsetPoints) || breakEvenOffsetPoints < 0 || breakEvenOffsetPoints > 10_000) return fail(res, 400, 'The break-even offset must be between 0 and 10000 points.');
+  if (breakEvenEnabled && !autoTradingRuntimeEnabled) return fail(res, 409, 'Break-even stop moves need the execution runtime, which is unavailable on this service right now.');
   let ownedAccount = null;
   if (executionAccountId) {
     const { rows: accountRows } = await pool.query(
@@ -778,15 +786,26 @@ app.put('/api/settings', authenticate, asyncRoute(async (req, res) => {
     catch { return fail(res, 409, 'A safe daily loss baseline could not be captured. Confirm the account is deployed and connected, then try again. Auto-Trading remains off.'); }
   }
   const { rows } = await pool.query(
-    `INSERT INTO settings(user_id,risk_mode,risk_percent,max_open_positions,daily_loss_limit,auto_trading_enabled,lot_size_mode,fixed_lot_size,max_daily_trades,execution_account_id)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(user_id) DO UPDATE SET risk_mode=EXCLUDED.risk_mode,risk_percent=EXCLUDED.risk_percent,max_open_positions=EXCLUDED.max_open_positions,daily_loss_limit=EXCLUDED.daily_loss_limit,auto_trading_enabled=EXCLUDED.auto_trading_enabled,lot_size_mode=EXCLUDED.lot_size_mode,fixed_lot_size=EXCLUDED.fixed_lot_size,max_daily_trades=EXCLUDED.max_daily_trades,execution_account_id=EXCLUDED.execution_account_id,updated_at=NOW()
-     RETURNING risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",lot_size_mode AS "lotSizeMode",fixed_lot_size AS "fixedLotSize",max_daily_trades AS "maxDailyTrades",execution_account_id AS "executionAccountId"`,
-    [req.userId, riskMode, riskPercent, maxOpenPositions, dailyLossLimit, autoTradingEnabled, lotSizeMode, fixedLotSize, maxDailyTrades, executionAccountId || null],
+    `INSERT INTO settings(user_id,risk_mode,risk_percent,max_open_positions,daily_loss_limit,auto_trading_enabled,lot_size_mode,fixed_lot_size,max_daily_trades,execution_account_id,break_even_enabled,break_even_trigger_points,break_even_offset_points)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT(user_id) DO UPDATE SET risk_mode=EXCLUDED.risk_mode,risk_percent=EXCLUDED.risk_percent,max_open_positions=EXCLUDED.max_open_positions,daily_loss_limit=EXCLUDED.daily_loss_limit,auto_trading_enabled=EXCLUDED.auto_trading_enabled,lot_size_mode=EXCLUDED.lot_size_mode,fixed_lot_size=EXCLUDED.fixed_lot_size,max_daily_trades=EXCLUDED.max_daily_trades,execution_account_id=EXCLUDED.execution_account_id,break_even_enabled=EXCLUDED.break_even_enabled,break_even_trigger_points=EXCLUDED.break_even_trigger_points,break_even_offset_points=EXCLUDED.break_even_offset_points,updated_at=NOW()
+     RETURNING risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",lot_size_mode AS "lotSizeMode",fixed_lot_size AS "fixedLotSize",max_daily_trades AS "maxDailyTrades",execution_account_id AS "executionAccountId",break_even_enabled AS "breakEvenEnabled",break_even_trigger_points AS "breakEvenTriggerPoints",break_even_offset_points AS "breakEvenOffsetPoints"`,
+    [req.userId, riskMode, riskPercent, maxOpenPositions, dailyLossLimit, autoTradingEnabled, lotSizeMode, fixedLotSize, maxDailyTrades, executionAccountId || null, breakEvenEnabled, breakEvenTriggerPoints, breakEvenOffsetPoints],
   );
   res.set('Cache-Control', 'no-store').json({ settings: rows[0], runtimeEnabled: autoTradingRuntimeEnabled });
 }));
 app.get('/api/trades', authenticate, asyncRoute(async (req, res) => {
-  const { rows } = await pool.query('SELECT id,signal_id AS "signalId",metaapi_account_id AS "metaApiAccountId",symbol,side,quantity,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",exit_price AS "exitPrice",pnl,status,broker_order_id AS "brokerOrderId",broker_position_id AS "brokerPositionId",error_message AS "errorMessage",created_at AS "createdAt",executed_at AS "executedAt" FROM trades WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50', [req.userId]);
+  const { rows } = await pool.query(
+    `SELECT t.id,t.signal_id AS "signalId",t.metaapi_account_id AS "metaApiAccountId",t.symbol,t.side,t.quantity,
+            t.entry_price AS "entryPrice",t.stop_loss AS "stopLoss",t.take_profit AS "takeProfit",t.exit_price AS "exitPrice",
+            t.pnl,t.status,t.broker_order_id AS "brokerOrderId",t.broker_position_id AS "brokerPositionId",
+            t.error_message AS "errorMessage",t.created_at AS "createdAt",t.executed_at AS "executedAt",
+            bm.status AS "breakEvenStatus",bm.stop_loss AS "breakEvenStopLoss",bm.previous_stop_loss AS "breakEvenPreviousStopLoss",
+            bm.updated_at AS "breakEvenAt",bm.error_message AS "breakEvenError"
+     FROM trades t
+     LEFT JOIN break_even_moves bm ON bm.user_id=t.user_id AND bm.metaapi_account_id=t.metaapi_account_id AND bm.broker_position_id=t.broker_position_id
+     WHERE t.user_id=$1 ORDER BY t.created_at DESC LIMIT 50`,
+    [req.userId],
+  );
   res.set('Cache-Control', 'no-store').json({ trades: rows, liveExecutionEnabled: autoTradingRuntimeEnabled });
 }));
 

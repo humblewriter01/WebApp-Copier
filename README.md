@@ -12,13 +12,16 @@ A deployable React/Vite and Express app for capturing Telegram channel messages,
 - **MT4/MT5 account setup:** signed-in users can create an account setup and enter broker credentials on a MetaAPI-hosted secure page.
 - **Admin panel:** workspace administrators get a `/admin` dashboard with user totals, user management (roles, suspension), promo-code creation, and billing activity.
 - **Paystack subscriptions:** Free, Pro, and Premium plans with a hosted Paystack checkout, promo codes, verified webhooks, plan-based limits, and automatic renewal through Paystack Plan Codes that are kept in step with the price an admin saves.
-- Risk preferences for planning only.
+- **Optional Auto-Trading:** a user can let clearly parsed Telegram signals place market orders on their own connected MT4/MT5 account, behind a chain of safety gates (see [Auto-Trading and break even](#auto-trading-and-break-even)).
+- **Break-even stop moves:** the stop of a trade Signal Desk opened is moved to the entry price (plus an optional offset) once the market has travelled the configured distance in favour of the trade.
 
 ## Important safety and data notes
 
-- **No trading orders are placed.** Signal Desk can create and connect an account through MetaAPI, but it does not submit, modify, or close trades.
+- **Live orders are only ever placed for a user who switched Auto-Trading on.** Every new workspace starts with the setting on so the feature is usable immediately, but nothing is submitted until that user also selects an owned, deployed trading account and every safety gate passes. Turning Auto-Trading off is immediate and stops *all* writes to the broker, including break-even stop moves.
+- Signal Desk never closes or partially closes a position and never widens a stop loss. It places market orders and, when break even is enabled, moves the stop of a position it opened itself to a price that reduces risk.
+- An ambiguous broker or network failure on an order or a stop move is recorded as `unknown` and is **not** retried automatically, because the broker may already have accepted the first request. The activity list says so; reconcile that position on the broker account.
 - The API uses `METAAPI_PROVISIONING_TOKEN` only on the server. Users enter their broker login and password on MetaAPI's HTTPS setup page; Signal Desk does not receive or store those credentials.
-- The MetaAPI client uses HTTPS and an allowlist of account-setup and account-read operations. It does not include order-placement or position-modification functions.
+- The MetaAPI client uses HTTPS and is limited to the operations above: account setup, account reads, market order submission, and stop-loss modification for break even. Trading credentials stay server-side.
 - Deleting a Signal Desk account removes that user's Supabase Auth identity, local workspace data, and every MetaAPI trading account this workspace provisioned, so MetaAPI billing for those accounts stops. Accounts a user linked with their own MetaAPI token are left untouched. Unlinking a single account from the Trading Accounts page also deletes it from MetaAPI (same cleanup path); accounts billed to a user's own MetaAPI token are only unlinked.
 - Telegram sessions are encrypted in the database with the same server encryption key. Rotating that key without re-encrypting existing values will invalidate saved sessions/tokens.
 - Render free web services can sleep, so continuous Telegram monitoring is not reliable on the free tier. Use an always-on backend before relying on unattended monitoring.
@@ -65,6 +68,24 @@ The app creates its PostgreSQL tables and indexes on backend startup. The new `m
 4. Return to Signal Desk and refresh the account status. Removing an account you created here deletes it from MetaAPI as well, so provider billing stops; your broker account and any open positions are unaffected. Accounts linked with your own MetaAPI token are only unlinked from Signal Desk.
 
 `META_API_URL` is an optional HTTPS base-URL override. Never add `METAAPI_PROVISIONING_TOKEN` to a `VITE_*` variable, frontend code, or Git.
+
+## Auto-Trading and break even
+
+Automatic execution is opt-in per workspace and lives in **Risk settings → Execution Settings**. The red warning above the toggle is required copy; the toggle saves on click so switching it off never waits for a form submit.
+
+Before an order is submitted the engine re-reads its inputs and fails closed on anything missing: the user's current Auto-Trading setting, the server-side `AUTO_TRADING_RUNTIME_ENABLED` switch, ownership and `DEPLOYED` state of the selected account, signal age (two minutes), synchronized positions/pending orders, the open-trade and daily-trade caps, the UTC-day equity baseline for the daily loss limit, a fresh valid quote, a stop loss on the correct side of that quote, and the broker's own minimum, maximum, and volume step. A signal with an entry price is only executed when the current quote is not worse than that entry for the signal's direction. The record is written to `trades` *before* the SDK call with a stable `clientId`, so a replay cannot duplicate an order.
+
+**Break even** extends the same loop instead of adding a second one. For each executed trade whose broker position is still open, once the market has travelled `breakEvenTriggerPoints` in favour of the trade, the stop is moved to the entry price plus `breakEvenOffsetPoints` — an offset is how you cover spread and commission instead of parking the stop exactly where the quote touches it.
+
+- Distances are MetaTrader **points**, aligned onto the symbol's `tickSize`; a buy rounds down and a sell rounds up, so the stop never lands beyond the intended price. On most FX pairs 10 points is one pip.
+- Only positions Signal Desk opened are considered; trades placed in the terminal keep their own stops.
+- A stop is only moved in the direction that reduces risk. If the existing stop is already at least that protective, the position is marked handled and nothing is sent.
+- The broker's `stopsLevel` and `freezeLevel` are respected. When the break-even price sits inside the minimum stop distance, the move is *deferred* and retried as the price travels further, rather than failing.
+- Every decision needs a fresh synchronized quote and symbol specification; missing or stale safety data means no request.
+- Results are persisted per broker position in `break_even_moves` with the status `moved`, `already_beyond`, `closed`, `deferred`, `failed`, or `unknown`, the previous and new stop, the quote used, and the sanitized provider message. A terminal status is never retried. Deferrals retry on their own clock (15 seconds while the price is too close, 60 seconds when account data could not be read) without consuming an attempt, a broker rejection retries up to ten times, and `unknown` never retries. Changing either distance re-arms positions that were already handled, because the stored row keeps the settings it was decided under.
+- Moves run only while the execution runtime is available **and** Auto-Trading is on, so "off" always means "Signal Desk is not talking to your broker".
+
+The sweep shares the worker's polling loop, and an order always goes first, so protecting an open position can never delay a fresh signal. A busy stream of signals cannot starve protection either: every fifth iteration also attempts a sweep. `BREAK_EVEN_SWEEP_INTERVAL_MS` throttles the sweep itself (default `5000` ms, floor `1000`), so calling it often costs nothing. No test or deployment path places a live order: the broker adapter is always faked.
 
 ## Paystack billing
 
@@ -150,7 +171,8 @@ Suspension blocks new sign-ins with the stored reason. Existing JWT sessions on 
 | `PAYSTACK_CURRENCY` | No | Billing currency; defaults to `NGN` |
 | `PAYSTACK_PLAN_PRO_AMOUNT` / `PAYSTACK_PLAN_PREMIUM_AMOUNT` | No | Fallback plan prices in kobo; the Admin Panel can override them at runtime |
 | `PAYSTACK_PLAN_INTERVAL` | No | Interval for Paystack plans; defaults to `monthly` |
-| `AUTO_TRADING_RUNTIME_ENABLED` | No | `true` enables the MetaAPI execution runtime |
+| `AUTO_TRADING_RUNTIME_ENABLED` | No | `true` enables the MetaAPI execution runtime (orders and break-even stop moves) |
+| `BREAK_EVEN_SWEEP_INTERVAL_MS` | No | Milliseconds between break-even sweeps; defaults to `5000` and never runs faster than every `1000` |
 | `PORT` | No | Render supplies this automatically |
 
 The UI/API can be used without Telegram credentials; Telegram is shown as unavailable until `API_ID` and `API_HASH` are configured. Never commit real credentials to Git.
@@ -187,7 +209,8 @@ The static site is served over HTTPS and includes a linked web app manifest, 192
 - `GET/POST /api/channels`, `DELETE /api/channels/:id`
 - `GET/POST /api/signals`
 - `GET/POST /api/accounts`, `DELETE /api/accounts/:id`
-- `GET/PUT /api/settings`
+- `GET/PUT /api/settings` – risk limits, lot sizing, selected execution account, and break-even trigger/offset
+- `GET /api/trades` – execution activity, including the break-even outcome for each position
 - `GET /api/metaapi/provisioning-status`, `GET /api/metaapi/linked-accounts`, `POST /api/metaapi/provisioned-accounts`, `POST /api/metaapi/provisioned-accounts/:accountId/configuration-link`, `POST /api/metaapi/provisioned-accounts/:accountId/refresh`, `DELETE /api/metaapi/accounts/:accountId`
 - `GET /api/telegram/status`, `POST /api/telegram/request-code`, `POST /api/telegram/verify-code`, `POST /api/telegram/verify-password`, `GET /api/telegram/chats`, `POST /api/telegram/disconnect`
 - `GET /health`

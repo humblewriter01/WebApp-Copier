@@ -160,6 +160,40 @@ export async function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS execution_jobs_ready_idx ON execution_jobs(status,created_at) WHERE status='queued';
     CREATE INDEX IF NOT EXISTS execution_jobs_stale_idx ON execution_jobs(status,locked_at) WHERE status='processing';
     CREATE INDEX IF NOT EXISTS trades_user_created_idx ON trades(user_id,created_at DESC);
+    /* Break-even stop management for positions Signal Desk opened. One row per
+     * broker position is the idempotency key: a terminal status means the stop is
+     * never sent to the broker again, while deferred and failed rows carry the next
+     * retry time so a sweep can never spam modify requests. */
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS break_even_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS break_even_trigger_points NUMERIC NOT NULL DEFAULT 20;
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS break_even_offset_points NUMERIC NOT NULL DEFAULT 0;
+    CREATE TABLE IF NOT EXISTS break_even_moves (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      trade_id UUID REFERENCES trades(id) ON DELETE SET NULL,
+      metaapi_account_id TEXT NOT NULL,
+      broker_position_id TEXT NOT NULL,
+      symbol TEXT,
+      side TEXT,
+      open_price NUMERIC,
+      trigger_points NUMERIC NOT NULL,
+      offset_points NUMERIC NOT NULL,
+      previous_stop_loss NUMERIC,
+      stop_loss NUMERIC,
+      status TEXT NOT NULL DEFAULT 'moved',
+      attempt_count INTEGER NOT NULL DEFAULT 1,
+      market_bid NUMERIC,
+      market_ask NUMERIC,
+      provider_response JSONB,
+      error_message TEXT,
+      next_attempt_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(user_id, metaapi_account_id, broker_position_id),
+      CONSTRAINT break_even_moves_status_check CHECK (status IN ('moved', 'already_beyond', 'closed', 'deferred', 'failed', 'unknown'))
+    );
+    CREATE INDEX IF NOT EXISTS break_even_moves_retry_idx ON break_even_moves(status, next_attempt_at);
+    ALTER TABLE break_even_moves ENABLE ROW LEVEL SECURITY;
     CREATE TABLE IF NOT EXISTS telegram_login_attempts (
       user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       encrypted_state TEXT NOT NULL,

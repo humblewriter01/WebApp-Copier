@@ -123,6 +123,21 @@ export function createMetaApiTradingAdapter({ MetaApiClass = MetaApi, now = () =
     throw new Error('Unsupported order direction.');
   }
 
+  /**
+   * Moves the stop loss of an open position. MetaAPI's
+   * `modifyPosition(positionId, stopLoss, takeProfit, trailingStopLoss, stopPriceBase)`
+   * omits any stop that is undefined, so passing only a numeric stop loss leaves the
+   * existing take profit untouched.
+   */
+  async function modifyPosition({ token, accountId, positionId, stopLoss }) {
+    const id = String(positionId ?? '').trim();
+    if (!id) throw new Error('A broker position id is required to move a stop loss.');
+    const price = Number(stopLoss);
+    if (!Number.isFinite(price) || price <= 0) throw new Error('A valid stop loss price is required to move a stop loss.');
+    const { connection } = await getConnection(token, accountId);
+    return connection.modifyPosition(id, price);
+  }
+
   async function close() {
     const pending = [...connections.values()];
     connections.clear();
@@ -133,5 +148,5 @@ export function createMetaApiTradingAdapter({ MetaApiClass = MetaApi, now = () =
     clients.clear();
   }
 
-  return { getAccountState, createMarketOrder, close };
+  return { getAccountState, createMarketOrder, modifyPosition, close };
 }

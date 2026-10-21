@@ -12,6 +12,7 @@ export function createExecutionWorker({ pool, engine, pollIntervalMs = 1200, sta
   let stopped = true;
   let timer = null;
   let active = null;
+  let jobsSinceSweep = 0;
 
   async function expireOldJobs() {
     await pool.query(
@@ -73,7 +74,22 @@ export function createExecutionWorker({ pool, engine, pollIntervalMs = 1200, sta
       await markStaleJobsUnknown();
       await engine.captureUtcDayBaselines?.();
       const job = await claimOne();
-      if (job) await engine.processJob(job);
+      if (job) {
+        await engine.processJob(job);
+        jobsSinceSweep += 1;
+      } else {
+        jobsSinceSweep = 0;
+      }
+      // Break-even stop moves share this loop so they react within a second or two of a
+      // quote change. An order always goes first, because protecting an open position must
+      // never delay a fresh signal, but a busy stream of signals cannot starve protection
+      // either: every fifth iteration also attempts a sweep (the engine's own throttle decides). The engine throttles the sweep itself,
+      // so calling it often costs nothing.
+      if (engine.sweepBreakEven && (!job || jobsSinceSweep >= 5)) {
+        const sweep = await engine.sweepBreakEven();
+        if (sweep?.moved) logger.info?.(JSON.stringify({ level: 'info', message: 'Break-even stop moved', ...sweep }));
+        jobsSinceSweep = 0;
+      }
     } catch (error) {
       logger.error?.(JSON.stringify({ level: 'error', message: 'Execution worker iteration failed', error: safeWorkerError(error) }));
     }
