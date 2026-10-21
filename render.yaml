@@ -41,10 +41,15 @@ services:
         sync: false
       - key: PAYSTACK_CURRENCY
         value: NGN
+      # Fallback prices only: the active Pro/Premium prices are stored in the
+      # admin_settings table and managed from Admin Panel -> Pricing & Plans, which
+      # also re-syncs the matching Paystack Plan Code so renewals use the new amount.
       - key: PAYSTACK_PLAN_PRO_AMOUNT
         value: "250000"
       - key: PAYSTACK_PLAN_PREMIUM_AMOUNT
         value: "600000"
+      - key: PAYSTACK_PLAN_INTERVAL
+        value: monthly
   - type: web
     name: telegram-copier-web
     runtime: static

@@ -94,7 +94,9 @@ export default function BillingPage({ token }) {
     try {
       const result = await request('/api/billing/cancel', token, { method: 'POST' });
       setData((current) => ({ ...current, subscription: result.subscription }));
-      setNotice('Renewal canceled. Your plan stays active until the end of the current period.');
+      const provider = result.subscription?.provider;
+      if (provider?.status === 'failed') setError(provider.message);
+      else setNotice(provider?.message || 'Renewal canceled. Your plan stays active until the end of the current period.');
     } catch (cancelError) {
       setError(cancelError.message);
     } finally { setBusy(''); }
@@ -106,7 +108,9 @@ export default function BillingPage({ token }) {
     try {
       const result = await request('/api/billing/resume', token, { method: 'POST' });
       setData((current) => ({ ...current, subscription: result.subscription }));
-      setNotice('Renewal resumed.');
+      const provider = result.subscription?.provider;
+      if (provider?.status === 'failed') setError(provider.message);
+      else setNotice(provider?.message || 'Renewal resumed.');
     } catch (resumeError) {
       setError(resumeError.message);
     } finally { setBusy(''); }
@@ -165,6 +169,7 @@ export default function BillingPage({ token }) {
           return <article key={plan.key} className={`billing-plan-card ${isCurrent ? 'current' : ''}`}>
             <header><h3>{plan.name}</h3><p>{plan.description}</p></header>
             <p className="billing-price">{formatMoney(plan.amountMinor, plan.currency)}<span>/{plan.interval === 'annually' ? 'year' : 'month'}</span></p>
+            <p className="billing-price-note">{plan.renewsAutomatically ? 'Renews automatically — cancel any time.' : 'One payment for one period.'}</p>
             <ul>
               <li>{plan.limits.maxTradingAccounts} trading accounts</li>
               <li>{plan.limits.maxTelegramChannels} Telegram channels</li>
@@ -192,6 +197,7 @@ export default function BillingPage({ token }) {
         Discounts apply to the plan you select. Applied at checkout for {selected?.name || 'the selected plan'}:
         {' '}<strong>{formatMoney(quotedAmount, currency)}</strong>
         {quote?.discountMinor ? <span> (saving {formatMoney(quote.discountMinor, currency)})</span> : null}
+        {quote?.promoCode ? <span> A discounted period is paid once and does not renew automatically.</span> : null}
       </p>
       {quoteError && <div className="alert alert-error" role="alert">{quoteError}</div>}
     </section>
@@ -205,7 +211,7 @@ export default function BillingPage({ token }) {
           <tbody>
             {data.recentTransactions.map((transaction) => <tr key={transaction.reference}>
               <td data-label="Reference"><strong>{transaction.reference}</strong>{transaction.promoCode ? <small>Promo {transaction.promoCode}</small> : null}</td>
-              <td data-label="Plan">{plans.find((plan) => plan.key === transaction.planKey)?.name || transaction.planKey}</td>
+              <td data-label="Plan">{plans.find((plan) => plan.key === transaction.planKey)?.name || transaction.planKey}{transaction.source === 'renewal' ? <small>Auto-renewal</small> : null}</td>
               <td data-label="Amount">{formatMoney(transaction.amountMinor, transaction.currency || currency)}</td>
               <td data-label="Status"><span className={`badge ${transaction.status === 'success' ? 'badge-buy' : ''}`}>{transaction.status}</span></td>
               <td data-label="Paid">{transaction.paidAt ? formatDate(transaction.paidAt) : '—'}</td>
@@ -213,7 +219,7 @@ export default function BillingPage({ token }) {
           </tbody>
         </table>
       </div>}
-      <p className="field-help">Payments are processed by Paystack. Signal Desk never receives or stores your card details.</p>
+      <p className="field-help">Prices are the ones the workspace publishes today. Payments are processed by Paystack; Signal Desk never receives or stores your card details.</p>
     </section>
   </>;
 }

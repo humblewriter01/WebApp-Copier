@@ -235,9 +235,19 @@ export async function initializeDatabase() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       CONSTRAINT billing_transactions_status_check CHECK (status IN ('pending', 'success', 'failed', 'abandoned', 'reversed', 'refunded'))
     );
+    ALTER TABLE billing_transactions ADD COLUMN IF NOT EXISTS plan_code TEXT;
+    ALTER TABLE billing_transactions ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'checkout';
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'billing_transactions_source_check' AND conrelid = 'billing_transactions'::regclass) THEN
+        ALTER TABLE billing_transactions ADD CONSTRAINT billing_transactions_source_check CHECK (source IN ('checkout', 'renewal', 'manual'));
+      END IF;
+    END $$;
+    ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS provider_subscription_code TEXT;
     CREATE INDEX IF NOT EXISTS billing_transactions_user_created_idx ON billing_transactions(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS billing_transactions_pending_idx ON billing_transactions(status, created_at) WHERE status='pending';
     CREATE INDEX IF NOT EXISTS subscriptions_period_end_idx ON subscriptions(status, current_period_end);
+    CREATE INDEX IF NOT EXISTS billing_transactions_source_idx ON billing_transactions(source, created_at DESC);
+    CREATE INDEX IF NOT EXISTS subscriptions_provider_code_idx ON subscriptions(provider_subscription_code) WHERE provider_subscription_code IS NOT NULL;
     ALTER TABLE subscriptions ENABLE ROW LEVEL SECURITY;
     ALTER TABLE billing_transactions ENABLE ROW LEVEL SECURITY;
     ALTER TABLE admin_settings ENABLE ROW LEVEL SECURITY;

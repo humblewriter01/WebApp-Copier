@@ -187,6 +187,50 @@ export function toSafeTransaction(data = {}) {
   };
 }
 
+/**
+ * Recurring billing arrives as invoice and subscription events rather than a
+ * checkout we started, so their payloads are read through these helpers. Only
+ * fields documented at https://paystack.com/docs/api/invoice/ and
+ * https://paystack.com/docs/api/subscription/ are used, and everything is
+ * optional: an unrecognised payload is ignored instead of changing access.
+ */
+const PAID_INVOICE_STATUSES = new Set(['success', 'paid']);
+
+export function eventCustomerEmail(data = {}) {
+  const email = data?.customer?.email || data?.email || data?.transaction?.customer?.email || data?.authorization?.email || '';
+  const value = String(email).trim().toLowerCase();
+  return value && value.includes('@') ? value.slice(0, 200) : null;
+}
+
+export function toSafeInvoice(data = {}) {
+  const candidate = String(data.invoice_code || (data.id ? `invt_${data.id}` : '')).trim();
+  const status = String(data.status || '').toLowerCase();
+  const amount = Number(data.amount ?? data.total_amount);
+  return {
+    invoiceCode: REFERENCE_PATTERN.test(candidate) ? candidate : null,
+    status,
+    paid: data.paid === true || PAID_INVOICE_STATUSES.has(status),
+    amountMinor: Number.isFinite(amount) ? Math.trunc(amount) : null,
+    currency: String(data.currency || data.total_currency || '').toUpperCase() || null,
+    paidAt: data.paid_at || null,
+    email: eventCustomerEmail(data),
+    subscriptionCode: data.subscription?.subscription_code || data.subscription_code || null,
+    planCode: data.plan?.plan_code || data.subscription?.plan?.plan_code || null,
+    nextPaymentDate: data.subscription?.next_payment_date || data.next_payment_date || null,
+  };
+}
+
+export function toSafeSubscriptionEvent(data = {}) {
+  return {
+    subscriptionCode: data.subscription_code || data.code || null,
+    status: String(data.status || '').toLowerCase() || null,
+    amountMinor: Number.isFinite(Number(data.amount)) ? Math.trunc(Number(data.amount)) : null,
+    email: eventCustomerEmail(data),
+    planCode: data.plan?.plan_code || data.plan_code || null,
+    nextPaymentDate: data.next_payment_date || null,
+  };
+}
+
 /** Subscription length in milliseconds, used to compute the next renewal date. */
 export function billingIntervalMs(interval) {
   switch (interval) {

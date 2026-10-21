@@ -25,8 +25,17 @@ function providerError(status, payload) {
 }
 
 /**
- * Minimal Paystack REST client. Both endpoints used here are documented at
- * https://paystack.com/docs/api/transaction/ — initialize and verify.
+ * Minimal Paystack REST client.
+ *
+ * Transactions: https://paystack.com/docs/api/transaction/ (initialize, verify).
+ * Plans: https://paystack.com/docs/api/plan/ (create, fetch, update) — used to
+ * keep a Paystack plan code at exactly the price set in the admin panel.
+ * Subscriptions: https://paystack.com/docs/api/subscription/ (fetch, disable,
+ * enable) — used so cancelling in Signal Desk also stops Paystack re-charging.
+ *
+ * Only these documented endpoints are called, the secret key never leaves the
+ * server, and provider failures are re-thrown with a `userMessage` that is safe
+ * to show in a browser.
  */
 export function createPaystackClient({ config, fetchImpl } = {}) {
   const settings = config || {};
@@ -109,5 +118,118 @@ export function createPaystackClient({ config, fetchImpl } = {}) {
     return payload.data;
   }
 
-  return Object.freeze({ isConfigured: () => Boolean(settings.secretKey), initializeTransaction, verifyTransaction });
+  /* ------------------------------- Plans ----------------------------------
+   * https://paystack.com/docs/api/plan/ — create (`POST /plan`), fetch
+   * (`GET /plan/:id_or_code`) and update (`PUT /plan/:id_or_code`). Update
+   * replies with a message only, so callers re-fetch the plan to confirm the
+   * amount that Paystack actually stored.
+   */
+  async function createPlan({ name, amountMinor, interval, currency, description, sendInvoices = true, invoiceLimit }) {
+    const body = { name, amount: amountMinor, interval, currency: currency || 'NGN', send_invoices: sendInvoices !== false };
+    if (description) body.description = String(description).slice(0, 300);
+    if (Number.isFinite(Number(invoiceLimit)) && Number(invoiceLimit) > 0) body.invoice_limit = Number(invoiceLimit);
+    const payload = await call('/plan', { method: 'POST', body });
+    const plan = toSafePlan(payload?.data);
+    if (!plan?.planCode) {
+      const error = new Error('Paystack did not return a plan code.');
+      error.status = 502;
+      error.code = 'PAYSTACK_INVALID_RESPONSE';
+      throw error;
+    }
+    return plan;
+  }
+
+  async function fetchPlan(idOrCode) {
+    const payload = await call(`/plan/${encodeURIComponent(String(idOrCode))}`);
+    return toSafePlan(payload?.data);
+  }
+
+  async function updatePlan(idOrCode, { name, amountMinor, interval, currency, description, sendInvoices = true, updateExistingSubscriptions = true }) {
+    const body = { amount: amountMinor, interval, currency: currency || 'NGN', send_invoices: sendInvoices !== false };
+    if (name) body.name = name;
+    if (description) body.description = String(description).slice(0, 300);
+    body.update_existing_subscriptions = updateExistingSubscriptions !== false;
+    const payload = await call(`/plan/${encodeURIComponent(String(idOrCode))}`, { method: 'PUT', body });
+    return {
+      message: typeof payload?.message === 'string' ? payload.message.slice(0, 300) : 'Plan updated',
+      affectedSubscriptions: parseAffectedSubscriptions(payload?.message),
+      plan: toSafePlan(payload?.data),
+    };
+  }
+
+  /* --------------------------- Provider subscriptions ----------------------
+   * A checkout raised with a plan code creates a Paystack subscription, which
+   * is what bills the customer again each interval. `POST /subscription/disable`
+   * stops those future charges; `POST /subscription/enable` restarts them and
+   * needs the email token and authorization from the subscription itself.
+   */
+  async function fetchSubscription(code) {
+    const payload = await call(`/subscription/${encodeURIComponent(String(code))}`);
+    return toSafeSubscription(payload?.data);
+  }
+
+  async function disableSubscription(code) {
+    const payload = await call('/subscription/disable', { method: 'POST', body: { code: String(code) } });
+    return { message: typeof payload?.message === 'string' ? payload.message.slice(0, 300) : 'Subscription cancelled' };
+  }
+
+  async function enableSubscription({ code, token, authorization }) {
+    const body = { code: String(code) };
+    if (token) body.token = String(token);
+    if (authorization) body.authorization = String(authorization);
+    const payload = await call('/subscription/enable', { method: 'POST', body });
+    return {
+      message: typeof payload?.message === 'string' ? payload.message.slice(0, 300) : 'Subscription reactivated',
+      subscription: toSafeSubscription(payload?.data),
+    };
+  }
+
+  return Object.freeze({
+    isConfigured: () => Boolean(settings.secretKey),
+    initializeTransaction,
+    verifyTransaction,
+    createPlan,
+    fetchPlan,
+    updatePlan,
+    fetchSubscription,
+    disableSubscription,
+    enableSubscription,
+  });
+}
+
+/** Number of existing subscriptions Paystack moved to the new plan details. */
+export function parseAffectedSubscriptions(message) {
+  const match = /(\d+)\s+subscription/i.exec(String(message || ''));
+  return match ? Number(match[1]) : null;
+}
+
+export function toSafePlan(data) {
+  if (!data || typeof data !== 'object') return null;
+  return {
+    id: Number.isFinite(Number(data.id)) ? Number(data.id) : null,
+    planCode: data.plan_code ? String(data.plan_code) : null,
+    name: data.name ? String(data.name).slice(0, 120) : null,
+    amountMinor: Number.isFinite(Number(data.amount)) ? Number(data.amount) : null,
+    interval: data.interval ? String(data.interval).toLowerCase() : null,
+    currency: data.currency ? String(data.currency).toUpperCase() : null,
+  };
+}
+
+export function toSafeSubscription(data) {
+  if (!data || typeof data !== 'object') return null;
+  return {
+    subscriptionCode: data.subscription_code ? String(data.subscription_code) : null,
+    status: data.status ? String(data.status).toLowerCase() : null,
+    amountMinor: Number.isFinite(Number(data.amount)) ? Number(data.amount) : null,
+    emailToken: data.email_token ? String(data.email_token) : null,
+    nextPaymentDate: data.next_payment_date ? String(data.next_payment_date) : null,
+    authorizationCode: data.authorization?.authorization_code ? String(data.authorization.authorization_code) : null,
+    planCode: data.plan?.plan_code ? String(data.plan.plan_code) : null,
+    customerEmail: data.customer?.email ? String(data.customer.email) : null,
+  };
+}
+
+/** True when Paystack answered "not found", e.g. a plan code we no longer own. */
+export function isProviderNotFound(error) {
+  return Number(error?.paystackStatus) === 404;
 }

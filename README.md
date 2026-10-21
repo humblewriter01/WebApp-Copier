@@ -11,7 +11,7 @@ A deployable React/Vite and Express app for capturing Telegram channel messages,
 - Reference-only account notes.
 - **MT4/MT5 account setup:** signed-in users can create an account setup and enter broker credentials on a MetaAPI-hosted secure page.
 - **Admin panel:** workspace administrators get a `/admin` dashboard with user totals, user management (roles, suspension), promo-code creation, and billing activity.
-- **Paystack subscriptions:** Free, Pro, and Premium plans with a hosted Paystack checkout, promo codes, verified webhooks, and plan-based limits.
+- **Paystack subscriptions:** Free, Pro, and Premium plans with a hosted Paystack checkout, promo codes, verified webhooks, plan-based limits, and automatic renewal through Paystack Plan Codes that are kept in step with the price an admin saves.
 - Risk preferences for planning only.
 
 ## Important safety and data notes
@@ -68,7 +68,9 @@ The app creates its PostgreSQL tables and indexes on backend startup. The new `m
 
 ## Paystack billing
 
-Signal Desk sells three plans. Prices and limits live in `server/services/billing.js`; the amount is always computed on the server, so a modified browser request can never change the charge.
+Signal Desk sells three plans. Limits and the built-in defaults live in `server/services/billing.js`; the amount charged is always computed on the server, so a modified browser request can never change the charge.
+
+**Prices are data, not configuration.** An administrator sets the active Pro and Premium prices in the Admin Panel (Pricing & Plans), and they are stored in the `admin_settings` table under the keys `pro_price` and `premium_price`, each with a short change history and the identity of whoever saved it. The environment variables below are only the fallback used while no price has been saved (and a saved price can be cleared to return to it). Every read order is the same: database first, then `PAYSTACK_PLAN_*_AMOUNT`.
 
 | Plan | Default price | Trading accounts | Telegram channels | Signals/day |
 |---|---|---:|---:|---:|
@@ -78,14 +80,29 @@ Signal Desk sells three plans. Prices and limits live in `server/services/billin
 
 Checkout flow:
 
-1. `POST /api/billing/checkout` recalculates the price (including any promo code), creates a `pending` row in `billing_transactions`, then calls Paystack's `POST /transaction/initialize` with that amount and a server-generated reference.
+1. `POST /api/billing/checkout` recalculates the price from the active (database) price, applies any promo code, creates a `pending` row in `billing_transactions`, then calls Paystack's `POST /transaction/initialize` with that amount and a server-generated reference. When the price is undiscounted and its Paystack Plan Code is confirmed to hold exactly that amount, the request also carries `plan`, which lets Paystack renew the customer automatically.
 2. The browser is redirected to the `authorization_url` Paystack returns. Card details are only ever entered on Paystack.
 3. Paystack redirects back to `/billing/callback?reference=…`. The page calls `GET /api/billing/verify`, which re-verifies with `GET /transaction/verify/:reference` before granting anything.
-4. Paystack also sends `charge.success` to `POST /api/billing/webhook`. The handler verifies the `x-paystack-signature` header (HMAC SHA512 of the raw request body using `PAYSTACK_SECRET_KEY`) and ignores everything else.
+4. Paystack also sends events to `POST /api/billing/webhook`: `charge.success` for first payments, and `invoice.create`, `invoice.update`, `invoice.payment_failed`, `subscription.create`, `subscription.enable`, `subscription.not_renew`, `subscription.disable` for the renewal cycle. The handler verifies the `x-paystack-signature` header (HMAC SHA512 of the raw request body using `PAYSTACK_SECRET_KEY`) and ignores everything else.
 
 Both paths share one fulfilment routine: the transaction is marked `success` once, the amount and currency must match the stored row, the user's plan and `plan_limits` are updated, and the promo code's `current_uses` is incremented. Replays are idempotent because the update is conditional on the row not already being `success`.
 
-Billing is a verified one-time charge per period; there is no stored card authorisation, so users renew from the Billing page. `cancel` marks `cancel_at_period_end` (access continues until the period ends) and `resume` clears it. An hourly sweep downgrades anyone whose period has passed back to the Free limits.
+Recurring billing is driven by Paystack Plan Codes, one per paid plan, kept on the server only (`admin_settings` key `paystack_plan_pro` / `paystack_plan_premium`, with the plan code, plan id, amount, currency, interval, and last sync result). `cancel` marks `cancel_at_period_end` (access continues until the period ends) and Paystack is asked to stop renewing; `resume` re-enables the Paystack subscription and clears the flag. A paid `invoice.update` extends the period from `max(now, current_period_end)` and records a `billing_transactions` row with `source = 'renewal'`; because renewal invoices reuse no local reference, idempotency is keyed on the Paystack `INV_…` invoice code, so a replayed webhook changes nothing. `invoice.payment_failed` sets `past_due` (access continues), and a completed or cancelled subscription keeps its access until the period ends and is then downgraded. An hourly sweep downgrades anyone whose period has passed back to the Free limits.
+
+### Keeping the Plan Code in step with the price
+
+A Paystack plan's amount overrides the amount in `transaction/initialize`, so a stale plan price would silently charge the old figure. Saving a price therefore synchronises the plan immediately (`server/services/plan-sync.js`):
+
+| Situation | Call | Result |
+|---|---|---|
+| No plan code yet | `POST /plan` with `name`, `amount`, `interval`, currency | `synced`, the returned `PLN_…` code is stored |
+| Code exists, amount and interval already match | none | `in_sync` (no write, no churn) |
+| Code exists, amount differs | `PUT /plan/:code` with `update_existing_subscriptions` | `synced`, plus the "n subscription(s) affected" count read from the response message |
+| Paystack no longer knows the code | `POST /plan` after the failed `GET /plan/:code` | `synced` with a fresh code |
+
+`PUT /plan` returns no body, so every write is followed by a `GET /plan/:code` and the amount, currency, and interval are compared with what this workspace charges. Only a match marks the plan `usable`; any mismatch, provider error, or network error is stored as `failed` with the message shown in the Admin Panel. Because the amount is verified, a failed sync cannot over- or under-charge: the plan code simply stops being sent and checkout continues as a one-time charge at the saved price, and **Re-sync** in the panel repairs it. Cancelling a price (clearing the input) restores the deployed default and re-syncs. Automatic renewal can also be switched off globally (`recurringEnabled`), which stops plan codes being sent without touching the stored prices, and `updateExistingSubscriptions` decides whether a price change moves subscribers who are already on a plan.
+
+Billing settings and prices are read and written through `GET`/`PUT /api/admin/pricing` and `POST /api/admin/pricing/sync`, all admin-only; plan codes and sync state never leave the server, and `GET /api/billing/plans` only returns names, amounts, intervals, limits, and whether the plan currently renews automatically.
 
 Configure in Render → API service → Environment:
 
@@ -93,10 +110,11 @@ Configure in Render → API service → Environment:
 |---|---:|---|
 | `PAYSTACK_SECRET_KEY` | Yes | Server-only key used for initialize, verify, and webhook signatures. Never expose it to the browser. |
 | `PAYSTACK_CURRENCY` | No | Defaults to `NGN`. |
-| `PAYSTACK_PLAN_PRO_AMOUNT` / `PAYSTACK_PLAN_PREMIUM_AMOUNT` | No | Price in the smallest currency unit (kobo). Defaults `250000` and `600000`. |
+| `PAYSTACK_PLAN_PRO_AMOUNT` / `PAYSTACK_PLAN_PREMIUM_AMOUNT` | No | Fallback price in the smallest currency unit (kobo), used only while no price is saved in `admin_settings`. Defaults `250000` and `600000`. |
+| `PAYSTACK_PLAN_INTERVAL` | No | Billing interval for created plans: `monthly` (default), `annually`, `quarterly`, or `biannually`. |
 | `PAYSTACK_API_URL` | No | HTTPS base URL override; defaults to `https://api.paystack.co`. |
 
-Then add the webhook URL in the Paystack dashboard (Settings → API Keys & Webhooks), in the same mode as the key (test or live): `https://<api-service-host>/api/billing/webhook`, with the `charge.success` event enabled. The callback URL is derived from `CLIENT_URL`, so that variable must be the exact public frontend origin.
+Then add the webhook URL in the Paystack dashboard (Settings → API Keys & Webhooks), in the same mode as the key (test or live): `https://<api-service-host>/api/billing/webhook`, with `charge.success` and the `invoice.*` and `subscription.*` events above enabled (renewals and cancellations arrive through them). The callback URL is derived from `CLIENT_URL`, so that variable must be the exact public frontend origin.
 
 ## Admin panel
 
@@ -108,7 +126,7 @@ The panel provides:
 
 - Dashboard totals: total users, administrators, suspended users, new sign-ups (7/30 days), promo codes, linked trading accounts, signals, and trades.
 - User management table: search by name or email, change role, suspend with a required reason, and restore access. An admin cannot demote or suspend their own account.
-- Promo code creator: code, percentage or fixed discount, optional maximum uses, and optional expiry. Existing codes can be paused, re-activated, or deleted. Codes are applied at Paystack checkout, and their `current_uses` increment only after a verified payment.
+- Pricing & Plans: the active Pro and Premium prices, how many subscribers a change would affect, whether each plan's Paystack plan is in sync (with its `PLN_…` code and last error), the per-plan price history, the two recurring-billing switches, a "Re-sync all plans with Paystack" action, and the promo-code creator: code, percentage or fixed discount, optional maximum uses, and optional expiry. Existing codes can be paused, re-activated, or deleted. Codes are applied at Paystack checkout, and their `current_uses` increment only after a verified payment.
 - Billing activity: active subscriptions, successful and pending payments, gross collected, discounts given, and the latest customer transactions.
 
 Suspension blocks new sign-ins with the stored reason. Existing JWT sessions on other devices remain valid until they expire (12 hours, or 30 days with "keep me signed in"), so revoke a role or suspend an account knowing that short window.
@@ -130,7 +148,8 @@ Suspension blocks new sign-ins with the stored reason. Existing JWT sessions on 
 | `ADMIN_EMAILS` | No | Comma-separated addresses that always hold the admin role |
 | `PAYSTACK_SECRET_KEY` | For billing | Server-only Paystack key for checkout, verification, and webhook signatures |
 | `PAYSTACK_CURRENCY` | No | Billing currency; defaults to `NGN` |
-| `PAYSTACK_PLAN_PRO_AMOUNT` / `PAYSTACK_PLAN_PREMIUM_AMOUNT` | No | Plan prices in kobo |
+| `PAYSTACK_PLAN_PRO_AMOUNT` / `PAYSTACK_PLAN_PREMIUM_AMOUNT` | No | Fallback plan prices in kobo; the Admin Panel can override them at runtime |
+| `PAYSTACK_PLAN_INTERVAL` | No | Interval for Paystack plans; defaults to `monthly` |
 | `AUTO_TRADING_RUNTIME_ENABLED` | No | `true` enables the MetaAPI execution runtime |
 | `PORT` | No | Render supplies this automatically |
 
@@ -160,6 +179,7 @@ The static site is served over HTTPS and includes a linked web app manifest, 192
 - `POST /api/auth/prepare-password-reset`, `POST /api/auth/sync-password`, `DELETE /api/auth/account`
 - `GET /api/admin/overview`, `GET /api/admin/users`, `PATCH /api/admin/users/:id`
 - `GET/POST /api/admin/promo-codes`, `PATCH/DELETE /api/admin/promo-codes/:id`, `GET /api/admin/billing`
+- `GET/PUT /api/admin/pricing`, `POST /api/admin/pricing/sync` – admin-only plan prices, recurring-billing settings, and Paystack Plan Code synchronisation
 - `GET /api/billing/plans` – public plan catalogue
 - `GET /api/billing/subscription`, `GET /api/billing/quote`, `POST /api/billing/checkout`, `GET /api/billing/verify`, `POST /api/billing/cancel`, `POST /api/billing/resume`
 - `POST /api/billing/webhook` – Paystack callback, authenticated by signature only

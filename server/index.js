@@ -22,9 +22,11 @@ import { createExecutionWorker } from './services/execution-worker.js';
 import { createSupabaseAuthBridge } from './services/supabase-auth.js';
 import { createAdminAccess, normalizePromoCodeInput, normalizePromoCodeUpdate, normalizeUserUpdate, assertAllowedSelfUpdate } from './services/admin.js';
 import { createAccountCleanup } from './services/account-cleanup.js';
-import { billingConfig, publicPlans, verifyWebhookSignature, normalizeReference } from './services/billing.js';
+import { billingConfig, verifyWebhookSignature, normalizeReference } from './services/billing.js';
 import { createPaystackClient } from './services/paystack.js';
 import { createBillingService } from './services/billing-service.js';
+import { createPricingStore, normalizePricingUpdate, normalizeBillingSettings, planChargeDecision, publicPricing } from './services/pricing.js';
+import { createPlanSynchronizer } from './services/plan-sync.js';
 import { planLimitsFor, buildLimitError } from './services/plan-limits.js';
 
 const app = express();
@@ -42,11 +44,21 @@ const adminAccess = createAdminAccess();
 const accountCleanup = createAccountCleanup({ logger: { warn: (message, extra = {}) => log('warn', message, extra) } });
 const paystackConfig = billingConfig();
 const paystackClient = createPaystackClient({ config: paystackConfig });
+const serviceLogger = {
+  info: (message, extra = {}) => log('info', message, extra),
+  warn: (message, extra = {}) => log('warn', message, extra),
+  error: (message, extra = {}) => log('error', message, extra),
+};
+// Prices are stored in `admin_settings` and maintained from the admin panel, with
+// the environment as the fallback whenever a plan has no stored price.
+const pricingStore = createPricingStore({ pool, config: paystackConfig, logger: serviceLogger });
+const planSynchronizer = createPlanSynchronizer({ paystack: paystackClient, pricing: pricingStore, config: paystackConfig, logger: serviceLogger });
 const billingService = createBillingService({
   pool,
+  pricing: pricingStore,
   paystack: paystackClient,
   config: paystackConfig,
-  logger: { info: (message, extra = {}) => log('info', message, extra), warn: (message, extra = {}) => log('warn', message, extra), error: (message, extra = {}) => log('error', message, extra) },
+  logger: serviceLogger,
 });
 
 const log = (level, message, extra = {}) => {
@@ -803,14 +815,18 @@ async function enforcePlanLimit(userId, limitKey, countSql) {
   }
 }
 
-app.get('/api/billing/plans', (_req, res) => {
+app.get('/api/billing/plans', asyncRoute(async (_req, res) => {
+  // Prices are read per request so a price saved in the admin panel is what the
+  // visitor sees and pays, with no cache or stale build to wait for.
+  const snapshot = await pricingStore.snapshot();
   res.set('Cache-Control', 'no-store').json({
-    plans: publicPlans(paystackConfig),
+    plans: publicPricing(snapshot),
     configured: paystackConfig.configured,
-    currency: paystackConfig.currency,
-    interval: paystackConfig.interval,
+    currency: snapshot.currency,
+    interval: snapshot.interval,
+    recurringEnabled: snapshot.recurringEnabled,
   });
-});
+}));
 
 app.get('/api/billing/subscription', authenticate, asyncRoute(async (req, res) => {
   const data = await billingService.subscriptionFor(req.userId);
@@ -1022,6 +1038,136 @@ app.delete('/api/admin/promo-codes/:id', authenticate, requireAdmin, asyncRoute(
   res.json({ ok: true });
 }));
 
+/* --------------------------- Admin: pricing control -------------------------
+ * Prices live in `admin_settings` (`pro_price`, `premium_price`), and every write
+ * also mirrors the price into a Paystack plan so recurring charges match what the
+ * site advertises. A sync problem is reported, never hidden, and never blocks
+ * saving the price.
+ */
+async function adminPricingPayload() {
+  const snapshot = await pricingStore.snapshot();
+  let subscribers = [];
+  try {
+    const { rows } = await pool.query(
+      `SELECT plan_key,COUNT(*)::int AS active_subscriptions FROM subscriptions
+       WHERE status IN ('active','non_renewing','past_due') GROUP BY plan_key`,
+    );
+    subscribers = rows;
+  } catch (error) {
+    log('warn', 'Subscription counts could not be read for the pricing panel', { code: error.code || 'PRICING_COUNTS_FAILED' });
+  }
+  const counts = new Map(subscribers.map((row) => [String(row.plan_key), Number(row.active_subscriptions || 0)]));
+  return {
+    currency: snapshot.currency,
+    interval: snapshot.interval,
+    configured: paystackConfig.configured,
+    billing: {
+      recurringEnabled: snapshot.recurringEnabled,
+      updateExistingSubscriptions: snapshot.updateExistingSubscriptions,
+    },
+    plans: snapshot.plans.map((plan) => ({
+      key: plan.key,
+      name: plan.name,
+      description: plan.description,
+      limits: plan.limits,
+      amountMinor: plan.amountMinor,
+      amount: plan.amount,
+      currency: plan.currency,
+      interval: plan.interval,
+      source: plan.source,
+      environmentAmountMinor: plan.environmentAmountMinor,
+      environmentAmount: plan.environmentAmountMinor / 100,
+      updatedAt: plan.updatedAt,
+      updatedBy: plan.updatedBy,
+      history: plan.history,
+      activeSubscribers: counts.get(plan.key) || 0,
+      paystack: plan.paystack
+        ? {
+          planCode: plan.paystack.planCode || null,
+          planId: plan.paystack.planId ?? null,
+          syncStatus: plan.paystack.syncStatus || 'pending',
+          syncedAmountMinor: plan.paystack.syncedAmountMinor ?? null,
+          syncedAt: plan.paystack.syncedAt || null,
+          currency: plan.paystack.currency || null,
+          interval: plan.paystack.interval || null,
+          name: plan.paystack.name || null,
+          message: plan.paystack.message || null,
+          error: plan.paystack.error || null,
+        }
+        : null,
+      renewsAutomatically: planChargeDecision({ plan, recurringEnabled: snapshot.recurringEnabled }).usePlan,
+    })),
+  };
+}
+
+app.get('/api/admin/pricing', authenticate, requireAdmin, asyncRoute(async (_req, res) => {
+  res.set('Cache-Control', 'no-store').json(await adminPricingPayload());
+}));
+
+app.put('/api/admin/pricing', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  let update;
+  try {
+    update = normalizePricingUpdate({ input: req.body || {}, config: paystackConfig });
+  } catch (error) {
+    return fail(res, error.status || 400, error.userMessage || error.message);
+  }
+
+  const saved = [];
+  for (const entry of update.entries) {
+    const result = await pricingStore.savePlanPrice({
+      planKey: entry.planKey,
+      amountMinor: entry.amountMinor,
+      actorId: req.userId,
+      actorEmail: req.userEmail,
+      note: update.note,
+    });
+    saved.push({ planKey: entry.planKey, ...result });
+  }
+  if (Object.keys(update.billing).length) {
+    await pricingStore.saveBillingSettings({ settings: update.billing, actorId: req.userId });
+  }
+
+  const syncs = [];
+  for (const planKey of update.syncPlanKeys) {
+    syncs.push(await planSynchronizer.syncPlan({ planKey, actorId: req.userId }));
+  }
+  const failed = syncs.filter((sync) => !sync.usable);
+  log('info', 'Admin updated pricing', {
+    actorId: req.userId,
+    plans: saved.map((item) => ({ planKey: item.planKey, amountMinor: item.amountMinor ?? null, cleared: Boolean(item.cleared) })),
+    syncStatuses: syncs.map((item) => `${item.planKey}:${item.status}`),
+  });
+  res.set('Cache-Control', 'no-store').json({
+    pricing: await adminPricingPayload(),
+    saved,
+    syncs,
+    notice: failed.length
+      ? `Saved, but Paystack could not confirm ${failed.map((item) => item.planKey).join(', ')}: ${failed[0].message} Users are charged the saved price as a one-time payment until the plan syncs.`
+      : 'Prices saved and mirrored to Paystack.',
+  });
+}));
+
+app.post('/api/admin/pricing/sync', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const requested = req.body?.plan ? [String(req.body.plan)] : paystackConfig.plans.map((plan) => plan.key);
+  for (const planKey of requested) {
+    if (!paystackConfig.plans.some((plan) => plan.key === String(planKey).trim().toLowerCase())) {
+      return fail(res, 400, 'Choose a valid plan to sync.');
+    }
+  }
+  let billing;
+  if (req.body && (Object.hasOwn(req.body, 'recurringEnabled') || Object.hasOwn(req.body, 'updateExistingSubscriptions'))) {
+    try { billing = normalizeBillingSettings(req.body); }
+    catch (error) { return fail(res, error.status || 400, error.message); }
+    await pricingStore.saveBillingSettings({ settings: billing, actorId: req.userId });
+  }
+  const syncs = [];
+  for (const planKey of requested) {
+    syncs.push(await planSynchronizer.syncPlan({ planKey, actorId: req.userId }));
+  }
+  log('info', 'Admin re-synced Paystack plans', { actorId: req.userId, results: syncs.map((item) => `${item.planKey}:${item.status}`) });
+  res.set('Cache-Control', 'no-store').json({ pricing: await adminPricingPayload(), syncs, billingSaved: Boolean(billing) });
+}));
+
 app.get('/api/admin/billing', authenticate, requireAdmin, asyncRoute(async (_req, res) => {
   const [summary, recent, subscriptions] = await Promise.all([
     pool.query(`SELECT
@@ -1030,7 +1176,7 @@ app.get('/api/admin/billing', authenticate, requireAdmin, asyncRoute(async (_req
       (SELECT COUNT(*)::int FROM billing_transactions WHERE status='pending') AS pending_payments,
       (SELECT COALESCE(SUM(amount_minor),0)::bigint FROM billing_transactions WHERE status='success') AS gross_minor,
       (SELECT COALESCE(SUM(discount_minor),0)::bigint FROM billing_transactions WHERE status='success') AS discounts_minor`),
-    pool.query(`SELECT t.reference,t.plan_key AS "planKey",t.status,t.amount_minor AS "amountMinor",t.currency,
+    pool.query(`SELECT t.reference,t.plan_key AS "planKey",t.source,t.plan_code AS "planCode",t.status,t.amount_minor AS "amountMinor",t.currency,
         t.promo_code AS "promoCode",t.paid_at AS "paidAt",t.created_at AS "createdAt",u.email
       FROM billing_transactions t JOIN users u ON u.id=t.user_id ORDER BY t.created_at DESC LIMIT 25`),
     pool.query(`SELECT s.plan_key AS "planKey",s.status,s.interval,s.current_period_end AS "currentPeriodEnd",
