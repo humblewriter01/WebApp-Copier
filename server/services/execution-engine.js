@@ -96,13 +96,17 @@ function successfulTradeResponse(result) {
   return /TRADE_RETCODE_(?:DONE|PLACED|DONE_PARTIAL)/.test(code) || [10008, 10009, 10010].includes(numeric);
 }
 
-/* -------------------------------- Break even --------------------------------
+/* --------------------------- Break even and trailing stop ---------------------------
  * Moves the stop loss of a position Signal Desk itself opened to (entry + a small
  * offset) once the market has travelled a configured distance in favour of the
- * trade, so a reversal can no longer turn the position into a loss.
+ * trade, so a reversal can no longer turn the position into a loss. With a trailing
+ * stop switched on instead of or alongside break even, the same sweep keeps ratcheting
+ * that stop in the trade's favour at the user's distance for as long as the position
+ * is open - one sweep, one set of guarantees, never a second decision path.
  *
  * Rules that never bend:
- *  - a stop is only ever moved in the direction that reduces risk (never widened);
+ *  - a stop is only ever moved in the direction that reduces risk (never widened), so a
+ *    retracing market never pulls a trailed stop back down;
  *  - the decision uses a fresh, synchronized quote, the live position from the
  *    synchronized terminal state, and the symbol's own tick/stops/freeze rules;
  *  - Auto-Trading off, a changed account, an undeployed account, or a missing
@@ -125,6 +129,14 @@ export const BREAK_EVEN_SWEEP_LIMIT = 20;
  */
 const BREAK_EVEN_DEFER_CODES = new Set([10016, 130]);
 const BREAK_EVEN_DEFER_TEXT = /(?:invalid|too small) stops|too close|stops level|freeze|requote|price (?:changed|off)|no prices|too many requests|being modified|market (?:is )?closed/i;
+
+/**
+ * A trail is a distance behind the market, so it needs a real distance to mean anything:
+ * zero would ask the broker to park a stop on the live price, and an absurd value is refused
+ * rather than clamped, because a clamped number is a number the user never chose.
+ */
+export const TRAILING_MIN_DISTANCE_POINTS = 1;
+export const TRAILING_MAX_DISTANCE_POINTS = 100_000;
 
 /** Codes that mean the request may or may not have reached the broker. */
 const BREAK_EVEN_AMBIGUOUS_CODES = new Set([10012, 7]);
@@ -160,14 +172,47 @@ export function normalizePositionSide(value) {
 }
 
 /**
- * Decides what to do with one open position. Returns one of:
+ * Break-even-only entry point to `calculateStopGuard`, kept as the named contract the
+ * settings, sweeps, and tests speak in. It decides what to do with one open position:
  *   wait          the market has not travelled far enough yet (check again later)
- *   already_beyond the current stop is already at least this protective (terminal)
+ *   already_beyond the current stop is already at least this protective (terminal here;
+ *                 a trailing stop turns the same finding into a `wait`, since a trail is
+ *                 a standing instruction rather than a one-off job)
  *   blocked       a safety input is missing or unusable (never send a request)
  *   defer         the broker rules forbid this exact price right now (retry later)
  *   move          send `stopLoss` to the broker
  */
 export function calculateBreakEvenStop({ side, openPrice, bid, ask, stopLoss, triggerPoints, offsetPoints, tickSize, stopsLevelPoints = 0, freezeLevelPoints = 0 }) {
+  return calculateStopGuard({
+    side, openPrice, bid, ask, stopLoss, tickSize, stopsLevelPoints, freezeLevelPoints,
+    breakEven: { triggerPoints, offsetPoints },
+  });
+}
+
+/**
+ * A true trailing stop: the stop keeps the user's distance from the market for as long as
+ * the position is open, ratcheting in the trade's favour and never releasing it back.
+ */
+export function calculateTrailingStop({ side, openPrice, bid, ask, stopLoss, distancePoints, tickSize, stopsLevelPoints = 0, freezeLevelPoints = 0, breakEven = null }) {
+  return calculateStopGuard({
+    side, openPrice, bid, ask, stopLoss, tickSize, stopsLevelPoints, freezeLevelPoints,
+    breakEven, trailing: { distancePoints },
+  });
+}
+
+/**
+ * One decision for both protections, because they must never disagree about safety.
+ *
+ *  - break even moves the stop to entry + offset once the market has travelled the trigger;
+ *  - a trailing stop holds the stop `distancePoints` from the market and keeps tightening it;
+ *  - when both are on, the more protective target wins, so turning trailing on can only
+ *    improve break even and turning break even on can never stall a trail.
+ *
+ * Returns `wait` (nothing to do yet), `already_beyond` (stop is at least this protective),
+ * `blocked` (a safety input is missing or unusable, so no request is ever built), `defer`
+ * (the broker forbids this price right now, retry later), or `move` (send `stopLoss`).
+ */
+export function calculateStopGuard({ side, openPrice, bid, ask, stopLoss, tickSize, stopsLevelPoints = 0, freezeLevelPoints = 0, breakEven = null, trailing = null }) {
   const direction = normalizePositionSide(side);
   if (!direction) return { action: 'blocked', reason: 'position-direction', message: 'MetaAPI did not report whether this position is a buy or a sell.' };
 
@@ -175,31 +220,94 @@ export function calculateBreakEvenStop({ side, openPrice, bid, ask, stopLoss, tr
   const marketBid = finiteNumber(bid);
   const marketAsk = finiteNumber(ask);
   const tick = finiteNumber(tickSize);
-  const trigger = finiteNumber(triggerPoints);
-  const offset = finiteNumber(offsetPoints) ?? 0;
   if (![entry, marketBid, marketAsk].every((value) => Number.isFinite(value) && value > 0) || marketBid >= marketAsk) {
     return { action: 'blocked', reason: 'quote-unavailable', message: 'A fresh, valid bid and ask price are required before a stop can be moved.' };
   }
   if (!Number.isFinite(tick) || tick <= 0) {
     return { action: 'blocked', reason: 'specification-unavailable', message: 'The broker did not provide a valid tick size for this symbol.' };
   }
-  if (!Number.isFinite(trigger) || trigger < 0 || trigger > 100_000) {
-    return { action: 'blocked', reason: 'invalid-trigger', message: 'The break-even trigger distance must be between 0 and 100000 points.' };
-  }
-  if (!Number.isFinite(offset) || offset < 0 || offset > 10_000) {
-    return { action: 'blocked', reason: 'invalid-offset', message: 'The break-even offset must be between 0 and 10000 points.' };
-  }
 
   const marketPrice = direction === 'buy' ? marketBid : marketAsk;
   const travelled = direction === 'buy' ? marketPrice - entry : entry - marketPrice;
   const travelledPoints = travelled / tick;
-  if (travelled + tick * 1e-6 < trigger * tick) {
-    return { action: 'wait', reason: 'trigger-not-reached', travelledPoints, requiredPoints: trigger };
+  const targets = [];
+
+  if (breakEven) {
+    const trigger = finiteNumber(breakEven.triggerPoints);
+    const offset = finiteNumber(breakEven.offsetPoints) ?? 0;
+    if (!Number.isFinite(trigger) || trigger < 0 || trigger > 100_000) {
+      return { action: 'blocked', reason: 'invalid-trigger', message: 'The break-even trigger distance must be between 0 and 100000 points.' };
+    }
+    if (!Number.isFinite(offset) || offset < 0 || offset > 10_000) {
+      return { action: 'blocked', reason: 'invalid-offset', message: 'The break-even offset must be between 0 and 10000 points.' };
+    }
+    if (travelled + tick * 1e-6 >= trigger * tick) {
+      targets.push({ label: 'break-even', price: direction === 'buy' ? entry + offset * tick : entry - offset * tick });
+    }
+  }
+  if (trailing) {
+    const distance = finiteNumber(trailing.distancePoints);
+    if (!Number.isFinite(distance) || distance < TRAILING_MIN_DISTANCE_POINTS || distance > TRAILING_MAX_DISTANCE_POINTS) {
+      return { action: 'blocked', reason: 'invalid-distance', message: `The trailing distance must be between ${TRAILING_MIN_DISTANCE_POINTS} and ${TRAILING_MAX_DISTANCE_POINTS} points.` };
+    }
+    targets.push({ label: 'trailing', price: direction === 'buy' ? marketPrice - distance * tick : marketPrice + distance * tick, distance });
   }
 
-  const target = direction === 'buy' ? entry + offset * tick : entry - offset * tick;
+  if (!targets.length) {
+    if (!breakEven) return { action: 'wait', reason: 'nothing-configured', travelledPoints };
+    return { action: 'wait', reason: 'trigger-not-reached', travelledPoints, requiredPoints: finiteNumber(breakEven.triggerPoints) };
+  }
+
+  // The more protective target wins - higher for a buy, lower for a sell. Choosing between
+  // two protective prices can never loosen anything, because both were computed to tighten.
+  const chosen = targets.reduce((best, item) => {
+    if (direction === 'buy') return item.price > best.price ? item : best;
+    return item.price < best.price ? item : best;
+  });
+
+  const decision = guardStopMove({
+    direction, marketBid, marketAsk, currentStop: finiteNumber(stopLoss), target: chosen.price,
+    tick, stopsLevelPoints, freezeLevelPoints, travelledPoints, label: chosen.label,
+  });
+
+  // A trail is a standing instruction, so "there is nothing tighter yet" is a wait until the
+  // market travels further - never the terminal `already_beyond` that ends break-even tracking.
+  if (decision.action === 'already_beyond' && trailing) {
+    return { action: 'wait', reason: 'trail-not-tighter', travelledPoints, stopLoss: decision.stopLoss, attemptedStopLoss: decision.attemptedStopLoss };
+  }
+  if (decision.action !== 'move') return { ...decision, source: chosen.label };
+
+  const { stopPrice, previousStopLoss } = decision;
+  return {
+    action: 'move',
+    stopLoss: stopPrice,
+    previousStopLoss,
+    openPrice: entry,
+    travelledPoints: Number(travelledPoints.toFixed(2)),
+    lockedPoints: Number((direction === 'buy' ? (stopPrice - entry) / tick : (entry - stopPrice) / tick).toFixed(2)),
+    source: chosen.label,
+    // The first trailing move off a broker-supplied stop is the start of a ratchet chain,
+    // which is what the ledger's move_count tracks and what the UI labels as trailing.
+    ratcheted: chosen.label === 'trailing' && previousStopLoss !== null,
+    trailingDistancePoints: chosen.distance ?? null,
+    improvementPoints: previousStopLoss === null ? null
+      : Number((direction === 'buy' ? (stopPrice - previousStopLoss) / tick : (previousStopLoss - stopPrice) / tick).toFixed(2)),
+  };
+}
+
+/**
+ * The rules that make a stop move safe, shared by both protections so neither can drift:
+ *  - the price is aligned onto the broker's tick grid, towards the market, so a stop never
+ *    lands beyond the price the user asked for;
+ *  - a stop that is already at least this protective is never touched again - a move is only
+ *    ever in the direction that reduces risk;
+ *  - the stop must stay on the correct side of the live quote that produced it;
+ *  - `stopsLevel` and `freezeLevel` are honoured, and a violation defers the move rather than
+ *    failing it, because it clears on its own as the price travels.
+ * `label` shapes the explanation the user sees, never the decision.
+ */
+function guardStopMove({ direction, marketBid, marketAsk, currentStop, target, tick, stopsLevelPoints, freezeLevelPoints, travelledPoints, label }) {
   const stopPrice = alignPriceToTick(target, tick, direction === 'buy' ? 'down' : 'up');
-  const currentStop = finiteNumber(stopLoss);
   const hasStop = Number.isFinite(currentStop) && currentStop > 0;
 
   if (hasStop) {
@@ -209,8 +317,9 @@ export function calculateBreakEvenStop({ side, openPrice, bid, ask, stopLoss, tr
     }
   }
 
+  const marketPrice = direction === 'buy' ? marketBid : marketAsk;
   if (direction === 'buy' ? stopPrice >= marketBid : stopPrice <= marketAsk) {
-    return { action: 'defer', reason: 'stop-side-of-market', message: 'The break-even price is on the wrong side of the current market price.', travelledPoints };
+    return { action: 'defer', reason: 'stop-side-of-market', message: `The ${label} price is on the wrong side of the current market price.`, travelledPoints };
   }
 
   const stopsLevel = Math.max(0, finiteNumber(stopsLevelPoints) ?? 0);
@@ -227,14 +336,7 @@ export function calculateBreakEvenStop({ side, openPrice, bid, ask, stopLoss, tr
     }
   }
 
-  return {
-    action: 'move',
-    stopLoss: stopPrice,
-    previousStopLoss: hasStop ? currentStop : null,
-    openPrice: entry,
-    travelledPoints: Number(travelledPoints.toFixed(2)),
-    lockedPoints: Number((direction === 'buy' ? (stopPrice - entry) / tick : (entry - stopPrice) / tick).toFixed(2)),
-  };
+  return { action: 'move', stopPrice, previousStopLoss: hasStop ? currentStop : null };
 }
 
 /**
@@ -467,14 +569,16 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
     }
   }
 
-  /* ------------------------- break-even stop sweep ------------------------- */
+  /* --------------------- break-even and trailing stop sweep --------------------- */
   let lastBreakEvenSweep = 0;
 
   async function candidates() {
     const { rows } = await pool.query(
       `SELECT t.id AS trade_id,t.user_id,t.metaapi_account_id,t.broker_position_id,t.symbol,t.side,
               t.entry_price,t.stop_loss,
+              s.break_even_enabled AS break_even_enabled,
               s.break_even_trigger_points AS trigger_points,s.break_even_offset_points AS offset_points,
+              s.trailing_stop_enabled AS trailing_enabled,s.trailing_stop_distance_points AS trailing_distance_points,
               ma.managed_by_app
        FROM trades t
        JOIN settings s ON s.user_id=t.user_id
@@ -483,19 +587,43 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
        LEFT JOIN break_even_moves m
          ON m.user_id=t.user_id AND m.metaapi_account_id=t.metaapi_account_id AND m.broker_position_id=t.broker_position_id
        WHERE t.status='executed' AND t.broker_position_id IS NOT NULL
-         AND s.break_even_enabled=TRUE AND s.auto_trading_enabled=TRUE AND s.execution_account_id=t.metaapi_account_id
+         AND (s.break_even_enabled=TRUE OR s.trailing_stop_enabled=TRUE)
+         AND s.auto_trading_enabled=TRUE AND s.execution_account_id=t.metaapi_account_id
          AND UPPER(COALESCE(ma.state,''))='DEPLOYED'
          AND u.subscription_status = ANY($4::text[])
          AND t.created_at >= NOW() - ($1::text || ' days')::interval
          AND (m.id IS NULL
               OR (m.status IN ('deferred','failed')
                   AND m.attempt_count < $2
-                  AND (m.next_attempt_at IS NULL OR m.next_attempt_at <= NOW())))
-       ORDER BY t.created_at ASC
+                  AND (m.next_attempt_at IS NULL OR m.next_attempt_at <= NOW()))
+              -- A trail is not finished by one move, so a handled position stays a candidate
+              -- while trailing is on. 'closed' and 'unknown' are excluded for good: the first is
+              -- gone and the second needs a human, so neither may be re-sent.
+              OR (s.trailing_stop_enabled=TRUE AND m.status IN ('moved','already_beyond')))
+       -- A position that has never been protected outranks a trail already running, so a
+       -- workspace with more open trades than the sweep limit cannot starve a fresh move;
+       -- inside each class the row touched longest ago goes first, which rotates the trails
+       -- instead of letting one position hold the queue.
+       ORDER BY CASE WHEN m.id IS NULL THEN 0
+                     WHEN m.status IN ('deferred','failed') THEN 1
+                     ELSE 2 END,
+                COALESCE(m.updated_at, t.created_at) ASC, t.created_at ASC
        LIMIT $3`,
       [String(BREAK_EVEN_TRACKING_DAYS), Number(breakEvenMaxAttempts) || BREAK_EVEN_MAX_ATTEMPTS, BREAK_EVEN_SWEEP_LIMIT, [...PAID_STATUSES]],
     );
     return rows;
+  }
+
+  /** What the ledger records about the settings a decision was made under. */
+  function moveLedger(candidate) {
+    const trailingOn = candidate.trailing_enabled === true;
+    return {
+      triggerPoints: candidate.trigger_points,
+      offsetPoints: candidate.offset_points,
+      trailingDistancePoints: trailingOn ? candidate.trailing_distance_points : null,
+      // Only a trail may revisit a row a previous sweep already settled, and only to tighten.
+      ratchet: trailingOn,
+    };
   }
 
   /** Persisted so a position is never sent twice, and so the UI can explain any outcome. */
@@ -503,42 +631,59 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
     const {
       status, stopLoss = null, previousStopLoss = null, openPrice = null, message = null,
       providerResponse = null, retryInMs = null, marketBid = null, marketAsk = null,
-      triggerPoints = null, offsetPoints = null, incrementAttempt = true,
+      triggerPoints = null, offsetPoints = null, trailingDistancePoints = null,
+      incrementAttempt = true, ratchet = false,
     } = patch;
     await pool.query(
       `INSERT INTO break_even_moves(
          user_id,trade_id,metaapi_account_id,broker_position_id,symbol,side,open_price,trigger_points,offset_points,
-         previous_stop_loss,stop_loss,status,attempt_count,market_bid,market_ask,provider_response,error_message,next_attempt_at,updated_at)
+         previous_stop_loss,stop_loss,status,attempt_count,market_bid,market_ask,provider_response,error_message,next_attempt_at,updated_at,
+         move_count,trailing_distance_points)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,$14,$15,$16,$17,
-               CASE WHEN $18::text IS NULL THEN NULL ELSE NOW() + ($18::text || ' milliseconds')::interval END,NOW())
+               CASE WHEN $18::text IS NULL THEN NULL ELSE NOW() + ($18::text || ' milliseconds')::interval END,NOW(),
+               CASE WHEN $12 = 'moved' THEN 1 ELSE 0 END,$20)
        ON CONFLICT(user_id,metaapi_account_id,broker_position_id) DO UPDATE SET
          symbol=EXCLUDED.symbol,side=EXCLUDED.side,open_price=EXCLUDED.open_price,trigger_points=EXCLUDED.trigger_points,
          offset_points=EXCLUDED.offset_points,previous_stop_loss=EXCLUDED.previous_stop_loss,stop_loss=EXCLUDED.stop_loss,
          status=EXCLUDED.status,
          attempt_count=break_even_moves.attempt_count + CASE WHEN $13::text = 'true' THEN 1 ELSE 0 END,
          market_bid=EXCLUDED.market_bid,market_ask=EXCLUDED.market_ask,provider_response=EXCLUDED.provider_response,
-         error_message=EXCLUDED.error_message,next_attempt_at=EXCLUDED.next_attempt_at,updated_at=NOW()
-       WHERE break_even_moves.status NOT IN ('moved','already_beyond','closed','unknown')`,
+         error_message=EXCLUDED.error_message,next_attempt_at=EXCLUDED.next_attempt_at,updated_at=NOW(),
+         trailing_distance_points=EXCLUDED.trailing_distance_points,
+         move_count=break_even_moves.move_count + CASE WHEN EXCLUDED.status = 'moved' THEN 1 ELSE 0 END
+       WHERE break_even_moves.status NOT IN ('moved','already_beyond','closed','unknown')
+          -- A ratchet write is the trail tightening the stop again; only it may revisit a row
+          -- that a previous sweep already settled, and never one that is closed or unconfirmed.
+          OR ($19::text = 'true' AND break_even_moves.status IN ('moved','already_beyond'))`,
       [candidate.user_id, candidate.trade_id || null, candidate.metaapi_account_id, candidate.broker_position_id,
         candidate.symbol || null, candidate.side || null, openPrice, triggerPoints, offsetPoints,
         previousStopLoss, stopLoss, status, String(incrementAttempt), marketBid, marketAsk, providerResponse,
-        message ? safeText(message) : null, retryInMs == null ? null : String(retryInMs)],
+        message ? safeText(message) : null, retryInMs == null ? null : String(retryInMs),
+        String(Boolean(ratchet)), trailingDistancePoints == null ? null : String(trailingDistancePoints)],
     );
   }
 
-  async function breakEvenEligible(userId, accountId) {
+  /**
+   * Re-read immediately before any broker write, so a switch flipped mid-sweep takes effect at
+   * once. Either protection being on is enough to act, because both move the same stop under
+   * the same rules; Auto-Trading off still means nothing reaches the broker. This is also what
+   * makes "off" trustworthy as a safety statement rather than a UI detail.
+   */
+  async function stopGuardEligible(userId, accountId) {
     const { rows } = await pool.query(
       `SELECT s.auto_trading_enabled AS "autoTradingEnabled",s.break_even_enabled AS "breakEvenEnabled",
+              s.trailing_stop_enabled AS "trailingStopEnabled",
               s.execution_account_id AS "executionAccountId"
        FROM settings s WHERE s.user_id=$1 LIMIT 1`,
       [userId],
     );
     const latest = rows[0];
-    return Boolean(latest && latest.autoTradingEnabled === true && latest.breakEvenEnabled === true && latest.executionAccountId === accountId);
+    if (!latest || latest.autoTradingEnabled !== true || latest.executionAccountId !== accountId) return false;
+    return latest.breakEvenEnabled === true || latest.trailingStopEnabled === true;
   }
 
   async function sweepBreakEven() {
-    const summary = { attempted: 0, moved: 0, deferred: 0, failed: 0, closed: 0, skipped: 0 };
+    const summary = { attempted: 0, moved: 0, ratcheted: 0, deferred: 0, failed: 0, closed: 0, skipped: 0 };
     if (!runtimeEnabled) return { ...summary, reason: 'runtime-disabled' };
     if (typeof trading.modifyPosition !== 'function') return { ...summary, reason: 'provider-unsupported' };
     const timestamp = now();
@@ -585,13 +730,24 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
           // Not being able to *look* is not the broker refusing anything, so it must
           // not consume an attempt: protection should resume as soon as the account
           // synchronizes again rather than resting forever after ten bad minutes.
-          await recordMove(candidate, { status: 'deferred', message: `Account data was not available: ${message}`, retryInMs: BREAK_EVEN_FAILED_RETRY_MS, triggerPoints: candidate.trigger_points, offsetPoints: candidate.offset_points, incrementAttempt: false }).catch(() => {});
+          await recordMove(candidate, { ...moveLedger(candidate), status: 'deferred', message: `Account data was not available: ${message}`, retryInMs: BREAK_EVEN_FAILED_RETRY_MS, incrementAttempt: false }).catch(() => {});
         }
         continue;
       }
 
       for (const candidate of group) {
         summary.attempted += 1;
+        const ledger = moveLedger(candidate);
+        // Which protection this workspace has switched on decides which targets the decision
+        // may consider. A row can only be here because at least one of them is on.
+        const guardMode = {
+          breakEven: candidate.break_even_enabled === true
+            ? { triggerPoints: candidate.trigger_points, offsetPoints: candidate.offset_points }
+            : null,
+          trailing: candidate.trailing_enabled === true
+            ? { distancePoints: candidate.trailing_distance_points }
+            : null,
+        };
         try {
           const position = (state.positions || []).find((item) => String(item.id) === String(candidate.broker_position_id));
           if (!position) {
@@ -599,37 +755,39 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
             await recordMove(candidate, { status: 'closed', message: 'The position is no longer open on the broker account.', triggerPoints: candidate.trigger_points, offsetPoints: candidate.offset_points, incrementAttempt: false });
             continue;
           }
-          const decision = calculateBreakEvenStop({
+          // The quote, the position, and the symbol specification below all come from this one
+          // account read, so a price can never be paired with a stop or a spec from another
+          // moment, and nothing is remembered from a previous sweep to act on instead.
+          const decision = calculateStopGuard({
             side: position.type ?? candidate.side,
             openPrice: position.openPrice ?? candidate.entry_price,
             bid: state.price?.bid,
             ask: state.price?.ask,
             stopLoss: position.stopLoss,
-            triggerPoints: candidate.trigger_points,
-            offsetPoints: candidate.offset_points,
             tickSize: state.specification?.tickSize,
             stopsLevelPoints: state.specification?.stopsLevel,
             freezeLevelPoints: state.specification?.freezeLevel,
+            ...guardMode,
           });
 
           if (decision.action === 'wait') { summary.skipped += 1; continue; }
           if (decision.action === 'already_beyond') {
-            await recordMove(candidate, { status: 'already_beyond', stopLoss: decision.stopLoss, openPrice: position.openPrice ?? null, triggerPoints: candidate.trigger_points, offsetPoints: candidate.offset_points, incrementAttempt: false });
+            await recordMove(candidate, { ...ledger, status: 'already_beyond', stopLoss: decision.stopLoss, openPrice: position.openPrice ?? null, incrementAttempt: false });
             summary.skipped += 1;
             continue;
           }
           if (decision.action === 'blocked') {
             summary.deferred += 1;
-            await recordMove(candidate, { status: 'deferred', message: decision.message, retryInMs: BREAK_EVEN_FAILED_RETRY_MS, triggerPoints: candidate.trigger_points, offsetPoints: candidate.offset_points, incrementAttempt: false });
+            await recordMove(candidate, { ...ledger, status: 'deferred', message: decision.message, retryInMs: BREAK_EVEN_FAILED_RETRY_MS, incrementAttempt: false });
             continue;
           }
           if (decision.action === 'defer') {
             summary.deferred += 1;
-            await recordMove(candidate, { status: 'deferred', message: decision.message, retryInMs: BREAK_EVEN_DEFERRED_RETRY_MS, marketBid: state.price?.bid ?? null, marketAsk: state.price?.ask ?? null, triggerPoints: candidate.trigger_points, offsetPoints: candidate.offset_points, incrementAttempt: false });
+            await recordMove(candidate, { ...ledger, status: 'deferred', message: decision.message, retryInMs: BREAK_EVEN_DEFERRED_RETRY_MS, marketBid: state.price?.bid ?? null, marketAsk: state.price?.ask ?? null, incrementAttempt: false });
             continue;
           }
 
-          if (!(await breakEvenEligible(userId, accountId))) {
+          if (!(await stopGuardEligible(userId, accountId))) {
             summary.skipped += 1;
             continue;
           }
@@ -637,34 +795,37 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
           const result = await trading.modifyPosition({ token, accountId, positionId: String(candidate.broker_position_id), stopLoss: decision.stopLoss });
           const providerResponse = safeProviderResponse(result, token);
           if (noChangeReported(result)) {
-            await recordMove(candidate, { status: 'already_beyond', stopLoss: decision.stopLoss, previousStopLoss: decision.previousStopLoss ?? null, openPrice: decision.openPrice ?? null, marketBid: state.price?.bid ?? null, marketAsk: state.price?.ask ?? null, providerResponse, triggerPoints: candidate.trigger_points, offsetPoints: candidate.offset_points, incrementAttempt: false });
+            await recordMove(candidate, { ...ledger, status: 'already_beyond', stopLoss: decision.stopLoss, previousStopLoss: decision.previousStopLoss ?? null, openPrice: decision.openPrice ?? null, marketBid: state.price?.bid ?? null, marketAsk: state.price?.ask ?? null, providerResponse, incrementAttempt: false });
             summary.skipped += 1;
             continue;
           }
           if (!successfulTradeResponse(result)) {
             const message = safeText(result?.message || `MetaAPI rejected the stop-loss change (${result?.stringCode || result?.numericCode || 'unknown provider code'}).`, [token]);
             summary.failed += 1;
-            await recordMove(candidate, { status: 'failed', message, providerResponse, retryInMs: BREAK_EVEN_FAILED_RETRY_MS, marketBid: state.price?.bid ?? null, marketAsk: state.price?.ask ?? null, triggerPoints: candidate.trigger_points, offsetPoints: candidate.offset_points });
+            await recordMove(candidate, { ...ledger, status: 'failed', message, providerResponse, retryInMs: BREAK_EVEN_FAILED_RETRY_MS, marketBid: state.price?.bid ?? null, marketAsk: state.price?.ask ?? null });
             continue;
           }
           await recordMove(candidate, {
-            status: 'moved', stopLoss: decision.stopLoss, previousStopLoss: decision.previousStopLoss, openPrice: decision.openPrice,
-            marketBid: state.price?.bid ?? null, marketAsk: state.price?.ask ?? null, providerResponse, triggerPoints: candidate.trigger_points, offsetPoints: candidate.offset_points, incrementAttempt: false,
+            ...ledger, status: 'moved', stopLoss: decision.stopLoss, previousStopLoss: decision.previousStopLoss, openPrice: decision.openPrice,
+            marketBid: state.price?.bid ?? null, marketAsk: state.price?.ask ?? null, providerResponse, incrementAttempt: false,
           });
           await pool.query('UPDATE trades SET stop_loss=$1 WHERE id=$2 AND user_id=$3', [decision.stopLoss, candidate.trade_id, userId]);
           summary.moved += 1;
+          // A ratchet is a trail tightening an already-protected stop, which is the outcome
+          // worth counting separately: it is exactly why a 'moved' row stays in the sweep.
+          if (decision.ratcheted) summary.ratcheted += 1;
         } catch (error) {
           const outcome = classifyBreakEvenFailure(error);
           const message = safeText(outcome.message || error?.message || error, [token]);
           if (outcome.status === 'unknown') summary.failed += 1; else summary.deferred += 1;
           await recordMove(candidate, {
+            ...ledger,
             status: outcome.status === 'unknown' ? 'unknown' : 'deferred',
             message: outcome.status === 'unknown'
               ? `${message} Reconcile the position on the broker account before changing the break-even settings.`
               : message,
             retryInMs: outcome.retry && outcome.status !== 'unknown' ? BREAK_EVEN_FAILED_RETRY_MS : null,
             marketBid: state.price?.bid ?? null, marketAsk: state.price?.ask ?? null,
-            triggerPoints: candidate.trigger_points, offsetPoints: candidate.offset_points,
             incrementAttempt: outcome.status !== 'deferred',
           }).catch(() => {});
           // The order itself filled, so the trade keeps its execution status: only the

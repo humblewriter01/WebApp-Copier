@@ -24,12 +24,13 @@ await build({
 });
 assert.ok(existsSync(outfile), 'the component bundle was produced');
 
-const { default: ExecutionSettings, EXECUTION_WARNING } = await import(pathToFileURL(outfile).href);
+const { default: ExecutionSettings, EXECUTION_WARNING, breakEvenSummary } = await import(pathToFileURL(outfile).href);
 
 const baseSettings = {
   riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 3, dailyLossLimit: 5, autoTradingEnabled: true,
   lotSizeMode: 'fixed', fixedLotSize: 0.01, maxDailyTrades: 10, executionAccountId: 'account-1',
   breakEvenEnabled: true, breakEvenTriggerPoints: 35, breakEvenOffsetPoints: 5,
+  trailingStopEnabled: true, trailingStopDistancePoints: 25,
 };
 const accounts = [{ metaApiAccountId: 'account-1', name: 'Demo MT5', platform: 'mt5', server: 'Broker-Demo', state: 'DEPLOYED' }];
 
@@ -95,4 +96,47 @@ test('the live-trading warning keeps the exact required wording', () => {
     'Warning: Enabling Auto-Trading will execute live trades on your connected broker account. Ensure you are using a demo account for testing. You are fully responsible for any financial losses.',
   );
   assert.ok(render().includes(EXECUTION_WARNING));
+});
+
+/* ------------------------------- the trailing stop ------------------------------- */
+/* A trail is the one setting here that writes to the broker over and over, so the copy has to
+ * carry the same three promises the engine enforces: only tighten, only on a fresh quote, and
+ * leave an unconfirmed answer alone instead of sending it again. */
+
+test('the trailing stop section states what it does and what it never does', () => {
+  const markup = render();
+  assert.match(markup, /<h3>Trailing Stop<\/h3>/);
+  assert.match(markup, /Trailing distance \(points\)/);
+  assert.match(markup, /Enable Trailing Stop ON/);
+  assert.match(markup, /never slips back/, 'the one-way ratchet is explained before it is switched on');
+  assert.match(markup, /only ever moves in the direction that reduces risk/i);
+  assert.match(markup, /fresh synchronized quote/i);
+  assert.match(markup, /the more protective stop wins/, 'the interaction with break even is stated, not left to be discovered');
+  assert.match(markup, /Turning Auto-Trading off stops these moves too/i, 'OFF has to mean no broker writes for the trail as well');
+  assert.match(markup, /reconcile it/i, 'an unconfirmed move waits for a human, it is not resent');
+});
+
+test('the trailing distance shows the saved value and never a blank or a silent zero', () => {
+  assert.match(render(), /id="trailing-distance"[^>]*value="25"/);
+  assert.match(render(), /id="trailing-distance"[^>]*min="1"[^>]*max="100000"/);
+  assert.match(render({ settings: { trailingStopDistancePoints: undefined } }), /id="trailing-distance"[^>]*value="10"/, 'a workspace that never touched it still sees the default it would get');
+});
+
+test('the trailing switch follows the runtime and the saved preference', () => {
+  assert.match(render(), /id="trailing-enabled"[^>]*checked/);
+  assert.equal(/id="trailing-enabled"[^>]*checked/.test(render({ settings: { trailingStopEnabled: false } })), false);
+  const noRuntime = render({ runtimeAvailable: false });
+  assert.match(noRuntime, /id="trailing-enabled"[^>]*disabled/, 'the switch cannot be turned on without a runtime, same as break even');
+  assert.match(noRuntime, /Trailing stop moves are unavailable while automatic execution is unavailable/i);
+});
+
+test('a trailed stop is labelled as a trail, not as break even', () => {
+  const trade = { id: 't1', side: 'buy', symbol: 'EURUSD', quantity: 0.05, status: 'executed', breakEvenStatus: 'moved', breakEvenStopLoss: '1.1020' };
+  assert.equal(breakEvenSummary(trade), 'Stop moved to break even (1.1020)', 'no trailing distance recorded means break even did it');
+  assert.equal(breakEvenSummary({ ...trade, breakEvenTrailingDistancePoints: '30', breakEvenMoveCount: 1 }), 'Stop trailed (1.1020)');
+  assert.equal(breakEvenSummary({ ...trade, breakEvenTrailingDistancePoints: '30', breakEvenMoveCount: 4 }), 'Stop trailed (1.1020) · 4 moves, 30 points behind');
+  assert.equal(breakEvenSummary({ ...trade, breakEvenStatus: 'deferred', breakEvenTrailingDistancePoints: '30' }), 'Waiting for room to move', 'only a completed move counts as a ratchet');
+
+  const markup = render({ trades: [{ ...trade, breakEvenTrailingDistancePoints: '30', breakEvenMoveCount: 2 }] });
+  assert.match(markup, /Stop trailed \(1\.1020\) · 2 moves, 30 points behind/);
 });

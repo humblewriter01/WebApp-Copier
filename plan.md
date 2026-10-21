@@ -36,6 +36,7 @@ A provisioned MetaAPI account bills for as long as it exists, so an account whos
 
 - **Design movement:** Continue the restrained navy-and-teal dashboard style, with a clear visual distinction between saved preferences and executable settings.
 - **Core principles:** Clear default-on notice, one-action immediate off control, fail-closed safeguards, legible status, and mobile-first touch access.
+- **Stop protection:** break even and the trailing stop share one sweep, one candidate query, one ledger, and one set of safety rules, so a guarantee stated once holds for both. A stop may only ever move tighter, only on a quote read in the same breath as the position, and an unconfirmed broker answer is parked for a human instead of resent. Any new protection mode is expected to join that sweep rather than open a second path to the broker.
 - **Color philosophy:** Preserve navy structure and teal actions; reserve saturated red for the live-trading warning and blocked safety conditions.
 - **Layout paradigm:** Keep the existing dashboard shell and present execution controls in a focused section that stacks vertically on mobile.
 - **Signature elements:** A prominent red Auto-Trading warning, visible OFF/ON status, and concise execution-result badges.

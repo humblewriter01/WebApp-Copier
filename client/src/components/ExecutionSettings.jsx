@@ -11,10 +11,20 @@ const BREAK_EVEN_LABELS = {
   closed: 'Position closed',
 };
 
-function breakEvenSummary(trade) {
+/**
+ * One line per trade, worded for the protection that actually produced it. A move that came
+ * from a trail is not "break even" and saying so would mislead the user about where their stop
+ * is heading, so the count of moves decides the wording rather than a setting guess.
+ */
+export function breakEvenSummary(trade) {
   const label = BREAK_EVEN_LABELS[trade.breakEvenStatus] || trade.breakEvenStatus;
-  if (trade.breakEvenStatus === 'moved' && trade.breakEvenStopLoss) return `${label} (${trade.breakEvenStopLoss})`;
-  return label;
+  if (trade.breakEvenStatus !== 'moved' || !trade.breakEvenStopLoss) return label;
+  const distance = Number(trade.breakEvenTrailingDistancePoints);
+  if (!(distance > 0)) return `${label} (${trade.breakEvenStopLoss})`;
+  const moves = Number(trade.breakEvenMoveCount) || 1;
+  return moves > 1
+    ? `Stop trailed (${trade.breakEvenStopLoss}) · ${moves} moves, ${distance} points behind`
+    : `Stop trailed (${trade.breakEvenStopLoss})`;
 }
 
 export default function ExecutionSettings({ settings, accounts = [], trades = [], runtimeAvailable = false, onChange, onSubmit, onToggle, saving = false }) {
@@ -102,6 +112,24 @@ export default function ExecutionSettings({ settings, accounts = [], trades = []
           </span>
         </label>
         {!runtimeAvailable && <p className="field-help">Break-even moves are unavailable while automatic execution is unavailable on this service.</p>}
+
+        <div className="execution-section-heading">
+          <h3>Trailing Stop</h3>
+          <p>Break even moves a stop once. A trailing stop keeps moving it: the stop stays a fixed distance from the market as the trade runs, and never slips back when the price retraces.</p>
+        </div>
+        <label htmlFor="trailing-distance">Trailing distance (points)
+          <input id="trailing-distance" type="number" min="1" max="100000" step="1" value={settings.trailingStopDistancePoints ?? 10} onChange={(event) => set('trailingStopDistancePoints', event.target.value)} required />
+          <small>How far the stop follows the market. A small distance locks profit quickly but is more likely to be stopped out by normal noise; on most FX pairs 10 points is one pip.</small>
+        </label>
+        <label className="execution-toggle-row" htmlFor="trailing-enabled">
+          <input id="trailing-enabled" type="checkbox" checked={Boolean(settings.trailingStopEnabled)} disabled={saving || !runtimeAvailable} onChange={(event) => set('trailingStopEnabled', event.target.checked)} />
+          <span>
+            <strong>Enable Trailing Stop {settings.trailingStopEnabled ? 'ON' : 'OFF'}</strong>
+            <small>The stop only ever moves in the direction that reduces risk: a buy ratchets up, a sell ratchets down, and a stop you moved yourself to a tighter price is never widened or replaced. Each workspace check uses a fresh synchronized quote and the broker&rsquo;s own stop and freeze distances, so a move that cannot be accepted yet is retried instead of forced. It can run with or without break even &mdash; with both on, the more protective stop wins. Turning Auto-Trading off stops these moves too: while it is off Signal Desk sends nothing to your broker.</small>
+          </span>
+        </label>
+        <p className="field-help">Trailing stops are checked on the same sweep as break-even moves, and only for trades Signal Desk opened. Distances are MetaTrader points, aligned onto the symbol&rsquo;s tick size, so a stop lands on a price the broker accepts rather than between ticks. A position whose move the broker could not confirm is left alone until you reconcile it, rather than being sent again.</p>
+        {!runtimeAvailable && <p className="field-help">Trailing stop moves are unavailable while automatic execution is unavailable on this service.</p>}
 
         <label className="execution-toggle-row" htmlFor="auto-trading-enabled">
           <input id="auto-trading-enabled" type="checkbox" checked={Boolean(settings.autoTradingEnabled)} disabled={saving || (!settings.autoTradingEnabled && !runtimeAvailable)} onChange={(event) => onToggle ? onToggle(event.target.checked) : set('autoTradingEnabled', event.target.checked)} />

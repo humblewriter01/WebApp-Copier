@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import {
   BREAK_EVEN_DEFERRED_RETRY_MS,
   BREAK_EVEN_MAX_ATTEMPTS,
+  TRAILING_MAX_DISTANCE_POINTS,
   calculateBreakEvenStop,
+  calculateStopGuard,
+  calculateTrailingStop,
   classifyBreakEvenFailure,
   createExecutionEngine,
   normalizePositionSide,
@@ -130,10 +133,11 @@ test('an ambiguous transport failure is never retried automatically', () => {
 });
 
 /* --------------------------------- the sweep --------------------------------- */
+// Mirrors the columns the candidate query selects, so the sweep sees what the database gives it.
 const candidate = {
   trade_id: 'trade-1', user_id: 'user-1', metaapi_account_id: 'account-1', broker_position_id: '42',
   symbol: 'EURUSD', side: 'buy', entry_price: '1.1', stop_loss: '1.089',
-  trigger_points: '20', offset_points: '0', managed_by_app: true,
+  break_even_enabled: true, trigger_points: '20', offset_points: '0', managed_by_app: true,
 };
 
 function fakeState(overrides = {}) {
@@ -149,7 +153,7 @@ function fakeState(overrides = {}) {
   };
 }
 
-function fakePool({ rows = [candidate], state = fakeState(), stateError = null, eligible = true, accountState = 'DEPLOYED', modifyResult = { stringCode: 'TRADE_RETCODE_DONE', numericCode: 10009 }, modifyError = null, token = 'secret-token-1' } = {}) {
+function fakePool({ rows = [candidate], state = fakeState(), stateError = null, eligible = true, trailingEligible = null, accountState = 'DEPLOYED', modifyResult = { stringCode: 'TRADE_RETCODE_DONE', numericCode: 10009 }, modifyError = null, token = 'secret-token-1' } = {}) {
   const calls = [];
   return {
     calls,
@@ -158,7 +162,16 @@ function fakePool({ rows = [candidate], state = fakeState(), stateError = null, 
       if (sql.includes('FROM trades t')) return { rows };
       if (sql.includes('FROM metaapi_accounts WHERE user_id=$1 AND metaapi_account_id=$2')) return { rows: [{ managed_by_app: true, state: accountState }] };
       if (sql.includes('break_even_enabled AS "breakEvenEnabled"')) {
-        return { rows: [{ autoTradingEnabled: eligible, breakEvenEnabled: eligible, executionAccountId: 'account-1' }] };
+        return {
+          rows: [{
+            autoTradingEnabled: eligible,
+            breakEvenEnabled: eligible,
+            // A workspace can run the trail without break even, so the fake has to be able to
+            // say the two switches apart instead of treating them as one flag.
+            trailingStopEnabled: trailingEligible === null ? eligible : trailingEligible,
+            executionAccountId: 'account-1',
+          }],
+        };
       }
       if (sql.includes('INSERT INTO break_even_moves')) return { rows: [] };
       if (sql.includes('UPDATE trades SET stop_loss')) return { rows: [] };
@@ -421,4 +434,225 @@ test('a break-even sweep failure cannot take the worker loop down', async () => 
   assert.equal(seen.length, 1, 'the loop logged the failure and carried on');
   assert.match(seen[0], /break-even exploded/);
   assert.equal(seen[0].includes('super-secret-9'), false);
+});
+
+
+/* ============================== the trailing stop ============================== */
+/* Same guarantees, one more decision: the trail may only ever tighten a stop, and every
+ * rule that protects a break-even move (fresh quote, tick grid, broker stop and freeze
+ * distances, re-checked settings, no retry on an unconfirmed answer) applies to it too. */
+const trail = (overrides = {}) => ({
+  side: 'buy', openPrice: 1.1, bid: 1.105, ask: 1.1051, stopLoss: 1.089, tickSize: tick,
+  trailing: { distancePoints: 30 }, ...overrides,
+});
+
+test('a trailing stop holds the stop the user distance behind the market', () => {
+  const decision = calculateTrailingStop({ side: 'buy', openPrice: 1.1, bid: 1.105, ask: 1.1051, stopLoss: 1.089, distancePoints: 30, tickSize: tick });
+  assert.equal(decision.action, 'move');
+  assert.equal(decision.stopLoss, 1.102, 'the bid minus the trailing distance, on the tick grid');
+  assert.equal(decision.previousStopLoss, 1.089);
+  assert.equal(decision.source, 'trailing');
+  assert.equal(decision.ratcheted, true, 'tightening an existing stop is a ratchet');
+  assert.equal(decision.improvementPoints, 130, 'the stop moved 130 points in the trade\'s favour');
+  assert.equal(decision.lockedPoints, 20, 'entry is still locked in, because the trail is above it');
+});
+
+test('a sell trail ratchets downward and reads the ask side', () => {
+  const decision = calculateTrailingStop({ side: 'sell', openPrice: 1.1, bid: 1.0950, ask: 1.0951, stopLoss: 1.111, distancePoints: 30, tickSize: tick });
+  assert.equal(decision.action, 'move');
+  assert.equal(decision.stopLoss, 1.0981, 'the ask plus the trailing distance');
+  assert.equal(decision.source, 'trailing');
+});
+
+test('a trailing stop never widens a stop when the price retraces', () => {
+  // The trail would put the stop at 1.0995, which is looser than the 1.102 the position
+  // already has, so nothing is sent - and the finding is a wait, not a terminal result,
+  // because the trail has to be re-checked as the market moves again.
+  const decision = calculateTrailingStop({ side: 'buy', openPrice: 1.1, bid: 1.1025, ask: 1.1026, stopLoss: 1.102, distancePoints: 30, tickSize: tick });
+  assert.equal(decision.action, 'wait');
+  assert.equal(decision.reason, 'trail-not-tighter');
+  assert.equal(decision.stopLoss, 1.102, 'the report keeps the tighter stop the user already has');
+
+  // The same inputs without a trail are break-even's terminal answer, unchanged.
+  const guarded = calculateStopGuard({ side: 'buy', openPrice: 1.1, bid: 1.105, ask: 1.1051, stopLoss: 1.1042, tickSize: tick, breakEven: { triggerPoints: 20, offsetPoints: 0 } });
+  assert.equal(guarded.action, 'already_beyond');
+});
+
+test('the more protective target wins when both protections are on', () => {
+  const both = { side: 'buy', openPrice: 1.1, stopLoss: 1.089, tickSize: tick, breakEven: { triggerPoints: 20, offsetPoints: 0 }, trailing: { distancePoints: 30 } };
+  const early = calculateStopGuard({ ...both, bid: 1.1025, ask: 1.1026 });
+  assert.equal(early.action, 'move');
+  assert.equal(early.stopLoss, 1.1, 'entry protects more than 30 points behind a 1.1025 bid');
+  assert.equal(early.source, 'break-even');
+
+  const later = calculateStopGuard({ ...both, bid: 1.105, ask: 1.1051 });
+  assert.equal(later.action, 'move');
+  assert.equal(later.stopLoss, 1.102, 'once the market travels, the trail is the tighter stop');
+  assert.equal(later.source, 'trailing');
+});
+
+test('a trail is refused without a fresh quote, a valid distance, or a tick size', () => {
+  const blocked = (input, why) => assert.equal(calculateStopGuard(trail(input)).action, 'blocked', why);
+  blocked({ bid: 0 }, 'no quote');
+  blocked({ bid: 1.106, ask: 1.105 }, 'a crossed market is never trusted');
+  blocked({ tickSize: undefined }, 'no tick grid');
+  blocked({ side: 'hold' }, 'no direction');
+  blocked({ openPrice: null }, 'no entry price');
+  blocked({ trailing: { distancePoints: 0 } }, 'a zero distance would mean a stop on the market');
+  blocked({ trailing: { distancePoints: TRAILING_MAX_DISTANCE_POINTS + 1 } }, 'an absurd distance is refused, not clamped');
+  assert.equal(calculateStopGuard(trail({ trailing: null, breakEven: null })).reason, 'nothing-configured', 'with neither protection on there is nothing to decide');
+});
+
+test('a trailing move obeys the broker stop and freeze distances and the tick grid', () => {
+  const tooClose = calculateTrailingStop({ side: 'buy', openPrice: 1.1, bid: 1.105, ask: 1.1051, stopLoss: 1.089, distancePoints: 5, tickSize: tick, stopsLevelPoints: 30 });
+  assert.equal(tooClose.action, 'defer');
+  assert.equal(tooClose.reason, 'broker-stop-distance', 'the trail is deferred, never forced through');
+
+  const frozen = calculateTrailingStop({ side: 'buy', openPrice: 1.1, bid: 1.105, ask: 1.1051, stopLoss: 1.1048, distancePoints: 1, tickSize: tick, freezeLevelPoints: 30 });
+  assert.equal(frozen.action, 'defer');
+  assert.equal(frozen.reason, 'broker-freeze-distance');
+
+  const aligned = calculateTrailingStop({ side: 'buy', openPrice: 1.1, bid: 1.10503, ask: 1.10505, stopLoss: 1.089, distancePoints: 3, tickSize: tick });
+  assert.equal(aligned.action, 'move');
+  assert.equal(aligned.stopLoss, 1.1047, 'aligned down onto the tick, never above the intended price');
+});
+
+test('a position with no stop at all is still protected by the trail', () => {
+  for (const stopLoss of [0, null, undefined]) {
+    const decision = calculateTrailingStop({ side: 'buy', openPrice: 1.1, bid: 1.105, ask: 1.1051, stopLoss, distancePoints: 30, tickSize: tick });
+    assert.equal(decision.action, 'move');
+    assert.equal(decision.previousStopLoss, null);
+    assert.equal(decision.ratcheted, false, 'the first stop on a naked position is not a ratchet');
+  }
+});
+
+/* ------------------------- the sweep, with the trail attached ------------------------- */
+const trailedCandidate = (overrides = {}) => ({
+  ...candidate, break_even_enabled: true, trailing_enabled: true, trailing_distance_points: '30', ...overrides,
+});
+// 1.1050 minus 30 points is 1.1020, which is tighter than break even's 1.1000, so a state
+// built on this quote is decided by the trail rather than by the one-off break-even target.
+const travelledState = (overrides = {}) => fakeState({ price: { bid: 1.105, ask: 1.1051, lossTickValue: 1, time: new Date().toISOString() }, ...overrides });
+
+test('the candidate query lets a handled position back in only while trailing is on', async () => {
+  const harness = buildEngine({ rows: [trailedCandidate()] });
+  await harness.engine.sweepBreakEven();
+  const { sql, params } = harness.pool.calls.find((call) => call.sql.includes('FROM trades t'));
+  assert.match(sql, /\(s\.break_even_enabled=TRUE OR s\.trailing_stop_enabled=TRUE\)/, 'either protection is enough to look, and neither is needed if both are off');
+  assert.match(sql, /s\.trailing_stop_enabled=TRUE AND m\.status IN \('moved','already_beyond'\)/, 'a trail re-visits a settled row; nothing else may');
+  assert.match(sql, /m\.status IN \('deferred','failed'\)/, 'break-even retry behaviour is unchanged');
+  assert.deepEqual(params, [String(30), BREAK_EVEN_MAX_ATTEMPTS, 20, ['active', 'non_renewing']], 'the ratchet branch needed no new parameter');
+});
+
+test('a trailing sweep ratchets the stop of a position break even already handled', async () => {
+  const harness = buildEngine({ rows: [trailedCandidate()], state: travelledState() });
+  const result = await harness.engine.sweepBreakEven();
+  assert.deepEqual({ attempted: result.attempted, moved: result.moved, ratcheted: result.ratcheted }, { attempted: 1, moved: 1, ratcheted: 1 });
+
+  const modify = harness.trading.calls.find((call) => call.method === 'modifyPosition');
+  assert.equal(modify.request.stopLoss, 1.102, 'the bid in the test quote minus 30 points');
+  assert.equal('takeProfit' in modify.request, false, 'a ratchet never touches the take profit');
+  assert.equal('trailingStopLoss' in modify.request, false, 'the trail is ours; MetaAPI native trailing is never asked for');
+
+  const insert = moveInsert(harness.pool);
+  assert.equal(insert.params[11], 'moved');
+  assert.equal(insert.params[10], 1.102);
+  assert.equal(insert.params[9], 1.089, 'the previous stop is kept for the audit');
+  assert.equal(insert.params[18], 'true', 'only a trail may rewrite a settled row');
+  assert.equal(insert.params[19], '30', 'the distance it was decided under is stored, not assumed');
+  assert.ok(harness.pool.calls.some((call) => call.sql.includes('UPDATE trades SET stop_loss')), 'the recorded stop follows the ratchet');
+});
+
+test('with trailing off the ledger keeps its old one-write-per-position behaviour', async () => {
+  const harness = buildEngine();
+  const result = await harness.engine.sweepBreakEven();
+  assert.equal(result.moved, 1);
+  const insert = moveInsert(harness.pool);
+  assert.equal(insert.params[18], 'false', 'break even alone cannot revisit a settled row');
+  assert.equal(insert.params[19], null, 'no trailing distance is invented for a workspace that never enabled it');
+  assert.equal(result.ratcheted, 0);
+});
+
+test('a workspace with only the trail on still moves the stop, and the re-check knows it', async () => {
+  const harness = buildEngine({ rows: [trailedCandidate({ break_even_enabled: false })] });
+  const result = await harness.engine.sweepBreakEven();
+  assert.equal(result.moved, 1);
+  const eligibility = harness.pool.calls.find((call) => call.sql.includes('break_even_enabled AS "breakEvenEnabled"'));
+  assert.match(eligibility.sql, /trailing_stop_enabled AS "trailingStopEnabled"/, 'the pre-write re-check reads both switches');
+});
+
+test('switching both protections off mid-sweep stops the trail at the broker', async () => {
+  const harness = buildEngine({ rows: [trailedCandidate({ break_even_enabled: false })], eligible: false, trailingEligible: false });
+  const result = await harness.engine.sweepBreakEven();
+  assert.equal(result.moved, 0);
+  assert.equal(harness.trading.calls.some((call) => call.method === 'modifyPosition'), false, 'Auto-Trading or both switches off means Signal Desk sends nothing');
+  assert.equal(moveInsert(harness.pool), undefined, 'a skipped move leaves no trace to retry');
+});
+
+test('an unconfirmed trailing move parks the trail instead of retrying it', async () => {
+  const harness = buildEngine({ rows: [trailedCandidate()], state: travelledState(), modifyError: Object.assign(new Error('Request timed out'), { numericCode: 10012, stringCode: 'TRADE_RETCODE_TIMEOUT' }) });
+  const result = await harness.engine.sweepBreakEven();
+  assert.equal(result.failed, 1);
+  const insert = moveInsert(harness.pool);
+  assert.equal(insert.params[11], 'unknown');
+  assert.equal(insert.params[17], null, 'no retry is scheduled while the broker answer is unknown');
+  assert.match(insert.params[16], /Reconcile the position/);
+  // The ratchet branch of the candidate query names only 'moved' and 'already_beyond', so an
+  // unconfirmed row cannot come back and send the same modification a second time.
+  const { sql } = harness.pool.calls.find((call) => call.sql.includes('FROM trades t'));
+  const ratchetBranch = sql.match(/OR \(s\.trailing_stop_enabled=TRUE AND m\.status IN \(([^)]*)\)\)/)[1];
+  assert.deepEqual(ratchetBranch.split(',').map((item) => item.trim()), ["'moved'", "'already_beyond'"], 'unknown and closed are never re-offered to the sweep');
+  assert.ok(insert.params[10] === null || insert.params[10] === undefined || insert.params[10] === 1.102, 'the unapplied price is not recorded as the live stop');
+});
+
+test('a deferred trailing attempt consumes no attempt and stays in the sweep', async () => {
+  const harness = buildEngine({
+    rows: [trailedCandidate({ trailing_distance_points: '3' })],
+    state: fakeState({ specification: { ...spec, stopsLevel: 30 } }),
+  });
+  const result = await harness.engine.sweepBreakEven();
+  assert.equal(result.deferred, 1);
+  const insert = moveInsert(harness.pool);
+  assert.equal(insert.params[11], 'deferred');
+  assert.equal(insert.params[12], 'false', 'a broker-side wait must not exhaust the attempts of a live trail');
+  assert.equal(Number(insert.params[17]), BREAK_EVEN_DEFERRED_RETRY_MS);
+  assert.equal(insert.params[18], 'true', 'a trail rewrites its own row to record the deferral');
+});
+
+test('the trailing sweep shares break-even throttle, runtime gate, and provider support checks', async () => {
+  const harness = buildEngine({ rows: [trailedCandidate()] });
+  assert.equal(harness.engine.sweepBreakEven instanceof Function, true, 'one sweep serves both protections');
+  await harness.engine.sweepBreakEven();
+  assert.equal((await harness.engine.sweepBreakEven()).reason, 'throttled', 'a ratchet cannot be used to hammer the broker');
+
+  const noRuntime = buildEngine({ rows: [trailedCandidate()], engine: { runtimeEnabled: false } });
+  assert.equal((await noRuntime.engine.sweepBreakEven()).reason, 'runtime-disabled');
+  assert.equal(noRuntime.pool.calls.length, 0, 'not even the database is read');
+});
+
+test('a fresh position always outranks an established trail', async () => {
+  // Without this, a workspace holding more open trades than the sweep limit could have every
+  // slot taken by positions that merely need re-checking, and a new trade would never get its
+  // stop moved at all.
+  const harness = buildEngine({ rows: [trailedCandidate(), trailedCandidate({ broker_position_id: '43' })] });
+  await harness.engine.sweepBreakEven();
+  const { sql } = harness.pool.calls.find((call) => call.sql.includes('FROM trades t'));
+  assert.match(sql, /ORDER BY CASE WHEN m\.id IS NULL THEN 0/, 'never-protected first');
+  assert.match(sql, /WHEN m\.status IN \('deferred','failed'\) THEN 1/, 'then a retry that is due');
+  assert.match(sql, /ELSE 2 END/, 'then the ratchets');
+  assert.match(sql, /COALESCE\(m\.updated_at, t\.created_at\) ASC/, 'and inside a class, whoever waited longest');
+});
+
+test('a trail reads the quote, the position, and the spec from one account read', async () => {
+  // The safety of a ratchet depends on price and stop belonging to the same moment, so the
+  // sweep must not mix a stored quote from the ledger with a newly read position.
+  // 1.0906 minus 30 points is 1.0876, looser than the 1.0890 the position already holds, and
+  // the break-even trigger has not been reached, so the sweep has nothing it may send.
+  const state = fakeState({ price: { bid: 1.0906, ask: 1.0908, lossTickValue: 1, time: new Date().toISOString() } });
+  const harness = buildEngine({ rows: [trailedCandidate()], state });
+  const result = await harness.engine.sweepBreakEven();
+  assert.equal(result.moved, 0, 'a retracing market never pulls the stop back down');
+  assert.equal(harness.trading.calls.filter((call) => call.method === 'getAccountState').length, 1);
+  const insert = moveInsert(harness.pool);
+  assert.equal(insert, undefined, 'a wait writes nothing at all');
 });
