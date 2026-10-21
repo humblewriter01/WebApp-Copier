@@ -5,4 +5,11 @@ export const navigationItems = [
   { key: 'accounts', label: 'Account Notes', iconPath: 'M20 21a8 8 0 0 0-16 0m8-10a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z' },
   { key: 'settings', label: 'Risk settings', iconPath: 'M4 6h6m4 0h6M4 12h10m4 0h2M4 18h2m4 0h10M12 6a2 2 0 1 0 0 .01M16 12a2 2 0 1 0 0 .01M8 18a2 2 0 1 0 0 .01' },
   { key: 'metaapi', label: 'Trading Accounts', iconPath: 'M7 12h.01M12 7h.01M17 12h.01M12 17h.01M7 12l5-5 5 5-5 5-5-5Z' },
+  { key: 'admin', label: 'Admin Panel', iconPath: 'M12 3l8 4v6c0 4.2-3.4 7.2-8 8-4.6-.8-8-3.8-8-8V7l8-4Zm0 6v5m0 3h.01', adminOnly: true },
 ];
+
+/** Navigation items a signed-in user is allowed to see for their role. */
+export function navigationItemsForRole(role) {
+  const isAdmin = String(role || '').toLowerCase() === 'admin';
+  return navigationItems.filter((item) => !item.adminOnly || isAdmin);
+}

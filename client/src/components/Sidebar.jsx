@@ -1,11 +1,12 @@
 import React from 'react';
-import { navigationItems } from '../navigation.js';
+import { navigationItemsForRole } from '../navigation.js';
 
 function NavIcon({ path }) {
   return <svg className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={path} /></svg>;
 }
 
 export default function Sidebar({ active, onNavigate, user, onSignOut, onClose, visible = true }) {
+  const items = navigationItemsForRole(user?.role);
   return <aside id="workspace-sidebar" className="sidebar" aria-label="Workspace navigation" aria-hidden={!visible}>
     <div className="side-brand">
       <div className="brand-mark"><img src="/icons/signal-desk-icon-192.png" alt="" /></div>
@@ -15,7 +16,7 @@ export default function Sidebar({ active, onNavigate, user, onSignOut, onClose, 
       </button>
     </div>
     <nav className="sidebar-nav" aria-label="Main navigation">
-      {navigationItems.map(({ key, label, iconPath }) => <button
+      {items.map(({ key, label, iconPath }) => <button
         key={key}
         type="button"
         className={`nav-item ${active === key ? 'active' : ''}`}

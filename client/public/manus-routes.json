@@ -1,1 +1,1 @@
-{"routes":[{"path":"/","title":"Signal Desk"},{"path":"/update-password","title":"Update password"}]}
+{"routes":[{"path":"/","title":"Signal Desk"},{"path":"/admin","title":"Admin Panel"},{"path":"/update-password","title":"Update password"}]}

@@ -24,6 +24,9 @@ function isAllowedRequest(method, endpoint, body) {
       && ['mt4', 'mt5'].includes(body.platform)
       && body.magic === 0;
   }
+  if (method === 'DELETE' && body === undefined) {
+    return new RegExp(`^${ACCOUNT_ENDPOINT}/[A-Za-z0-9_-]{1,200}$`).test(endpoint);
+  }
   return method === 'PUT' && body === undefined && new RegExp(`^${ACCOUNT_ENDPOINT}/[A-Za-z0-9_-]{1,200}/configuration-link$`).test(endpoint);
 }
 
@@ -246,6 +249,27 @@ export async function createMetaApiConfigurationLink(apiToken, accountId) {
     throw error;
   }
   return link.href;
+}
+
+/**
+ * Permanently removes an account from MetaAPI. This is the REST equivalent of
+ * `accountApi.account.remove(accountId)` in the MetaAPI SDK and stops MetaAPI
+ * from billing for the account. A 404 means the account was already removed, so
+ * the call is safe to repeat.
+ */
+export async function deleteMetaApiAccount(apiToken, accountId) {
+  if (typeof accountId !== 'string' || !ACCOUNT_ID_PATTERN.test(accountId)) {
+    const error = new Error('A valid account is required.');
+    error.status = 400;
+    throw error;
+  }
+  try {
+    await metaApiRequest(apiToken, `${ACCOUNT_ENDPOINT}/${encodeURIComponent(accountId)}`, { method: 'DELETE' });
+    return { accountId, deleted: true, alreadyMissing: false };
+  } catch (error) {
+    if (error?.metaApiStatus === 404 || error?.status === 404) return { accountId, deleted: false, alreadyMissing: true };
+    throw error;
+  }
 }
 
 export function toSafeMetaApiAccount(account) {

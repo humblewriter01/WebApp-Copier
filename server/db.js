@@ -1,4 +1,5 @@
 import pg from 'pg';
+import { createAdminAccess } from './services/admin.js';
 
 const { Pool } = pg;
 
@@ -38,7 +39,6 @@ export async function initializeDatabase() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_limits JSONB NOT NULL DEFAULT '{}'::jsonb;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS suspension_reason TEXT;
-    UPDATE users SET role='admin' WHERE lower(email)='ameenujaafar432@gmail.com' AND role <> 'admin';
     CREATE TABLE IF NOT EXISTS channels (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -209,5 +209,12 @@ export async function initializeDatabase() {
     ALTER TABLE metaapi_accounts ENABLE ROW LEVEL SECURITY;
     ALTER TABLE telegram_login_attempts ENABLE ROW LEVEL SECURITY;
   `);
+  const adminAccess = createAdminAccess();
+  if (adminAccess.emails.length) {
+    await pool.query(
+      "UPDATE users SET role='admin' WHERE lower(email) = ANY($1::text[]) AND role <> 'admin'",
+      [adminAccess.emails],
+    );
+  }
   await pool.query('SELECT 1');
 }
