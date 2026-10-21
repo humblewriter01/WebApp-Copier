@@ -5,6 +5,8 @@ import MetaApiPanel from './components/MetaApiPanel.jsx';
 import ExecutionSettings from './components/ExecutionSettings.jsx';
 import AccountDeletionSettings from './components/AccountDeletionSettings.jsx';
 import AdminPanel from './components/AdminPanel.jsx';
+import BillingPage from './components/BillingPage.jsx';
+import BillingCallbackPage from './components/BillingCallbackPage.jsx';
 import UpdatePasswordPage from './components/UpdatePasswordPage.jsx';
 import { navigationItemsForRole } from './navigation.js';
 import { request } from './lib/api.js';
@@ -98,7 +100,13 @@ function App() {
     catch { return sessionStorage.getItem('signal-token') || ''; }
   });
   const [user, setUser] = useState(null);
-  const [tab, setTab] = useState(() => (window.location.pathname.replace(/\/+$/, '') === '/admin' ? 'admin' : 'overview'));
+  const initialTabFromPath = (pathname) => {
+    const path = String(pathname || '').replace(/\/+$/, '');
+    if (path === '/admin') return 'admin';
+    if (path === '/billing') return 'billing';
+    return 'overview';
+  };
+  const [tab, setTab] = useState(() => initialTabFromPath(window.location.pathname));
   const [dashboard, setDashboard] = useState(null);
   const [channels, setChannels] = useState([]);
   const [accounts, setAccounts] = useState([]);
@@ -149,7 +157,7 @@ function App() {
     setTab(nextTab);
     closeMobileSidebar();
     try {
-      const path = nextTab === 'admin' ? '/admin' : '/';
+      const path = nextTab === 'admin' ? '/admin' : nextTab === 'billing' ? '/billing' : '/';
       if (window.location.pathname !== path) window.history.pushState({ tab: nextTab }, '', path);
     } catch {}
   };
@@ -174,7 +182,7 @@ function App() {
   useEffect(() => {
     const syncTabFromPath = () => {
       const path = window.location.pathname.replace(/\/+$/, '');
-      setTab(path === '/admin' ? 'admin' : 'overview');
+      setTab(path === '/admin' ? 'admin' : path === '/billing' ? 'billing' : 'overview');
     };
     window.addEventListener('popstate', syncTabFromPath);
     return () => window.removeEventListener('popstate', syncTabFromPath);
@@ -241,7 +249,11 @@ function App() {
   const isAdmin = user?.role === 'admin';
   const tabs = navigationItemsForRole(user?.role).map(({ key, label }) => [key, label]);
 
-  if (window.location.pathname.replace(/\/+$/, '') === '/update-password') return <UpdatePasswordPage />;
+  const normalizedPath = window.location.pathname.replace(/\/+$/, '');
+  if (normalizedPath === '/billing/callback') return token
+    ? <BillingCallbackPage />
+    : <AuthScreen onAuthenticated={authenticated} installPrompt={installPrompt} onInstall={installApp} />;
+  if (normalizedPath === '/update-password') return <UpdatePasswordPage />;
   if (!token) return <AuthScreen onAuthenticated={authenticated} installPrompt={installPrompt} onInstall={installApp} />;
   if (loading) return <main className="loading-shell"><div className="spinner" /><span>Loading your workspace…</span></main>;
   return <div className={`app-shell ${sidebarVisible ? '' : 'sidebar-hidden'}`}>
@@ -261,6 +273,7 @@ function App() {
         {tab === 'metaapi' && <MetaApiPanel token={token} />}
         {tab === 'signals' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">CAPTURED MESSAGES</p><h2>Signal history</h2></div><span className="count-badge">{signals.length}</span></div><SignalTable signals={signals} onEmptyAction={() => setTab('telegram')} /></section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">MANUAL ENTRY</p><h2>Add a signal note</h2></div></div><p className="muted">Save a message for tracking. Signal Desk may identify the symbol, direction, entry, stop, and target.</p><form className="form-stack" onSubmit={addManualSignal}><label>Signal message<textarea rows="7" value={signalText} onChange={e => setSignalText(e.target.value)} placeholder={'BUY EURUSD\nEntry: 1.0850\nSL: 1.0800\nTP: 1.0950'} required maxLength={5000} /></label><button className="button button-primary">Save signal</button></form></section></div>}
         {tab === 'accounts' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">YOUR NOTES</p><h2>Account Notes</h2></div><span className="count-badge">{accounts.length}</span></div><p className="muted">Save a label or optional reference for your own notes. To connect a trading account, open Trading Accounts.</p>{!accounts.length ? <div className="empty-state"><strong>No account notes yet</strong><span>Add a label for your own reference.</span></div> : <div className="chat-list">{accounts.map(account => <div className="chat-row" key={account.id}><div><strong>{account.label}</strong><small>{[account.broker, account.platform, account.accountReference].filter(Boolean).join(' · ') || 'Reference only'}</small></div><button className="icon-button" onClick={async () => { await request(`/api/accounts/${account.id}`, token, { method: 'DELETE' }); await refresh(); }}>Remove</button></div>)}</div>}</section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">ADD A NOTE</p><h2>Account note</h2></div></div><form className="form-stack" onSubmit={addAccount}><label>Label<input value={accountForm.label} onChange={e => setAccountForm({ ...accountForm, label: e.target.value })} placeholder="Demo MT5 account" required maxLength={100} /></label><div className="form-row"><label>Broker<input value={accountForm.broker} onChange={e => setAccountForm({ ...accountForm, broker: e.target.value })} /></label><label>Platform<input value={accountForm.platform} onChange={e => setAccountForm({ ...accountForm, platform: e.target.value })} placeholder="MT4, MT5…" /></label></div><label>Reference<input value={accountForm.accountReference} onChange={e => setAccountForm({ ...accountForm, accountReference: e.target.value })} placeholder="Optional alias" /></label><button className="button button-primary">Save note</button></form></section></div>}
+        {tab === 'billing' && <BillingPage token={token} />}
         {tab === 'admin' && (isAdmin
           ? <AdminPanel token={token} currentUser={user} />
           : <section className="panel admin-denied" aria-labelledby="admin-denied-title">

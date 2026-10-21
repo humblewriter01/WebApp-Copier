@@ -37,6 +37,14 @@ services:
         value: https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai
       - key: AUTO_TRADING_RUNTIME_ENABLED
         value: "true"
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
+      - key: PAYSTACK_CURRENCY
+        value: NGN
+      - key: PAYSTACK_PLAN_PRO_AMOUNT
+        value: "250000"
+      - key: PAYSTACK_PLAN_PREMIUM_AMOUNT
+        value: "600000"
   - type: web
     name: telegram-copier-web
     runtime: static

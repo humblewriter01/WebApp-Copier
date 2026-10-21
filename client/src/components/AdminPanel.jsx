@@ -15,6 +15,15 @@ function formatDateTime(value) {
   return Number.isNaN(date.getTime()) ? 'Never' : date.toLocaleString();
 }
 
+function formatMoney(amountMinor, currency = 'NGN') {
+  const value = Number(amountMinor || 0) / 100;
+  try {
+    return new Intl.NumberFormat('en-NG', { style: 'currency', currency, maximumFractionDigits: 2 }).format(value);
+  } catch {
+    return `${currency} ${value.toFixed(2)}`;
+  }
+}
+
 function Stat({ label, value, note }) {
   return <div className="metric-card"><span className="metric-label">{label}</span><strong>{value ?? '—'}</strong><span className="metric-note">{note}</span></div>;
 }
@@ -32,6 +41,7 @@ export default function AdminPanel({ token, currentUser }) {
   const [searchInput, setSearchInput] = useState('');
   const [search, setSearch] = useState('');
   const [promoCodes, setPromoCodes] = useState([]);
+  const [billing, setBilling] = useState(null);
   const [promoForm, setPromoForm] = useState({ code: '', discountType: 'percentage', discountValue: '', maxUses: '', expiresAt: '' });
   const [suspension, setSuspension] = useState({ userId: '', reason: '' });
   const [loading, setLoading] = useState(true);
@@ -57,16 +67,21 @@ export default function AdminPanel({ token, currentUser }) {
     setPromoCodes(data.promoCodes || []);
   }, [token]);
 
+  const loadBilling = useCallback(async () => {
+    const data = await request('/api/admin/billing', token);
+    setBilling(data);
+  }, [token]);
+
   const loadEverything = useCallback(async (nextSearch = search, nextOffset = offset) => {
     setError('');
     try {
-      await Promise.all([loadOverview(), loadUsers(nextSearch, nextOffset), loadPromoCodes()]);
+      await Promise.all([loadOverview(), loadUsers(nextSearch, nextOffset), loadPromoCodes(), loadBilling()]);
     } catch (loadError) {
       setError(loadError.message);
     } finally {
       setLoading(false);
     }
-  }, [loadOverview, loadUsers, loadPromoCodes, search, offset]);
+  }, [loadOverview, loadUsers, loadPromoCodes, loadBilling, search, offset]);
 
   useEffect(() => { loadEverything(); }, [loadEverything]);
 
@@ -136,6 +151,7 @@ export default function AdminPanel({ token, currentUser }) {
       setPromoForm({ code: '', discountType: 'percentage', discountValue: '', maxUses: '', expiresAt: '' });
       setNotice(`Promo code ${data.promoCode.code} created.`);
       await loadOverview();
+      await loadBilling();
     } catch (createError) {
       setError(createError.message);
     } finally {
@@ -151,6 +167,7 @@ export default function AdminPanel({ token, currentUser }) {
       setPromoCodes((current) => current.map((item) => (item.id === promoCode.id ? data.promoCode : item)));
       setNotice(`${promoCode.code} is now ${data.promoCode.active ? 'active' : 'paused'}.`);
       await loadOverview();
+      await loadBilling();
     } catch (updateError) {
       setError(updateError.message);
     }
@@ -165,6 +182,7 @@ export default function AdminPanel({ token, currentUser }) {
       setPromoCodes((current) => current.filter((item) => item.id !== promoCode.id));
       setNotice(`${promoCode.code} deleted.`);
       await loadOverview();
+      await loadBilling();
     } catch (deleteError) {
       setError(deleteError.message);
     }
@@ -308,6 +326,35 @@ export default function AdminPanel({ token, currentUser }) {
         <Stat label="Linked trading accounts" value={stats?.linkedTradingAccounts ?? 0} note="Connected through MetaAPI" />
         <Stat label="Signals captured" value={stats?.totalSignals ?? 0} note={`${stats?.totalTrades ?? 0} execution records`} />
       </div>
+    </section>
+
+    <section className="panel admin-panel" aria-labelledby="admin-billing-title">
+      <div className="panel-heading">
+        <div><p className="eyebrow">BILLING</p><h2 id="admin-billing-title">Subscriptions and payments</h2></div>
+        <span className={`status-pill ${billing?.configured ? 'online' : ''}`}>{billing?.configured ? 'Paystack ready' : 'Payments off'}</span>
+      </div>
+      <div className="metrics-grid admin-metrics">
+        <Stat label="Active subscriptions" value={billing?.summary?.activeSubscriptions ?? 0} note="Paid plans currently active" />
+        <Stat label="Successful payments" value={billing?.summary?.successfulPayments ?? 0} note={`${billing?.summary?.pendingPayments ?? 0} pending checkouts`} />
+        <Stat label="Gross collected" value={formatMoney(billing?.summary?.grossMinor, billing?.summary?.currency)} note="Verified Paystack payments" />
+        <Stat label="Discounts given" value={formatMoney(billing?.summary?.discountsMinor, billing?.summary?.currency)} note="Applied promo codes" />
+      </div>
+
+      {!billing?.transactions?.length ? <div className="empty-state"><strong>No payments yet</strong><span>Successful and pending Paystack transactions will appear here.</span></div> : <div className="admin-table-wrap admin-billing-table">
+        <table className="admin-table">
+          <caption className="sr-only">Recent billing transactions</caption>
+          <thead><tr><th scope="col">Customer</th><th scope="col">Plan</th><th scope="col">Amount</th><th scope="col">Status</th><th scope="col">Created</th></tr></thead>
+          <tbody>
+            {billing.transactions.map((transaction) => <tr key={transaction.reference}>
+              <td data-label="Customer"><strong>{transaction.email}</strong><small>{transaction.reference}</small>{transaction.promoCode ? <small>Promo {transaction.promoCode}</small> : null}</td>
+              <td data-label="Plan">{transaction.planKey}</td>
+              <td data-label="Amount">{formatMoney(transaction.amountMinor, transaction.currency)}</td>
+              <td data-label="Status"><span className={`badge ${transaction.status === 'success' ? 'badge-buy' : ''}`}>{transaction.status}</span></td>
+              <td data-label="Created">{formatDate(transaction.createdAt)}</td>
+            </tr>)}
+          </tbody>
+        </table>
+      </div>}
     </section>
   </>;
 }

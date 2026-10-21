@@ -10,7 +10,8 @@ A deployable React/Vite and Express app for capturing Telegram channel messages,
 - Signal history and manual signal notes.
 - Reference-only account notes.
 - **MT4/MT5 account setup:** signed-in users can create an account setup and enter broker credentials on a MetaAPI-hosted secure page.
-- **Admin panel:** workspace administrators get a `/admin` dashboard with user totals, user management (roles, suspension), and promo-code creation.
+- **Admin panel:** workspace administrators get a `/admin` dashboard with user totals, user management (roles, suspension), promo-code creation, and billing activity.
+- **Paystack subscriptions:** Free, Pro, and Premium plans with a hosted Paystack checkout, promo codes, verified webhooks, and plan-based limits.
 - Risk preferences for planning only.
 
 ## Important safety and data notes
@@ -18,7 +19,7 @@ A deployable React/Vite and Express app for capturing Telegram channel messages,
 - **No trading orders are placed.** Signal Desk can create and connect an account through MetaAPI, but it does not submit, modify, or close trades.
 - The API uses `METAAPI_PROVISIONING_TOKEN` only on the server. Users enter their broker login and password on MetaAPI's HTTPS setup page; Signal Desk does not receive or store those credentials.
 - The MetaAPI client uses HTTPS and an allowlist of account-setup and account-read operations. It does not include order-placement or position-modification functions.
-- Deleting a Signal Desk account removes that user's Supabase Auth identity, local workspace data, and every MetaAPI trading account this workspace provisioned, so MetaAPI billing for those accounts stops. Accounts a user linked with their own MetaAPI token are left untouched. Unlinking a single account from the Trading Accounts page still only removes the local link.
+- Deleting a Signal Desk account removes that user's Supabase Auth identity, local workspace data, and every MetaAPI trading account this workspace provisioned, so MetaAPI billing for those accounts stops. Accounts a user linked with their own MetaAPI token are left untouched. Unlinking a single account from the Trading Accounts page also deletes it from MetaAPI (same cleanup path); accounts billed to a user's own MetaAPI token are only unlinked.
 - Telegram sessions are encrypted in the database with the same server encryption key. Rotating that key without re-encrypting existing values will invalidate saved sessions/tokens.
 - Render free web services can sleep, so continuous Telegram monitoring is not reliable on the free tier. Use an always-on backend before relying on unattended monitoring.
 - The app is not financial advice. Review all signals independently.
@@ -61,9 +62,41 @@ The app creates its PostgreSQL tables and indexes on backend startup. The new `m
 1. The workspace owner adds a MetaAPI provisioning token to the backend environment as `METAAPI_PROVISIONING_TOKEN`.
 2. In Signal Desk, open **Trading Accounts** and enter an account name, MT4/MT5 platform, and the exact broker server name.
 3. Signal Desk creates the account setup and returns a secure link hosted by MetaAPI. Enter the trading login and password only on that page. For monitoring, choose an investor/read-only password if your broker offers one.
-4. Return to Signal Desk and refresh the account status. Removing an account from Signal Desk removes only its local link; it does not delete the MetaAPI or broker account.
+4. Return to Signal Desk and refresh the account status. Removing an account you created here deletes it from MetaAPI as well, so provider billing stops; your broker account and any open positions are unaffected. Accounts linked with your own MetaAPI token are only unlinked from Signal Desk.
 
 `META_API_URL` is an optional HTTPS base-URL override. Never add `METAAPI_PROVISIONING_TOKEN` to a `VITE_*` variable, frontend code, or Git.
+
+## Paystack billing
+
+Signal Desk sells three plans. Prices and limits live in `server/services/billing.js`; the amount is always computed on the server, so a modified browser request can never change the charge.
+
+| Plan | Default price | Trading accounts | Telegram channels | Signals/day |
+|---|---|---:|---:|---:|
+| Free | ₦0 | 1 | 3 | 50 |
+| Pro | ₦2,500 / month | 5 | 25 | 500 |
+| Premium | ₦6,000 / month | 15 | 100 | 2,000 |
+
+Checkout flow:
+
+1. `POST /api/billing/checkout` recalculates the price (including any promo code), creates a `pending` row in `billing_transactions`, then calls Paystack's `POST /transaction/initialize` with that amount and a server-generated reference.
+2. The browser is redirected to the `authorization_url` Paystack returns. Card details are only ever entered on Paystack.
+3. Paystack redirects back to `/billing/callback?reference=…`. The page calls `GET /api/billing/verify`, which re-verifies with `GET /transaction/verify/:reference` before granting anything.
+4. Paystack also sends `charge.success` to `POST /api/billing/webhook`. The handler verifies the `x-paystack-signature` header (HMAC SHA512 of the raw request body using `PAYSTACK_SECRET_KEY`) and ignores everything else.
+
+Both paths share one fulfilment routine: the transaction is marked `success` once, the amount and currency must match the stored row, the user's plan and `plan_limits` are updated, and the promo code's `current_uses` is incremented. Replays are idempotent because the update is conditional on the row not already being `success`.
+
+Billing is a verified one-time charge per period; there is no stored card authorisation, so users renew from the Billing page. `cancel` marks `cancel_at_period_end` (access continues until the period ends) and `resume` clears it. An hourly sweep downgrades anyone whose period has passed back to the Free limits.
+
+Configure in Render → API service → Environment:
+
+| Variable | Required | Purpose |
+|---|---:|---|
+| `PAYSTACK_SECRET_KEY` | Yes | Server-only key used for initialize, verify, and webhook signatures. Never expose it to the browser. |
+| `PAYSTACK_CURRENCY` | No | Defaults to `NGN`. |
+| `PAYSTACK_PLAN_PRO_AMOUNT` / `PAYSTACK_PLAN_PREMIUM_AMOUNT` | No | Price in the smallest currency unit (kobo). Defaults `250000` and `600000`. |
+| `PAYSTACK_API_URL` | No | HTTPS base URL override; defaults to `https://api.paystack.co`. |
+
+Then add the webhook URL in the Paystack dashboard (Settings → API Keys & Webhooks), in the same mode as the key (test or live): `https://<api-service-host>/api/billing/webhook`, with the `charge.success` event enabled. The callback URL is derived from `CLIENT_URL`, so that variable must be the exact public frontend origin.
 
 ## Admin panel
 
@@ -75,7 +108,8 @@ The panel provides:
 
 - Dashboard totals: total users, administrators, suspended users, new sign-ups (7/30 days), promo codes, linked trading accounts, signals, and trades.
 - User management table: search by name or email, change role, suspend with a required reason, and restore access. An admin cannot demote or suspend their own account.
-- Promo code creator: code, percentage or fixed discount, optional maximum uses, and optional expiry. Existing codes can be paused, re-activated, or deleted. Creating promo codes does not change billing; checkout is not implemented yet.
+- Promo code creator: code, percentage or fixed discount, optional maximum uses, and optional expiry. Existing codes can be paused, re-activated, or deleted. Codes are applied at Paystack checkout, and their `current_uses` increment only after a verified payment.
+- Billing activity: active subscriptions, successful and pending payments, gross collected, discounts given, and the latest customer transactions.
 
 Suspension blocks new sign-ins with the stored reason. Existing JWT sessions on other devices remain valid until they expire (12 hours, or 30 days with "keep me signed in"), so revoke a role or suspend an account knowing that short window.
 
@@ -94,6 +128,9 @@ Suspension blocks new sign-ins with the stored reason. Existing JWT sessions on 
 | `SUPABASE_PUBLISHABLE_KEY` | For recovery | Supabase publishable key (public); also served by `GET /api/config` |
 | `SUPABASE_SECRET_KEY` | For recovery | Server-only Supabase secret/service-role key used for Auth admin operations |
 | `ADMIN_EMAILS` | No | Comma-separated addresses that always hold the admin role |
+| `PAYSTACK_SECRET_KEY` | For billing | Server-only Paystack key for checkout, verification, and webhook signatures |
+| `PAYSTACK_CURRENCY` | No | Billing currency; defaults to `NGN` |
+| `PAYSTACK_PLAN_PRO_AMOUNT` / `PAYSTACK_PLAN_PREMIUM_AMOUNT` | No | Plan prices in kobo |
 | `AUTO_TRADING_RUNTIME_ENABLED` | No | `true` enables the MetaAPI execution runtime |
 | `PORT` | No | Render supplies this automatically |
 
@@ -122,7 +159,10 @@ The static site is served over HTTPS and includes a linked web app manifest, 192
 - `POST /api/auth/register`, `POST /api/auth/login`, `GET /api/auth/me`
 - `POST /api/auth/prepare-password-reset`, `POST /api/auth/sync-password`, `DELETE /api/auth/account`
 - `GET /api/admin/overview`, `GET /api/admin/users`, `PATCH /api/admin/users/:id`
-- `GET/POST /api/admin/promo-codes`, `PATCH/DELETE /api/admin/promo-codes/:id`
+- `GET/POST /api/admin/promo-codes`, `PATCH/DELETE /api/admin/promo-codes/:id`, `GET /api/admin/billing`
+- `GET /api/billing/plans` – public plan catalogue
+- `GET /api/billing/subscription`, `GET /api/billing/quote`, `POST /api/billing/checkout`, `GET /api/billing/verify`, `POST /api/billing/cancel`, `POST /api/billing/resume`
+- `POST /api/billing/webhook` – Paystack callback, authenticated by signature only
 - `GET /api/dashboard`
 - `GET/POST /api/channels`, `DELETE /api/channels/:id`
 - `GET/POST /api/signals`

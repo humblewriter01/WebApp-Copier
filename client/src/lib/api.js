@@ -27,6 +27,8 @@ export async function request(path, token, options = {}) {
     if (typeof payload.metaApiErrorCode === 'string') error.metaApiErrorCode = payload.metaApiErrorCode;
     if (typeof payload.metaApiErrorType === 'string') error.metaApiErrorType = payload.metaApiErrorType;
     if (typeof payload.metaApiNetworkDiagnostic === 'string') error.metaApiNetworkDiagnostic = payload.metaApiNetworkDiagnostic;
+    if (typeof payload.code === 'string') error.code = payload.code;
+    if (payload.upgradeRequired === true) error.upgradeRequired = true;
     throw error;
   }
   return payload;

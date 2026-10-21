@@ -223,3 +223,31 @@ button,input,textarea,select{touch-action:manipulation}
   .admin-table td[data-label="User"]::before{flex:none}
   .admin-table-wrap{overflow-x:visible}
 }
+
+/* Billing */
+.billing-current-body{display:flex;flex-wrap:wrap;gap:18px;align-items:flex-start;justify-content:space-between}
+.billing-plan-name{display:block;font:700 22px Manrope,sans-serif;color:#1a2a40;margin-bottom:6px}
+.billing-limit-list{display:flex;flex-wrap:wrap;gap:8px}
+.billing-limit-list span{background:#eef7f6;color:#1d7780;border-radius:100px;padding:7px 12px;font-size:11px;font-weight:700}
+.billing-actions{margin:16px 0 0}
+.billing-plans .panel-heading{margin-bottom:14px}
+.billing-plan-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
+.billing-plan-card{border:1px solid #e8ebf0;border-radius:13px;padding:18px;display:flex;flex-direction:column;gap:12px;background:#fff}
+.billing-plan-card.current{border-color:#63d7bb;box-shadow:0 0 0 3px #63d7bb1f}
+.billing-plan-card header h3{font:700 16px Manrope,sans-serif;margin:0 0 5px;color:#1b2a40}
+.billing-plan-card header p{color:#68778c;font-size:11px;line-height:1.5;margin:0}
+.billing-price{font:800 26px Manrope,sans-serif;color:#1a2a40;margin:0}
+.billing-price span{font:600 12px 'DM Sans',sans-serif;color:#8792a3;margin-left:4px}
+.billing-plan-card ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:7px;font-size:11px;color:#526074}
+.billing-plan-card li{padding-left:18px;position:relative}
+.billing-plan-card li:before{content:'✓';position:absolute;left:0;color:#26815c;font-weight:700}
+.billing-plan-card .button{margin-top:auto;min-height:44px}
+.billing-promo{display:flex;flex-wrap:wrap;gap:9px;align-items:flex-end;margin:18px 0 6px}
+.billing-promo label{display:flex;flex-direction:column;gap:7px;font-size:11px;font-weight:700;color:#344258;flex:1 1 220px}
+.billing-promo input{min-height:44px;border:1px solid #dce2ea;border-radius:9px;padding:10px 12px;background:#fff;color:#172338;outline:none;text-transform:uppercase}
+.billing-promo input:focus{border-color:#428c9f;box-shadow:0 0 0 3px #438c9f1e}
+.admin-billing-table{margin-top:14px}
+@media(max-width:700px){
+  .billing-current-body{flex-direction:column}
+  .billing-plan-grid{grid-template-columns:1fr}
+}
