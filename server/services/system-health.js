@@ -69,11 +69,15 @@ export const RECENT_ERRORS_CTE = `recent AS (
     AND s.created_at >= NOW() - ($1::int * INTERVAL '1 hour')
 )`;
 
-export const RECENT_ERRORS_SELECT = `${RECENT_ERRORS_CTE}
+/* The `WITH` belongs to the queries that reach Postgres, not to the shared fragment: a statement
+ * that begins with a bare `recent AS (` is a syntax error, and because each health section swallows
+ * its own read failure, that error would have shown up as a permanently unreadable errors panel
+ * rather than as a crash. Both forms were run against the live database to confirm the difference. */
+export const RECENT_ERRORS_SELECT = `WITH ${RECENT_ERRORS_CTE}
 SELECT kind,occurred_at AS "occurredAt",status,message,symbol,side,account_id AS "accountId",user_id AS "userId",email,name
 FROM recent ORDER BY occurred_at DESC LIMIT $2`;
 
-export const RECENT_ERROR_COUNTS_SELECT = `${RECENT_ERRORS_CTE}
+export const RECENT_ERROR_COUNTS_SELECT = `WITH ${RECENT_ERRORS_CTE}
 SELECT kind,COUNT(*)::int AS count,COUNT(DISTINCT user_id)::int AS "affectedUsers",MAX(occurred_at) AS "lastSeen"
 FROM recent GROUP BY kind`;
 
