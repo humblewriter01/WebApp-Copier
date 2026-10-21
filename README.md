@@ -61,6 +61,24 @@ A deployable React/Vite and Express app for capturing Telegram channel messages,
 
 The app creates its PostgreSQL tables and indexes on backend startup. The new `metaapi_credentials` and `metaapi_accounts` tables have row-level security enabled; the backend uses its private database role.
 
+## Telegram connection state in the UI
+
+Everything that mentions the Telegram source reads one shared value: `TelegramStatusProvider` in `client/src/components/TelegramStatus.jsx`, exposed to the app through `useTelegramStatus()`. No page, panel, or empty state fetches `/api/telegram/status` or keeps a local copy, because that is how a page ends up showing a connection prompt it has not been told about.
+
+The rule the state machine enforces is that **the connection is unknown, never `false`, until the backend answers**:
+
+| Confirmed state | Topbar pill | Empty signal list (Dashboard and Signals) | Trading Accounts |
+|---|---|---|---|
+| Nothing back yet | skeleton, "Checking Telegram…" | skeleton + "Checking your sources", no button | no note at all |
+| `connected: true` | Telegram connected | "Telegram is connected. Waiting for messages from your selected channels…" | nothing to warn about |
+| `connected: true`, no channels selected | Telegram connected | "Choose channels to monitor" (never a sign-in prompt) | note: no channels selected |
+| `connected: false` | Telegram not connected | "Connect Telegram" | note: not connected, with the connect link |
+| `configured: false` | Telegram unavailable | explains the service is unavailable, no button | note: unavailable |
+| check failed, last answer known | last answer marked stale | unchanged | unchanged |
+| check failed, nothing ever known | Status unavailable + Check again | Check again, no connect button | no note |
+
+The refresh is deduplicated, re-runs when the tab regains focus or becomes visible again (the API can sleep between visits), and polls every 30 seconds. Connect and disconnect flows publish their outcome through `applyStatus()`/`markDisconnected()` instead of waiting on a second round trip, so the pill, both empty states, and the Trading Accounts note change together. A failed check keeps the last confirmed answer and marks it stale rather than inventing a disconnection, and the `showConnectCallToAction` flag is the only way any component may render a connect prompt — `client/test/telegram-status-ui.test.mjs` asserts that invariant against the source tree, along with the rule that exactly one module may call the status endpoint.
+
 ## MetaAPI account setup
 
 1. The workspace owner adds a MetaAPI provisioning token to the backend environment as `METAAPI_PROVISIONING_TOKEN`.

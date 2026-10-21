@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { request } from '../lib/api.js';
 import Toast from './Toast.jsx';
+import { TelegramStatusPill, useTelegramStatus } from './TelegramStatus.jsx';
 
 function normalizePhone(value) {
   return value.replace(/[\s().-]/g, '');
@@ -17,7 +18,9 @@ function friendlyTelegramError(error) {
 }
 
 export default function TelegramConnect({ token, channels, onRefresh }) {
-  const [status, setStatus] = useState({ connected: false });
+  // The connection is shared state, never a local guess: this page must not show the
+  // sign-in form for a moment before discovering the user is already connected.
+  const { connected, view, refresh, markDisconnected } = useTelegramStatus();
   const [chats, setChats] = useState([]);
   const [phone, setPhone] = useState('');
   const [code, setCode] = useState('');
@@ -38,19 +41,13 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
     return () => window.clearTimeout(timeout);
   }, [toast]);
 
-  const checkStatus = useCallback(async () => {
-    const current = await request('/api/telegram/status', token);
-    setStatus(current);
-    return current;
-  }, [token]);
-
   const completeLogin = async () => {
     setStep('phone');
     setPhone('');
     setCode('');
     setPassword('');
     setChatSearch('');
-    await checkStatus();
+    await refresh();
     await onRefresh();
     notify('Telegram is connected to your workspace.');
   };
@@ -67,13 +64,12 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
     }
   }, [notify, token]);
 
+  // `connected === true` and not merely truthy: unknown must not load chats, and a
+  // confirmed disconnection must clear them.
   useEffect(() => {
-    checkStatus().catch((error) => notify(friendlyTelegramError(error), 'error'));
-  }, [checkStatus, notify]);
-
-  useEffect(() => {
-    if (status.connected) loadChats();
-  }, [status.connected, loadChats]);
+    if (connected === true) { loadChats(); return; }
+    if (connected === false) setChats([]);
+  }, [connected, loadChats]);
 
   const searchTerm = chatSearch.trim().toLocaleLowerCase();
   const filteredChats = chats.filter((chat) => `${chat.title || ''} ${chat.username || ''}`.toLocaleLowerCase().includes(searchTerm));
@@ -184,7 +180,7 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
     setBusy(true);
     try {
       await request('/api/telegram/disconnect', token, { method: 'POST', body: {} });
-      setStatus((previous) => ({ ...previous, connected: false }));
+      markDisconnected();
       setChats([]);
       setPhone('');
       setCode('');
@@ -230,9 +226,16 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
     <section className="panel" aria-labelledby="telegram-connection-title">
       <div className="panel-heading">
         <div><p className="eyebrow">SOURCE ACCOUNT</p><h2 id="telegram-connection-title">Telegram connection</h2></div>
-        <span className={`status-pill ${status.connected ? 'online' : ''}`} aria-live="polite">{status.connected ? 'Connected' : 'Not connected'}</span>
+        <TelegramStatusPill detailed />
       </div>
-      {status.connected ? <>
+      {view.key === 'checking' || view.key === 'unreachable' ? <>
+        <span className="skeleton skeleton-block" aria-hidden="true"><i /><i /><i /></span>
+        <p className="muted" role="status" aria-live="polite">{view.key === 'checking' ? 'Checking your Telegram connection…' : view.detail}</p>
+        {view.key === 'unreachable' ? <div className="button-row"><button className="button button-secondary" type="button" onClick={() => refresh()}>Check again</button></div> : null}
+      </> : view.key === 'unavailable' ? <>
+        <p className="muted">{view.detail}</p>
+        <div className="button-row"><button className="button button-secondary" type="button" onClick={() => refresh()}>Try again</button></div>
+      </> : connected ? <>
         <p className="muted">Your sign-in is protected. Only the groups and channels you choose are monitored.</p>
         <div className="button-row">
           <button className="button button-secondary" type="button" disabled={loadingChats} onClick={loadChats}>{loadingChats ? 'Refreshing…' : 'Refresh groups & channels'}</button>
@@ -277,7 +280,7 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
     </section>
     <section className="panel" aria-labelledby="monitored-sources-title">
       <div className="panel-heading"><div><p className="eyebrow">MONITORED SOURCES</p><h2 id="monitored-sources-title">Monitored groups &amp; channels</h2></div><span className="count-badge">{channels.length}</span></div>
-      {!channels.length ? <div className="empty-state"><span className="empty-icon" aria-hidden="true">⌁</span><strong>No chats selected</strong><span>Connect Telegram and choose which groups or channels to monitor.</span></div> : <div className="chat-list">{channels.map((channel) => <div className="chat-row" key={channel.id}><div><strong>{channel.title}</strong><small>{channel.enabled ? 'Monitoring enabled' : 'Paused'}</small></div><button className="button button-small button-secondary" type="button" aria-label={`Stop monitoring ${channel.title}`} disabled={busy} onClick={() => removeChannel(channel.id)}>Stop monitoring</button></div>)}</div>}
+      {!channels.length ? <div className="empty-state"><span className="empty-icon" aria-hidden="true">⌁</span><strong>No chats selected</strong><span>{connected ? 'Choose the groups and channels to monitor above, and Signal Desk will read only those.' : 'Connect Telegram to choose which groups or channels to monitor.'}</span></div> : <div className="chat-list">{channels.map((channel) => <div className="chat-row" key={channel.id}><div><strong>{channel.title}</strong><small>{channel.enabled ? 'Monitoring enabled' : 'Paused'}</small></div><button className="button button-small button-secondary" type="button" aria-label={`Stop monitoring ${channel.title}`} disabled={busy} onClick={() => removeChannel(channel.id)}>Stop monitoring</button></div>)}</div>}
       <div className="note-box">Monitoring may pause if the service goes to sleep.</div>
     </section>
   </div>;

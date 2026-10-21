@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { request } from '../lib/api.js';
+import { useTelegramStatus } from './TelegramStatus.jsx';
 
 function accountStateLabel(state) {
   const normalized = String(state || '').toUpperCase();
@@ -36,7 +37,26 @@ export function idleWarnings({ accounts = [], inactivity = null } = {}) {
     });
 }
 
-export default function MetaApiPanel({ token }) {
+/**
+ * Whether the broker account on this page can receive anything to trade, stated only from
+ * a confirmed Telegram state. While the answer is unknown the line is simply absent —
+ * an absent note is honest, a guessed one is what made this page flash a connect prompt.
+ */
+export function telegramSourceNote({ view, channelCount = 0 } = {}) {
+  if (view?.key === 'disconnected') {
+    return { tone: 'info', action: 'connect', text: 'Telegram is not connected, so there are no signals for this account to execute.' };
+  }
+  if (view?.key === 'connected' && !Number(channelCount)) {
+    return { tone: 'info', action: 'choose', text: 'Telegram is connected, but no channels are selected yet, so nothing new will arrive to execute.' };
+  }
+  if (view?.key === 'unavailable') {
+    return { tone: 'info', action: null, text: view.detail || 'Telegram sign-in is temporarily unavailable, so new signals cannot be captured yet.' };
+  }
+  return null;
+}
+
+export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }) {
+  const { view } = useTelegramStatus();
   const [available, setAvailable] = useState(false);
   const [accounts, setAccounts] = useState([]);
   const [form, setForm] = useState({ name: '', platform: 'mt5', server: '' });
@@ -156,6 +176,7 @@ export default function MetaApiPanel({ token }) {
 
   const provisionedAccounts = accounts.filter((account) => account.managedByApp);
   const warnings = idleWarnings({ accounts, inactivity });
+  const sourceNote = telegramSourceNote({ view, channelCount });
   const previouslyLinkedAccounts = accounts.filter((account) => !account.managedByApp);
 
   return <div className="panel-grid">
@@ -188,6 +209,11 @@ export default function MetaApiPanel({ token }) {
           ? 'This workspace is exempt, so no account here is scheduled for deletion.'
           : 'Sign in, save execution settings, or execute a signal to reset the clock.'}
       </p>
+      {sourceNote ? <div className={`alert alert-${sourceNote.tone} telegram-source-note`} role="status">
+        <span>{sourceNote.text}</span>
+        {sourceNote.action === 'choose' && onOpenTelegram ? <button type="button" className="text-button" onClick={onOpenTelegram}>Choose channels</button> : null}
+        {sourceNote.action === 'connect' && onOpenTelegram && view.showConnectCallToAction ? <button type="button" className="text-button" onClick={onOpenTelegram}>Connect Telegram</button> : null}
+      </div> : null}
       <div className="note-box">Adding an account does not place a trade by itself. Auto-Trading is ON by default for new workspaces; after you select a deployed account, new eligible Telegram signals may place orders. Turn it off in Risk Settings to stop new orders. MetaAPI usage limits or charges may apply when a trading account is connected.</div>
     </section>
 
