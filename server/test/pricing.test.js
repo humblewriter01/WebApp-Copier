@@ -111,13 +111,17 @@ test('the database price wins and the environment price stays visible', () => {
   });
   const pro = snapshot.plans.find((plan) => plan.key === 'pro');
   const premium = snapshot.plans.find((plan) => plan.key === 'premium');
+  const starter = snapshot.plans.find((plan) => plan.key === 'starter');
+  assert.equal(snapshot.plans.length, 3, 'one price row per paid tier');
+  assert.equal(starter.source, 'environment', 'an untouched tier falls back to the deployed price');
+  assert.equal(starter.amountMinor, 6_000_000);
   assert.equal(pro.amountMinor, 300_000);
   assert.equal(pro.amount, 3000);
   assert.equal(pro.source, 'database');
-  assert.equal(pro.environmentAmountMinor, 250_000);
+  assert.equal(pro.environmentAmountMinor, 10_500_000);
   assert.equal(pro.paystack.planCode, 'PLN_pro');
   assert.equal(premium.source, 'environment');
-  assert.equal(premium.amountMinor, 600_000);
+  assert.equal(premium.amountMinor, 15_000_000);
   assert.deepEqual(snapshot.byCode, { PLN_PRO: 'pro' });
   assert.equal(snapshot.recurringEnabled, true);
   assert.equal(snapshot.updateExistingSubscriptions, true);
@@ -148,10 +152,10 @@ test('public pricing shows the price but never the provider plan code', () => {
     providerPlans: { pro_paystack_plan: { planCode: 'PLN_secret', syncStatus: 'synced', syncedAmountMinor: 300_000 } },
   });
   const plans = publicPricing(snapshot);
-  assert.deepEqual(plans.map((plan) => plan.key), ['pro', 'premium']);
-  assert.equal(plans[0].amount, 3000);
-  assert.equal(plans[0].renewsAutomatically, true);
-  assert.equal(plans[1].renewsAutomatically, false);
+  assert.deepEqual(plans.map((plan) => plan.key), ['starter', 'pro', 'premium']);
+  assert.equal(plans[1].amount, 3000);
+  assert.equal(plans[1].renewsAutomatically, true);
+  assert.equal(plans[2].renewsAutomatically, false);
   const json = JSON.stringify(plans);
   assert.equal(json.includes('PLN_secret'), false);
   assert.equal(json.includes('syncStatus'), false);
@@ -193,7 +197,7 @@ test('saving a price writes pro_price with a bounded history and preserves the p
 
   const saved = await store.savePlanPrice({ planKey: 'pro', amountMinor: 300_000, actorId: 'user-1', actorEmail: 'admin@example.com', note: 'launch' });
   assert.equal(saved.unchanged, false);
-  assert.equal(saved.previousAmountMinor, 250_000, 'the first change records the environment price as the previous one');
+  assert.equal(saved.previousAmountMinor, 10_500_000, 'the first change records the environment price as the previous one');
   const row = settings.get('pro_price').setting_value;
   assert.equal(row.amountMinor, 300_000);
   assert.equal(row.currency, 'NGN');
@@ -219,9 +223,10 @@ test('clearing a price removes only the price row', async () => {
   assert.equal(settings.has('pro_price'), false);
   assert.equal(settings.has('pro_paystack_plan'), true, 'the provider link survives so re-syncing can find the plan');
   const snapshot = await store.snapshot();
-  assert.equal(snapshot.plans[0].amountMinor, 250_000, 'the environment price becomes active again');
-  assert.equal(snapshot.plans[0].source, 'environment');
-  assert.equal(planChargeDecision({ plan: snapshot.plans[0] }).reason, 'amount-mismatch', 'a stale plan code is never charged');
+  const pro = snapshot.plans.find((plan) => plan.key === 'pro');
+  assert.equal(pro.amountMinor, 10_500_000, 'the environment price becomes active again');
+  assert.equal(pro.source, 'environment');
+  assert.equal(planChargeDecision({ plan: pro }).reason, 'amount-mismatch', 'a stale plan code is never charged');
 });
 
 test('a sync result is stored next to the price, not inside it', async () => {
@@ -243,19 +248,21 @@ test('a sync result is stored next to the price, not inside it', async () => {
   assert.equal(settings.get('pro_paystack_plan').setting_value.syncStatus, 'failed', 'an unrecognised state cannot claim success');
 
   const snapshot = await store.snapshot();
-  assert.equal(snapshot.plans[0].paystack.planCode, 'PLN_pro');
-  assert.equal(snapshot.plans[0].history.length, 1);
+  const pro = snapshot.plans.find((plan) => plan.key === 'pro');
+  assert.equal(pro.paystack.planCode, 'PLN_pro');
+  assert.equal(pro.history.length, 1);
 });
 
 test('a sync attempt without a stored price does not invent one', async () => {
   const { pool, settings } = fakeStore();
   const store = createPricingStore({ pool, config, logger: { info() {}, warn() {}, error() {} } });
-  await store.recordPlanSync({ planKey: 'premium', sync: { status: 'synced', planCode: 'PLN_p', syncedAmountMinor: 600_000 } });
+  await store.recordPlanSync({ planKey: 'premium', sync: { status: 'synced', planCode: 'PLN_p', syncedAmountMinor: 15_000_000 } });
   assert.equal(settings.has('premium_price'), false);
   assert.equal(settings.get('premium_paystack_plan').setting_value.amountMinor, undefined, 'the mirror stores provider state only');
   const snapshot = await store.snapshot();
-  assert.equal(snapshot.plans[1].amountMinor, 600_000);
-  assert.equal(snapshot.plans[1].source, 'environment');
+  const premium = snapshot.plans.find((plan) => plan.key === 'premium');
+  assert.equal(premium.amountMinor, 15_000_000);
+  assert.equal(premium.source, 'environment');
 });
 
 test('billing settings round-trip and merge', async () => {
@@ -281,7 +288,7 @@ test('a broken settings table or row cannot take checkout down', async () => {
   });
   const snapshot = await broken.snapshot();
   assert.ok(warnings >= 1, 'the degradation is logged, never silent');
-  assert.equal(snapshot.plans[0].amountMinor, 250_000, 'falls back to the deployed price');
+  assert.deepEqual(snapshot.plans.map((plan) => plan.amountMinor), [6_000_000, 10_500_000, 15_000_000], 'every tier falls back to its deployed price');
   assert.equal(snapshot.recurringEnabled, true);
 
   const unreadable = createPricingStore({
@@ -301,6 +308,11 @@ test('pricing reads only ask for the settings they own', async () => {
   const selects = pool.calls.filter((call) => call.sql.includes('FROM admin_settings'));
   assert.equal(selects.length, 3);
   const keys = selects.flatMap((call) => call.params);
-  assert.deepEqual([...new Set(keys)].sort(), ['billing_settings', 'premium_paystack_plan', 'premium_price', 'pro_paystack_plan', 'pro_price'].sort());
+  assert.deepEqual([...new Set(keys)].sort(), [
+    'billing_settings',
+    'starter_price', 'starter_paystack_plan',
+    'pro_price', 'pro_paystack_plan',
+    'premium_price', 'premium_paystack_plan',
+  ].sort(), 'the third tier is read like the others, with no extra query');
   assert.equal(keys.includes('PAYSTACK_SECRET_KEY'), false);
 });

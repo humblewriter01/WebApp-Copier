@@ -11,18 +11,19 @@ A deployable React/Vite and Express app for capturing Telegram channel messages,
 - Reference-only account notes.
 - **MT4/MT5 account setup:** signed-in users can create an account setup and enter broker credentials on a MetaAPI-hosted secure page.
 - **Admin panel:** workspace administrators get a `/admin` dashboard with user totals, user management (roles, suspension), promo-code creation, and billing activity.
-- **Paystack subscriptions:** Free, Pro, and Premium plans with a hosted Paystack checkout, promo codes, verified webhooks, plan-based limits, and automatic renewal through Paystack Plan Codes that are kept in step with the price an admin saves.
+- **Paystack subscriptions:** a free review-only tier plus Starter, Pro, and Premium plans, with a hosted Paystack checkout, promo codes, verified webhooks, plan-based limits the server enforces, and automatic renewal through Paystack Plan Codes that are kept in step with the price an admin saves.
 - **Optional Auto-Trading:** a user can let clearly parsed Telegram signals place market orders on their own connected MT4/MT5 account, behind a chain of safety gates (see [Auto-Trading and break even](#auto-trading-and-break-even)).
 - **Break-even stop moves:** the stop of a trade Signal Desk opened is moved to the entry price (plus an optional offset) once the market has travelled the configured distance in favour of the trade.
 
 ## Important safety and data notes
 
-- **Live orders are only ever placed for a user who switched Auto-Trading on.** Every new workspace starts with the setting on so the feature is usable immediately, but nothing is submitted until that user also selects an owned, deployed trading account and every safety gate passes. Turning Auto-Trading off is immediate and stops *all* writes to the broker, including break-even stop moves.
+- **Live orders are only ever placed for a user who switched Auto-Trading on.** Every new workspace starts with the setting on so the feature is usable immediately, but nothing is submitted until that user also selects an owned, deployed trading account, is on a paid plan, and every safety gate passes. Turning Auto-Trading off is immediate and stops *all* writes to the broker, including break-even stop moves.
 - Signal Desk never closes or partially closes a position and never widens a stop loss. It places market orders and, when break even is enabled, moves the stop of a position it opened itself to a price that reduces risk.
 - An ambiguous broker or network failure on an order or a stop move is recorded as `unknown` and is **not** retried automatically, because the broker may already have accepted the first request. The activity list says so; reconcile that position on the broker account.
 - The API uses `METAAPI_PROVISIONING_TOKEN` only on the server. Users enter their broker login and password on MetaAPI's HTTPS setup page; Signal Desk does not receive or store those credentials.
 - The MetaAPI client uses HTTPS and is limited to the operations above: account setup, account reads, market order submission, and stop-loss modification for break even. Trading credentials stay server-side.
 - Deleting a Signal Desk account removes that user's Supabase Auth identity, local workspace data, and every MetaAPI trading account this workspace provisioned, so MetaAPI billing for those accounts stops. Accounts a user linked with their own MetaAPI token are left untouched. Unlinking a single account from the Trading Accounts page also deletes it from MetaAPI (same cleanup path); accounts billed to a user's own MetaAPI token are only unlinked.
+- An MT4/MT5 account this workspace provisioned is deleted from MetaAPI after 30 days without a sign-in, settings change, or executed signal, so an abandoned account stops being billed. A user on a paid plan or with the admin role is exempt, an account still holding a position or pending order is left alone, and nothing is deleted when the position state cannot be read. See **Idle account cleanup**.
 - Telegram sessions are encrypted in the database with the same server encryption key. Rotating that key without re-encrypting existing values will invalidate saved sessions/tokens.
 - Render free web services can sleep, so continuous Telegram monitoring is not reliable on the free tier. Use an always-on backend before relying on unattended monitoring.
 - The app is not financial advice. Review all signals independently.
@@ -69,6 +70,19 @@ The app creates its PostgreSQL tables and indexes on backend startup. The new `m
 
 `META_API_URL` is an optional HTTPS base-URL override. Never add `METAAPI_PROVISIONING_TOKEN` to a `VITE_*` variable, frontend code, or Git.
 
+## Idle account cleanup
+
+A provisioned MetaAPI account keeps billing this workspace for as long as it exists, so an account nobody has used for a month is removed. This is the whole policy, implemented in `server/services/inactivity.js`:
+
+- **Accounts always stay deployed.** Signal Desk never sleeps, wakes, or undeploys an account, because a wake-up would delay execution. The only destructive action is deletion after 30 idle days.
+- **The clock is `users.last_active_at`**, refreshed when the user signs in, saves Execution Settings, or has a signal executed. It is read as an age rather than compared with a calendar day, so a service that was asleep or restarted catches up on its next sweep instead of missing its window.
+- **Day 25** records a warning notice containing the account name, the days idle, and the days remaining, asking the user to log in. Each idle spell is warned about once; signing in re-arms it.
+- **Day 30** deletes the account through MetaAPI (`DELETE /users/current/accounts/:id`), removes the local link, and turns Auto-Trading off for a workspace whose selected execution account disappeared.
+- **Three rules outrank the schedule.** A user whose subscription is `active` or `non_renewing` is exempt, because they are paying for the account. An account whose synchronized state still shows an open position or pending order is *deferred* rather than deleted, so a trade is never stranded with nobody able to close it; the reason is shown to the user and retried on a later sweep. And a user with the `admin` role is never swept at all — an operator running the product must not watch their own test accounts disappear, and warning about a deletion that will never happen is noise. The exemptions are applied twice: the candidate query filters them out so they cannot occupy a sweep slot, and the decision function re-checks them, so an exempt account is not even read from MetaAPI.
+- **Nothing is destroyed on a guess.** If the position state cannot be read the sweep fails closed and waits. If MetaAPI refuses the deletion the local row is kept so a later sweep can retry, and after ten failed attempts the account is marked `failed` with a notice telling the user to remove it manually rather than looping forever. Each account is handled in its own `try`, so one provider outage cannot take the job down and the workspace is never left with a still-billed account no retry path can reach.
+
+Notices live in `account_activity_notices` (RLS-enabled, user-scoped) and are surfaced in-app as a banner on **Trading Accounts**, under the policy note beside the add-account form. This project has no email transport, so the in-app banner is the delivery channel and `warningText()` is the single seam a later email sender would reuse. The sweep runs at startup and every six hours, `INACTIVITY_SWEEP_LIMIT` accounts per pass, oldest first, and `INACTIVITY_WARNING_DAYS` / `INACTIVITY_DELETION_DAYS` move the thresholds (`INACTIVITY_CLEANUP_ENABLED=false` turns the job off); warnings and deletions are logged with user and account ids and never with tokens.
+
 ## Auto-Trading and break even
 
 Automatic execution is opt-in per workspace and lives in **Risk settings → Execution Settings**. The red warning above the toggle is required copy; the toggle saves on click so switching it off never waits for a form submit.
@@ -83,21 +97,26 @@ Before an order is submitted the engine re-reads its inputs and fails closed on 
 - The broker's `stopsLevel` and `freezeLevel` are respected. When the break-even price sits inside the minimum stop distance, the move is *deferred* and retried as the price travels further, rather than failing.
 - Every decision needs a fresh synchronized quote and symbol specification; missing or stale safety data means no request.
 - Results are persisted per broker position in `break_even_moves` with the status `moved`, `already_beyond`, `closed`, `deferred`, `failed`, or `unknown`, the previous and new stop, the quote used, and the sanitized provider message. A terminal status is never retried. Deferrals retry on their own clock (15 seconds while the price is too close, 60 seconds when account data could not be read) without consuming an attempt, a broker rejection retries up to ten times, and `unknown` never retries. Changing either distance re-arms positions that were already handled, because the stored row keeps the settings it was decided under.
-- Moves run only while the execution runtime is available **and** Auto-Trading is on, so "off" always means "Signal Desk is not talking to your broker".
+- Moves run only while the execution runtime is available, Auto-Trading is on, **and** the user is on a paid plan, so "off" — or a lapsed subscription — always means "Signal Desk is not talking to your broker".
 
 The sweep shares the worker's polling loop, and an order always goes first, so protecting an open position can never delay a fresh signal. A busy stream of signals cannot starve protection either: every fifth iteration also attempts a sweep. `BREAK_EVEN_SWEEP_INTERVAL_MS` throttles the sweep itself (default `5000` ms, floor `1000`), so calling it often costs nothing. No test or deployment path places a live order: the broker adapter is always faked.
 
 ## Paystack billing
 
-Signal Desk sells three plans. Limits and the built-in defaults live in `server/services/billing.js`; the amount charged is always computed on the server, so a modified browser request can never change the charge.
-
-**Prices are data, not configuration.** An administrator sets the active Pro and Premium prices in the Admin Panel (Pricing & Plans), and they are stored in the `admin_settings` table under the keys `pro_price` and `premium_price`, each with a short change history and the identity of whoever saved it. The environment variables below are only the fallback used while no price has been saved (and a saved price can be cleared to return to it). Every read order is the same: database first, then `PAYSTACK_PLAN_*_AMOUNT`.
+Signal Desk sells a free tier and three paid plans. Every price, limit, and label comes from `PLAN_DEFINITIONS` and `FREE_PLAN` in `server/services/billing.js`, and the amount charged is always computed on the server, so a modified browser request can never change the charge. Nothing else needs to know how many paid plans exist — pricing storage, Paystack plan synchronisation, the Billing page, and the Admin Panel all iterate over that catalogue.
 
 | Plan | Default price | Trading accounts | Telegram channels | Signals/day |
 |---|---|---:|---:|---:|
-| Free | ₦0 | 1 | 3 | 50 |
-| Pro | ₦2,500 / month | 5 | 25 | 500 |
-| Premium | ₦6,000 / month | 15 | 100 | 2,000 |
+| Free | ₦0 | none (review only) | 1 | 50 |
+| Starter | ₦60,000 / month | 1 | 10 | 200 |
+| Pro | ₦105,000 / month | 3 | 50 | 500 |
+| Premium | ₦150,000 / month | 5 | 100 | 2,000 |
+
+The paid prices are set against what a MetaAPI account costs this workspace each month, so one automated account is the cheapest paid tier and every step up pays for more accounts and more traffic. **Free cannot execute at all**, which is enforced in two places rather than one: `maxTradingAccounts: 0` blocks a new link, and the execution worker plus the Auto-Trading and Break-even switches require a paid subscription — so a workspace that connected an account while it was paying and later lapsed still cannot place orders.
+
+A limit of `0` is a real limit, not "unset": it survives the `plan_limits` snapshot, and the error says the tier does not include that thing rather than announcing a zero allowance. For any plan the catalogue still lists, the deployed definition outranks the snapshot stored at purchase, so re-pricing or re-limiting a tier cannot leave existing subscribers on allowances nobody advertises; a snapshot only carries a retired plan key.
+
+**Prices are data, not configuration.** An administrator sets the active Starter, Pro, and Premium prices in the Admin Panel (Pricing & Plans), and they are stored in the `admin_settings` table under the keys `starter_price`, `pro_price`, and `premium_price`, each with a short change history and the identity of whoever saved it. The environment variables below are only the fallback used while no price has been saved (and a saved price can be cleared to return to it). Every read order is the same: database first, then `PAYSTACK_PLAN_*_AMOUNT`.
 
 Checkout flow:
 
@@ -108,7 +127,7 @@ Checkout flow:
 
 Both paths share one fulfilment routine: the transaction is marked `success` once, the amount and currency must match the stored row, the user's plan and `plan_limits` are updated, and the promo code's `current_uses` is incremented. Replays are idempotent because the update is conditional on the row not already being `success`.
 
-Recurring billing is driven by Paystack Plan Codes, one per paid plan, kept on the server only (`admin_settings` key `paystack_plan_pro` / `paystack_plan_premium`, with the plan code, plan id, amount, currency, interval, and last sync result). `cancel` marks `cancel_at_period_end` (access continues until the period ends) and Paystack is asked to stop renewing; `resume` re-enables the Paystack subscription and clears the flag. A paid `invoice.update` extends the period from `max(now, current_period_end)` and records a `billing_transactions` row with `source = 'renewal'`; because renewal invoices reuse no local reference, idempotency is keyed on the Paystack `INV_…` invoice code, so a replayed webhook changes nothing. `invoice.payment_failed` sets `past_due` (access continues), and a completed or cancelled subscription keeps its access until the period ends and is then downgraded. An hourly sweep downgrades anyone whose period has passed back to the Free limits.
+Recurring billing is driven by Paystack Plan Codes, one per paid plan, kept on the server only (`admin_settings` key `paystack_plan_starter` / `paystack_plan_pro` / `paystack_plan_premium`, with the plan code, plan id, amount, currency, interval, and last sync result). `cancel` marks `cancel_at_period_end` (access continues until the period ends) and Paystack is asked to stop renewing; `resume` re-enables the Paystack subscription and clears the flag. A paid `invoice.update` extends the period from `max(now, current_period_end)` and records a `billing_transactions` row with `source = 'renewal'`; because renewal invoices reuse no local reference, idempotency is keyed on the Paystack `INV_…` invoice code, so a replayed webhook changes nothing. `invoice.payment_failed` sets `past_due` (access continues), and a completed or cancelled subscription keeps its access until the period ends and is then downgraded. An hourly sweep downgrades anyone whose period has passed back to the Free limits.
 
 ### Keeping the Plan Code in step with the price
 
@@ -123,6 +142,8 @@ A Paystack plan's amount overrides the amount in `transaction/initialize`, so a 
 
 `PUT /plan` returns no body, so every write is followed by a `GET /plan/:code` and the amount, currency, and interval are compared with what this workspace charges. Only a match marks the plan `usable`; any mismatch, provider error, or network error is stored as `failed` with the message shown in the Admin Panel. Because the amount is verified, a failed sync cannot over- or under-charge: the plan code simply stops being sent and checkout continues as a one-time charge at the saved price, and **Re-sync** in the panel repairs it. Cancelling a price (clearing the input) restores the deployed default and re-syncs. Automatic renewal can also be switched off globally (`recurringEnabled`), which stops plan codes being sent without touching the stored prices, and `updateExistingSubscriptions` decides whether a price change moves subscribers who are already on a plan.
 
+Every plan boundary is a server check. `server/services/plan-limits.js` resolves the effective limits for a user and the routes that create resources call `enforcePlanLimit` before writing: adding a monitored channel and connecting a trading account both answer `402` with `code: PLAN_LIMIT_REACHED` and `upgradeRequired: true`, which the frontend uses to route the visitor to the Billing page. `maxDailySignals` is counted per UTC day against `signals`, and an over-limit user keeps read access to everything already stored.
+
 Billing settings and prices are read and written through `GET`/`PUT /api/admin/pricing` and `POST /api/admin/pricing/sync`, all admin-only; plan codes and sync state never leave the server, and `GET /api/billing/plans` only returns names, amounts, intervals, limits, and whether the plan currently renews automatically.
 
 Configure in Render → API service → Environment:
@@ -131,7 +152,7 @@ Configure in Render → API service → Environment:
 |---|---:|---|
 | `PAYSTACK_SECRET_KEY` | Yes | Server-only key used for initialize, verify, and webhook signatures. Never expose it to the browser. |
 | `PAYSTACK_CURRENCY` | No | Defaults to `NGN`. |
-| `PAYSTACK_PLAN_PRO_AMOUNT` / `PAYSTACK_PLAN_PREMIUM_AMOUNT` | No | Fallback price in the smallest currency unit (kobo), used only while no price is saved in `admin_settings`. Defaults `250000` and `600000`. |
+| `PAYSTACK_PLAN_STARTER_AMOUNT` / `PAYSTACK_PLAN_PRO_AMOUNT` / `PAYSTACK_PLAN_PREMIUM_AMOUNT` | No | Fallback price in the smallest currency unit (kobo), used only while no price is saved in `admin_settings`. Defaults `6000000`, `10500000`, and `15000000`. |
 | `PAYSTACK_PLAN_INTERVAL` | No | Billing interval for created plans: `monthly` (default), `annually`, `quarterly`, or `biannually`. |
 | `PAYSTACK_API_URL` | No | HTTPS base URL override; defaults to `https://api.paystack.co`. |
 
@@ -147,7 +168,7 @@ The panel provides:
 
 - Dashboard totals: total users, administrators, suspended users, new sign-ups (7/30 days), promo codes, linked trading accounts, signals, and trades.
 - User management table: search by name or email, change role, suspend with a required reason, and restore access. An admin cannot demote or suspend their own account.
-- Pricing & Plans: the active Pro and Premium prices, how many subscribers a change would affect, whether each plan's Paystack plan is in sync (with its `PLN_…` code and last error), the per-plan price history, the two recurring-billing switches, a "Re-sync all plans with Paystack" action, and the promo-code creator: code, percentage or fixed discount, optional maximum uses, and optional expiry. Existing codes can be paused, re-activated, or deleted. Codes are applied at Paystack checkout, and their `current_uses` increment only after a verified payment.
+- Pricing & Plans: the active Starter, Pro, and Premium prices, how many subscribers a change would affect, whether each plan's Paystack plan is in sync (with its `PLN_…` code and last error), the per-plan price history, the two recurring-billing switches, a "Re-sync all plans with Paystack" action, and the promo-code creator: code, percentage or fixed discount, optional maximum uses, and optional expiry. Existing codes can be paused, re-activated, or deleted. Codes are applied at Paystack checkout, and their `current_uses` increment only after a verified payment.
 - Billing activity: active subscriptions, successful and pending payments, gross collected, discounts given, and the latest customer transactions.
 
 Suspension blocks new sign-ins with the stored reason. Existing JWT sessions on other devices remain valid until they expire (12 hours, or 30 days with "keep me signed in"), so revoke a role or suspend an account knowing that short window.
@@ -169,10 +190,13 @@ Suspension blocks new sign-ins with the stored reason. Existing JWT sessions on 
 | `ADMIN_EMAILS` | No | Comma-separated addresses that always hold the admin role |
 | `PAYSTACK_SECRET_KEY` | For billing | Server-only Paystack key for checkout, verification, and webhook signatures |
 | `PAYSTACK_CURRENCY` | No | Billing currency; defaults to `NGN` |
-| `PAYSTACK_PLAN_PRO_AMOUNT` / `PAYSTACK_PLAN_PREMIUM_AMOUNT` | No | Fallback plan prices in kobo; the Admin Panel can override them at runtime |
+| `PAYSTACK_PLAN_STARTER_AMOUNT` / `PAYSTACK_PLAN_PRO_AMOUNT` / `PAYSTACK_PLAN_PREMIUM_AMOUNT` | No | Fallback plan prices in kobo; the Admin Panel can override them at runtime |
 | `PAYSTACK_PLAN_INTERVAL` | No | Interval for Paystack plans; defaults to `monthly` |
 | `AUTO_TRADING_RUNTIME_ENABLED` | No | `true` enables the MetaAPI execution runtime (orders and break-even stop moves) |
 | `BREAK_EVEN_SWEEP_INTERVAL_MS` | No | Milliseconds between break-even sweeps; defaults to `5000` and never runs faster than every `1000` |
+| `INACTIVITY_CLEANUP_ENABLED` | No | `false` stops the idle-account sweep entirely; defaults to `true` |
+| `INACTIVITY_WARNING_DAYS` / `INACTIVITY_DELETION_DAYS` | No | Idle-account thresholds in days; default to `25` and `30`, and a pair where deletion does not come after the warning falls back to both defaults |
+| `INACTIVITY_SWEEP_LIMIT` | No | Accounts examined per sweep pass, oldest first; defaults to `25` |
 | `PORT` | No | Render supplies this automatically |
 
 The UI/API can be used without Telegram credentials; Telegram is shown as unavailable until `API_ID` and `API_HASH` are configured. Never commit real credentials to Git.
@@ -211,7 +235,7 @@ The static site is served over HTTPS and includes a linked web app manifest, 192
 - `GET/POST /api/accounts`, `DELETE /api/accounts/:id`
 - `GET/PUT /api/settings` – risk limits, lot sizing, selected execution account, and break-even trigger/offset
 - `GET /api/trades` – execution activity, including the break-even outcome for each position
-- `GET /api/metaapi/provisioning-status`, `GET /api/metaapi/linked-accounts`, `POST /api/metaapi/provisioned-accounts`, `POST /api/metaapi/provisioned-accounts/:accountId/configuration-link`, `POST /api/metaapi/provisioned-accounts/:accountId/refresh`, `DELETE /api/metaapi/accounts/:accountId`
+- `GET /api/metaapi/provisioning-status`, `GET /api/metaapi/linked-accounts` (each account also carries its idle age and warning state, plus the workspace's inactivity policy), `POST /api/metaapi/provisioned-accounts`, `POST /api/metaapi/provisioned-accounts/:accountId/configuration-link`, `POST /api/metaapi/provisioned-accounts/:accountId/refresh`, `DELETE /api/metaapi/accounts/:accountId`
 - `GET /api/telegram/status`, `POST /api/telegram/request-code`, `POST /api/telegram/verify-code`, `POST /api/telegram/verify-password`, `GET /api/telegram/chats`, `POST /api/telegram/disconnect`
 - `GET /health`
 

@@ -9,15 +9,16 @@ const baseItem = {
   auto_trading_enabled: true, lot_size_mode: 'fixed', fixed_lot_size: 0.01, risk_percent: 1,
   max_open_positions: 3, max_daily_trades: 10, daily_loss_limit: 5, execution_account_id: 'account-1',
   metaapi_account_id: 'account-1', managed_by_app: true, account_state: 'DEPLOYED',
+  subscription_status: 'active', subscription_plan: 'pro',
 };
 
-function fakePool({ baseline = 1000, localTrades = 0, disableBeforeSubmit = false } = {}) {
+function fakePool({ baseline = 1000, localTrades = 0, disableBeforeSubmit = false, subscriptionStatus = 'active' } = {}) {
   const calls = [];
   return {
     calls,
     async query(sql, params = []) {
       calls.push({ sql, params });
-      if (sql.includes('SELECT ej.id AS job_id')) return { rows: [{ ...baseItem }] };
+      if (sql.includes('SELECT ej.id AS job_id')) return { rows: [{ ...baseItem, subscription_status: subscriptionStatus }] };
       if (sql.includes('SELECT baseline_equity')) return { rows: [{ baseline_equity: baseline }] };
       if (sql.includes('SELECT COUNT(*)::int AS count FROM trades')) return { rows: [{ count: localTrades }] };
       if (sql.includes('SELECT auto_trading_enabled AS "autoTradingEnabled"')) return { rows: [{ autoTradingEnabled: !disableBeforeSubmit, executionAccountId: 'account-1' }] };
@@ -71,6 +72,20 @@ test('fully gated test signal sends only to the injected fake adapter and persis
   const insert = pool.calls.find(({ sql }) => sql.includes('INSERT INTO trades'));
   assert.ok(insert, 'trade row is created before submitting the market order');
   assert.ok(pool.calls.some(({ sql }) => sql.includes("SET status='executed'")));
+  assert.ok(pool.calls.some(({ sql }) => sql.includes('UPDATE users SET last_active_at=NOW()')), 'a executed signal keeps the workspace active');
+});
+
+test('a signal for a user without a paid plan is never sent to the broker', async () => {
+  for (const status of ['free', 'canceled', 'expired', 'past_due']) {
+    const pool = fakePool({ subscriptionStatus: status });
+    const trading = fakeTrading();
+    const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true });
+    const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+    assert.equal(result.status, 'skipped', `${status} must not execute`);
+    assert.match(result.message, /paid plan/i);
+    assert.equal(trading.calls.length, 0, 'no MetaAPI call at all');
+    assert.equal(pool.calls.some(({ sql }) => sql.includes('INSERT INTO trades')), false, 'no trade row');
+  }
 });
 
 test('a newly turned-off setting blocks queued work before any MetaAPI order call', async () => {
