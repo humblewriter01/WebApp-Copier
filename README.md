@@ -77,7 +77,21 @@ The rule the state machine enforces is that **the connection is unknown, never `
 | check failed, last answer known | last answer marked stale | unchanged | unchanged |
 | check failed, nothing ever known | Status unavailable + Check again | Check again, no connect button | no note |
 
-The refresh is deduplicated, re-runs when the tab regains focus or becomes visible again (the API can sleep between visits), and polls every 30 seconds. Connect and disconnect flows publish their outcome through `applyStatus()`/`markDisconnected()` instead of waiting on a second round trip, so the pill, both empty states, and the Trading Accounts note change together. A failed check keeps the last confirmed answer and marks it stale rather than inventing a disconnection, and the `showConnectCallToAction` flag is the only way any component may render a connect prompt — `client/test/telegram-status-ui.test.mjs` asserts that invariant against the source tree, along with the rule that exactly one module may call the status endpoint.
+The refresh is deduplicated, re-runs when the tab regains focus or becomes visible again (the API can sleep between visits), and polls every 30 seconds. Connect and disconnect flows publish their outcome through `applyStatus()`/`markDisconnected()` instead of waiting on a second round trip, so the pill, both empty states, and the Trading Accounts note change together. A failed check keeps the last confirmed answer and marks it stale rather than inventing a disconnection, and the `showConnectCallToAction` flag is the only way any component may render a connect prompt — `client/test/telegram-status-ui.test.mjs` asserts that invariant against the source tree, along with the rule that exactly one module may call the status endpoint. The same fetch lifecycle and failure policy are shared with the MetaAPI setup indicator through `client/src/lib/status-resource.js`; see [MetaAPI setup availability](#metaapi-setup-availability).
+
+## MetaAPI setup availability
+
+The **Trading Accounts** pill follows the same rulebook, because a page must not explain a problem it has not observed. `MetaApiStatusProvider` in `client/src/components/MetaApiStatus.jsx` is the only module that calls `GET /api/metaapi/provisioning-status`; `useMetaApiStatus()` shares it and `MetaApiStatusPill` renders it:
+
+| Confirmed state | Panel pill | Create-account card |
+|---|---|---|
+| Nothing back yet | skeleton, "Checking setup…" | skeleton and "Checking whether account setup is available…" — no verdict, no form |
+| `available: true` | Setup ready | the account name, platform, and broker server form |
+| `available: false` | Setup unavailable | "Account setup is not available yet" with the owner instruction, and no form |
+| check failed, last answer known | last answer, marked stale | unchanged |
+| check failed, nothing ever known | Status unavailable + Check again | says the check failed, without claiming anything about the configuration |
+
+`allowSetupForm` is stricter than "not told otherwise": the form submits a real provider request, so it appears only on a confirmed yes, exactly as a connect prompt appears only on a confirmed no. Both indicators get their fetch lifecycle and failure policy from `client/src/lib/status-resource.js`, so the rules that stop a status defaulting to its negative value exist once and cannot drift apart between the two endpoints. `client/test/metaapi-status-ui.test.mjs` holds that line, including a source-wide rule that no component may initialise a fetched status flag with `useState(true)` or `useState(false)`.
 
 ## MetaAPI account setup
 

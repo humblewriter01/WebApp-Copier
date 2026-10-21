@@ -1,5 +1,6 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef } from 'react';
+import React, { createContext, useMemo } from 'react';
 import { request } from '../lib/api.js';
+import { STATUS_POLL_INTERVAL_MS, statusFailed, statusSettled, useStatusContext, useStatusResource } from '../lib/status-resource.js';
 
 /**
  * The one place the app learns whether Telegram is connected.
@@ -12,7 +13,7 @@ import { request } from '../lib/api.js';
  * therefore shows a pending state, never a wrong one.
  */
 export const TELEGRAM_STATUS_ENDPOINT = '/api/telegram/status';
-export const TELEGRAM_POLL_INTERVAL_MS = 30_000;
+export const TELEGRAM_POLL_INTERVAL_MS = STATUS_POLL_INTERVAL_MS;
 export const WAITING_FOR_MESSAGES_MESSAGE = 'Telegram is connected. Waiting for messages from your selected channels...';
 
 const UNKNOWN_STATE = Object.freeze({
@@ -36,26 +37,19 @@ export function telegramStatusReducer(state = UNKNOWN_STATE, action = {}) {
     case 'resolve':
     case 'apply': {
       const result = action.payload || {};
-      return {
+      return statusSettled({
         ...state,
-        loading: false,
         connected: Boolean(result.connected),
+        // `apply` comes from a local flow that only knows the connection, so it must not
+        // erase whether this service can perform a sign-in at all.
         configured: typeof result.configured === 'boolean' ? result.configured : (action.type === 'apply' ? state.configured : null),
         message: typeof result.message === 'string' ? result.message : null,
-        error: null,
-        stale: false,
-        checkedAt: action.at || Date.now(),
-      };
+      }, action);
     }
     case 'reject':
-      return {
-        ...state,
-        loading: state.connected === null,
-        stale: state.connected !== null,
-        error: action.message || 'Telegram status could not be checked.',
-      };
+      return statusFailed(state, action);
     case 'mark-disconnected':
-      return { ...state, loading: false, connected: false, stale: false, error: null, checkedAt: action.at || Date.now() };
+      return statusSettled({ ...state, connected: false }, action);
     case 'reset':
       return UNKNOWN_STATE;
     default:
@@ -88,95 +82,49 @@ export function telegramConnectionView(state = UNKNOWN_STATE) {
 
 export const TelegramStatusContext = createContext(null);
 
-export function TelegramStatusProvider({ token, children, pollIntervalMs = TELEGRAM_POLL_INTERVAL_MS, fetchStatus = null }) {
-  const [state, dispatch] = useReducer(telegramStatusReducer, UNKNOWN_STATE);
-  const mounted = useRef(true);
-  const inFlight = useRef(null);
-  // A fetcher seam keeps the flows testable without a network, exactly like the server's
-  // fake adapters, and lets a caller reuse an already-loaded payload.
-  const fetcher = useRef(fetchStatus || ((currentToken) => request(TELEGRAM_STATUS_ENDPOINT, currentToken)));
-  if (fetchStatus) fetcher.current = fetchStatus;
+const fetchTelegramStatus = (token) => request(TELEGRAM_STATUS_ENDPOINT, token);
 
-  useEffect(() => {
-    mounted.current = true;
-    return () => { mounted.current = false; };
-  }, []);
-
-  const refresh = useCallback(async () => {
-    if (!token) {
-      // Signed out: there is nothing to know, and no stale value to keep showing.
-      dispatch({ type: 'reset' });
-      return null;
-    }
-    if (inFlight.current) return inFlight.current;
-    const run = async () => {
-      try {
-        const result = await fetcher.current(token);
-        if (!mounted.current) return result;
-        dispatch({ type: 'resolve', payload: result });
-        return result;
-      } catch (error) {
-        // A failed check proves nothing about the account: the reducer keeps the last
-        // confirmed answer as stale, or stays unknown if nothing was ever confirmed.
-        if (mounted.current) dispatch({ type: 'reject', message: error?.message });
-        return null;
-      } finally {
-        inFlight.current = null;
-      }
-    };
-    inFlight.current = run();
-    return inFlight.current;
-  }, [token]);
-
-  useEffect(() => { refresh(); }, [refresh]);
-
-  useEffect(() => {
-    if (!token || !pollIntervalMs) return undefined;
-    const visible = () => typeof document === 'undefined' || document.visibilityState !== 'hidden';
-    const timer = setInterval(() => { if (visible()) refresh(); }, pollIntervalMs);
-    const onVisible = () => { if (visible()) refresh(); };
-    const targets = [
-      [typeof window !== 'undefined' ? window : null, 'focus', onVisible],
-      [typeof document !== 'undefined' ? document : null, 'visibilitychange', onVisible],
-    ];
-    for (const [target, event, handler] of targets) target?.addEventListener?.(event, handler);
-    return () => {
-      clearInterval(timer);
-      for (const [target, event, handler] of targets) target?.removeEventListener?.(event, handler);
-    };
-  }, [token, pollIntervalMs, refresh]);
-
-  /** Publish a status the caller already has, so a flow never waits for a second round trip. */
-  const applyStatus = useCallback((result) => {
-    if (mounted.current) dispatch({ type: 'apply', payload: result });
-  }, []);
+/**
+ * `fetchStatus` is a seam: the flows are testable without a network, exactly like the
+ * server's fake MetaAPI and Paystack adapters.
+ */
+export function TelegramStatusProvider({ token, children, pollIntervalMs = TELEGRAM_POLL_INTERVAL_MS, fetchStatus = fetchTelegramStatus }) {
+  const { state, refresh, publish } = useStatusResource({
+    token, fetchStatus, reducer: telegramStatusReducer, initialState: UNKNOWN_STATE, pollIntervalMs,
+  });
 
   const value = useMemo(() => ({
     ...state,
     view: telegramConnectionView(state),
     refresh,
-    applyStatus,
-    /** Local flows that know the answer without asking again (disconnect, failed restore). */
-    markDisconnected: () => dispatch({ type: 'mark-disconnected' }),
-  }), [state, refresh, applyStatus]);
+    /** A flow that already has the answer publishes it rather than triggering a second call. */
+    applyStatus: (result) => publish({ type: 'apply', payload: result }),
+    markDisconnected: () => publish({ type: 'mark-disconnected' }),
+  }), [state, refresh, publish]);
 
   return <TelegramStatusContext.Provider value={value}>{children}</TelegramStatusContext.Provider>;
 }
 
-/**
- * Safe without a provider: an unmounted or unwired consumer gets the unknown view, which
- * renders a pending state rather than a connect button. Defaults must fail safe, because a
- * single forgotten provider is otherwise exactly the flash this module exists to remove.
- */
-export function useTelegramStatus() {
-  const context = useContext(TelegramStatusContext);
-  return context || useMemo(() => ({
-    ...UNKNOWN_STATE,
-    view: telegramConnectionView(UNKNOWN_STATE),
+/** A status value with no live provider behind it: real state, no working actions. */
+export function staticTelegramStatusValue(state = UNKNOWN_STATE) {
+  return {
+    ...state,
+    view: telegramConnectionView(state),
     refresh: async () => null,
     applyStatus: () => {},
     markDisconnected: () => {},
-  }), []);
+  };
+}
+
+const TELEGRAM_FALLBACK = Object.freeze(staticTelegramStatusValue());
+
+/**
+ * Safe without a provider: an unwired consumer gets the unknown view, which renders a
+ * pending state rather than a connect button. Defaults must fail safe, because one
+ * forgotten provider is otherwise exactly the flash this module exists to remove.
+ */
+export function useTelegramStatus() {
+  return useStatusContext(TelegramStatusContext, TELEGRAM_FALLBACK);
 }
 
 /**

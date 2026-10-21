@@ -3,6 +3,7 @@ import Sidebar from './components/Sidebar.jsx';
 import SignalTable from './components/SignalTable.jsx';
 import TelegramConnect from './components/TelegramConnect.jsx';
 import { TelegramStatusProvider, TelegramStatusPill, useTelegramStatus, monitoringLabel } from './components/TelegramStatus.jsx';
+import { MetaApiStatusProvider } from './components/MetaApiStatus.jsx';
 import MetaApiPanel from './components/MetaApiPanel.jsx';
 import ExecutionSettings from './components/ExecutionSettings.jsx';
 import AccountDeletionSettings from './components/AccountDeletionSettings.jsx';
@@ -251,6 +252,7 @@ function App() {
   if (!token) return <AuthScreen onAuthenticated={authenticated} installPrompt={installPrompt} onInstall={installApp} />;
   if (loading) return <main className="loading-shell"><div className="spinner" /><span>Loading your workspace…</span></main>;
   return <TelegramStatusProvider token={token}>
+    <MetaApiStatusProvider token={token}>
     <div className={`app-shell ${sidebarVisible ? '' : 'sidebar-hidden'}`}>
     <Sidebar active={tab} onNavigate={navigateToTab} user={user} onSignOut={logout} onClose={closeMobileSidebar} visible={sidebarVisible} />
     {isMobileViewport && sidebarVisible && <button type="button" className="sidebar-backdrop" aria-label="Close navigation menu" onClick={closeMobileSidebar} />}
@@ -282,6 +284,7 @@ function App() {
       <footer className="footer">Not financial advice. Use at your own risk.</footer>
     </main>
     </div>
+    </MetaApiStatusProvider>
   </TelegramStatusProvider>;
 }
 

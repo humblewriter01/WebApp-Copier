@@ -321,3 +321,9 @@ button,input,textarea,select{touch-action:manipulation}
 @media (prefers-reduced-motion:reduce){.skeleton:after{animation:none}}
 
 .live-label.idle{color:#8b97a8}
+
+/* MetaAPI provisioning status follows the Telegram rulebook: a pending check renders a
+   skeleton instead of claiming account setup is unavailable. */
+.metaapi-status-pill.pending { color: var(--muted); }
+.setup-pending { display: grid; gap: 10px; padding: 6px 0 2px; color: var(--muted); font-size: 0.9rem; }
+.setup-pending .skeleton-block:nth-child(2) { width: 62%; }

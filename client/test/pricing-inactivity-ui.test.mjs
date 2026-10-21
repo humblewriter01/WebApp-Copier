@@ -17,6 +17,7 @@ await build({
     contents: [
       "export { default as BillingPage, nextPlanKey, PLAN_ORDER } from './BillingPage.jsx';",
       "export { default as MetaApiPanel, idleWarnings } from './MetaApiPanel.jsx';",
+      "export { MetaApiStatusContext, metaApiStatusReducer, staticMetaApiStatusValue } from './MetaApiStatus.jsx';",
     ].join('\n'),
     resolveDir: path.join(here, '..', 'src', 'components'),
     loader: 'jsx',
@@ -31,7 +32,15 @@ await build({
 });
 assert.ok(existsSync(outfile), 'the component bundle was produced');
 
-const { BillingPage, nextPlanKey, PLAN_ORDER, MetaApiPanel, idleWarnings } = await import(pathToFileURL(outfile).href);
+const { BillingPage, nextPlanKey, PLAN_ORDER, MetaApiPanel, idleWarnings, MetaApiStatusContext, metaApiStatusReducer, staticMetaApiStatusValue } = await import(pathToFileURL(outfile).href);
+
+// The panel refuses to speak about account setup until the shared status answers, so tests
+// that care about the rest of the page mount a provider that already knows the answer.
+const withSetup = (available, element) => renderToStaticMarkup(React.createElement(
+  MetaApiStatusContext.Provider,
+  { value: staticMetaApiStatusValue(metaApiStatusReducer(undefined, { type: 'resolve', payload: { available }, at: 1 })) },
+  element,
+));
 const sources = {
   billing: readFileSync(path.join(here, '..', 'src', 'components', 'BillingPage.jsx'), 'utf8'),
   accounts: readFileSync(path.join(here, '..', 'src', 'components', 'MetaApiPanel.jsx'), 'utf8'),
@@ -105,9 +114,9 @@ test('the trading accounts page states the deletion policy near the add-account 
 });
 
 test('the rendered panel keeps its add-account form and policy note together', () => {
-  const html = renderToStaticMarkup(React.createElement(MetaApiPanel, { token: 'test-token' }));
+  const html = withSetup(true, React.createElement(MetaApiPanel, { token: 'test-token' }));
   assert.match(html, /Add an MT4\/MT5 account/);
-  assert.match(html, /Create secure setup link|Account setup is not available yet/);
+  assert.match(html, /Create secure setup link/);
   assert.match(html, /Idle accounts are cleaned up automatically/);
   assert.match(html, /reset the clock|Sign in, save execution settings, or execute a signal to reset the clock/);
   assert.match(html, /Adding an account does not place a trade by itself/);
