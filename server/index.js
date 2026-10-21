@@ -20,6 +20,14 @@ import { createMetaApiTradingAdapter } from './services/metaapi-trading.js';
 import { createExecutionEngine } from './services/execution-engine.js';
 import { createExecutionWorker } from './services/execution-worker.js';
 import { createSupabaseAuthBridge } from './services/supabase-auth.js';
+import { createAdminAccess, normalizePromoCodeInput, normalizePromoCodeUpdate, normalizeUserUpdate, assertAllowedSelfUpdate } from './services/admin.js';
+import { createAccountCleanup } from './services/account-cleanup.js';
+import { billingConfig, verifyWebhookSignature, normalizeReference } from './services/billing.js';
+import { createPaystackClient } from './services/paystack.js';
+import { createBillingService } from './services/billing-service.js';
+import { createPricingStore, normalizePricingUpdate, normalizeBillingSettings, planChargeDecision, publicPricing } from './services/pricing.js';
+import { createPlanSynchronizer } from './services/plan-sync.js';
+import { planLimitsFor, buildLimitError } from './services/plan-limits.js';
 
 const app = express();
 app.set('trust proxy', 1);
@@ -32,6 +40,26 @@ const telegramLogins = new Map();
 const autoTradingRuntimeEnabled = String(process.env.AUTO_TRADING_RUNTIME_ENABLED || '').toLowerCase() === 'true';
 const tradingAdapter = createMetaApiTradingAdapter();
 const supabaseAuthBridge = createSupabaseAuthBridge();
+const adminAccess = createAdminAccess();
+const accountCleanup = createAccountCleanup({ logger: { warn: (message, extra = {}) => log('warn', message, extra) } });
+const paystackConfig = billingConfig();
+const paystackClient = createPaystackClient({ config: paystackConfig });
+const serviceLogger = {
+  info: (message, extra = {}) => log('info', message, extra),
+  warn: (message, extra = {}) => log('warn', message, extra),
+  error: (message, extra = {}) => log('error', message, extra),
+};
+// Prices are stored in `admin_settings` and maintained from the admin panel, with
+// the environment as the fallback whenever a plan has no stored price.
+const pricingStore = createPricingStore({ pool, config: paystackConfig, logger: serviceLogger });
+const planSynchronizer = createPlanSynchronizer({ paystack: paystackClient, pricing: pricingStore, config: paystackConfig, logger: serviceLogger });
+const billingService = createBillingService({
+  pool,
+  pricing: pricingStore,
+  paystack: paystackClient,
+  config: paystackConfig,
+  logger: serviceLogger,
+});
 
 const log = (level, message, extra = {}) => {
   const safe = { ...extra };
@@ -51,10 +79,17 @@ app.use(cors({
   },
   credentials: true,
 }));
-app.use(express.json({ limit: '1mb' }));
+// Capture the raw body so the Paystack webhook can be verified against the exact
+// bytes Paystack signed (HMAC SHA512 of the raw payload).
+app.use(express.json({
+  limit: '1mb',
+  verify: (req, _res, buffer) => { req.rawBody = Buffer.from(buffer); },
+}));
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false }));
 app.use('/api/metaapi', rateLimit({ windowMs: 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false }));
 const passwordResetLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 5, standardHeaders: true, legacyHeaders: false });
+const billingLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
+const webhookLimiter = rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false });
 
 function encryptSecret(value) {
   const secret = process.env.SESSION_ENCRYPTION_KEY;
@@ -91,7 +126,20 @@ function authenticate(req, res, next) {
     return fail(res, 401, 'Your session has expired. Please sign in again.');
   }
 }
-function publicUser(row) { return { id: row.id, name: row.name, email: row.email, createdAt: row.created_at }; }
+function publicUser(row) { return { id: row.id, name: row.name, email: row.email, role: row.role === 'admin' ? 'admin' : 'user', createdAt: row.created_at }; }
+function isAdminRole(role) { return adminAccess.isAdminRole(role); }
+async function loadUserRole(userId) {
+  const { rows } = await pool.query('SELECT role FROM users WHERE id=$1 LIMIT 1', [userId]);
+  return rows[0]?.role || null;
+}
+const requireAdmin = asyncRoute(async (req, res, next) => {
+  const role = await loadUserRole(req.userId);
+  if (!isAdminRole(role)) {
+    log('warn', 'Admin endpoint denied', { userId: req.userId, role: role || 'missing' });
+    return fail(res, 403, 'You do not have access to the admin panel.');
+  }
+  return next();
+});
 
 async function getMetaApiToken(userId) {
   const { rows } = await pool.query('SELECT encrypted_api_token FROM metaapi_credentials WHERE user_id=$1', [userId]);
@@ -211,6 +259,18 @@ io.on('connection', (socket) => {
 app.get('/health', asyncRoute(async (_req, res) => { await pool.query('SELECT 1'); res.json({ status: 'ok', timestamp: new Date().toISOString() }); }));
 app.get('/api/health', asyncRoute(async (_req, res) => { await pool.query('SELECT 1'); res.json({ status: 'ok', timestamp: new Date().toISOString() }); }));
 
+// Public browser configuration. These two values are safe to ship to a browser
+// (they are already bundled into every frontend build); exposing them at runtime
+// means password recovery works even when the static-site build did not receive
+// the VITE_SUPABASE_* variables.
+app.get('/api/config', (_req, res) => {
+  res.set('Cache-Control', 'no-store').json({
+    supabaseUrl: String(process.env.SUPABASE_URL || '').trim(),
+    supabasePublishableKey: String(process.env.SUPABASE_PUBLISHABLE_KEY || '').trim(),
+    passwordRecoveryConfigured: supabaseAuthBridge.isAdminConfigured(),
+  });
+});
+
 app.post('/api/auth/register', asyncRoute(async (req, res) => {
   const name = String(req.body.name || '').trim().slice(0, 100);
   const email = String(req.body.email || '').trim().toLowerCase();
@@ -229,7 +289,7 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
   const dbClient = await pool.connect();
   try {
     await dbClient.query('BEGIN');
-    const { rows } = await dbClient.query("INSERT INTO users(name,email,password_hash,supabase_user_id,role) VALUES($1,$2,$3,$4,CASE WHEN lower($2)='ameenujaafar432@gmail.com' THEN 'admin' ELSE 'user' END) RETURNING id,name,email,created_at", [name, email, hash, supabaseUserId]);
+    const { rows } = await dbClient.query("INSERT INTO users(name,email,password_hash,supabase_user_id,role) VALUES($1,$2,$3,$4,$5) RETURNING id,name,email,role,created_at", [name, email, hash, supabaseUserId, adminAccess.isAdminEmail(email) ? 'admin' : 'user']);
     await dbClient.query('INSERT INTO settings(user_id) VALUES($1) ON CONFLICT DO NOTHING', [rows[0].id]);
     await dbClient.query('COMMIT');
     const user = publicUser(rows[0]);
@@ -244,7 +304,7 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
 app.post('/api/auth/login', asyncRoute(async (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
   const password = String(req.body.password || '');
-  const { rows } = await pool.query('SELECT id,name,email,password_hash,supabase_user_id,created_at FROM users WHERE email=$1', [email]);
+  const { rows } = await pool.query('SELECT id,name,email,password_hash,supabase_user_id,role,is_suspended,suspension_reason,created_at FROM users WHERE email=$1', [email]);
   if (!rows[0]) return fail(res, 401, 'Email or password is incorrect.');
   const localPasswordValid = await bcrypt.compare(password, rows[0].password_hash);
   if (rows[0].supabase_user_id && supabaseAuthBridge.isPublicConfigured()) {
@@ -283,6 +343,13 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
     } catch (error) {
       log('warn', 'Legacy account Auth bridge deferred', { userId: rows[0].id, code: error.code || 'AUTH_PROVIDER_ERROR' });
     }
+  }
+  if (rows[0].is_suspended === true) {
+    log('warn', 'Suspended account sign-in blocked', { userId: rows[0].id });
+    return res.status(403).json({
+      error: 'This account is suspended. Contact the workspace administrator if you believe this is a mistake.',
+      suspensionReason: String(rows[0].suspension_reason || '').slice(0, 200) || null,
+    });
   }
   await pool.query('UPDATE users SET last_login=NOW() WHERE id=$1', [rows[0].id]);
   const user = publicUser(rows[0]);
@@ -364,6 +431,25 @@ app.delete('/api/auth/account', authenticate, asyncRoute(async (req, res) => {
     }
   }
 
+  // Stop MetaAPI billing for trading accounts this workspace provisioned. This runs
+  // after the Auth identity is gone (so a failed Auth deletion leaves everything
+  // intact) and before the local rows are removed (so we still know the account IDs).
+  // Provider failures are logged and reported, but they never block deletion.
+  let metaApiCleanup = { total: 0, attempted: 0, deleted: 0, alreadyMissing: 0, failed: 0, skipped: 0, failures: [] };
+  try {
+    const { rows: providerAccounts } = await pool.query(
+      'SELECT metaapi_account_id,managed_by_app FROM metaapi_accounts WHERE user_id=$1 AND managed_by_app=TRUE',
+      [user.id],
+    );
+    metaApiCleanup = await accountCleanup.removeProviderAccounts({
+      accounts: providerAccounts,
+      resolveToken: () => getMetaApiProvisioningToken(),
+    });
+    if (metaApiCleanup.failed) log('warn', 'MetaAPI account deletion finished with failures', { userId: user.id, failed: metaApiCleanup.failed });
+  } catch (error) {
+    log('warn', 'MetaAPI account cleanup could not run during account deletion', { userId: user.id, code: error.code || 'METAAPI_CLEANUP_FAILED' });
+  }
+
   const dbClient = await pool.connect();
   try {
     await dbClient.query('BEGIN');
@@ -382,10 +468,11 @@ app.delete('/api/auth/account', authenticate, asyncRoute(async (req, res) => {
     map.delete(user.id);
   }
   io.in(`user:${user.id}`).disconnectSockets(true);
-  res.json({ ok: true });
+  log('info', 'Account deleted', { userId: user.id, metaApiDeleted: metaApiCleanup.deleted, metaApiFailed: metaApiCleanup.failed });
+  res.json({ ok: true, metaApiCleanup });
 }));
 app.get('/api/auth/me', authenticate, asyncRoute(async (req, res) => {
-  const { rows } = await pool.query('SELECT id,name,email,created_at FROM users WHERE id=$1', [req.userId]);
+  const { rows } = await pool.query('SELECT id,name,email,role,created_at FROM users WHERE id=$1', [req.userId]);
   if (!rows[0]) return fail(res, 404, 'User not found.');
   res.json({ user: publicUser(rows[0]) });
 }));
@@ -415,6 +502,7 @@ app.post('/api/channels', authenticate, asyncRoute(async (req, res) => {
   const title = String(req.body.title || '').trim().slice(0, 160);
   const username = String(req.body.username || '').trim().slice(0, 100) || null;
   if (!channelId || !title) return fail(res, 400, 'Channel ID and title are required.');
+  await enforcePlanLimit(req.userId, 'maxTelegramChannels', 'SELECT COUNT(*)::int AS count FROM channels WHERE user_id=$1');
   const { rows } = await pool.query(
     `INSERT INTO channels(user_id,channel_id,title,username) VALUES($1,$2,$3,$4)
      ON CONFLICT(user_id,channel_id) DO UPDATE SET title=EXCLUDED.title,username=EXCLUDED.username,enabled=TRUE
@@ -518,6 +606,7 @@ app.post('/api/metaapi/provisioned-accounts', authenticate, asyncRoute(async (re
   if (!name || name.length > 100) return fail(res, 400, 'Enter an account name of 1 to 100 characters.');
   if (!server || server.length > 160) return fail(res, 400, 'Enter the broker server name shown in your MetaTrader account details.');
   if (!['mt4', 'mt5'].includes(platform)) return fail(res, 400, 'Choose MetaTrader 4 or MetaTrader 5.');
+  await enforcePlanLimit(req.userId, 'maxTradingAccounts', 'SELECT COUNT(*)::int AS count FROM metaapi_accounts WHERE user_id=$1');
 
   const accountData = await metaApiRequest(apiToken, '/users/current/accounts', {
     method: 'POST',
@@ -618,10 +707,33 @@ app.post('/api/metaapi/accounts/link', authenticate, asyncRoute(async (req, res)
   res.status(201).json({ account: rows[0] });
 }));
 app.delete('/api/metaapi/accounts/:accountId', authenticate, asyncRoute(async (req, res) => {
-  await pool.query('UPDATE settings SET auto_trading_enabled=FALSE,execution_account_id=NULL,updated_at=NOW() WHERE user_id=$1 AND execution_account_id=$2', [req.userId, req.params.accountId]);
-  const result = await pool.query('DELETE FROM metaapi_accounts WHERE user_id=$1 AND metaapi_account_id=$2', [req.userId, req.params.accountId]);
+  const accountId = String(req.params.accountId || '').trim();
+  const { rows } = await pool.query(
+    'SELECT metaapi_account_id,managed_by_app FROM metaapi_accounts WHERE user_id=$1 AND metaapi_account_id=$2 LIMIT 1',
+    [req.userId, accountId],
+  );
+  const account = rows[0];
+  if (!account) return fail(res, 404, 'Linked MetaAPI account not found.');
+
+  // Unlinking also stops provider billing: delete the account from MetaAPI itself,
+  // using the same cleanup path as full account deletion. A provider failure is
+  // logged and reported but never blocks the local unlink.
+  let metaApiCleanup = { total: 1, attempted: 0, deleted: 0, alreadyMissing: 0, failed: 0, skipped: 0, failures: [] };
+  try {
+    metaApiCleanup = await accountCleanup.removeProviderAccounts({
+      accounts: [account],
+      resolveToken: () => getMetaApiProvisioningToken(),
+    });
+    if (metaApiCleanup.failed) log('warn', 'MetaAPI account deletion failed during unlink', { userId: req.userId, accountId });
+  } catch (error) {
+    log('warn', 'MetaAPI account cleanup could not run during unlink', { userId: req.userId, accountId, code: error.code || 'METAAPI_CLEANUP_FAILED' });
+  }
+
+  await pool.query('UPDATE settings SET auto_trading_enabled=FALSE,execution_account_id=NULL,updated_at=NOW() WHERE user_id=$1 AND execution_account_id=$2', [req.userId, accountId]);
+  const result = await pool.query('DELETE FROM metaapi_accounts WHERE user_id=$1 AND metaapi_account_id=$2', [req.userId, accountId]);
   if (!result.rowCount) return fail(res, 404, 'Linked MetaAPI account not found.');
-  res.json({ ok: true });
+  log('info', 'Trading account unlinked', { userId: req.userId, accountId, metaApiDeleted: metaApiCleanup.deleted, metaApiFailed: metaApiCleanup.failed });
+  res.json({ ok: true, metaApiCleanup });
 }));
 
 app.get('/api/settings', authenticate, asyncRoute(async (req, res) => {
@@ -676,6 +788,415 @@ app.put('/api/settings', authenticate, asyncRoute(async (req, res) => {
 app.get('/api/trades', authenticate, asyncRoute(async (req, res) => {
   const { rows } = await pool.query('SELECT id,signal_id AS "signalId",metaapi_account_id AS "metaApiAccountId",symbol,side,quantity,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",exit_price AS "exitPrice",pnl,status,broker_order_id AS "brokerOrderId",broker_position_id AS "brokerPositionId",error_message AS "errorMessage",created_at AS "createdAt",executed_at AS "executedAt" FROM trades WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50', [req.userId]);
   res.set('Cache-Control', 'no-store').json({ trades: rows, liveExecutionEnabled: autoTradingRuntimeEnabled });
+}));
+
+/* -------------------------------- Billing --------------------------------
+ * Paystack checkout, verification, and webhooks. Prices live in the plan
+ * definitions and are never trusted from the browser: the server always
+ * recalculates the amount (including any promo code) before charging.
+ */
+async function currentPlanLimits(userId) {
+  const { rows } = await pool.query(
+    'SELECT subscription_status,subscription_plan,plan_limits FROM users WHERE id=$1 LIMIT 1',
+    [userId],
+  );
+  return planLimitsFor(rows[0] || {});
+}
+
+async function enforcePlanLimit(userId, limitKey, countSql) {
+  const limits = await currentPlanLimits(userId);
+  const limit = Number(limits[limitKey]);
+  if (!Number.isFinite(limit)) return;
+  const { rows } = await pool.query(countSql, [userId]);
+  const current = Number(rows[0]?.count || 0);
+  if (current >= limit) {
+    const { rows: userRows } = await pool.query('SELECT subscription_plan FROM users WHERE id=$1 LIMIT 1', [userId]);
+    throw buildLimitError({ limitKey, limit, planKey: userRows[0]?.subscription_plan || 'free' });
+  }
+}
+
+app.get('/api/billing/plans', asyncRoute(async (_req, res) => {
+  // Prices are read per request so a price saved in the admin panel is what the
+  // visitor sees and pays, with no cache or stale build to wait for.
+  const snapshot = await pricingStore.snapshot();
+  res.set('Cache-Control', 'no-store').json({
+    plans: publicPricing(snapshot),
+    configured: paystackConfig.configured,
+    currency: snapshot.currency,
+    interval: snapshot.interval,
+    recurringEnabled: snapshot.recurringEnabled,
+  });
+}));
+
+app.get('/api/billing/subscription', authenticate, asyncRoute(async (req, res) => {
+  const data = await billingService.subscriptionFor(req.userId);
+  const limits = await currentPlanLimits(req.userId);
+  res.set('Cache-Control', 'no-store').json({ ...data, limits });
+}));
+
+app.get('/api/billing/quote', authenticate, billingLimiter, asyncRoute(async (req, res) => {
+  const quote = await billingService.quote({ planKey: req.query.plan, promoCode: req.query.code });
+  res.set('Cache-Control', 'no-store').json({ quote });
+}));
+
+app.post('/api/billing/checkout', authenticate, billingLimiter, asyncRoute(async (req, res) => {
+  const checkout = await billingService.initialize({
+    userId: req.userId,
+    planKey: req.body?.plan,
+    promoCode: req.body?.promoCode,
+  });
+  res.set('Cache-Control', 'no-store').json({ checkout });
+}));
+
+app.get('/api/billing/verify', authenticate, billingLimiter, asyncRoute(async (req, res) => {
+  const reference = normalizeReference(req.query.reference);
+  if (!reference) return fail(res, 400, 'That payment reference is not valid.');
+  const result = await billingService.verifyAndFulfill({ userId: req.userId, reference });
+  res.set('Cache-Control', 'no-store').json(result);
+}));
+
+app.post('/api/billing/cancel', authenticate, billingLimiter, asyncRoute(async (req, res) => {
+  const subscription = await billingService.cancel({ userId: req.userId });
+  res.set('Cache-Control', 'no-store').json({ subscription });
+}));
+
+app.post('/api/billing/resume', authenticate, billingLimiter, asyncRoute(async (req, res) => {
+  const subscription = await billingService.resume({ userId: req.userId });
+  res.set('Cache-Control', 'no-store').json({ subscription });
+}));
+
+// Paystack calls this endpoint. The HMAC SHA512 signature is computed over the
+// exact raw bytes received, so it is verified before anything else happens.
+app.post('/api/billing/webhook', webhookLimiter, asyncRoute(async (req, res) => {
+  const signature = req.headers['x-paystack-signature'];
+  if (!paystackConfig.secretKey) {
+    log('error', 'Paystack webhook received but PAYSTACK_SECRET_KEY is not configured');
+    return res.status(503).json({ error: 'Payments are not configured.' });
+  }
+  if (!verifyWebhookSignature(req.rawBody, signature)) {
+    log('warn', 'Paystack webhook signature rejected', { hasSignature: Boolean(signature) });
+    return res.status(401).json({ error: 'Invalid signature.' });
+  }
+  let event;
+  try { event = JSON.parse(req.rawBody.toString('utf8')); }
+  catch {
+    log('warn', 'Paystack webhook body was not valid JSON');
+    return res.status(400).json({ error: 'Invalid payload.' });
+  }
+  const result = await billingService.handleWebhookEvent(event);
+  log('info', 'Paystack webhook processed', { event: result.event, handled: result.handled, reason: result.reason });
+  res.json({ received: true, result });
+}));
+
+/* --------------------------------- Admin ---------------------------------
+ * Every route below is authenticated and re-checks the caller's current role in
+ * the database on each request, so a stale token cannot keep admin access after
+ * the role is removed.
+ */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const adminUserColumns = `u.id,u.name,u.email,u.role,u.subscription_status AS "subscriptionStatus",
+  u.subscription_plan AS "subscriptionPlan",u.is_suspended AS "isSuspended",
+  u.suspension_reason AS "suspensionReason",u.created_at AS "createdAt",u.last_login AS "lastLogin",
+  (u.supabase_user_id IS NOT NULL) AS "authLinked",
+  (SELECT COUNT(*)::int FROM signals s WHERE s.user_id=u.id) AS "signalCount"`;
+const promoCodeColumns = `id,code,discount_type AS "discountType",discount_value AS "discountValue",
+  max_uses AS "maxUses",current_uses AS "currentUses",expires_at AS "expiresAt",active,
+  created_at AS "createdAt",updated_at AS "updatedAt"`;
+
+app.get('/api/admin/overview', authenticate, requireAdmin, asyncRoute(async (_req, res) => {
+  const { rows } = await pool.query(`SELECT
+    (SELECT COUNT(*)::int FROM users) AS total_users,
+    (SELECT COUNT(*)::int FROM users WHERE role='admin') AS admin_users,
+    (SELECT COUNT(*)::int FROM users WHERE is_suspended=TRUE) AS suspended_users,
+    (SELECT COUNT(*)::int FROM users WHERE created_at >= NOW() - INTERVAL '7 days') AS new_users_7d,
+    (SELECT COUNT(*)::int FROM users WHERE created_at >= NOW() - INTERVAL '30 days') AS new_users_30d,
+    (SELECT COUNT(*)::int FROM users WHERE subscription_plan <> 'free') AS paid_users,
+    (SELECT COUNT(*)::int FROM promo_codes) AS total_promo_codes,
+    (SELECT COUNT(*)::int FROM promo_codes WHERE active=TRUE AND (expires_at IS NULL OR expires_at > NOW())) AS active_promo_codes,
+    (SELECT COUNT(*)::int FROM signals) AS total_signals,
+    (SELECT COUNT(*)::int FROM metaapi_accounts) AS linked_trading_accounts,
+    (SELECT COUNT(*)::int FROM trades) AS total_trades`);
+  const stats = rows[0] || {};
+  res.set('Cache-Control', 'no-store').json({
+    stats: {
+      totalUsers: stats.total_users ?? 0,
+      adminUsers: stats.admin_users ?? 0,
+      suspendedUsers: stats.suspended_users ?? 0,
+      newUsers7d: stats.new_users_7d ?? 0,
+      newUsers30d: stats.new_users_30d ?? 0,
+      paidUsers: stats.paid_users ?? 0,
+      totalPromoCodes: stats.total_promo_codes ?? 0,
+      activePromoCodes: stats.active_promo_codes ?? 0,
+      totalSignals: stats.total_signals ?? 0,
+      linkedTradingAccounts: stats.linked_trading_accounts ?? 0,
+      totalTrades: stats.total_trades ?? 0,
+    },
+    runtimeEnabled: autoTradingRuntimeEnabled,
+  });
+}));
+
+app.get('/api/admin/users', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const search = String(req.query.search || '').trim().slice(0, 100);
+  const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 25));
+  const offset = Math.max(0, Number.parseInt(req.query.offset, 10) || 0);
+  const filter = `WHERE ($1::text = '' OR position(lower($1) in lower(u.name)) > 0 OR position(lower($1) in lower(u.email)) > 0)`;
+  const [list, count] = await Promise.all([
+    pool.query(`SELECT ${adminUserColumns} FROM users u ${filter} ORDER BY u.created_at DESC LIMIT $2 OFFSET $3`, [search, limit, offset]),
+    pool.query(`SELECT COUNT(*)::int AS count FROM users u ${filter}`, [search]),
+  ]);
+  res.set('Cache-Control', 'no-store').json({
+    users: list.rows,
+    total: count.rows[0]?.count ?? 0,
+    limit,
+    offset,
+    search,
+  });
+}));
+
+app.patch('/api/admin/users/:id', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const targetId = String(req.params.id || '').trim();
+  if (!UUID_PATTERN.test(targetId)) return fail(res, 400, 'Choose a valid user account.');
+  let update;
+  try {
+    update = normalizeUserUpdate(req.body || {});
+    assertAllowedSelfUpdate({ actorId: req.userId, targetId, update });
+  } catch (error) {
+    return fail(res, error.status || 400, error.message);
+  }
+
+  const assignments = [];
+  const values = [];
+  const push = (column, value) => { values.push(value); assignments.push(`${column}=$${values.length}`); };
+  if (update.role !== undefined) push('role', update.role);
+  if (update.isSuspended !== undefined) push('is_suspended', update.isSuspended);
+  if (update.suspensionReason !== undefined) push('suspension_reason', update.suspensionReason || null);
+  values.push(targetId);
+
+  const { rows } = await pool.query(
+    `UPDATE users SET ${assignments.join(',')} WHERE id=$${values.length}
+     RETURNING id AS "userId"`,
+    values,
+  );
+  if (!rows[0]) return fail(res, 404, 'That user could not be found.');
+  const { rows: updatedRows } = await pool.query(`SELECT ${adminUserColumns} FROM users u WHERE u.id=$1`, [targetId]);
+  log('info', 'Admin updated user', { actorId: req.userId, targetId, role: update.role, isSuspended: update.isSuspended });
+  res.set('Cache-Control', 'no-store').json({ user: updatedRows[0] });
+}));
+
+app.get('/api/admin/promo-codes', authenticate, requireAdmin, asyncRoute(async (_req, res) => {
+  const { rows } = await pool.query(`SELECT ${promoCodeColumns} FROM promo_codes ORDER BY created_at DESC LIMIT 200`);
+  res.set('Cache-Control', 'no-store').json({ promoCodes: rows });
+}));
+
+app.post('/api/admin/promo-codes', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  let input;
+  try { input = normalizePromoCodeInput(req.body || {}); }
+  catch (error) { return fail(res, error.status || 400, error.message); }
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO promo_codes(code,discount_type,discount_value,max_uses,expires_at,created_by)
+       VALUES($1,$2,$3,$4,$5,$6) RETURNING ${promoCodeColumns}`,
+      [input.code, input.discountType, input.discountValue, input.maxUses, input.expiresAt, req.userId],
+    );
+    log('info', 'Admin created promo code', { actorId: req.userId, promoCodeId: rows[0].id, discountType: input.discountType });
+    res.set('Cache-Control', 'no-store').status(201).json({ promoCode: rows[0] });
+  } catch (error) {
+    if (error.code === '23505') return fail(res, 409, 'That promo code already exists. Choose a different code.');
+    throw error;
+  }
+}));
+
+app.patch('/api/admin/promo-codes/:id', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const promoCodeId = String(req.params.id || '').trim();
+  if (!UUID_PATTERN.test(promoCodeId)) return fail(res, 400, 'Choose a valid promo code.');
+  let update;
+  try { update = normalizePromoCodeUpdate(req.body || {}); }
+  catch (error) { return fail(res, error.status || 400, error.message); }
+
+  const assignments = [];
+  const values = [];
+  const push = (column, value) => { values.push(value); assignments.push(`${column}=$${values.length}`); };
+  if (update.active !== undefined) push('active', update.active);
+  if (update.maxUses !== undefined) push('max_uses', update.maxUses);
+  if (update.expiresAt !== undefined) push('expires_at', update.expiresAt);
+  values.push(promoCodeId);
+  const { rows } = await pool.query(
+    `UPDATE promo_codes SET ${assignments.join(',')},updated_at=NOW() WHERE id=$${values.length} RETURNING ${promoCodeColumns}`,
+    values,
+  );
+  if (!rows[0]) return fail(res, 404, 'That promo code could not be found.');
+  log('info', 'Admin updated promo code', { actorId: req.userId, promoCodeId, active: update.active });
+  res.set('Cache-Control', 'no-store').json({ promoCode: rows[0] });
+}));
+
+app.delete('/api/admin/promo-codes/:id', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const promoCodeId = String(req.params.id || '').trim();
+  if (!UUID_PATTERN.test(promoCodeId)) return fail(res, 400, 'Choose a valid promo code.');
+  const result = await pool.query('DELETE FROM promo_codes WHERE id=$1', [promoCodeId]);
+  if (!result.rowCount) return fail(res, 404, 'That promo code could not be found.');
+  log('info', 'Admin deleted promo code', { actorId: req.userId, promoCodeId });
+  res.json({ ok: true });
+}));
+
+/* --------------------------- Admin: pricing control -------------------------
+ * Prices live in `admin_settings` (`pro_price`, `premium_price`), and every write
+ * also mirrors the price into a Paystack plan so recurring charges match what the
+ * site advertises. A sync problem is reported, never hidden, and never blocks
+ * saving the price.
+ */
+async function adminPricingPayload() {
+  const snapshot = await pricingStore.snapshot();
+  let subscribers = [];
+  try {
+    const { rows } = await pool.query(
+      `SELECT plan_key,COUNT(*)::int AS active_subscriptions FROM subscriptions
+       WHERE status IN ('active','non_renewing','past_due') GROUP BY plan_key`,
+    );
+    subscribers = rows;
+  } catch (error) {
+    log('warn', 'Subscription counts could not be read for the pricing panel', { code: error.code || 'PRICING_COUNTS_FAILED' });
+  }
+  const counts = new Map(subscribers.map((row) => [String(row.plan_key), Number(row.active_subscriptions || 0)]));
+  return {
+    currency: snapshot.currency,
+    interval: snapshot.interval,
+    configured: paystackConfig.configured,
+    billing: {
+      recurringEnabled: snapshot.recurringEnabled,
+      updateExistingSubscriptions: snapshot.updateExistingSubscriptions,
+    },
+    plans: snapshot.plans.map((plan) => ({
+      key: plan.key,
+      name: plan.name,
+      description: plan.description,
+      limits: plan.limits,
+      amountMinor: plan.amountMinor,
+      amount: plan.amount,
+      currency: plan.currency,
+      interval: plan.interval,
+      source: plan.source,
+      environmentAmountMinor: plan.environmentAmountMinor,
+      environmentAmount: plan.environmentAmountMinor / 100,
+      updatedAt: plan.updatedAt,
+      updatedBy: plan.updatedBy,
+      history: plan.history,
+      activeSubscribers: counts.get(plan.key) || 0,
+      paystack: plan.paystack
+        ? {
+          planCode: plan.paystack.planCode || null,
+          planId: plan.paystack.planId ?? null,
+          syncStatus: plan.paystack.syncStatus || 'pending',
+          syncedAmountMinor: plan.paystack.syncedAmountMinor ?? null,
+          syncedAt: plan.paystack.syncedAt || null,
+          currency: plan.paystack.currency || null,
+          interval: plan.paystack.interval || null,
+          name: plan.paystack.name || null,
+          message: plan.paystack.message || null,
+          error: plan.paystack.error || null,
+        }
+        : null,
+      renewsAutomatically: planChargeDecision({ plan, recurringEnabled: snapshot.recurringEnabled }).usePlan,
+    })),
+  };
+}
+
+app.get('/api/admin/pricing', authenticate, requireAdmin, asyncRoute(async (_req, res) => {
+  res.set('Cache-Control', 'no-store').json(await adminPricingPayload());
+}));
+
+app.put('/api/admin/pricing', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  let update;
+  try {
+    update = normalizePricingUpdate({ input: req.body || {}, config: paystackConfig });
+  } catch (error) {
+    return fail(res, error.status || 400, error.userMessage || error.message);
+  }
+
+  const saved = [];
+  for (const entry of update.entries) {
+    const result = await pricingStore.savePlanPrice({
+      planKey: entry.planKey,
+      amountMinor: entry.amountMinor,
+      actorId: req.userId,
+      actorEmail: req.userEmail,
+      note: update.note,
+    });
+    saved.push({ planKey: entry.planKey, ...result });
+  }
+  if (Object.keys(update.billing).length) {
+    await pricingStore.saveBillingSettings({ settings: update.billing, actorId: req.userId });
+  }
+
+  const syncs = [];
+  for (const planKey of update.syncPlanKeys) {
+    syncs.push(await planSynchronizer.syncPlan({ planKey, actorId: req.userId }));
+  }
+  const failed = syncs.filter((sync) => !sync.usable);
+  log('info', 'Admin updated pricing', {
+    actorId: req.userId,
+    plans: saved.map((item) => ({ planKey: item.planKey, amountMinor: item.amountMinor ?? null, cleared: Boolean(item.cleared) })),
+    syncStatuses: syncs.map((item) => `${item.planKey}:${item.status}`),
+  });
+  res.set('Cache-Control', 'no-store').json({
+    pricing: await adminPricingPayload(),
+    saved,
+    syncs,
+    notice: failed.length
+      ? `Saved, but Paystack could not confirm ${failed.map((item) => item.planKey).join(', ')}: ${failed[0].message} Users are charged the saved price as a one-time payment until the plan syncs.`
+      : 'Prices saved and mirrored to Paystack.',
+  });
+}));
+
+app.post('/api/admin/pricing/sync', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const requested = req.body?.plan ? [String(req.body.plan)] : paystackConfig.plans.map((plan) => plan.key);
+  for (const planKey of requested) {
+    if (!paystackConfig.plans.some((plan) => plan.key === String(planKey).trim().toLowerCase())) {
+      return fail(res, 400, 'Choose a valid plan to sync.');
+    }
+  }
+  let billing;
+  if (req.body && (Object.hasOwn(req.body, 'recurringEnabled') || Object.hasOwn(req.body, 'updateExistingSubscriptions'))) {
+    try { billing = normalizeBillingSettings(req.body); }
+    catch (error) { return fail(res, error.status || 400, error.message); }
+    await pricingStore.saveBillingSettings({ settings: billing, actorId: req.userId });
+  }
+  const syncs = [];
+  for (const planKey of requested) {
+    syncs.push(await planSynchronizer.syncPlan({ planKey, actorId: req.userId }));
+  }
+  log('info', 'Admin re-synced Paystack plans', { actorId: req.userId, results: syncs.map((item) => `${item.planKey}:${item.status}`) });
+  res.set('Cache-Control', 'no-store').json({ pricing: await adminPricingPayload(), syncs, billingSaved: Boolean(billing) });
+}));
+
+app.get('/api/admin/billing', authenticate, requireAdmin, asyncRoute(async (_req, res) => {
+  const [summary, recent, subscriptions] = await Promise.all([
+    pool.query(`SELECT
+      (SELECT COUNT(*)::int FROM users WHERE subscription_plan <> 'free' AND subscription_status='active') AS active_subscriptions,
+      (SELECT COUNT(*)::int FROM billing_transactions WHERE status='success') AS successful_payments,
+      (SELECT COUNT(*)::int FROM billing_transactions WHERE status='pending') AS pending_payments,
+      (SELECT COALESCE(SUM(amount_minor),0)::bigint FROM billing_transactions WHERE status='success') AS gross_minor,
+      (SELECT COALESCE(SUM(discount_minor),0)::bigint FROM billing_transactions WHERE status='success') AS discounts_minor`),
+    pool.query(`SELECT t.reference,t.plan_key AS "planKey",t.source,t.plan_code AS "planCode",t.status,t.amount_minor AS "amountMinor",t.currency,
+        t.promo_code AS "promoCode",t.paid_at AS "paidAt",t.created_at AS "createdAt",u.email
+      FROM billing_transactions t JOIN users u ON u.id=t.user_id ORDER BY t.created_at DESC LIMIT 25`),
+    pool.query(`SELECT s.plan_key AS "planKey",s.status,s.interval,s.current_period_end AS "currentPeriodEnd",
+        s.cancel_at_period_end AS "cancelAtPeriodEnd",u.email,u.name
+      FROM subscriptions s JOIN users u ON u.id=s.user_id ORDER BY s.updated_at DESC LIMIT 25`),
+  ]);
+  const row = summary.rows[0] || {};
+  res.set('Cache-Control', 'no-store').json({
+    summary: {
+      activeSubscriptions: row.active_subscriptions ?? 0,
+      successfulPayments: row.successful_payments ?? 0,
+      pendingPayments: row.pending_payments ?? 0,
+      grossMinor: Number(row.gross_minor || 0),
+      discountsMinor: Number(row.discounts_minor || 0),
+      currency: paystackConfig.currency,
+    },
+    transactions: recent.rows.map((item) => ({ ...item, amountMinor: Number(item.amountMinor) })),
+    subscriptions: subscriptions.rows,
+    configured: paystackConfig.configured,
+  });
 }));
 
 app.get('/api/telegram/status', authenticate, asyncRoute(async (req, res) => {
@@ -911,7 +1432,11 @@ app.use((error, _req, res, _next) => {
     metaApiNetworkDiagnostic: error.metaApiNetworkDiagnostic,
   });
   if (res.headersSent) return;
-  const payload = { error: error.status ? error.message : 'Something went wrong. Please try again in a moment.' };
+  const payload = {
+    error: error.status ? error.message : 'Something went wrong. Please try again in a moment.',
+    ...(error.code ? { code: error.code } : {}),
+    ...(error.upgradeRequired ? { upgradeRequired: true } : {}),
+  };
   if (typeof error.userMessage === 'string') payload.userMessage = error.userMessage;
   if (Number.isInteger(error.metaApiStatus)) payload.metaApiStatus = error.metaApiStatus;
   if (typeof error.metaApiErrorCode === 'string') payload.metaApiErrorCode = error.metaApiErrorCode;
@@ -926,6 +1451,11 @@ async function start() {
   await initializeDatabase();
   await pool.query('DELETE FROM telegram_login_attempts WHERE expires_at <= NOW()');
   executionWorker.start();
+  void billingService.expireDueSubscriptions().catch((error) => log('warn', 'Subscription expiry sweep failed', { code: error.code || 'SUBSCRIPTION_SWEEP_FAILED' }));
+  const billingSweep = setInterval(() => {
+    void billingService.expireDueSubscriptions().catch((error) => log('warn', 'Subscription expiry sweep failed', { code: error.code || 'SUBSCRIPTION_SWEEP_FAILED' }));
+  }, 60 * 60 * 1000);
+  billingSweep.unref?.();
   httpServer.listen(PORT, '0.0.0.0', () => log('info', 'Server listening', { port: PORT }));
   const { rows: telegramUsers } = await pool.query('SELECT id FROM users WHERE telegram_connected=TRUE AND telegram_session IS NOT NULL');
   for (const row of telegramUsers) {

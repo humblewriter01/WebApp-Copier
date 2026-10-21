@@ -99,15 +99,25 @@ export default function MetaApiPanel({ token }) {
   };
 
   const removeAccount = async (account) => {
-    if (!window.confirm('Remove this trading account from Signal Desk? It will remain in your MetaAPI account.')) return;
+    const confirmation = account.managedByApp
+      ? 'Remove this trading account? It will be permanently deleted from MetaAPI, which stops MetaAPI billing for it. Your broker account and any open positions are not affected.'
+      : 'Remove this trading account from Signal Desk? It stays in MetaAPI under your own MetaAPI token, so it is not deleted there.';
+    if (!window.confirm(confirmation)) return;
     setBusy(true);
     setError('');
     setNotice('');
     try {
-      await request(`/api/metaapi/accounts/${encodeURIComponent(account.metaApiAccountId)}`, token, { method: 'DELETE' });
+      const result = await request(`/api/metaapi/accounts/${encodeURIComponent(account.metaApiAccountId)}`, token, { method: 'DELETE' });
       if (setupLink?.accountId === account.metaApiAccountId) setSetupLink(null);
       await refresh();
-      setNotice('Trading account removed from Signal Desk.');
+      const cleanup = result?.metaApiCleanup;
+      if (cleanup?.failed) {
+        setError('The account was removed from Signal Desk, but MetaAPI could not confirm its deletion. It may still be billed; check your MetaAPI dashboard before trying again.');
+      } else if (cleanup?.skipped) {
+        setNotice('Trading account removed from Signal Desk. It was not deleted from MetaAPI because it is billed to your own MetaAPI token.');
+      } else {
+        setNotice('Trading account deleted from MetaAPI and removed from Signal Desk.');
+      }
     } catch (requestError) {
       setError(requestError.message || 'We could not remove this trading account. Please try again.');
     } finally {
@@ -160,16 +170,16 @@ export default function MetaApiPanel({ token }) {
           <div className="account-actions">
             <button type="button" className="button button-secondary button-small" disabled={busy} onClick={() => refreshAccount(account)}>Refresh status</button>
             <button type="button" className="button button-small" disabled={busy} onClick={() => createLink(account)}>New setup link</button>
-            <button type="button" className="icon-button" disabled={busy} onClick={() => removeAccount(account)}>Remove</button>
+            <button type="button" className="icon-button" disabled={busy} onClick={() => removeAccount(account)}>Delete account</button>
           </div>
         </div>)}
         {previouslyLinkedAccounts.map((account) => <div className="chat-row account-row" key={account.id}>
           <div><strong>{account.name || account.login || 'Trading account'}</strong><small>{[account.platform?.toUpperCase(), account.login && `Login ${account.login}`, account.state && accountStateLabel(account.state), 'Previously connected'].filter(Boolean).join(' · ')}</small></div>
-          <div className="account-actions"><button type="button" className="icon-button" disabled={busy} onClick={() => removeAccount(account)}>Remove from Signal Desk</button></div>
+          <div className="account-actions"><button type="button" className="icon-button" disabled={busy} onClick={() => removeAccount(account)}>Unlink</button></div>
         </div>)}
       </div>}
       {(error || notice) && <div className={`alert ${error ? 'alert-error' : 'alert-success'}`} role={error ? 'alert' : 'status'} aria-live="polite">{error || notice}</div>}
-      <p className="field-help account-retention-note">Removing a trading account here only removes its link to Signal Desk. It does not delete the account from MetaAPI or your broker.</p>
+      <p className="field-help account-retention-note">Removing an account you created here deletes it from MetaAPI as well, so provider billing for it stops. Your broker account, open positions, and orders already sent are not affected. Accounts you added with your own MetaAPI token are only unlinked.</p>
     </section>
   </div>;
 }
