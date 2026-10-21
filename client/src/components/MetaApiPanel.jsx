@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { request } from '../lib/api.js';
+import { useTelegramStatus } from './TelegramStatus.jsx';
+import { MetaApiStatusPill, useMetaApiStatus } from './MetaApiStatus.jsx';
 
 function accountStateLabel(state) {
   const normalized = String(state || '').toUpperCase();
@@ -36,8 +38,30 @@ export function idleWarnings({ accounts = [], inactivity = null } = {}) {
     });
 }
 
-export default function MetaApiPanel({ token }) {
-  const [available, setAvailable] = useState(false);
+/**
+ * Whether the broker account on this page can receive anything to trade, stated only from
+ * a confirmed Telegram state. While the answer is unknown the line is simply absent —
+ * an absent note is honest, a guessed one is what made this page flash a connect prompt.
+ */
+export function telegramSourceNote({ view, channelCount = 0 } = {}) {
+  if (view?.key === 'disconnected') {
+    return { tone: 'info', action: 'connect', text: 'Telegram is not connected, so there are no signals for this account to execute.' };
+  }
+  if (view?.key === 'connected' && !Number(channelCount)) {
+    return { tone: 'info', action: 'choose', text: 'Telegram is connected, but no channels are selected yet, so nothing new will arrive to execute.' };
+  }
+  if (view?.key === 'unavailable') {
+    return { tone: 'info', action: null, text: view.detail || 'Telegram sign-in is temporarily unavailable, so new signals cannot be captured yet.' };
+  }
+  return null;
+}
+
+export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }) {
+  const { view } = useTelegramStatus();
+  // Whether this service can provision accounts is shared, not local: a private copy of it
+  // is how the panel came to flash "Unavailable" and swap the form for an explanation while
+  // its own request was still in flight.
+  const { view: setup, refresh: refreshSetup } = useMetaApiStatus();
   const [accounts, setAccounts] = useState([]);
   const [form, setForm] = useState({ name: '', platform: 'mt5', server: '' });
   const [setupLink, setSetupLink] = useState(null);
@@ -49,13 +73,14 @@ export default function MetaApiPanel({ token }) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
+    // The provisioning pill is owned by the shared status provider; asking it to re-check
+    // keeps a manual refresh behaving the way it did when this panel fetched the status
+    // itself. The provider deduplicates concurrent checks, so mounting alongside its own
+    // fetch costs nothing.
+    refreshSetup();
     setError('');
     try {
-      const [status, linked] = await Promise.all([
-        request('/api/metaapi/provisioning-status', token),
-        request('/api/metaapi/linked-accounts', token),
-      ]);
-      setAvailable(Boolean(status.available));
+      const linked = await request('/api/metaapi/linked-accounts', token);
       setAccounts(linked.accounts || []);
       setInactivity(linked.inactivity || null);
     } catch (requestError) {
@@ -63,7 +88,7 @@ export default function MetaApiPanel({ token }) {
     } finally {
       setLoading(false);
     }
-  }, [token]);
+  }, [token, refreshSetup]);
 
   useEffect(() => { refresh(); }, [refresh]);
 
@@ -156,16 +181,17 @@ export default function MetaApiPanel({ token }) {
 
   const provisionedAccounts = accounts.filter((account) => account.managedByApp);
   const warnings = idleWarnings({ accounts, inactivity });
+  const sourceNote = telegramSourceNote({ view, channelCount });
   const previouslyLinkedAccounts = accounts.filter((account) => !account.managedByApp);
 
   return <div className="panel-grid">
     <section className="panel" aria-labelledby="metaapi-setup-title">
       <div className="panel-heading">
         <div><p className="eyebrow">TRADING ACCOUNT</p><h2 id="metaapi-setup-title">Add an MT4/MT5 account</h2></div>
-        <span className={`status-pill ${available ? 'online' : ''}`}>{available ? 'Ready' : 'Unavailable'}</span>
+        <MetaApiStatusPill />
       </div>
       <p className="muted">Enter the trading account name, platform, and broker server. You’ll enter your trading login and password on MetaAPI’s secure page—not in Signal Desk.</p>
-      {available ? <form className="form-stack" onSubmit={createAccount} aria-busy={busy}>
+      {setup.allowSetupForm ? <form className="form-stack" onSubmit={createAccount} aria-busy={busy}>
         <label htmlFor="metaapi-account-name">Account name
           <input id="metaapi-account-name" value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="My MT5 account" maxLength={100} autoComplete="off" required />
         </label>
@@ -180,7 +206,12 @@ export default function MetaApiPanel({ token }) {
         </label>
         <small className="field-help">Use the exact server name shown by your broker. For monitoring, choose an investor/read-only password on MetaAPI if your broker offers one.</small>
         <button className="button button-primary" type="submit" disabled={busy || loading || !form.name.trim() || !form.server.trim()}>{busy ? 'Preparing secure setup…' : 'Create secure setup link'}</button>
-      </form> : <div className="empty-state compact-empty"><strong>Account setup is not available yet</strong><span>Please ask the workspace owner to finish setting up account connections.</span></div>}
+      </form> : setup.key === 'unavailable' ? <div className="empty-state compact-empty"><strong>Account setup is not available yet</strong><span>Please ask the workspace owner to finish setting up account connections.</span></div> : <div className="setup-pending" aria-busy={setup.key === 'checking'}>
+        <span className="skeleton skeleton-block" aria-hidden="true" />
+        <span className="skeleton skeleton-block short" aria-hidden="true" />
+        <span>{setup.key === 'unreachable' ? 'Signal Desk could not confirm whether account setup is available right now.' : 'Checking whether account setup is available…'}</span>
+        {setup.key === 'unreachable' ? <button type="button" className="text-button" onClick={() => { refreshSetup(); }}>Check again</button> : null}
+      </div>}
       <p className="field-help account-idle-policy">
         Idle accounts are cleaned up automatically: if nobody signs in or trades for {inactivity?.deletionDays || 30} days, an account created here is deleted from MetaAPI so
         it stops being billed, with a warning here on day {inactivity?.warningDays || 25}. Accounts with an open position are left for you to close, and a paid plan is never
@@ -188,6 +219,11 @@ export default function MetaApiPanel({ token }) {
           ? 'This workspace is exempt, so no account here is scheduled for deletion.'
           : 'Sign in, save execution settings, or execute a signal to reset the clock.'}
       </p>
+      {sourceNote ? <div className={`alert alert-${sourceNote.tone} telegram-source-note`} role="status">
+        <span>{sourceNote.text}</span>
+        {sourceNote.action === 'choose' && onOpenTelegram ? <button type="button" className="text-button" onClick={onOpenTelegram}>Choose channels</button> : null}
+        {sourceNote.action === 'connect' && onOpenTelegram && view.showConnectCallToAction ? <button type="button" className="text-button" onClick={onOpenTelegram}>Connect Telegram</button> : null}
+      </div> : null}
       <div className="note-box">Adding an account does not place a trade by itself. Auto-Trading is ON by default for new workspaces; after you select a deployed account, new eligible Telegram signals may place orders. Turn it off in Risk Settings to stop new orders. MetaAPI usage limits or charges may apply when a trading account is connected.</div>
     </section>
 

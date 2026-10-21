@@ -305,3 +305,25 @@ button,input,textarea,select{touch-action:manipulation}
 .idle-warning-card li{font-size:12.5px;line-height:1.5}
 .idle-warning-card p{margin:8px 0 0;font-size:12px;line-height:1.5;color:#8a5a2b}
 .billing-plan-card ul li.billing-plan-absent{color:#8a5a55}
+.skeleton{position:relative;overflow:hidden;background:#e9edf3;border-radius:6px;display:block}
+.skeleton:after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent,#f8fafc,transparent);animation:skeleton-sweep 1.4s ease-in-out infinite}
+.skeleton-dot{width:7px;height:7px;border-radius:100%;flex:0 0 auto}
+.skeleton-block{display:flex;flex-direction:column;gap:7px;min-height:140px;width:100%;padding:14px;border-radius:10px;background:#f2f5f8}
+.skeleton-block i{display:block;height:11px;border-radius:5px;background:#e0e6ee}
+.skeleton-block i:nth-child(2){width:72%}
+.skeleton-block i:nth-child(3){width:52%}
+.signal-empty.tone-pending,.signal-empty.tone-online{gap:9px}
+.telegram-status-pill.pending{background:#eef1f6;color:#6f7c90}
+.telegram-status-pill.online{background:#e8f8f3;color:#26866d}
+.telegram-status-pill:not(.online){background:#fdf1ef;color:#a4574e}
+.telegram-status-pill small{display:block;font-weight:600;font-size:9px;opacity:.85;margin-left:8px;max-width:220px}
+.telegram-source-note{display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:space-between}
+@media (prefers-reduced-motion:reduce){.skeleton:after{animation:none}}
+
+.live-label.idle{color:#8b97a8}
+
+/* MetaAPI provisioning status follows the Telegram rulebook: a pending check renders a
+   skeleton instead of claiming account setup is unavailable. */
+.metaapi-status-pill.pending { color: var(--muted); }
+.setup-pending { display: grid; gap: 10px; padding: 6px 0 2px; color: var(--muted); font-size: 0.9rem; }
+.setup-pending .skeleton-block:nth-child(2) { width: 62%; }

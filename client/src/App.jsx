@@ -1,6 +1,9 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import Sidebar from './components/Sidebar.jsx';
+import SignalTable from './components/SignalTable.jsx';
 import TelegramConnect from './components/TelegramConnect.jsx';
+import { TelegramStatusProvider, TelegramStatusPill, useTelegramStatus, monitoringLabel } from './components/TelegramStatus.jsx';
+import { MetaApiStatusProvider } from './components/MetaApiStatus.jsx';
 import MetaApiPanel from './components/MetaApiPanel.jsx';
 import ExecutionSettings from './components/ExecutionSettings.jsx';
 import AccountDeletionSettings from './components/AccountDeletionSettings.jsx';
@@ -76,22 +79,14 @@ function AuthScreen({ onAuthenticated, installPrompt, onInstall }) {
   </main>;
 }
 
-function Metric({ label, value, note }) {
-  return <div className="metric-card"><span className="metric-label">{label}</span><strong>{value ?? '—'}</strong><span className="metric-note">{note}</span></div>;
+function LiveLabel({ channelCount }) {
+  const { view } = useTelegramStatus();
+  const label = monitoringLabel({ view, channelCount });
+  return <span className={`live-label ${label.live ? '' : 'idle'}`} role="status" aria-live="polite">{label.live ? <i aria-hidden="true" /> : null}<span>{label.text}</span></span>;
 }
 
-function SignalTable({ signals, compact = false, onEmptyAction }) {
-  if (!signals?.length) return <div className="empty-state signal-empty">
-    <span className="empty-icon" aria-hidden="true">↗</span>
-    <strong>No signals yet</strong>
-    <span>Connect Telegram to collect messages from your selected chats, or add a signal note.</span>
-    {onEmptyAction && <button className="button button-secondary" type="button" onClick={onEmptyAction}>Connect Telegram</button>}
-  </div>;
-  return <div className="signal-list">{signals.map(signal => <article className="signal-item" key={signal.id}>
-    <div className="signal-top"><div><strong>{signal.symbol || 'Signal message'}</strong><span className="signal-source">{signal.channelTitle || 'Telegram chat'}</span></div><span className={`badge ${signal.side === 'buy' ? 'badge-buy' : signal.side === 'sell' ? 'badge-sell' : ''}`}>{signal.side || 'received'}</span></div>
-    <p className="signal-message">{signal.message}</p>
-    <div className="signal-meta">{signal.entryPrice != null && <span>Entry {signal.entryPrice}</span>}{signal.stopLoss != null && <span>SL {signal.stopLoss}</span>}{signal.takeProfit != null && <span>TP {signal.takeProfit}</span>}<time>{signal.createdAt ? new Date(signal.createdAt).toLocaleString() : ''}</time></div>
-  </article>)}</div>;
+function Metric({ label, value, note }) {
+  return <div className="metric-card"><span className="metric-label">{label}</span><strong>{value ?? '—'}</strong><span className="metric-note">{note}</span></div>;
 }
 
 function App() {
@@ -256,22 +251,24 @@ function App() {
   if (normalizedPath === '/update-password') return <UpdatePasswordPage />;
   if (!token) return <AuthScreen onAuthenticated={authenticated} installPrompt={installPrompt} onInstall={installApp} />;
   if (loading) return <main className="loading-shell"><div className="spinner" /><span>Loading your workspace…</span></main>;
-  return <div className={`app-shell ${sidebarVisible ? '' : 'sidebar-hidden'}`}>
+  return <TelegramStatusProvider token={token}>
+    <MetaApiStatusProvider token={token}>
+    <div className={`app-shell ${sidebarVisible ? '' : 'sidebar-hidden'}`}>
     <Sidebar active={tab} onNavigate={navigateToTab} user={user} onSignOut={logout} onClose={closeMobileSidebar} visible={sidebarVisible} />
     {isMobileViewport && sidebarVisible && <button type="button" className="sidebar-backdrop" aria-label="Close navigation menu" onClick={closeMobileSidebar} />}
-    <main className="main-area"><header className="topbar"><div><span className="eyebrow">PERSONAL WORKSPACE</span><h1>{tabs.find(([key]) => key === tab)?.[1] || 'Overview'}</h1></div><div className="topbar-right"><button type="button" className="button button-secondary button-small sidebar-toggle" aria-controls="workspace-sidebar" aria-expanded={sidebarVisible} aria-label={isMobileViewport ? (sidebarVisible ? 'Close navigation menu' : 'Open navigation menu') : (sidebarVisible ? 'Hide sidebar' : 'Show sidebar')} title={isMobileViewport ? (sidebarVisible ? 'Close navigation menu' : 'Open navigation menu') : (sidebarVisible ? 'Hide sidebar' : 'Show sidebar')} onClick={toggleSidebar}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{isMobileViewport ? <path d="M4 6h16M4 12h16M4 18h16" /> : <><rect x="3" y="4" width="18" height="16" rx="2"/><path d={sidebarVisible ? 'M9 4v16' : 'M15 4v16'} /></>}</svg><span>{sidebarVisible ? 'Hide sidebar' : 'Show sidebar'}</span></button>{installPrompt && <button className="button button-primary button-small install-app-button" onClick={installApp}>Install app</button>}<span className="status-pill online"><i /> Connected</span><button className="button button-secondary button-small" onClick={refresh}>Refresh</button></div></header>
+    <main className="main-area"><header className="topbar"><div><span className="eyebrow">PERSONAL WORKSPACE</span><h1>{tabs.find(([key]) => key === tab)?.[1] || 'Overview'}</h1></div><div className="topbar-right"><button type="button" className="button button-secondary button-small sidebar-toggle" aria-controls="workspace-sidebar" aria-expanded={sidebarVisible} aria-label={isMobileViewport ? (sidebarVisible ? 'Close navigation menu' : 'Open navigation menu') : (sidebarVisible ? 'Hide sidebar' : 'Show sidebar')} title={isMobileViewport ? (sidebarVisible ? 'Close navigation menu' : 'Open navigation menu') : (sidebarVisible ? 'Hide sidebar' : 'Show sidebar')} onClick={toggleSidebar}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{isMobileViewport ? <path d="M4 6h16M4 12h16M4 18h16" /> : <><rect x="3" y="4" width="18" height="16" rx="2"/><path d={sidebarVisible ? 'M9 4v16' : 'M15 4v16'} /></>}</svg><span>{sidebarVisible ? 'Hide sidebar' : 'Show sidebar'}</span></button>{installPrompt && <button className="button button-primary button-small install-app-button" onClick={installApp}>Install app</button>}<TelegramStatusPill /><button className="button button-secondary button-small" onClick={refresh}>Refresh</button></div></header>
       {error && <div className="alert alert-error global-alert" role="alert">{error}<button className="alert-close" onClick={() => setError('')}>×</button></div>}{notice && <div className="alert alert-success global-alert" role="status" aria-live="polite">{notice}<button className="alert-close" onClick={() => setNotice('')}>×</button></div>}
       <div className="content-area">
         {tab === 'overview' && <>
-          <section className="welcome-row"><div><h2>Good to see you, {user?.name?.split(' ')[0] || 'trader'}.</h2><p>Monitor Telegram signals and keep your setup organized.</p></div><span className="live-label"><i /> Signal monitoring</span></section>
+          <section className="welcome-row"><div><h2>Good to see you, {user?.name?.split(' ')[0] || 'trader'}.</h2><p>Monitor Telegram signals and keep your setup organized.</p></div><LiveLabel channelCount={channels.length} /></section>
           <div className="metrics-grid"><Metric label="Signals captured" value={dashboard?.stats?.totalSignals ?? 0} note="Across your workspace" /><Metric label="Active sources" value={dashboard?.stats?.activeChannels ?? 0} note="Telegram channels" /><Metric label="Account Notes" value={dashboard?.stats?.accounts ?? 0} note="Labels and references" /><Metric label="Auto-Trading" value={settings.autoTradingEnabled ? 'On' : 'Off'} note={settings.autoTradingEnabled ? 'Eligible signals may place orders' : 'Off until you enable it'} /></div>
           {settings.autoTradingEnabled && <div className="execution-warning" role="alert">Warning: Auto-Trading can execute live trades on your selected broker account. It is ON by default for new workspaces. Use a demo account for testing; you are responsible for any financial losses. Turn Auto-Trading off in Risk Settings to stop new orders from being submitted.</div>}
           <div className="notice-banner"><strong>{settings.autoTradingEnabled ? 'Auto-Trading is on' : 'Auto-Trading is off'}</strong><span>{settings.autoTradingEnabled ? 'New eligible Telegram signals may place live orders on your selected account. You can turn this off in Risk Settings.' : 'Signals are saved for review only. Turn Auto-Trading on in Risk Settings to submit new eligible signals to your broker.'}</span></div>
-          <section className="panel"><div className="panel-heading"><div><p className="eyebrow">LATEST ACTIVITY</p><h2>Recent signals</h2></div><button className="text-button" onClick={() => setTab('signals')}>View all</button></div><SignalTable signals={dashboard?.signals || []} compact onEmptyAction={() => setTab('telegram')} /></section>
+          <section className="panel"><div className="panel-heading"><div><p className="eyebrow">LATEST ACTIVITY</p><h2>Recent signals</h2></div><button className="text-button" onClick={() => setTab('signals')}>View all</button></div><SignalTable signals={dashboard?.signals || []} channelCount={channels.length} onOpenTelegram={() => navigateToTab('telegram')} /></section>
         </>}
         {tab === 'telegram' && <TelegramConnect token={token} channels={channels} onRefresh={refresh} />}
-        {tab === 'metaapi' && <MetaApiPanel token={token} />}
-        {tab === 'signals' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">CAPTURED MESSAGES</p><h2>Signal history</h2></div><span className="count-badge">{signals.length}</span></div><SignalTable signals={signals} onEmptyAction={() => setTab('telegram')} /></section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">MANUAL ENTRY</p><h2>Add a signal note</h2></div></div><p className="muted">Save a message for tracking. Signal Desk may identify the symbol, direction, entry, stop, and target.</p><form className="form-stack" onSubmit={addManualSignal}><label>Signal message<textarea rows="7" value={signalText} onChange={e => setSignalText(e.target.value)} placeholder={'BUY EURUSD\nEntry: 1.0850\nSL: 1.0800\nTP: 1.0950'} required maxLength={5000} /></label><button className="button button-primary">Save signal</button></form></section></div>}
+        {tab === 'metaapi' && <MetaApiPanel token={token} channelCount={channels.length} onOpenTelegram={() => navigateToTab('telegram')} />}
+        {tab === 'signals' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">CAPTURED MESSAGES</p><h2>Signal history</h2></div><span className="count-badge">{signals.length}</span></div><SignalTable signals={signals} channelCount={channels.length} onOpenTelegram={() => navigateToTab('telegram')} /></section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">MANUAL ENTRY</p><h2>Add a signal note</h2></div></div><p className="muted">Save a message for tracking. Signal Desk may identify the symbol, direction, entry, stop, and target.</p><form className="form-stack" onSubmit={addManualSignal}><label>Signal message<textarea rows="7" value={signalText} onChange={e => setSignalText(e.target.value)} placeholder={'BUY EURUSD\nEntry: 1.0850\nSL: 1.0800\nTP: 1.0950'} required maxLength={5000} /></label><button className="button button-primary">Save signal</button></form></section></div>}
         {tab === 'accounts' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">YOUR NOTES</p><h2>Account Notes</h2></div><span className="count-badge">{accounts.length}</span></div><p className="muted">Save a label or optional reference for your own notes. To connect a trading account, open Trading Accounts.</p>{!accounts.length ? <div className="empty-state"><strong>No account notes yet</strong><span>Add a label for your own reference.</span></div> : <div className="chat-list">{accounts.map(account => <div className="chat-row" key={account.id}><div><strong>{account.label}</strong><small>{[account.broker, account.platform, account.accountReference].filter(Boolean).join(' · ') || 'Reference only'}</small></div><button className="icon-button" onClick={async () => { await request(`/api/accounts/${account.id}`, token, { method: 'DELETE' }); await refresh(); }}>Remove</button></div>)}</div>}</section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">ADD A NOTE</p><h2>Account note</h2></div></div><form className="form-stack" onSubmit={addAccount}><label>Label<input value={accountForm.label} onChange={e => setAccountForm({ ...accountForm, label: e.target.value })} placeholder="Demo MT5 account" required maxLength={100} /></label><div className="form-row"><label>Broker<input value={accountForm.broker} onChange={e => setAccountForm({ ...accountForm, broker: e.target.value })} /></label><label>Platform<input value={accountForm.platform} onChange={e => setAccountForm({ ...accountForm, platform: e.target.value })} placeholder="MT4, MT5…" /></label></div><label>Reference<input value={accountForm.accountReference} onChange={e => setAccountForm({ ...accountForm, accountReference: e.target.value })} placeholder="Optional alias" /></label><button className="button button-primary">Save note</button></form></section></div>}
         {tab === 'billing' && <BillingPage token={token} />}
         {tab === 'admin' && (isAdmin
@@ -286,7 +283,9 @@ function App() {
       </div>
       <footer className="footer">Not financial advice. Use at your own risk.</footer>
     </main>
-  </div>;
+    </div>
+    </MetaApiStatusProvider>
+  </TelegramStatusProvider>;
 }
 
 export default App;
