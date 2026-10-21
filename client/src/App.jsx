@@ -8,6 +8,9 @@ import MetaApiPanel from './components/MetaApiPanel.jsx';
 import ExecutionSettings from './components/ExecutionSettings.jsx';
 import AccountDeletionSettings from './components/AccountDeletionSettings.jsx';
 import AdminPanel from './components/AdminPanel.jsx';
+import AnnouncementBanner from './components/AnnouncementBanner.jsx';
+import SupportSessionBar from './components/SupportSessionBar.jsx';
+import { clearSupportSession, readSupportSession, writeSupportSession } from './lib/support-session.js';
 import BillingPage from './components/BillingPage.jsx';
 import BillingCallbackPage from './components/BillingCallbackPage.jsx';
 import UpdatePasswordPage from './components/UpdatePasswordPage.jsx';
@@ -95,6 +98,12 @@ function App() {
     catch { return sessionStorage.getItem('signal-token') || ''; }
   });
   const [user, setUser] = useState(null);
+  /* A support session is a second, one-hour, read-only token an administrator mints for
+   * themselves. While it is active the whole workspace is rendered with *that* token, so what the
+   * admin sees is the customer's dashboard - their signals, their accounts, their notices - and
+   * every write the server refuses is refused by the server, not by a client-side guess. */
+  const [support, setSupport] = useState(() => readSupportSession());
+  const authToken = support?.token || token;
   const initialTabFromPath = (pathname) => {
     const path = String(pathname || '').replace(/\/+$/, '');
     if (path === '/admin') return 'admin';
@@ -110,6 +119,9 @@ function App() {
   const [linkedAccounts, setLinkedAccounts] = useState([]);
   const [trades, setTrades] = useState([]);
   const [executionRuntimeEnabled, setExecutionRuntimeEnabled] = useState(false);
+  // The platform's own switch, read with the settings so the panel can explain a pause instead
+  // of letting a user hunt for a toggle that is already on.
+  const [executionPaused, setExecutionPaused] = useState(null);
   const [loading, setLoading] = useState(true);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [error, setError] = useState('');
@@ -190,19 +202,42 @@ function App() {
     return () => window.removeEventListener('keydown', closeOnEscape);
   }, [isMobileViewport, sidebarVisible]);
 
-  const logout = useCallback(() => { try { void supabaseReady().then((client) => client?.auth.signOut({ scope: 'local' })).catch(() => {}); } catch {} try { localStorage.removeItem('signal-token'); } catch {} sessionStorage.removeItem('signal-token'); setToken(''); setUser(null); setDashboard(null); setLoading(false); }, []);
+  const exitSupport = useCallback(async (session) => {
+    const current = session || readSupportSession();
+    // Closing the tab would leave the row alive for the rest of the hour, so say so out loud.
+    if (current?.token) {
+      try { await request('/api/auth/support/exit', current.token, { method: 'POST', body: {} }); } catch { /* the local session ends either way */ }
+    }
+    clearSupportSession();
+    setSupport(null);
+    setNotice('Support view closed. That workspace is no longer being watched.');
+  }, []);
+  const logout = useCallback(() => { try { void supabaseReady().then((client) => client?.auth.signOut({ scope: 'local' })).catch(() => {}); } catch {} try { localStorage.removeItem('signal-token'); } catch {} sessionStorage.removeItem('signal-token'); clearSupportSession(); setSupport(null); setToken(''); setUser(null); setDashboard(null); setLoading(false); }, []);
   const refresh = useCallback(async () => {
-    if (!token) return;
+    if (!authToken) return;
     try {
       const [me, dash, channelsData, accountsData, signalsData, settingsData, tradingAccountsData, tradesData] = await Promise.all([
-        request('/api/auth/me', token), request('/api/dashboard', token), request('/api/channels', token), request('/api/accounts', token), request('/api/signals?limit=50', token), request('/api/settings', token), request('/api/metaapi/linked-accounts', token), request('/api/trades', token),
+        request('/api/auth/me', authToken), request('/api/dashboard', authToken), request('/api/channels', authToken), request('/api/accounts', authToken), request('/api/signals?limit=50', authToken), request('/api/settings', authToken), request('/api/metaapi/linked-accounts', authToken), request('/api/trades', authToken),
       ]);
-      setUser(me.user); setDashboard(dash); setChannels(channelsData.channels); setAccounts(accountsData.accounts); setSignals(signalsData.signals); setSettings((current) => ({ ...current, ...settingsData.settings })); setExecutionRuntimeEnabled(Boolean(settingsData.runtimeEnabled)); setLinkedAccounts(tradingAccountsData.accounts || []); setTrades(tradesData.trades || []);
+      setUser(me.user); setDashboard(dash); setChannels(channelsData.channels); setAccounts(accountsData.accounts); setSignals(signalsData.signals); setSettings((current) => ({ ...current, ...settingsData.settings })); setExecutionRuntimeEnabled(Boolean(settingsData.runtimeEnabled)); setExecutionPaused(settingsData.executionPaused || null); setLinkedAccounts(tradingAccountsData.accounts || []); setTrades(tradesData.trades || []);
       setError('');
-    } catch (e) { if (/expired|sign in/i.test(e.message)) logout(); else setError(e.message); }
+    } catch (e) {
+      // A support session that just ran out must not sign the administrator out of their own work.
+      if (/support session/i.test(e.message)) { void exitSupport(); return; }
+      if (/expired|sign in/i.test(e.message)) logout(); else setError(e.message);
+    }
     finally { setLoading(false); }
-  }, [token, logout]);
-  useEffect(() => { if (!token) { setLoading(false); return; } refresh(); const timer = setInterval(refresh, 20_000); return () => clearInterval(timer); }, [token, refresh]);
+  }, [authToken, logout, exitSupport]);
+  useEffect(() => { if (!authToken) { setLoading(false); return; } refresh(); const timer = setInterval(refresh, 20_000); return () => clearInterval(timer); }, [authToken, refresh]);
+
+  const beginSupportSession = useCallback((data) => {
+    if (!writeSupportSession(data)) {
+      setError('The browser refused to hold the support session, so it was not opened.');
+      return;
+    }
+    setSupport(readSupportSession());
+    setLoading(true);
+  }, []);
 
   const authenticated = (data, rememberMe = true) => {
     sessionStorage.removeItem('signal-token');
@@ -212,30 +247,36 @@ function App() {
     } catch { sessionStorage.setItem('signal-token', data.token); }
     setToken(data.token); setUser(data.user); setLoading(true);
   };
+  const readOnlySupport = Boolean(support);
   const addManualSignal = async (event) => {
     event.preventDefault(); setError(''); setNotice('');
-    try { await request('/api/signals', token, { method: 'POST', body: { message: signalText } }); setSignalText(''); setNotice('Signal saved.'); await refresh(); }
+    if (readOnlySupport) { setError('Support view is read-only.'); return; }
+    try { await request('/api/signals', authToken, { method: 'POST', body: { message: signalText } }); setSignalText(''); setNotice('Signal saved.'); await refresh(); }
     catch (e) { setError(e.message); }
   };
   const addAccount = async (event) => {
     event.preventDefault(); setError('');
-    try { await request('/api/accounts', token, { method: 'POST', body: accountForm }); setAccountForm({ label: '', broker: '', platform: '', accountReference: '' }); setNotice('Account note saved.'); await refresh(); }
+    if (readOnlySupport) { setError('Support view is read-only.'); return; }
+    try { await request('/api/accounts', authToken, { method: 'POST', body: accountForm }); setAccountForm({ label: '', broker: '', platform: '', accountReference: '' }); setNotice('Account note saved.'); await refresh(); }
     catch (e) { setError(e.message); }
   };
   const saveSettings = async (event) => {
-    event.preventDefault(); setError(''); setNotice(''); setSettingsSaving(true);
-    try { const result = await request('/api/settings', token, { method: 'PUT', body: settings }); setSettings(result.settings); setExecutionRuntimeEnabled(Boolean(result.runtimeEnabled)); setNotice('Execution settings saved.'); }
+    event.preventDefault(); setError(''); setNotice('');
+    if (readOnlySupport) { setError('Support view is read-only, so risk and execution settings cannot be changed.'); return; }
+    setSettingsSaving(true);
+    try { const result = await request('/api/settings', authToken, { method: 'PUT', body: settings }); setSettings(result.settings); setExecutionRuntimeEnabled(Boolean(result.runtimeEnabled)); setExecutionPaused(result.executionPaused || null); setNotice('Execution settings saved.'); }
     catch (e) { setError(e.message); }
     finally { setSettingsSaving(false); }
   };
   const toggleAutoTrading = async (enabled) => {
     if (settingsSaving) return;
+    if (readOnlySupport) { setError('Support view is read-only, so Auto-Trading cannot be switched here.'); return; }
     const previous = settings;
     const updated = { ...previous, autoTradingEnabled: enabled };
     setSettings(updated); setError(''); setNotice(''); setSettingsSaving(true);
     try {
-      const result = await request('/api/settings', token, { method: 'PUT', body: updated });
-      setSettings(result.settings); setExecutionRuntimeEnabled(Boolean(result.runtimeEnabled));
+      const result = await request('/api/settings', authToken, { method: 'PUT', body: updated });
+      setSettings(result.settings); setExecutionRuntimeEnabled(Boolean(result.runtimeEnabled)); setExecutionPaused(result.executionPaused || null);
       setNotice(enabled ? 'Auto-Trading is on. New eligible Telegram signals may place live orders.' : 'Auto-Trading is off. No new signal orders will be submitted.');
     } catch (e) { setSettings(previous); setError(e.message); }
     finally { setSettingsSaving(false); }
@@ -245,18 +286,20 @@ function App() {
   const tabs = navigationItemsForRole(user?.role).map(({ key, label }) => [key, label]);
 
   const normalizedPath = window.location.pathname.replace(/\/+$/, '');
-  if (normalizedPath === '/billing/callback') return token
+  if (normalizedPath === '/billing/callback') return authToken
     ? <BillingCallbackPage />
     : <AuthScreen onAuthenticated={authenticated} installPrompt={installPrompt} onInstall={installApp} />;
   if (normalizedPath === '/update-password') return <UpdatePasswordPage />;
-  if (!token) return <AuthScreen onAuthenticated={authenticated} installPrompt={installPrompt} onInstall={installApp} />;
+  if (!authToken) return <AuthScreen onAuthenticated={authenticated} installPrompt={installPrompt} onInstall={installApp} />;
   if (loading) return <main className="loading-shell"><div className="spinner" /><span>Loading your workspace…</span></main>;
-  return <TelegramStatusProvider token={token}>
-    <MetaApiStatusProvider token={token}>
+  return <TelegramStatusProvider token={authToken}>
+    <MetaApiStatusProvider token={authToken}>
     <div className={`app-shell ${sidebarVisible ? '' : 'sidebar-hidden'}`}>
     <Sidebar active={tab} onNavigate={navigateToTab} user={user} onSignOut={logout} onClose={closeMobileSidebar} visible={sidebarVisible} />
     {isMobileViewport && sidebarVisible && <button type="button" className="sidebar-backdrop" aria-label="Close navigation menu" onClick={closeMobileSidebar} />}
     <main className="main-area"><header className="topbar"><div><span className="eyebrow">PERSONAL WORKSPACE</span><h1>{tabs.find(([key]) => key === tab)?.[1] || 'Overview'}</h1></div><div className="topbar-right"><button type="button" className="button button-secondary button-small sidebar-toggle" aria-controls="workspace-sidebar" aria-expanded={sidebarVisible} aria-label={isMobileViewport ? (sidebarVisible ? 'Close navigation menu' : 'Open navigation menu') : (sidebarVisible ? 'Hide sidebar' : 'Show sidebar')} title={isMobileViewport ? (sidebarVisible ? 'Close navigation menu' : 'Open navigation menu') : (sidebarVisible ? 'Hide sidebar' : 'Show sidebar')} onClick={toggleSidebar}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{isMobileViewport ? <path d="M4 6h16M4 12h16M4 18h16" /> : <><rect x="3" y="4" width="18" height="16" rx="2"/><path d={sidebarVisible ? 'M9 4v16' : 'M15 4v16'} /></>}</svg><span>{sidebarVisible ? 'Hide sidebar' : 'Show sidebar'}</span></button>{installPrompt && <button className="button button-primary button-small install-app-button" onClick={installApp}>Install app</button>}<TelegramStatusPill /><button className="button button-secondary button-small" onClick={refresh}>Refresh</button></div></header>
+      {support ? <SupportSessionBar session={support} onExit={() => { void exitSupport(support); }} /> : null}
+      <AnnouncementBanner token={authToken} />
       {error && <div className="alert alert-error global-alert" role="alert">{error}<button className="alert-close" onClick={() => setError('')}>×</button></div>}{notice && <div className="alert alert-success global-alert" role="status" aria-live="polite">{notice}<button className="alert-close" onClick={() => setNotice('')}>×</button></div>}
       <div className="content-area">
         {tab === 'overview' && <>
@@ -266,20 +309,20 @@ function App() {
           <div className="notice-banner"><strong>{settings.autoTradingEnabled ? 'Auto-Trading is on' : 'Auto-Trading is off'}</strong><span>{settings.autoTradingEnabled ? 'New eligible Telegram signals may place live orders on your selected account. You can turn this off in Risk Settings.' : 'Signals are saved for review only. Turn Auto-Trading on in Risk Settings to submit new eligible signals to your broker.'}</span></div>
           <section className="panel"><div className="panel-heading"><div><p className="eyebrow">LATEST ACTIVITY</p><h2>Recent signals</h2></div><button className="text-button" onClick={() => setTab('signals')}>View all</button></div><SignalTable signals={dashboard?.signals || []} channelCount={channels.length} onOpenTelegram={() => navigateToTab('telegram')} /></section>
         </>}
-        {tab === 'telegram' && <TelegramConnect token={token} channels={channels} onRefresh={refresh} />}
-        {tab === 'metaapi' && <MetaApiPanel token={token} channelCount={channels.length} onOpenTelegram={() => navigateToTab('telegram')} />}
+        {tab === 'telegram' && <TelegramConnect token={authToken} channels={channels} onRefresh={refresh} />}
+        {tab === 'metaapi' && <MetaApiPanel token={authToken} channelCount={channels.length} onOpenTelegram={() => navigateToTab('telegram')} />}
         {tab === 'signals' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">CAPTURED MESSAGES</p><h2>Signal history</h2></div><span className="count-badge">{signals.length}</span></div><SignalTable signals={signals} channelCount={channels.length} onOpenTelegram={() => navigateToTab('telegram')} /></section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">MANUAL ENTRY</p><h2>Add a signal note</h2></div></div><p className="muted">Save a message for tracking. Signal Desk may identify the symbol, direction, entry, stop, and target.</p><form className="form-stack" onSubmit={addManualSignal}><label>Signal message<textarea rows="7" value={signalText} onChange={e => setSignalText(e.target.value)} placeholder={'BUY EURUSD\nEntry: 1.0850\nSL: 1.0800\nTP: 1.0950'} required maxLength={5000} /></label><button className="button button-primary">Save signal</button></form></section></div>}
-        {tab === 'accounts' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">YOUR NOTES</p><h2>Account Notes</h2></div><span className="count-badge">{accounts.length}</span></div><p className="muted">Save a label or optional reference for your own notes. To connect a trading account, open Trading Accounts.</p>{!accounts.length ? <div className="empty-state"><strong>No account notes yet</strong><span>Add a label for your own reference.</span></div> : <div className="chat-list">{accounts.map(account => <div className="chat-row" key={account.id}><div><strong>{account.label}</strong><small>{[account.broker, account.platform, account.accountReference].filter(Boolean).join(' · ') || 'Reference only'}</small></div><button className="icon-button" onClick={async () => { await request(`/api/accounts/${account.id}`, token, { method: 'DELETE' }); await refresh(); }}>Remove</button></div>)}</div>}</section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">ADD A NOTE</p><h2>Account note</h2></div></div><form className="form-stack" onSubmit={addAccount}><label>Label<input value={accountForm.label} onChange={e => setAccountForm({ ...accountForm, label: e.target.value })} placeholder="Demo MT5 account" required maxLength={100} /></label><div className="form-row"><label>Broker<input value={accountForm.broker} onChange={e => setAccountForm({ ...accountForm, broker: e.target.value })} /></label><label>Platform<input value={accountForm.platform} onChange={e => setAccountForm({ ...accountForm, platform: e.target.value })} placeholder="MT4, MT5…" /></label></div><label>Reference<input value={accountForm.accountReference} onChange={e => setAccountForm({ ...accountForm, accountReference: e.target.value })} placeholder="Optional alias" /></label><button className="button button-primary">Save note</button></form></section></div>}
-        {tab === 'billing' && <BillingPage token={token} />}
+        {tab === 'accounts' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">YOUR NOTES</p><h2>Account Notes</h2></div><span className="count-badge">{accounts.length}</span></div><p className="muted">Save a label or optional reference for your own notes. To connect a trading account, open Trading Accounts.</p>{!accounts.length ? <div className="empty-state"><strong>No account notes yet</strong><span>Add a label for your own reference.</span></div> : <div className="chat-list">{accounts.map(account => <div className="chat-row" key={account.id}><div><strong>{account.label}</strong><small>{[account.broker, account.platform, account.accountReference].filter(Boolean).join(' · ') || 'Reference only'}</small></div><button className="icon-button" onClick={async () => { if (readOnlySupport) { setError('Support view is read-only.'); return; } await request(`/api/accounts/${account.id}`, authToken, { method: 'DELETE' }); await refresh(); }}>Remove</button></div>)}</div>}</section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">ADD A NOTE</p><h2>Account note</h2></div></div><form className="form-stack" onSubmit={addAccount}><label>Label<input value={accountForm.label} onChange={e => setAccountForm({ ...accountForm, label: e.target.value })} placeholder="Demo MT5 account" required maxLength={100} /></label><div className="form-row"><label>Broker<input value={accountForm.broker} onChange={e => setAccountForm({ ...accountForm, broker: e.target.value })} /></label><label>Platform<input value={accountForm.platform} onChange={e => setAccountForm({ ...accountForm, platform: e.target.value })} placeholder="MT4, MT5…" /></label></div><label>Reference<input value={accountForm.accountReference} onChange={e => setAccountForm({ ...accountForm, accountReference: e.target.value })} placeholder="Optional alias" /></label><button className="button button-primary">Save note</button></form></section></div>}
+        {tab === 'billing' && <BillingPage token={authToken} />}
         {tab === 'admin' && (isAdmin
-          ? <AdminPanel token={token} currentUser={user} />
+          ? <AdminPanel token={token} currentUser={user} onImpersonate={beginSupportSession} />
           : <section className="panel admin-denied" aria-labelledby="admin-denied-title">
             <p className="eyebrow">RESTRICTED AREA</p>
             <h2 id="admin-denied-title">Admin access required</h2>
             <p className="muted">This area is only available to workspace administrators. If you believe you should have access, contact the workspace owner.</p>
             <button type="button" className="button button-secondary" onClick={() => navigateToTab('overview')}>Return to overview</button>
           </section>)}
-        {tab === 'settings' && <><ExecutionSettings settings={settings} accounts={linkedAccounts} trades={trades} runtimeAvailable={executionRuntimeEnabled} onChange={setSettings} onSubmit={saveSettings} onToggle={toggleAutoTrading} saving={settingsSaving} /><AccountDeletionSettings token={token} onDeleted={logout} /></>}
+        {tab === 'settings' && <><ExecutionSettings settings={settings} accounts={linkedAccounts} trades={trades} runtimeAvailable={executionRuntimeEnabled} platformPause={executionPaused} onChange={setSettings} onSubmit={saveSettings} onToggle={toggleAutoTrading} saving={settingsSaving} /><AccountDeletionSettings token={authToken} onDeleted={logout} /></>}
       </div>
       <footer className="footer">Not financial advice. Use at your own risk.</footer>
     </main>

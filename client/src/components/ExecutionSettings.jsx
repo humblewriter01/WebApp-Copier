@@ -27,7 +27,21 @@ export function breakEvenSummary(trade) {
     : `Stop trailed (${trade.breakEvenStopLoss})`;
 }
 
-export default function ExecutionSettings({ settings, accounts = [], trades = [], runtimeAvailable = false, onChange, onSubmit, onToggle, saving = false }) {
+/**
+ * What a workspace is told when their own toggle is on but nothing is executing. The state comes
+ * from the server, and an unreadable switch says so out loud rather than implying the user's
+ * settings are to blame or that everything is fine.
+ */
+export function platformPauseNotice(platformPause) {
+  if (!platformPause || platformPause.paused !== true) return '';
+  const reason = platformPause.reason ? ` Reason given: ${platformPause.reason}` : '';
+  return platformPause.state === 'unavailable'
+    ? `Signal Desk could not confirm its platform execution switch, so new orders are on hold until it can.${reason}`
+    : `Automatic execution is paused by Signal Desk for every workspace. Your own settings are untouched, and new signals are saved for review until the pause is lifted.${reason}`;
+}
+
+export default function ExecutionSettings({ settings, accounts = [], trades = [], runtimeAvailable = false, platformPause = null, onChange, onSubmit, onToggle, saving = false }) {
+  const pauseNotice = platformPauseNotice(platformPause);
   const connectedAccounts = accounts.filter((account) => String(account.state || '').toUpperCase() === 'DEPLOYED');
   const set = (key, value) => onChange({ ...settings, [key]: value });
 
@@ -41,6 +55,7 @@ export default function ExecutionSettings({ settings, accounts = [], trades = []
       </div>
 
       <div className="execution-warning" role="alert">{EXECUTION_WARNING}</div>
+      {pauseNotice ? <div className="alert alert-info execution-paused-notice" role="alert">{pauseNotice}</div> : null}
       {!runtimeAvailable && <div className="alert alert-info" role="status">Automatic execution is currently unavailable. You can still turn Auto-Trading off; eligible signals will not place orders while execution is unavailable.</div>}
       {runtimeAvailable && <p className="field-help execution-runtime-note">The worker runs while Signal Desk is online. If the service is offline, new signals may be missed; stale signals are never executed after it returns.</p>}
 

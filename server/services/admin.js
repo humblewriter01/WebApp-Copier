@@ -139,3 +139,77 @@ export function assertAllowedSelfUpdate({ actorId, targetId, update }) {
     throw error;
   }
 }
+
+/**
+ * Validates a manual subscription adjustment: grant a plan, add days, or both. The reason is
+ * mandatory because it is what makes the audit row readable months later - "why does this
+ * account have Premium for free" should never depend on remembering who asked.
+ *
+ * `endsAt` is offered for the case where support promised a specific date ("until the 30th");
+ * it is validated as a future timestamp and takes precedence over `days`.
+ */
+export function normalizeSubscriptionAdjustment(input = {}, { plans = [] } = {}) {
+  const planKeys = ['free', ...plans.map((plan) => String(plan.key).toLowerCase())];
+  const adjustment = { planKey: null, days: null, endsAt: null, reason: '' };
+
+  if (input.plan !== undefined && input.plan !== null && String(input.plan).trim() !== '') {
+    const planKey = String(input.plan).trim().toLowerCase();
+    if (!planKeys.includes(planKey)) {
+      throw validationError(`Choose a plan the workspace sells: ${planKeys.join(', ')}.`);
+    }
+    adjustment.planKey = planKey;
+  }
+
+  if (input.days !== undefined && input.days !== null && String(input.days).trim() !== '') {
+    const days = Number(input.days);
+    if (!Number.isInteger(days) || days < 1 || days > 365) {
+      throw validationError('Extend the subscription by 1 to 365 whole days.');
+    }
+    adjustment.days = days;
+  }
+
+  if (input.endsAt !== undefined && input.endsAt !== null && String(input.endsAt).trim() !== '') {
+    const endsAt = new Date(input.endsAt);
+    if (Number.isNaN(endsAt.getTime())) throw validationError('That expiry date is not readable.');
+    if (endsAt.getTime() <= Date.now()) throw validationError('Set an expiry date in the future.');
+    adjustment.endsAt = endsAt.toISOString();
+  }
+
+  const reason = String(input.reason ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
+  if (reason.length < 5) throw validationError('Add a short reason for this adjustment (at least 5 characters).');
+  adjustment.reason = reason;
+
+  if (!adjustment.planKey && adjustment.days === null && !adjustment.endsAt) {
+    throw validationError('Choose a plan to grant, days to add, or an expiry date.');
+  }
+  if (adjustment.planKey === 'free' && (adjustment.days !== null || adjustment.endsAt)) {
+    throw validationError('Moving an account to Free already ends its paid period - remove the extra days.');
+  }
+  if (adjustment.days !== null && adjustment.endsAt) {
+    throw validationError('Use either a number of days or an expiry date, not both.');
+  }
+  return Object.freeze(adjustment);
+}
+
+/**
+ * Support access rules. A suspended account cannot sign in, so viewing its dashboard would show a
+ * locked screen rather than what the customer sees, and an admin looking at their own workspace
+ * gains nothing but an unauditable blur between two sessions.
+ */
+export function assertAllowedImpersonation({ actorId, target }) {
+  if (!target) {
+    const error = new Error('That account could not be found.');
+    error.status = 404;
+    throw error;
+  }
+  if (String(actorId) === String(target.id)) {
+    const error = new Error('You cannot open a support session on your own account.');
+    error.status = 409;
+    throw error;
+  }
+  if (target.isSuspended === true) {
+    const error = new Error('That account is suspended, so its dashboard is locked. Lift the suspension first.');
+    error.status = 409;
+    throw error;
+  }
+}

@@ -98,3 +98,78 @@ test('a newly turned-off setting blocks queued work before any MetaAPI order cal
   assert.equal(trading.calls.filter((call) => typeof call === 'object').length, 0);
   assert.equal(pool.calls.some(({ sql }) => sql.includes('INSERT INTO trades')), false);
 });
+
+/* ------------------------- platform kill switch -------------------------
+ * The switch is an operator's last resort, so the questions it has to answer are narrow: does it
+ * stop the order, does it stop it before anything touches the broker, and does an unreadable
+ * switch fail towards "no trade" rather than "trade".
+ */
+test('an engaged kill switch skips the job without touching MetaAPI at all', async () => {
+  const pool = fakePool();
+  const trading = fakeTrading();
+  let asked = 0;
+  const engine = createExecutionEngine({
+    pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true,
+    isTradingPaused: async () => { asked += 1; return true; },
+  });
+  const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.equal(result.status, 'skipped');
+  assert.match(result.message, /paused by Signal Desk/i);
+  assert.equal(asked, 1, 'the switch is asked first, before any expensive work');
+  assert.equal(trading.calls.length, 0, 'not even the account snapshot is fetched');
+  assert.equal(pool.calls.some(({ sql }) => sql.includes('INSERT INTO trades')), false, 'no trade row is opened');
+  assert.ok(pool.calls.some(({ sql }) => sql.includes('UPDATE execution_jobs')), 'the skip is recorded for the user to read');
+});
+
+test('a switch engaged while a job is in flight stops it at the last gate before the order', async () => {
+  const pool = fakePool();
+  const trading = fakeTrading();
+  let calls = 0;
+  const engine = createExecutionEngine({
+    pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true,
+    // released for the gates, engaged by the time the order is about to be sent
+    isTradingPaused: async () => { calls += 1; return calls > 1; },
+  });
+  const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.equal(result.status, 'skipped');
+  assert.match(result.message, /before it reached the broker/i);
+  assert.equal(calls, 2, 'checked once per job AND once more immediately before the trade');
+  assert.equal(trading.calls.filter((call) => typeof call === 'object').length, 0, 'createMarketOrder was never reached');
+  assert.equal(pool.calls.some(({ sql }) => sql.includes('INSERT INTO trades')), false);
+});
+
+test('a released switch is asked twice per job and never blocks the trade', async () => {
+  const pool = fakePool();
+  const trading = fakeTrading();
+  let calls = 0;
+  const engine = createExecutionEngine({
+    pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true,
+    isTradingPaused: async () => { calls += 1; return false; },
+  });
+  assert.equal((await engine.processJob({ id: 'job-1', user_id: 'user-1' })).status, 'executed');
+  assert.equal(calls, 2);
+  assert.equal(trading.calls.filter((call) => typeof call === 'object').length, 1);
+});
+
+test('a kill switch that cannot be read stops trading instead of guessing', async () => {
+  const pool = fakePool();
+  const trading = fakeTrading();
+  const logged = [];
+  const engine = createExecutionEngine({
+    pool, trading, runtimeEnabled: true, logger: { error: (line) => logged.push(line) },
+    resolveToken: async () => 'fake-token',
+    isTradingPaused: async () => { throw Object.assign(new Error('connection terminated'), { code: '08006' }); },
+  });
+  const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.equal(result.status, 'skipped');
+  assert.match(result.message, /paused by Signal Desk/i);
+  assert.equal(trading.calls.length, 0);
+  assert.equal(JSON.parse(logged[0]).message, 'The platform auto-trading switch could not be read; execution stays blocked');
+});
+
+test('an engine built without the switch still trades, and the flag is never trusted from the job payload', async () => {
+  const pool = fakePool();
+  const trading = fakeTrading();
+  const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true });
+  assert.equal((await engine.processJob({ id: 'job-1', user_id: 'user-1', tradingPaused: true })).status, 'executed');
+});
