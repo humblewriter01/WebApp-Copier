@@ -167,6 +167,12 @@ export async function initializeDatabase() {
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS break_even_enabled BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS break_even_trigger_points NUMERIC NOT NULL DEFAULT 20;
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS break_even_offset_points NUMERIC NOT NULL DEFAULT 0;
+    /* A true trailing stop continues where break even stops: instead of parking the stop at
+     * entry once, it keeps ratcheting the stop in the trade's favour at a fixed distance from
+     * the market. It reuses the same sweep, the same freshness rules, and the same ledger, so
+     * "never widen a stop" and "never act on a stale quote" are enforced once, not per mode. */
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS trailing_stop_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS trailing_stop_distance_points NUMERIC NOT NULL DEFAULT 10;
     CREATE TABLE IF NOT EXISTS break_even_moves (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -192,6 +198,10 @@ export async function initializeDatabase() {
       UNIQUE(user_id, metaapi_account_id, broker_position_id),
       CONSTRAINT break_even_moves_status_check CHECK (status IN ('moved', 'already_beyond', 'closed', 'deferred', 'failed', 'unknown'))
     );
+    /* A trailing stop moves the same position more than once, so the row counts the moves and
+     * records the distance it was decided under - an audit of the setting, not of intent. */
+    ALTER TABLE break_even_moves ADD COLUMN IF NOT EXISTS move_count INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE break_even_moves ADD COLUMN IF NOT EXISTS trailing_distance_points NUMERIC;
     CREATE INDEX IF NOT EXISTS break_even_moves_retry_idx ON break_even_moves(status, next_attempt_at);
     ALTER TABLE break_even_moves ENABLE ROW LEVEL SECURITY;
     /* Inactivity cleanup for MetaAPI accounts the workspace pays for. */
