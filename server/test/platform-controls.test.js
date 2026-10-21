@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   createPlatformControls,
   KILL_SWITCH_SETTING_KEY,
@@ -151,6 +152,35 @@ test('the error feed reads the records the platform already wrote and never show
   assert.match(RECENT_ERRORS_SELECT, /FROM signals s JOIN users u ON u\.id=s\.user_id/, 'workspace identity is joined so the admin sees who was affected');
   assert.match(RECENT_ERRORS_SELECT, /ORDER BY occurred_at DESC LIMIT \$2/);
   assert.match(RECENT_ERROR_COUNTS_SELECT, /COUNT\(DISTINCT user_id\)::int AS "affectedUsers"/);
+});
+
+test('the recent-error queries are complete statements, not a bare CTE body', () => {
+  // A string that starts `recent AS (` is a syntax error on the server, and because each health
+  // section catches its own read failure, the symptom would have been a permanently unreadable
+  // errors panel rather than a crash. Both forms were run against a live PostgreSQL to be sure.
+  for (const sql of [RECENT_ERRORS_SELECT, RECENT_ERROR_COUNTS_SELECT]) {
+    assert.match(sql, /^WITH recent AS \(/, 'the WITH has to be on the statement that is executed');
+    assert.equal(/^\s*(WITH|SELECT|INSERT|UPDATE|DELETE)\b/.test(sql), true, 'a query handed to the pool must be a whole statement');
+  }
+});
+
+test('no service in this feature hands the pool a fragment instead of a statement', () => {
+  const services = ['system-health.js', 'audit.js', 'announcements.js', 'support-sessions.js', 'platform-controls.js'];
+  for (const name of services) {
+    const source = readFileSync(new URL(`../services/${name}`, import.meta.url), 'utf8');
+    const queries = [...source.matchAll(/pool\.query\(\s*(`(?:[^`\\]|\\.)*`|[A-Z_][A-Z0-9_]*)/g)].map((match) => match[1]);
+    assert.ok(queries.length, `${name} was expected to run at least one query`);
+    for (const raw of queries) {
+      let body = raw.startsWith('`') ? raw.slice(1, -1) : null;
+      if (body === null) {
+        const definition = source.match(new RegExp(`(?:const|export const) ${raw} = \`([\\s\\S]*?)\`;`, 'm'));
+        assert.ok(definition, `${name}.${raw} is executed as a query but is not a template literal in this file`);
+        body = definition[1];
+      }
+      const statement = body.replace(/\$\{[^}]*\}/g, 'x');
+      assert.match(statement, /^\s*(WITH|SELECT|INSERT|UPDATE|DELETE)\b/, `${name}: ${raw} is not a complete statement`);
+    }
+  }
 });
 
 test('a health snapshot composes the switch, the queue, the counts, and the newest failures', async () => {
