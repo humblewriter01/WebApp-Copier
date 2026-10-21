@@ -37,6 +37,8 @@ services:
         value: https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai
       - key: AUTO_TRADING_RUNTIME_ENABLED
         value: "true"
+      - key: BREAK_EVEN_SWEEP_INTERVAL_MS
+        value: "5000"
       - key: PAYSTACK_SECRET_KEY
         sync: false
       - key: PAYSTACK_CURRENCY

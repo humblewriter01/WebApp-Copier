@@ -85,13 +85,180 @@ function safeProviderResponse(result, token = null) {
   return output;
 }
 
+function noChangeReported(result) {
+  return /TRADE_RETCODE_NO_CHANGES/.test(String(result?.stringCode || '').toUpperCase());
+}
+
 function successfulTradeResponse(result) {
   const code = String(result?.stringCode || '').toUpperCase();
   const numeric = Number(result?.numericCode);
   return /TRADE_RETCODE_(?:DONE|PLACED|DONE_PARTIAL)/.test(code) || [10008, 10009, 10010].includes(numeric);
 }
 
-export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnabled = false, now = () => Date.now() }) {
+/* -------------------------------- Break even --------------------------------
+ * Moves the stop loss of a position Signal Desk itself opened to (entry + a small
+ * offset) once the market has travelled a configured distance in favour of the
+ * trade, so a reversal can no longer turn the position into a loss.
+ *
+ * Rules that never bend:
+ *  - a stop is only ever moved in the direction that reduces risk (never widened);
+ *  - the decision uses a fresh, synchronized quote, the live position from the
+ *    synchronized terminal state, and the symbol's own tick/stops/freeze rules;
+ *  - Auto-Trading off, a changed account, an undeployed account, or a missing
+ *    specification all stop the request from ever reaching the broker;
+ *  - an ambiguous transport failure is recorded as `unknown` and never retried,
+ *    because the broker may already have applied the modification.
+ */
+export const BREAK_EVEN_MAX_ATTEMPTS = 10;
+export const BREAK_EVEN_DEFERRED_RETRY_MS = 15_000;
+export const BREAK_EVEN_FAILED_RETRY_MS = 60_000;
+export const BREAK_EVEN_TRACKING_DAYS = 30;
+export const BREAK_EVEN_SWEEP_LIMIT = 20;
+
+/**
+ * MetaTrader trade return codes that describe a *condition* rather than a refusal:
+ * the same request can succeed a moment later, so the move is deferred and retried.
+ * 10016 TRADE_RETCODE_INVALID_STOPS (stop too close to the market price) and MT4's
+ * 130 ERR_INVALID_STOPS are the common ones; the string codes cover the rest so no
+ * numeric value has to be guessed for platforms that report names only.
+ */
+const BREAK_EVEN_DEFER_CODES = new Set([10016, 130]);
+const BREAK_EVEN_DEFER_TEXT = /(?:invalid|too small) stops|too close|stops level|freeze|requote|price (?:changed|off)|no prices|too many requests|being modified|market (?:is )?closed/i;
+
+/** Codes that mean the request may or may not have reached the broker. */
+const BREAK_EVEN_AMBIGUOUS_CODES = new Set([10012, 7]);
+const BREAK_EVEN_AMBIGUOUS_TEXT = /timed? ?out|socket hang ?up|network|fetch failed|ECONNRESET|ETIMEDOUT|connection/i;
+
+function finiteNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function priceDecimals(step) {
+  const text = String(step);
+  return text.includes('.') ? text.length - text.indexOf('.') - 1 : 0;
+}
+
+/**
+ * Aligns a price onto the broker's tick grid, towards (down) or away (up) from the
+ * market. The epsilon absorbs binary floating-point noise only (1.1 / 0.0001 evaluates
+ * to 10999.999999999998), so an exact tick multiple stays where it is while a
+ * genuinely unaligned price is still moved conservatively.
+ */
+function alignPriceToTick(value, tickSize, direction) {
+  const steps = value / tickSize;
+  const aligned = direction === 'down' ? Math.floor(steps + 1e-6) : Math.ceil(steps - 1e-6);
+  return Number((aligned * tickSize).toFixed(priceDecimals(tickSize)));
+}
+
+export function normalizePositionSide(value) {
+  const text = String(value ?? '').toLowerCase();
+  if (text.includes('buy')) return 'buy';
+  if (text.includes('sell')) return 'sell';
+  return null;
+}
+
+/**
+ * Decides what to do with one open position. Returns one of:
+ *   wait          the market has not travelled far enough yet (check again later)
+ *   already_beyond the current stop is already at least this protective (terminal)
+ *   blocked       a safety input is missing or unusable (never send a request)
+ *   defer         the broker rules forbid this exact price right now (retry later)
+ *   move          send `stopLoss` to the broker
+ */
+export function calculateBreakEvenStop({ side, openPrice, bid, ask, stopLoss, triggerPoints, offsetPoints, tickSize, stopsLevelPoints = 0, freezeLevelPoints = 0 }) {
+  const direction = normalizePositionSide(side);
+  if (!direction) return { action: 'blocked', reason: 'position-direction', message: 'MetaAPI did not report whether this position is a buy or a sell.' };
+
+  const entry = finiteNumber(openPrice);
+  const marketBid = finiteNumber(bid);
+  const marketAsk = finiteNumber(ask);
+  const tick = finiteNumber(tickSize);
+  const trigger = finiteNumber(triggerPoints);
+  const offset = finiteNumber(offsetPoints) ?? 0;
+  if (![entry, marketBid, marketAsk].every((value) => Number.isFinite(value) && value > 0) || marketBid >= marketAsk) {
+    return { action: 'blocked', reason: 'quote-unavailable', message: 'A fresh, valid bid and ask price are required before a stop can be moved.' };
+  }
+  if (!Number.isFinite(tick) || tick <= 0) {
+    return { action: 'blocked', reason: 'specification-unavailable', message: 'The broker did not provide a valid tick size for this symbol.' };
+  }
+  if (!Number.isFinite(trigger) || trigger < 0 || trigger > 100_000) {
+    return { action: 'blocked', reason: 'invalid-trigger', message: 'The break-even trigger distance must be between 0 and 100000 points.' };
+  }
+  if (!Number.isFinite(offset) || offset < 0 || offset > 10_000) {
+    return { action: 'blocked', reason: 'invalid-offset', message: 'The break-even offset must be between 0 and 10000 points.' };
+  }
+
+  const marketPrice = direction === 'buy' ? marketBid : marketAsk;
+  const travelled = direction === 'buy' ? marketPrice - entry : entry - marketPrice;
+  const travelledPoints = travelled / tick;
+  if (travelled + tick * 1e-6 < trigger * tick) {
+    return { action: 'wait', reason: 'trigger-not-reached', travelledPoints, requiredPoints: trigger };
+  }
+
+  const target = direction === 'buy' ? entry + offset * tick : entry - offset * tick;
+  const stopPrice = alignPriceToTick(target, tick, direction === 'buy' ? 'down' : 'up');
+  const currentStop = finiteNumber(stopLoss);
+  const hasStop = Number.isFinite(currentStop) && currentStop > 0;
+
+  if (hasStop) {
+    const alreadyProtected = direction === 'buy' ? currentStop >= stopPrice : currentStop <= stopPrice;
+    if (alreadyProtected) {
+      return { action: 'already_beyond', reason: 'stop-already-protective', stopLoss: currentStop, attemptedStopLoss: stopPrice };
+    }
+  }
+
+  if (direction === 'buy' ? stopPrice >= marketBid : stopPrice <= marketAsk) {
+    return { action: 'defer', reason: 'stop-side-of-market', message: 'The break-even price is on the wrong side of the current market price.', travelledPoints };
+  }
+
+  const stopsLevel = Math.max(0, finiteNumber(stopsLevelPoints) ?? 0);
+  const distanceToMarket = direction === 'buy' ? marketBid - stopPrice : stopPrice - marketAsk;
+  if (distanceToMarket + tick * 1e-6 < stopsLevel * tick) {
+    return { action: 'defer', reason: 'broker-stop-distance', message: `The broker requires stops to sit at least ${stopsLevel} points from the market price.`, travelledPoints };
+  }
+
+  const freezeLevel = Math.max(0, finiteNumber(freezeLevelPoints) ?? 0);
+  if (hasStop && freezeLevel > 0) {
+    const distanceFromStop = Math.abs(marketPrice - currentStop);
+    if (distanceFromStop + tick * 1e-6 < freezeLevel * tick) {
+      return { action: 'defer', reason: 'broker-freeze-distance', message: `The broker freezes changes within ${freezeLevel} points of the current stop.`, travelledPoints };
+    }
+  }
+
+  return {
+    action: 'move',
+    stopLoss: stopPrice,
+    previousStopLoss: hasStop ? currentStop : null,
+    openPrice: entry,
+    travelledPoints: Number(travelledPoints.toFixed(2)),
+    lockedPoints: Number((direction === 'buy' ? (stopPrice - entry) / tick : (entry - stopPrice) / tick).toFixed(2)),
+  };
+}
+
+/**
+ * Turns a provider or transport failure into the right follow-up: retry soon for a
+ * temporary broker condition, retry a few times for a real rejection, and never
+ * retry when it is unknown whether the broker applied the change.
+ */
+export function classifyBreakEvenFailure(error) {
+  const numeric = Number(error?.numericCode);
+  const code = String(error?.stringCode || '').toUpperCase();
+  const message = String(error?.message || '');
+  const hasProviderCode = code.startsWith('TRADE_RETCODE_') || code.startsWith('ERR_') || Number.isInteger(numeric);
+  // MetaApi reports a numeric MetaTrader retcode, a machine-readable code name, or
+  // both, so the code name is matched alongside the message before deciding how to follow up.
+  const signature = `${code} ${message}`.trim();
+  if (BREAK_EVEN_AMBIGUOUS_CODES.has(numeric) || (!hasProviderCode && BREAK_EVEN_AMBIGUOUS_TEXT.test(message))) {
+    return { status: 'unknown', retry: false, message: message || 'The broker did not confirm whether the stop was changed, so Signal Desk will not send the request again automatically.' };
+  }
+  if (BREAK_EVEN_DEFER_CODES.has(numeric) || BREAK_EVEN_DEFER_TEXT.test(signature)) {
+    return { status: 'deferred', retry: true, message: message || 'The broker will not accept this stop price yet.' };
+  }
+  return { status: 'failed', retry: true, message: message || 'The broker rejected the stop-loss change.' };
+}
+
+export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnabled = false, now = () => Date.now(), breakEvenIntervalMs = 5_000, breakEvenMaxAttempts = BREAK_EVEN_MAX_ATTEMPTS, logger = console } = {}) {
   if (!pool?.query || !trading?.getAccountState || !trading?.createMarketOrder || typeof resolveToken !== 'function') {
     throw new TypeError('Execution engine dependencies are incomplete.');
   }
@@ -288,7 +455,213 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
     }
   }
 
-  return { processJob, captureDailyBaseline, captureUtcDayBaselines, runtimeEnabled: Boolean(runtimeEnabled) };
+  /* ------------------------- break-even stop sweep ------------------------- */
+  let lastBreakEvenSweep = 0;
+
+  async function candidates() {
+    const { rows } = await pool.query(
+      `SELECT t.id AS trade_id,t.user_id,t.metaapi_account_id,t.broker_position_id,t.symbol,t.side,
+              t.entry_price,t.stop_loss,
+              s.break_even_trigger_points AS trigger_points,s.break_even_offset_points AS offset_points,
+              ma.managed_by_app
+       FROM trades t
+       JOIN settings s ON s.user_id=t.user_id
+       JOIN metaapi_accounts ma ON ma.user_id=t.user_id AND ma.metaapi_account_id=t.metaapi_account_id
+       LEFT JOIN break_even_moves m
+         ON m.user_id=t.user_id AND m.metaapi_account_id=t.metaapi_account_id AND m.broker_position_id=t.broker_position_id
+       WHERE t.status='executed' AND t.broker_position_id IS NOT NULL
+         AND s.break_even_enabled=TRUE AND s.auto_trading_enabled=TRUE AND s.execution_account_id=t.metaapi_account_id
+         AND UPPER(COALESCE(ma.state,''))='DEPLOYED'
+         AND t.created_at >= NOW() - ($1::text || ' days')::interval
+         AND (m.id IS NULL
+              OR (m.status IN ('deferred','failed')
+                  AND m.attempt_count < $2
+                  AND (m.next_attempt_at IS NULL OR m.next_attempt_at <= NOW())))
+       ORDER BY t.created_at ASC
+       LIMIT $3`,
+      [String(BREAK_EVEN_TRACKING_DAYS), Number(breakEvenMaxAttempts) || BREAK_EVEN_MAX_ATTEMPTS, BREAK_EVEN_SWEEP_LIMIT],
+    );
+    return rows;
+  }
+
+  /** Persisted so a position is never sent twice, and so the UI can explain any outcome. */
+  async function recordMove(candidate, patch) {
+    const {
+      status, stopLoss = null, previousStopLoss = null, openPrice = null, message = null,
+      providerResponse = null, retryInMs = null, marketBid = null, marketAsk = null,
+      triggerPoints = null, offsetPoints = null, incrementAttempt = true,
+    } = patch;
+    await pool.query(
+      `INSERT INTO break_even_moves(
+         user_id,trade_id,metaapi_account_id,broker_position_id,symbol,side,open_price,trigger_points,offset_points,
+         previous_stop_loss,stop_loss,status,attempt_count,market_bid,market_ask,provider_response,error_message,next_attempt_at,updated_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,$14,$15,$16,$17,
+               CASE WHEN $18::text IS NULL THEN NULL ELSE NOW() + ($18::text || ' milliseconds')::interval END,NOW())
+       ON CONFLICT(user_id,metaapi_account_id,broker_position_id) DO UPDATE SET
+         symbol=EXCLUDED.symbol,side=EXCLUDED.side,open_price=EXCLUDED.open_price,trigger_points=EXCLUDED.trigger_points,
+         offset_points=EXCLUDED.offset_points,previous_stop_loss=EXCLUDED.previous_stop_loss,stop_loss=EXCLUDED.stop_loss,
+         status=EXCLUDED.status,
+         attempt_count=break_even_moves.attempt_count + CASE WHEN $13::text = 'true' THEN 1 ELSE 0 END,
+         market_bid=EXCLUDED.market_bid,market_ask=EXCLUDED.market_ask,provider_response=EXCLUDED.provider_response,
+         error_message=EXCLUDED.error_message,next_attempt_at=EXCLUDED.next_attempt_at,updated_at=NOW()
+       WHERE break_even_moves.status NOT IN ('moved','already_beyond','closed','unknown')`,
+      [candidate.user_id, candidate.trade_id || null, candidate.metaapi_account_id, candidate.broker_position_id,
+        candidate.symbol || null, candidate.side || null, openPrice, triggerPoints, offsetPoints,
+        previousStopLoss, stopLoss, status, String(incrementAttempt), marketBid, marketAsk, providerResponse,
+        message ? safeText(message) : null, retryInMs == null ? null : String(retryInMs)],
+    );
+  }
+
+  async function breakEvenEligible(userId, accountId) {
+    const { rows } = await pool.query(
+      `SELECT s.auto_trading_enabled AS "autoTradingEnabled",s.break_even_enabled AS "breakEvenEnabled",
+              s.execution_account_id AS "executionAccountId"
+       FROM settings s WHERE s.user_id=$1 LIMIT 1`,
+      [userId],
+    );
+    const latest = rows[0];
+    return Boolean(latest && latest.autoTradingEnabled === true && latest.breakEvenEnabled === true && latest.executionAccountId === accountId);
+  }
+
+  async function sweepBreakEven() {
+    const summary = { attempted: 0, moved: 0, deferred: 0, failed: 0, closed: 0, skipped: 0 };
+    if (!runtimeEnabled) return { ...summary, reason: 'runtime-disabled' };
+    if (typeof trading.modifyPosition !== 'function') return { ...summary, reason: 'provider-unsupported' };
+    const timestamp = now();
+    const intervalMs = Math.max(1_000, Number(breakEvenIntervalMs) || 5_000);
+    if (timestamp - lastBreakEvenSweep < intervalMs) return { ...summary, reason: 'throttled' };
+    lastBreakEvenSweep = timestamp;
+
+    let rows;
+    try {
+      rows = await candidates();
+    } catch (error) {
+      logger.error?.(JSON.stringify({ level: 'error', message: 'Break-even candidates could not be read', error: safeText(error?.message || error) }));
+      return { ...summary, reason: 'candidates-unavailable' };
+    }
+    if (!rows.length) return summary;
+
+    const groups = new Map();
+    for (const row of rows) {
+      const key = `${row.user_id}|${row.metaapi_account_id}|${row.symbol || ''}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(row);
+    }
+
+    for (const group of groups.values()) {
+      const [{ user_id: userId, metaapi_account_id: accountId, symbol }] = group;
+      let state = null;
+      let token = null;
+      try {
+        const { rows: accountRows } = await pool.query(
+          'SELECT managed_by_app,state FROM metaapi_accounts WHERE user_id=$1 AND metaapi_account_id=$2 LIMIT 1',
+          [userId, accountId],
+        );
+        if (!accountRows[0] || String(accountRows[0].state || '').toUpperCase() !== 'DEPLOYED') {
+          for (const candidate of group) summary.skipped += 1;
+          continue;
+        }
+        token = await resolveToken(userId, accountId, accountRows[0].managed_by_app);
+        if (!token) throw new Error('The trading account access token is unavailable.');
+        state = await trading.getAccountState({ token, accountId, symbol });
+      } catch (error) {
+        const message = safeText(error?.message || error, [token]);
+        for (const candidate of group) {
+          summary.deferred += 1;
+          // Not being able to *look* is not the broker refusing anything, so it must
+          // not consume an attempt: protection should resume as soon as the account
+          // synchronizes again rather than resting forever after ten bad minutes.
+          await recordMove(candidate, { status: 'deferred', message: `Account data was not available: ${message}`, retryInMs: BREAK_EVEN_FAILED_RETRY_MS, triggerPoints: candidate.trigger_points, offsetPoints: candidate.offset_points, incrementAttempt: false }).catch(() => {});
+        }
+        continue;
+      }
+
+      for (const candidate of group) {
+        summary.attempted += 1;
+        try {
+          const position = (state.positions || []).find((item) => String(item.id) === String(candidate.broker_position_id));
+          if (!position) {
+            summary.closed += 1;
+            await recordMove(candidate, { status: 'closed', message: 'The position is no longer open on the broker account.', triggerPoints: candidate.trigger_points, offsetPoints: candidate.offset_points, incrementAttempt: false });
+            continue;
+          }
+          const decision = calculateBreakEvenStop({
+            side: position.type ?? candidate.side,
+            openPrice: position.openPrice ?? candidate.entry_price,
+            bid: state.price?.bid,
+            ask: state.price?.ask,
+            stopLoss: position.stopLoss,
+            triggerPoints: candidate.trigger_points,
+            offsetPoints: candidate.offset_points,
+            tickSize: state.specification?.tickSize,
+            stopsLevelPoints: state.specification?.stopsLevel,
+            freezeLevelPoints: state.specification?.freezeLevel,
+          });
+
+          if (decision.action === 'wait') { summary.skipped += 1; continue; }
+          if (decision.action === 'already_beyond') {
+            await recordMove(candidate, { status: 'already_beyond', stopLoss: decision.stopLoss, openPrice: position.openPrice ?? null, triggerPoints: candidate.trigger_points, offsetPoints: candidate.offset_points, incrementAttempt: false });
+            summary.skipped += 1;
+            continue;
+          }
+          if (decision.action === 'blocked') {
+            summary.deferred += 1;
+            await recordMove(candidate, { status: 'deferred', message: decision.message, retryInMs: BREAK_EVEN_FAILED_RETRY_MS, triggerPoints: candidate.trigger_points, offsetPoints: candidate.offset_points, incrementAttempt: false });
+            continue;
+          }
+          if (decision.action === 'defer') {
+            summary.deferred += 1;
+            await recordMove(candidate, { status: 'deferred', message: decision.message, retryInMs: BREAK_EVEN_DEFERRED_RETRY_MS, marketBid: state.price?.bid ?? null, marketAsk: state.price?.ask ?? null, triggerPoints: candidate.trigger_points, offsetPoints: candidate.offset_points, incrementAttempt: false });
+            continue;
+          }
+
+          if (!(await breakEvenEligible(userId, accountId))) {
+            summary.skipped += 1;
+            continue;
+          }
+
+          const result = await trading.modifyPosition({ token, accountId, positionId: String(candidate.broker_position_id), stopLoss: decision.stopLoss });
+          const providerResponse = safeProviderResponse(result, token);
+          if (noChangeReported(result)) {
+            await recordMove(candidate, { status: 'already_beyond', stopLoss: decision.stopLoss, previousStopLoss: decision.previousStopLoss ?? null, openPrice: decision.openPrice ?? null, marketBid: state.price?.bid ?? null, marketAsk: state.price?.ask ?? null, providerResponse, triggerPoints: candidate.trigger_points, offsetPoints: candidate.offset_points, incrementAttempt: false });
+            summary.skipped += 1;
+            continue;
+          }
+          if (!successfulTradeResponse(result)) {
+            const message = safeText(result?.message || `MetaAPI rejected the stop-loss change (${result?.stringCode || result?.numericCode || 'unknown provider code'}).`, [token]);
+            summary.failed += 1;
+            await recordMove(candidate, { status: 'failed', message, providerResponse, retryInMs: BREAK_EVEN_FAILED_RETRY_MS, marketBid: state.price?.bid ?? null, marketAsk: state.price?.ask ?? null, triggerPoints: candidate.trigger_points, offsetPoints: candidate.offset_points });
+            continue;
+          }
+          await recordMove(candidate, {
+            status: 'moved', stopLoss: decision.stopLoss, previousStopLoss: decision.previousStopLoss, openPrice: decision.openPrice,
+            marketBid: state.price?.bid ?? null, marketAsk: state.price?.ask ?? null, providerResponse, triggerPoints: candidate.trigger_points, offsetPoints: candidate.offset_points, incrementAttempt: false,
+          });
+          await pool.query('UPDATE trades SET stop_loss=$1 WHERE id=$2 AND user_id=$3', [decision.stopLoss, candidate.trade_id, userId]);
+          summary.moved += 1;
+        } catch (error) {
+          const outcome = classifyBreakEvenFailure(error);
+          const message = safeText(outcome.message || error?.message || error, [token]);
+          if (outcome.status === 'unknown') summary.failed += 1; else summary.deferred += 1;
+          await recordMove(candidate, {
+            status: outcome.status === 'unknown' ? 'unknown' : 'deferred',
+            message: outcome.status === 'unknown'
+              ? `${message} Reconcile the position on the broker account before changing the break-even settings.`
+              : message,
+            retryInMs: outcome.retry && outcome.status !== 'unknown' ? BREAK_EVEN_FAILED_RETRY_MS : null,
+            marketBid: state.price?.bid ?? null, marketAsk: state.price?.ask ?? null,
+            triggerPoints: candidate.trigger_points, offsetPoints: candidate.offset_points,
+            incrementAttempt: outcome.status !== 'deferred',
+          }).catch(() => {});
+          // The order itself filled, so the trade keeps its execution status: only the
+          // stop move is unconfirmed, and that is recorded on the move row.
+        }
+      }
+    }
+    return summary;
+  }
+
+  return { processJob, captureDailyBaseline, captureUtcDayBaselines, sweepBreakEven, runtimeEnabled: Boolean(runtimeEnabled) };
 }
 
 export function stableClientId(jobId) {

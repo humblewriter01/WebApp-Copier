@@ -111,7 +111,7 @@ function App() {
   const [channels, setChannels] = useState([]);
   const [accounts, setAccounts] = useState([]);
   const [signals, setSignals] = useState([]);
-  const [settings, setSettings] = useState({ riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 3, dailyLossLimit: 5, autoTradingEnabled: false, lotSizeMode: 'fixed', fixedLotSize: 0.01, maxDailyTrades: 10, executionAccountId: '' });
+  const [settings, setSettings] = useState({ riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 3, dailyLossLimit: 5, autoTradingEnabled: false, lotSizeMode: 'fixed', fixedLotSize: 0.01, maxDailyTrades: 10, executionAccountId: '', breakEvenEnabled: false, breakEvenTriggerPoints: 20, breakEvenOffsetPoints: 0 });
   const [linkedAccounts, setLinkedAccounts] = useState([]);
   const [trades, setTrades] = useState([]);
   const [executionRuntimeEnabled, setExecutionRuntimeEnabled] = useState(false);
