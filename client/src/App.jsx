@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import Sidebar from './components/Sidebar.jsx';
 import SignalTable from './components/SignalTable.jsx';
+import { RISK_REMINDER } from './components/RiskWarningModal.jsx';
+import { signalsAwaitingUpgrade } from './lib/signal-outcome.js';
 import TelegramConnect from './components/TelegramConnect.jsx';
 import { TelegramStatusProvider, TelegramStatusPill, useTelegramStatus, monitoringLabel } from './components/TelegramStatus.jsx';
 import { MetaApiStatusProvider } from './components/MetaApiStatus.jsx';
@@ -115,7 +117,7 @@ function App() {
   const [channels, setChannels] = useState([]);
   const [accounts, setAccounts] = useState([]);
   const [signals, setSignals] = useState([]);
-  const [settings, setSettings] = useState({ riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 3, dailyLossLimit: 5, autoTradingEnabled: false, lotSizeMode: 'fixed', fixedLotSize: 0.01, maxDailyTrades: 10, executionAccountId: '', breakEvenEnabled: false, breakEvenTriggerPoints: 20, breakEvenOffsetPoints: 0, trailingStopEnabled: false, trailingStopDistancePoints: 10 });
+  const [settings, setSettings] = useState({ riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 3, dailyLossLimit: 5, autoTradingEnabled: false, hasAcceptedRiskWarning: false, lotSizeMode: 'fixed', fixedLotSize: 0.01, maxDailyTrades: 10, executionAccountId: '', breakEvenEnabled: false, breakEvenTriggerPoints: 20, breakEvenOffsetPoints: 0, trailingStopEnabled: false, trailingStopDistancePoints: 10 });
   const [linkedAccounts, setLinkedAccounts] = useState([]);
   const [trades, setTrades] = useState([]);
   const [executionRuntimeEnabled, setExecutionRuntimeEnabled] = useState(false);
@@ -268,11 +270,13 @@ function App() {
     catch (e) { setError(e.message); }
     finally { setSettingsSaving(false); }
   };
-  const toggleAutoTrading = async (enabled) => {
+  // `accepted` carries the live-trading acknowledgement with the switch it belongs to, so the
+  // confirmation and the change it authorises are one write and can never disagree.
+  const toggleAutoTrading = async (enabled, accepted) => {
     if (settingsSaving) return;
     if (readOnlySupport) { setError('Support view is read-only, so Auto-Trading cannot be switched here.'); return; }
     const previous = settings;
-    const updated = { ...previous, autoTradingEnabled: enabled };
+    const updated = { ...previous, autoTradingEnabled: enabled, ...(enabled && accepted?.hasAcceptedRiskWarning ? { hasAcceptedRiskWarning: true } : {}) };
     setSettings(updated); setError(''); setNotice(''); setSettingsSaving(true);
     try {
       const result = await request('/api/settings', authToken, { method: 'PUT', body: updated });
@@ -305,13 +309,13 @@ function App() {
         {tab === 'overview' && <>
           <section className="welcome-row"><div><h2>Good to see you, {user?.name?.split(' ')[0] || 'trader'}.</h2><p>Monitor Telegram signals and keep your setup organized.</p></div><LiveLabel channelCount={channels.length} /></section>
           <div className="metrics-grid"><Metric label="Signals captured" value={dashboard?.stats?.totalSignals ?? 0} note="Across your workspace" /><Metric label="Active sources" value={dashboard?.stats?.activeChannels ?? 0} note="Telegram channels" /><Metric label="Account Notes" value={dashboard?.stats?.accounts ?? 0} note="Labels and references" /><Metric label="Auto-Trading" value={settings.autoTradingEnabled ? 'On' : 'Off'} note={settings.autoTradingEnabled ? 'Eligible signals may place orders' : 'Off until you enable it'} /></div>
-          {settings.autoTradingEnabled && <div className="execution-warning" role="alert">Warning: Auto-Trading can execute live trades on your selected broker account. It is ON by default for new workspaces. Use a demo account for testing; you are responsible for any financial losses. Turn Auto-Trading off in Risk Settings to stop new orders from being submitted.</div>}
+          {settings.autoTradingEnabled && <p className="risk-reminder risk-reminder-compact"><span>{RISK_REMINDER} Use a demo account while you are testing, and turn this off in Risk settings whenever you want no new orders.</span></p>}
           <div className="notice-banner"><strong>{settings.autoTradingEnabled ? 'Auto-Trading is on' : 'Auto-Trading is off'}</strong><span>{settings.autoTradingEnabled ? 'New eligible Telegram signals may place live orders on your selected account. You can turn this off in Risk Settings.' : 'Signals are saved for review only. Turn Auto-Trading on in Risk Settings to submit new eligible signals to your broker.'}</span></div>
-          <section className="panel"><div className="panel-heading"><div><p className="eyebrow">LATEST ACTIVITY</p><h2>Recent signals</h2></div><button className="text-button" onClick={() => setTab('signals')}>View all</button></div><SignalTable signals={dashboard?.signals || []} channelCount={channels.length} onOpenTelegram={() => navigateToTab('telegram')} /></section>
+          <section className="panel"><div className="panel-heading"><div><p className="eyebrow">LATEST ACTIVITY</p><h2>Recent signals</h2></div><button className="text-button" onClick={() => setTab('signals')}>View all</button></div><SignalTable signals={dashboard?.signals || []} channelCount={channels.length} onOpenTelegram={() => navigateToTab('telegram')} onUpgrade={() => navigateToTab('billing')} /></section>
         </>}
         {tab === 'telegram' && <TelegramConnect token={authToken} channels={channels} onRefresh={refresh} />}
         {tab === 'metaapi' && <MetaApiPanel token={authToken} channelCount={channels.length} onOpenTelegram={() => navigateToTab('telegram')} />}
-        {tab === 'signals' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">CAPTURED MESSAGES</p><h2>Signal history</h2></div><span className="count-badge">{signals.length}</span></div><SignalTable signals={signals} channelCount={channels.length} onOpenTelegram={() => navigateToTab('telegram')} /></section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">MANUAL ENTRY</p><h2>Add a signal note</h2></div></div><p className="muted">Save a message for tracking. Signal Desk may identify the symbol, direction, entry, stop, and target.</p><form className="form-stack" onSubmit={addManualSignal}><label>Signal message<textarea rows="7" value={signalText} onChange={e => setSignalText(e.target.value)} placeholder={'BUY EURUSD\nEntry: 1.0850\nSL: 1.0800\nTP: 1.0950'} required maxLength={5000} /></label><button className="button button-primary">Save signal</button></form></section></div>}
+        {tab === 'signals' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">CAPTURED MESSAGES</p><h2>Signal history</h2></div><span className="count-badge">{signals.length}</span></div>{signalsAwaitingUpgrade(signals) ? <p className="field-help signal-capture-note">Every message from your connected channels is captured and saved here, whatever your plan. Where a signal was not executed, the reason is written under it.</p> : null}<SignalTable signals={signals} channelCount={channels.length} onOpenTelegram={() => navigateToTab('telegram')} onUpgrade={() => navigateToTab('billing')} /></section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">MANUAL ENTRY</p><h2>Add a signal note</h2></div></div><p className="muted">Save a message for tracking. Signal Desk may identify the symbol, direction, entry, stop, and target.</p><form className="form-stack" onSubmit={addManualSignal}><label>Signal message<textarea rows="7" value={signalText} onChange={e => setSignalText(e.target.value)} placeholder={'BUY EURUSD\nEntry: 1.0850\nSL: 1.0800\nTP: 1.0950'} required maxLength={5000} /></label><button className="button button-primary">Save signal</button></form></section></div>}
         {tab === 'accounts' && <div className="panel-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">YOUR NOTES</p><h2>Account Notes</h2></div><span className="count-badge">{accounts.length}</span></div><p className="muted">Save a label or optional reference for your own notes. To connect a trading account, open Trading Accounts.</p>{!accounts.length ? <div className="empty-state"><strong>No account notes yet</strong><span>Add a label for your own reference.</span></div> : <div className="chat-list">{accounts.map(account => <div className="chat-row" key={account.id}><div><strong>{account.label}</strong><small>{[account.broker, account.platform, account.accountReference].filter(Boolean).join(' · ') || 'Reference only'}</small></div><button className="icon-button" onClick={async () => { if (readOnlySupport) { setError('Support view is read-only.'); return; } await request(`/api/accounts/${account.id}`, authToken, { method: 'DELETE' }); await refresh(); }}>Remove</button></div>)}</div>}</section><section className="panel"><div className="panel-heading"><div><p className="eyebrow">ADD A NOTE</p><h2>Account note</h2></div></div><form className="form-stack" onSubmit={addAccount}><label>Label<input value={accountForm.label} onChange={e => setAccountForm({ ...accountForm, label: e.target.value })} placeholder="Demo MT5 account" required maxLength={100} /></label><div className="form-row"><label>Broker<input value={accountForm.broker} onChange={e => setAccountForm({ ...accountForm, broker: e.target.value })} /></label><label>Platform<input value={accountForm.platform} onChange={e => setAccountForm({ ...accountForm, platform: e.target.value })} placeholder="MT4, MT5…" /></label></div><label>Reference<input value={accountForm.accountReference} onChange={e => setAccountForm({ ...accountForm, accountReference: e.target.value })} placeholder="Optional alias" /></label><button className="button button-primary">Save note</button></form></section></div>}
         {tab === 'billing' && <BillingPage token={authToken} />}
         {tab === 'admin' && (isAdmin

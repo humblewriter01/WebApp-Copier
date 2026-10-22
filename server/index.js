@@ -20,14 +20,15 @@ import { createMetaApiTradingAdapter } from './services/metaapi-trading.js';
 import { createExecutionEngine, PLATFORM_PAUSE_MESSAGE } from './services/execution-engine.js';
 import { createExecutionWorker } from './services/execution-worker.js';
 import { createSupabaseAuthBridge } from './services/supabase-auth.js';
-import { createAdminAccess, normalizePromoCodeInput, normalizePromoCodeUpdate, normalizeUserUpdate, assertAllowedSelfUpdate, normalizeSubscriptionAdjustment, assertAllowedImpersonation } from './services/admin.js';
+import { createAdminAccess, normalizePromoCodeInput, normalizePromoCodeUpdate, normalizeUserUpdate, assertAllowedSelfUpdate, normalizeSubscriptionAdjustment, assertAllowedImpersonation, adminActionError } from './services/admin.js';
 import { createAccountCleanup } from './services/account-cleanup.js';
 import { billingConfig, verifyWebhookSignature, normalizeReference, findPlan, FREE_PLAN } from './services/billing.js';
 import { createPaystackClient } from './services/paystack.js';
 import { createBillingService } from './services/billing-service.js';
 import { createPricingStore, normalizePricingUpdate, normalizeBillingSettings, planChargeDecision, publicPricing } from './services/pricing.js';
 import { createPlanSynchronizer } from './services/plan-sync.js';
-import { planLimitsFor, buildLimitError, isPaidSubscriber } from './services/plan-limits.js';
+import { planLimitsFor, buildLimitError } from './services/plan-limits.js';
+import { decideSignalOutcome } from './services/signal-outcome.js';
 import {
   createInactivityService, daysInactiveSince,
   INACTIVITY_WARNING_DAYS, INACTIVITY_DELETION_DAYS, INACTIVITY_SWEEP_LIMIT,
@@ -77,6 +78,14 @@ const log = (level, message, extra = {}) => {
 };
 const asyncRoute = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 const fail = (res, status, error) => res.status(status).json({ error });
+
+const adminRoute = (action, handler) => asyncRoute(async (req, res) => {
+  try {
+    await handler(req, res);
+  } catch (error) {
+    throw adminActionError(action, error);
+  }
+});
 
 app.disable('x-powered-by');
 app.use(helmet());
@@ -265,14 +274,14 @@ async function saveSignal(userId, message, channel = {}) {
      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
      ON CONFLICT DO NOTHING
      RETURNING id,channel_id AS "channelId",channel_title AS "channelTitle",telegram_message_id AS "telegramMessageId",source,message,symbol,side,
-       entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",status,created_at AS "createdAt"`,
+       entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt"`,
     [userId, channel.channelId || null, channel.title || null, telegramMessageId, source, savedText, parsed.symbol, parsed.side, parsed.entryPrice, parsed.stopLoss, parsed.takeProfit, parsed.executionReady, parsed.parseError || null, parsed.executionReady ? 'received' : 'unparsed'],
   );
   let signal = rows[0];
   if (!signal && telegramMessageId) {
     const existing = await pool.query(
       `SELECT id,channel_id AS "channelId",channel_title AS "channelTitle",telegram_message_id AS "telegramMessageId",source,message,symbol,side,
-         entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",status,created_at AS "createdAt"
+         entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt"
        FROM signals WHERE user_id=$1 AND channel_id=$2 AND telegram_message_id=$3 AND source='telegram' LIMIT 1`,
       [userId, channel.channelId, telegramMessageId],
     );
@@ -281,15 +290,44 @@ async function saveSignal(userId, message, channel = {}) {
   }
   if (!signal) throw new Error('The signal could not be saved.');
 
-  if (source === 'telegram' && telegramMessageId && parsed.executionReady) {
-    const { rows: settingsRows } = await pool.query('SELECT auto_trading_enabled FROM settings WHERE user_id=$1 LIMIT 1', [userId]);
-    if (settingsRows[0]?.auto_trading_enabled === true) {
-      await pool.query(
-        `INSERT INTO execution_jobs(user_id,signal_id,status,expires_at)
-         VALUES($1,$2,'queued',NOW()+INTERVAL '2 minutes') ON CONFLICT(signal_id) DO NOTHING`,
-        [userId, signal.id],
-      );
-    }
+  /* Nothing below decides whether the message is stored - it already is. Plan, linked accounts,
+     the execution runtime and the platform switch decide only whether a job is queued, and the
+     outcome recorded on the signal row. A free workspace with no MetaAPI account therefore
+     captures every message exactly like a paid one and sees it as unexecuted, instead of the
+     listener staying quiet because trading could never have started. */
+  const deliverable = source === 'telegram' && Boolean(telegramMessageId) && parsed.executionReady === true;
+  const { rows: contextRows } = await pool.query(
+    `SELECT s.auto_trading_enabled AS autoTrading,s.execution_account_id AS executionAccountId,
+            ma.state AS accountState,u.subscription_status AS subscriptionStatus
+     FROM users u
+     LEFT JOIN settings s ON s.user_id=u.id
+     LEFT JOIN metaapi_accounts ma ON ma.user_id=u.id AND ma.metaapi_account_id=s.execution_account_id
+     WHERE u.id=$1 LIMIT 1`,
+    [userId],
+  );
+  const context = contextRows[0] || {};
+  const outcome = decideSignalOutcome({
+    manual: !deliverable,
+    executionReady: parsed.executionReady === true,
+    autoTradingEnabled: context.autoTrading === true,
+    runtimeEnabled: autoTradingRuntimeEnabled,
+    // A pause and an upgrade are only worth mentioning for a signal that could have traded;
+    // a note on a manual entry or an unparseable message would just be noise.
+    paused: deliverable ? await platformControls.isPaused().catch(() => true) : false,
+    subscriptionStatus: context.subscriptionStatus,
+    accountSelected: Boolean(context.executionAccountId),
+    accountState: context.accountState,
+  });
+  if (outcome.queue) {
+    await pool.query(
+      `INSERT INTO execution_jobs(user_id,signal_id,status,expires_at)
+       VALUES($1,$2,'queued',NOW()+INTERVAL '2 minutes') ON CONFLICT(signal_id) DO NOTHING`,
+      [userId, signal.id],
+    );
+  }
+  if (outcome.status !== signal.status || (outcome.note || '') !== (signal.executionNote || '')) {
+    const { rows: recorded } = await pool.query('UPDATE signals SET status=$2,execution_note=$3 WHERE id=$1 RETURNING status,execution_note AS "executionNote"', [signal.id, outcome.status, outcome.note]);
+    if (recorded[0]) Object.assign(signal, recorded[0]);
   }
   io.to(`user:${userId}`).emit('signal:received', signal);
   return signal;
@@ -575,7 +613,7 @@ app.get('/api/dashboard', authenticate, asyncRoute(async (req, res) => {
     pool.query('SELECT COUNT(*)::int AS count FROM signals WHERE user_id=$1', [req.userId]),
     pool.query('SELECT COUNT(*)::int AS count FROM channels WHERE user_id=$1 AND enabled=TRUE', [req.userId]),
     pool.query('SELECT COUNT(*)::int AS count FROM accounts WHERE user_id=$1', [req.userId]),
-    pool.query(`SELECT id,channel_title AS "channelTitle",message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT 10`, [req.userId]),
+    pool.query(`SELECT id,channel_title AS "channelTitle",message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_note AS "executionNote",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT 10`, [req.userId]),
     pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled" FROM settings WHERE user_id=$1', [req.userId]),
   ]);
   res.json({
@@ -614,7 +652,7 @@ app.delete('/api/channels/:id', authenticate, asyncRoute(async (req, res) => {
 
 app.get('/api/signals', authenticate, asyncRoute(async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
-  const { rows } = await pool.query(`SELECT id,channel_title AS "channelTitle",message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2`, [req.userId, limit]);
+  const { rows } = await pool.query(`SELECT id,channel_title AS "channelTitle",message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2`, [req.userId, limit]);
   res.json({ signals: rows });
 }));
 app.post('/api/signals', authenticate, asyncRoute(async (req, res) => {
@@ -847,9 +885,9 @@ app.delete('/api/metaapi/accounts/:accountId', authenticate, asyncRoute(async (r
 }));
 
 app.get('/api/settings', authenticate, asyncRoute(async (req, res) => {
-  const { rows } = await pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",lot_size_mode AS "lotSizeMode",fixed_lot_size AS "fixedLotSize",max_daily_trades AS "maxDailyTrades",execution_account_id AS "executionAccountId",break_even_enabled AS "breakEvenEnabled",break_even_trigger_points AS "breakEvenTriggerPoints",break_even_offset_points AS "breakEvenOffsetPoints",trailing_stop_enabled AS "trailingStopEnabled",trailing_stop_distance_points AS "trailingStopDistancePoints" FROM settings WHERE user_id=$1', [req.userId]);
+  const { rows } = await pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",lot_size_mode AS "lotSizeMode",fixed_lot_size AS "fixedLotSize",max_daily_trades AS "maxDailyTrades",execution_account_id AS "executionAccountId",break_even_enabled AS "breakEvenEnabled",break_even_trigger_points AS "breakEvenTriggerPoints",break_even_offset_points AS "breakEvenOffsetPoints",trailing_stop_enabled AS "trailingStopEnabled",trailing_stop_distance_points AS "trailingStopDistancePoints",has_accepted_risk_warning AS "hasAcceptedRiskWarning" FROM settings WHERE user_id=$1', [req.userId]);
   res.set('Cache-Control', 'no-store').json({
-    settings: { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 3, dailyLossLimit: 5, autoTradingEnabled: false, lotSizeMode: 'fixed', fixedLotSize: 0.01, maxDailyTrades: 10, executionAccountId: '', breakEvenEnabled: false, breakEvenTriggerPoints: 20, breakEvenOffsetPoints: 0, trailingStopEnabled: false, trailingStopDistancePoints: 10, ...(rows[0] || {}) },
+    settings: { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 3, dailyLossLimit: 5, autoTradingEnabled: false, lotSizeMode: 'fixed', fixedLotSize: 0.01, maxDailyTrades: 10, executionAccountId: '', breakEvenEnabled: false, breakEvenTriggerPoints: 20, breakEvenOffsetPoints: 0, trailingStopEnabled: false, trailingStopDistancePoints: 10, hasAcceptedRiskWarning: false, ...(rows[0] || {}) },
     runtimeEnabled: autoTradingRuntimeEnabled,
     // The user's own toggle being on is not the same as orders being possible: if the platform
     // switch is engaged, say so here instead of letting the panel imply their setting is at fault.
@@ -857,6 +895,7 @@ app.get('/api/settings', authenticate, asyncRoute(async (req, res) => {
   });
 }));
 app.put('/api/settings', authenticate, asyncRoute(async (req, res) => {
+  let hasAcceptedRiskWarning = req.body.hasAcceptedRiskWarning === true;
   const riskMode = ['fixed', 'percent'].includes(req.body.riskMode) ? req.body.riskMode : 'fixed';
   const numeric = (value, fallback) => value === '' || value === null || value === undefined ? fallback : Number(value);
   const riskPercent = numeric(req.body.riskPercent, 1);
@@ -886,17 +925,16 @@ app.put('/api/settings', authenticate, asyncRoute(async (req, res) => {
   // distance that is missing or absurd is rejected instead of clamped into something real.
   if (!Number.isInteger(trailingStopDistancePoints) || trailingStopDistancePoints < 1 || trailingStopDistancePoints > 100_000) return fail(res, 400, 'The trailing distance must be between 1 and 100000 points.');
   if (trailingStopEnabled && !autoTradingRuntimeEnabled) return fail(res, 409, 'Trailing stop moves need the execution runtime, which is unavailable on this service right now.');
-  if (autoTradingEnabled || breakEvenEnabled || trailingStopEnabled) {
-    // Free is review-only. Tying the switches to a paid plan is what makes the free
-    // tier's zero trading-account limit meaningful, including for workspaces that
-    // connected an account under the old limits.
-    const { rows: planRows } = await pool.query('SELECT subscription_status FROM users WHERE id=$1 LIMIT 1', [req.userId]);
-    if (!isPaidSubscriber(planRows[0] || {})) {
-      const error = new Error('Automatic execution needs a paid plan. Upgrade to Starter or higher to switch Auto-Trading on.');
-      error.status = 402;
-      error.code = 'PLAN_REQUIRED';
-      error.upgradeRequired = true;
-      throw error;
+  // The execution switches are not a paid feature. Free is review-only because the engine refuses
+  // to send an order without a linked trading account and a paid plan, and that refusal happens per
+  // signal where the user can read it - gating the switch here only turned a harmless preference into
+  // a red banner and left the workspace unable to state its own intent.
+  const acceptsRiskNow = req.body.hasAcceptedRiskWarning === true;
+  if (autoTradingEnabled) {
+    const { rows: ackRows } = await pool.query('SELECT has_accepted_risk_warning AS "hasAcceptedRiskWarning" FROM settings WHERE user_id=$1 LIMIT 1', [req.userId]);
+    hasAcceptedRiskWarning = ackRows[0]?.hasAcceptedRiskWarning === true || acceptsRiskNow;
+    if (hasAcceptedRiskWarning !== true) {
+      return fail(res, 409, 'Confirm the live-trading warning before Auto-Trading is turned on. Nothing has been changed.');
     }
   }
   let ownedAccount = null;
@@ -909,17 +947,19 @@ app.put('/api/settings', authenticate, asyncRoute(async (req, res) => {
     if (!ownedAccount) return fail(res, 404, 'The selected trading account is not connected to your workspace.');
     if (autoTradingEnabled && String(ownedAccount.state || '').toUpperCase() !== 'DEPLOYED') return fail(res, 409, 'The selected trading account must be deployed before Auto-Trading can be enabled.');
   }
-  const { rows: previousRows } = await pool.query('SELECT auto_trading_enabled AS "autoTradingEnabled",execution_account_id AS "executionAccountId" FROM settings WHERE user_id=$1 LIMIT 1', [req.userId]);
+  const { rows: previousRows } = await pool.query('SELECT auto_trading_enabled AS "autoTradingEnabled",execution_account_id AS "executionAccountId",has_accepted_risk_warning AS "hasAcceptedRiskWarning" FROM settings WHERE user_id=$1 LIMIT 1', [req.userId]);
+  // The acknowledgement is sticky: saving any other part of the panel must never quietly revoke it.
+  if (previousRows[0]?.hasAcceptedRiskWarning === true) hasAcceptedRiskWarning = true;
   const previous = previousRows[0] || {};
   if (autoTradingEnabled && executionAccountId && (!previous.autoTradingEnabled || previous.executionAccountId !== executionAccountId)) {
     try { await executionEngine.captureDailyBaseline(req.userId, executionAccountId); }
     catch { return fail(res, 409, 'A safe daily loss baseline could not be captured. Confirm the account is deployed and connected, then try again. Auto-Trading remains off.'); }
   }
   const { rows } = await pool.query(
-    `INSERT INTO settings(user_id,risk_mode,risk_percent,max_open_positions,daily_loss_limit,auto_trading_enabled,lot_size_mode,fixed_lot_size,max_daily_trades,execution_account_id,break_even_enabled,break_even_trigger_points,break_even_offset_points,trailing_stop_enabled,trailing_stop_distance_points)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT(user_id) DO UPDATE SET risk_mode=EXCLUDED.risk_mode,risk_percent=EXCLUDED.risk_percent,max_open_positions=EXCLUDED.max_open_positions,daily_loss_limit=EXCLUDED.daily_loss_limit,auto_trading_enabled=EXCLUDED.auto_trading_enabled,lot_size_mode=EXCLUDED.lot_size_mode,fixed_lot_size=EXCLUDED.fixed_lot_size,max_daily_trades=EXCLUDED.max_daily_trades,execution_account_id=EXCLUDED.execution_account_id,break_even_enabled=EXCLUDED.break_even_enabled,break_even_trigger_points=EXCLUDED.break_even_trigger_points,break_even_offset_points=EXCLUDED.break_even_offset_points,trailing_stop_enabled=EXCLUDED.trailing_stop_enabled,trailing_stop_distance_points=EXCLUDED.trailing_stop_distance_points,updated_at=NOW()
-     RETURNING risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",lot_size_mode AS "lotSizeMode",fixed_lot_size AS "fixedLotSize",max_daily_trades AS "maxDailyTrades",execution_account_id AS "executionAccountId",break_even_enabled AS "breakEvenEnabled",break_even_trigger_points AS "breakEvenTriggerPoints",break_even_offset_points AS "breakEvenOffsetPoints",trailing_stop_enabled AS "trailingStopEnabled",trailing_stop_distance_points AS "trailingStopDistancePoints"`,
-    [req.userId, riskMode, riskPercent, maxOpenPositions, dailyLossLimit, autoTradingEnabled, lotSizeMode, fixedLotSize, maxDailyTrades, executionAccountId || null, breakEvenEnabled, breakEvenTriggerPoints, breakEvenOffsetPoints, trailingStopEnabled, trailingStopDistancePoints],
+    `INSERT INTO settings(user_id,risk_mode,risk_percent,max_open_positions,daily_loss_limit,auto_trading_enabled,lot_size_mode,fixed_lot_size,max_daily_trades,execution_account_id,break_even_enabled,break_even_trigger_points,break_even_offset_points,trailing_stop_enabled,trailing_stop_distance_points,has_accepted_risk_warning)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) ON CONFLICT(user_id) DO UPDATE SET risk_mode=EXCLUDED.risk_mode,risk_percent=EXCLUDED.risk_percent,max_open_positions=EXCLUDED.max_open_positions,daily_loss_limit=EXCLUDED.daily_loss_limit,auto_trading_enabled=EXCLUDED.auto_trading_enabled,lot_size_mode=EXCLUDED.lot_size_mode,fixed_lot_size=EXCLUDED.fixed_lot_size,max_daily_trades=EXCLUDED.max_daily_trades,execution_account_id=EXCLUDED.execution_account_id,break_even_enabled=EXCLUDED.break_even_enabled,break_even_trigger_points=EXCLUDED.break_even_trigger_points,break_even_offset_points=EXCLUDED.break_even_offset_points,trailing_stop_enabled=EXCLUDED.trailing_stop_enabled,trailing_stop_distance_points=EXCLUDED.trailing_stop_distance_points,has_accepted_risk_warning=EXCLUDED.has_accepted_risk_warning,updated_at=NOW()
+     RETURNING risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",lot_size_mode AS "lotSizeMode",fixed_lot_size AS "fixedLotSize",max_daily_trades AS "maxDailyTrades",execution_account_id AS "executionAccountId",break_even_enabled AS "breakEvenEnabled",break_even_trigger_points AS "breakEvenTriggerPoints",break_even_offset_points AS "breakEvenOffsetPoints",trailing_stop_enabled AS "trailingStopEnabled",trailing_stop_distance_points AS "trailingStopDistancePoints",has_accepted_risk_warning AS "hasAcceptedRiskWarning"`,
+    [req.userId, riskMode, riskPercent, maxOpenPositions, dailyLossLimit, autoTradingEnabled, lotSizeMode, fixedLotSize, maxDailyTrades, executionAccountId || null, breakEvenEnabled, breakEvenTriggerPoints, breakEvenOffsetPoints, trailingStopEnabled, trailingStopDistancePoints, hasAcceptedRiskWarning === true],
   );
   // Saving execution settings counts as activity for the inactivity policy.
   await inactivityService.touchQuietly(req.userId);
@@ -1109,7 +1149,7 @@ app.get('/api/admin/users', authenticate, requireAdmin, asyncRoute(async (req, r
   });
 }));
 
-app.patch('/api/admin/users/:id', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+app.patch('/api/admin/users/:id', authenticate, requireAdmin, adminRoute('Updating that account', async (req, res) => {
   const targetId = String(req.params.id || '').trim();
   if (!UUID_PATTERN.test(targetId)) return fail(res, 400, 'Choose a valid user account.');
   let update;
@@ -1517,7 +1557,7 @@ app.get('/api/admin/announcements', authenticate, requireAdmin, asyncRoute(async
   res.set('Cache-Control', 'no-store').json(await announcementService.list(query));
 }));
 
-app.post('/api/admin/announcements', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+app.post('/api/admin/announcements', authenticate, requireAdmin, adminRoute('Publishing that announcement', async (req, res) => {
   let draft;
   try { draft = normalizeAnnouncementDraft(req.body || {}); }
   catch (error) { return fail(res, error.status || 400, error.message); }
@@ -1698,7 +1738,7 @@ function dateLabel(value) {
   return Number.isNaN(date.getTime()) ? 'no end date' : date.toISOString().slice(0, 10);
 }
 
-app.patch('/api/admin/users/:id/subscription', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+app.patch('/api/admin/users/:id/subscription', authenticate, requireAdmin, adminRoute('Adjusting that plan', async (req, res) => {
   const targetId = String(req.params.id || '').trim();
   if (!UUID_PATTERN.test(targetId)) return fail(res, 400, 'Choose a valid user account.');
   let adjustment;
@@ -2065,8 +2105,18 @@ app.post('/api/telegram/disconnect', authenticate, asyncRoute(async (req, res) =
 }));
 
 app.use((req, res) => res.status(404).json({ error: 'We could not find that page or action. Return to your workspace and try again.' }));
-app.use((error, _req, res, _next) => {
+app.use((error, req, res, _next) => {
+  /* An error with no status is an unexpected one: its message may name a table, a column, or a
+     dependency, none of which belongs in a browser. So the message stays generic while the *where*
+     is logged next to a short reference, and that same reference is returned. A user reporting
+     "it failed" becomes a line that can be found in the service log, which is the difference
+     between a reproducible defect and a screenshot. */
+  const requestId = crypto.randomBytes(4).toString('hex');
   log('error', 'Request failed', {
+    requestId,
+    method: req.method,
+    path: String(req.originalUrl || req.url || '').split('?')[0],
+    status: Number(error.status) || 500,
     error: error.message,
     code: error.code,
     metaApiStatus: error.metaApiStatus,
@@ -2076,8 +2126,9 @@ app.use((error, _req, res, _next) => {
   });
   if (res.headersSent) return;
   const payload = {
-    error: error.status ? error.message : 'Something went wrong. Please try again in a moment.',
-    ...(error.code ? { code: error.code } : {}),
+    error: error.status ? (typeof error.userMessage === 'string' ? error.userMessage : error.message) : 'Something went wrong. Please try again in a moment.',
+    ...(error.code ? { code: error.code } : { code: 'UNEXPECTED' }),
+    requestId,
     ...(error.upgradeRequired ? { upgradeRequired: true } : {}),
   };
   if (typeof error.userMessage === 'string') payload.userMessage = error.userMessage;

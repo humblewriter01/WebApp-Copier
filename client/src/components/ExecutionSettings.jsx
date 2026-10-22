@@ -1,6 +1,16 @@
 import React from 'react';
+import RiskWarningModal, { needsRiskAcknowledgement, RISK_REMINDER, RISK_WARNING_COPY } from './RiskWarningModal.jsx';
 
-export const EXECUTION_WARNING = 'Warning: Enabling Auto-Trading will execute live trades on your connected broker account. Ensure you are using a demo account for testing. You are fully responsible for any financial losses.';
+/**
+ * Kept as the full sentence the warning used to be, for surfaces that need to quote it in one line.
+ * The panel itself no longer prints it: the same words are asked as a decision in
+ * RiskWarningModal, and reduced to RISK_REMINDER underneath the switch once they have been agreed to.
+ */
+export const EXECUTION_WARNING = RISK_WARNING_COPY.body;
+
+/* The acknowledgement belongs to this panel, so its parts are re-exported here: one module owns the
+ * switch, the sentence that guards it, and the decision that dismisses it. */
+export { default as RiskWarningModal, needsRiskAcknowledgement, RISK_REMINDER, RISK_WARNING_COPY } from './RiskWarningModal.jsx';
 
 const BREAK_EVEN_LABELS = {
   moved: 'Stop moved to break even',
@@ -41,7 +51,23 @@ export function platformPauseNotice(platformPause) {
 }
 
 export default function ExecutionSettings({ settings, accounts = [], trades = [], runtimeAvailable = false, platformPause = null, onChange, onSubmit, onToggle, saving = false }) {
+  const [riskWarningOpen, setRiskWarningOpen] = React.useState(false);
   const pauseNotice = platformPauseNotice(platformPause);
+  // Turning the switch on is the only action here that spends money, so it is the only one that
+  // asks first. Cancelling is not an error: the switch simply stays where it was.
+  const requestAutoTrading = (enabled) => {
+    if (enabled && needsRiskAcknowledgement(settings)) {
+      setRiskWarningOpen(true);
+      return;
+    }
+    if (onToggle) onToggle(enabled);
+    else set('autoTradingEnabled', enabled);
+  };
+  const confirmRiskWarning = () => {
+    setRiskWarningOpen(false);
+    if (onToggle) onToggle(true, { hasAcceptedRiskWarning: true });
+    else set('autoTradingEnabled', true);
+  };
   const connectedAccounts = accounts.filter((account) => String(account.state || '').toUpperCase() === 'DEPLOYED');
   const set = (key, value) => onChange({ ...settings, [key]: value });
 
@@ -54,7 +80,6 @@ export default function ExecutionSettings({ settings, accounts = [], trades = []
         </span>
       </div>
 
-      <div className="execution-warning" role="alert">{EXECUTION_WARNING}</div>
       {pauseNotice ? <div className="alert alert-info execution-paused-notice" role="alert">{pauseNotice}</div> : null}
       {!runtimeAvailable && <div className="alert alert-info" role="status">Automatic execution is currently unavailable. You can still turn Auto-Trading off; eligible signals will not place orders while execution is unavailable.</div>}
       {runtimeAvailable && <p className="field-help execution-runtime-note">The worker runs while Signal Desk is online. If the service is offline, new signals may be missed; stale signals are never executed after it returns.</p>}
@@ -147,12 +172,32 @@ export default function ExecutionSettings({ settings, accounts = [], trades = []
         {!runtimeAvailable && <p className="field-help">Trailing stop moves are unavailable while automatic execution is unavailable on this service.</p>}
 
         <label className="execution-toggle-row" htmlFor="auto-trading-enabled">
-          <input id="auto-trading-enabled" type="checkbox" checked={Boolean(settings.autoTradingEnabled)} disabled={saving || (!settings.autoTradingEnabled && !runtimeAvailable)} onChange={(event) => onToggle ? onToggle(event.target.checked) : set('autoTradingEnabled', event.target.checked)} />
-          <span><strong>Auto-Trading {settings.autoTradingEnabled ? 'ON' : 'OFF'}</strong><small>ON by default for new workspaces. This toggle saves immediately; switch it off to stop new orders from being submitted. An order already sent to the broker cannot be recalled here.</small></span>
+          <input id="auto-trading-enabled" type="checkbox" checked={Boolean(settings.autoTradingEnabled)} disabled={saving || (!settings.autoTradingEnabled && !runtimeAvailable)} onChange={(event) => requestAutoTrading(event.target.checked)} />
+          <span><strong>Auto-Trading {settings.autoTradingEnabled ? 'ON' : 'OFF'}</strong><small>This toggle saves immediately. Switch it off whenever you want no new orders to be submitted.</small></span>
         </label>
+        <p className="risk-reminder">
+          <span>{RISK_REMINDER}</span>
+          <details className="risk-reminder-details">
+            <summary>What else applies to this switch</summary>
+            <ul>
+              {settings.breakEvenEnabled || settings.trailingStopEnabled
+                ? <li>Break-even and trailing-stop moves send further modify requests for trades Signal Desk opened, so protection follows the trade without you.</li>
+                : <li>Break-even and trailing-stop moves are off, so nothing protects an open trade automatically.</li>}
+              <li>An order that has already reached the broker cannot be recalled here; close it in your trading terminal.</li>
+              <li>Signals without a clear symbol, direction, or stop loss are saved for review and never traded, whatever this switch says.</li>
+              {settings.hasAcceptedRiskWarning === true ? <li>You confirmed the live-trading warning for this workspace, so it is not asked for again.</li> : <li>You have not confirmed the live-trading warning yet; you will be asked the first time you switch this on.</li>}
+            </ul>
+          </details>
+        </p>
         <p className="field-help">Break-even moves apply to positions Signal Desk opened; trades you placed yourself in the terminal keep their own stops. The open-trade limit counts open positions and pending orders. The daily trade limit counts new broker positions opened during the current UTC day. Signals without a clear direction, symbol, or stop loss are saved for review but are not traded.</p>
         <button className="button button-primary" type="submit" disabled={saving}>{saving ? 'Saving settings…' : 'Save settings'}</button>
       </form>
+      <RiskWarningModal
+        open={riskWarningOpen}
+        saving={saving}
+        onCancel={() => setRiskWarningOpen(false)}
+        onConfirm={confirmRiskWarning}
+      />
       <div className="execution-history" aria-labelledby="execution-history-title">
         <div className="execution-section-heading"><h3 id="execution-history-title">Recent execution activity</h3><p>Order outcomes and safe rejection reasons for this workspace.</p></div>
         {!trades.length ? <p className="field-help">No execution activity yet. Signals are only considered while Auto-Trading is on.</p> : <div className="execution-trade-list">{trades.slice(0, 8).map((trade) => <article className="execution-trade-row" key={trade.id}>

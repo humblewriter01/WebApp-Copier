@@ -24,7 +24,15 @@ await build({
 });
 assert.ok(existsSync(outfile), 'the component bundle was produced');
 
-const { default: ExecutionSettings, EXECUTION_WARNING, breakEvenSummary } = await import(pathToFileURL(outfile).href);
+const {
+  default: ExecutionSettings,
+  EXECUTION_WARNING,
+  breakEvenSummary,
+  RiskWarningModal,
+  needsRiskAcknowledgement,
+  RISK_REMINDER,
+  RISK_WARNING_COPY,
+} = await import(pathToFileURL(outfile).href);
 
 const baseSettings = {
   riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 3, dailyLossLimit: 5, autoTradingEnabled: true,
@@ -90,12 +98,46 @@ test('break-even outcomes are labelled per trade in the activity list', () => {
   assert.equal(markup.includes('execution-breakeven-undefined'), false, 'a trade without a break-even result renders no badge');
 });
 
-test('the live-trading warning keeps the exact required wording', () => {
-  assert.equal(
-    EXECUTION_WARNING,
-    'Warning: Enabling Auto-Trading will execute live trades on your connected broker account. Ensure you are using a demo account for testing. You are fully responsible for any financial losses.',
-  );
-  assert.ok(render().includes(EXECUTION_WARNING));
+test('the live-trading warning keeps the exact required wording, as a decision rather than decoration', () => {
+  const required = 'Warning: Enabling Auto-Trading will execute live trades on your connected broker account. You are fully responsible for any financial losses.';
+  assert.equal(RISK_WARNING_COPY.body, required, 'the sentence the workspace has to agree to, word for word');
+  assert.equal(EXECUTION_WARNING, required);
+  assert.equal(RISK_WARNING_COPY.confirm, 'I Understand');
+  assert.equal(RISK_WARNING_COPY.cancel, 'Cancel');
+
+  const markup = renderToStaticMarkup(React.createElement(RiskWarningModal, { open: true, onCancel() {}, onConfirm() {} }));
+  assert.ok(markup.includes(required));
+  assert.match(markup, /role="alertdialog"/);
+  assert.match(markup, /aria-modal="true"/);
+  assert.match(markup, /I Understand<\/button>/);
+  assert.match(markup, /Cancel<\/button>/);
+  // A demo-account caution is still worth saying, but as a point to read, not as a second warning.
+  assert.match(markup, /demo account/);
+  assert.equal(renderToStaticMarkup(React.createElement(RiskWarningModal, { open: false })), '', 'a closed acknowledgement renders nothing at all');
+});
+
+test('the panel no longer shouts, and keeps one quiet line under the switch instead', () => {
+  const markup = render({ settings: { breakEvenEnabled: false, trailingStopEnabled: false, hasAcceptedRiskWarning: true } });
+  assert.equal(markup.includes('execution-warning'), false, 'the giant red box is gone from a panel whose user has already agreed');
+  assert.equal(markup.includes(RISK_WARNING_COPY.body), false, 'the full warning is asked for, not printed on every visit');
+  assert.ok(markup.includes(RISK_REMINDER), 'Auto-Trading executes live orders. Trade at your own risk.');
+  assert.match(markup, /<details class="risk-reminder-details">/);
+  assert.match(markup, /cannot be recalled/i);
+  assert.match(markup, /Break-even and trailing-stop moves are off/, 'what is not protecting the trade is said as plainly as what is');
+});
+
+test('the warning is asked for the first time only, and cancelling is never an error', () => {
+  assert.equal(needsRiskAcknowledgement({ autoTradingEnabled: false, hasAcceptedRiskWarning: false }), true, 'the switch is going up for the first time');
+  assert.equal(needsRiskAcknowledgement({ autoTradingEnabled: false }), true, 'a missing answer is not an agreement');
+  assert.equal(needsRiskAcknowledgement(undefined), true);
+  assert.equal(needsRiskAcknowledgement({ autoTradingEnabled: false, hasAcceptedRiskWarning: true }), false, 'once agreed it is never asked again, including after switching back on');
+  assert.equal(needsRiskAcknowledgement({ autoTradingEnabled: true, hasAcceptedRiskWarning: false }), false, 'an already-live workspace is not interrupted by its own panel');
+
+  const unaccepted = render({ settings: { hasAcceptedRiskWarning: false } });
+  assert.match(unaccepted, /have not confirmed the live-trading warning yet/, 'a workspace that has never agreed is told so, in one line, without being blocked from reading the panel');
+  const accepted = render({ settings: { hasAcceptedRiskWarning: true } });
+  assert.match(accepted, /confirmed the live-trading warning for this workspace, so it is not asked for again/);
+  assert.equal(accepted.includes('have not confirmed'), false);
 });
 
 /* ------------------------------- the trailing stop ------------------------------- */

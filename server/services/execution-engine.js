@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { countSignalEntryDeals as countDailySignalEntryDeals, resolveBrokerSymbol } from './signal-parser.js';
 import { isPaidSubscriber, PAID_STATUSES } from './plan-limits.js';
+import { signalStatusForJobStatus } from './signal-outcome.js';
 
 const MAX_SIGNAL_AGE_MS = 120_000;
 const UTC_DAY_MS = 24 * 60 * 60 * 1000;
@@ -429,7 +430,13 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
       `UPDATE execution_jobs SET status=$1,error_message=$2,locked_at=NULL,updated_at=NOW() WHERE id=$3 AND user_id=$4`,
       [status, errorMessage || null, jobId, userId],
     );
-    await pool.query('UPDATE signals SET status=$1 WHERE id=(SELECT signal_id FROM execution_jobs WHERE id=$2 AND user_id=$3)', [status, jobId, userId]);
+    // The job table and the signal table describe one event in different words: a skipped job is a
+    // signal the workspace reads as unexecuted, and the reason travels with it so the panel never
+    // has to guess why nothing reached the broker.
+    await pool.query(
+      `UPDATE signals SET status=$1,execution_note=$2 WHERE id=(SELECT signal_id FROM execution_jobs WHERE id=$3 AND user_id=$4)`,
+      [signalStatusForJobStatus(status), ['skipped', 'expired', 'unknown'].includes(status) ? safeText(errorMessage) || null : null, jobId, userId],
+    );
   }
 
   async function stop(job, status, message) {
