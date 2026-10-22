@@ -213,3 +213,24 @@ export function assertAllowedImpersonation({ actorId, target }) {
     throw error;
   }
 }
+
+/**
+ * A failed administrative mutation used to arrive at the panel as one anonymous sentence, because an
+ * unexpected error has no status and its message is not safe to show. This names the action instead:
+ * the administrator reads which button failed and why in one line, while the status is kept for
+ * anything a validation chose deliberately. Sub-500 errors pass through untouched, because their
+ * message was written for the person who just typed it.
+ */
+export function adminActionError(action, error) {
+  const status = Number(error?.status) || 500;
+  if (status < 500) return error;
+  const wrapped = new Error(error?.message || `${action} could not be completed.`);
+  wrapped.status = status;
+  if (error?.code) wrapped.code = error.code;
+  if (error?.upgradeRequired) wrapped.upgradeRequired = true;
+  const detail = [error?.message, error?.detail].filter(Boolean).join(' - ').replace(/\s+/g, ' ').trim().slice(0, 180);
+  wrapped.userMessage = typeof error?.userMessage === 'string' && error.userMessage.trim()
+    ? error.userMessage
+    : `${action} did not complete${detail ? `: ${detail}` : ''}. Nothing was changed - please try again, and send us this reference if it fails twice.`;
+  return wrapped;
+}

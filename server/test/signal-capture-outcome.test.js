@@ -1,0 +1,204 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import {
+  decideSignalOutcome,
+  signalStatusForJobStatus,
+  SIGNAL_STATUSES,
+  UPGRADE_REQUIRED_NOTE,
+} from '../services/signal-outcome.js';
+import { createExecutionEngine } from '../services/execution-engine.js';
+
+const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+const engineSource = readFileSync(new URL('../services/execution-engine.js', import.meta.url), 'utf8');
+
+function section(source, startMarker, endMarker) {
+  const start = source.indexOf(startMarker);
+  assert.notEqual(start, -1, `${startMarker} is missing from the source`);
+  const end = source.indexOf(endMarker, start + startMarker.length);
+  return source.slice(start, end === -1 ? source.length : end);
+}
+
+const saveSignalBody = section(index, 'async function saveSignal(', '\nasync function startTelegramListener');
+const listenerBody = section(index, 'async function startTelegramListener(', '\nasync function restoreTelegramClient');
+const settingsPut = section(index, "app.put('/api/settings'", '\napp.get(\'/api/trades\'');
+
+const eligible = {
+  executionReady: true,
+  autoTradingEnabled: true,
+  runtimeEnabled: true,
+  paused: false,
+  subscriptionStatus: 'active',
+  accountSelected: true,
+  accountState: 'DEPLOYED',
+};
+
+test('a free workspace with no trading account is an unexecuted signal, never a missing one', () => {
+  const outcome = decideSignalOutcome({
+    executionReady: true,
+    autoTradingEnabled: true,
+    runtimeEnabled: true,
+    paused: false,
+    subscriptionStatus: undefined,
+    accountSelected: false,
+    accountState: undefined,
+  });
+  assert.equal(outcome.status, SIGNAL_STATUSES.unexecuted);
+  assert.equal(outcome.queue, false);
+  assert.equal(outcome.upgradeRequired, true);
+  assert.equal(outcome.note, UPGRADE_REQUIRED_NOTE);
+  // The sentence has to name the action the user can take, not just refuse them.
+  assert.match(outcome.note, /Upgrade to Starter or higher/);
+  assert.match(outcome.note, /saved for review/);
+});
+
+test('every condition that stops execution explains itself in the note', () => {
+  const cases = [
+    [{ accountSelected: false }, /No trading account is selected/],
+    [{ accountState: 'STOPPED' }, /not deployed/],
+    [{ runtimeEnabled: false }, /unavailable on this service/],
+    [{ paused: true }, /paused by Signal Desk/],
+    [{ autoTradingEnabled: false }, /Auto-Trading is off/],
+  ];
+  for (const [override, pattern] of cases) {
+    const outcome = decideSignalOutcome({ ...eligible, ...override });
+    assert.equal(outcome.status, 'autoTradingEnabled' in override ? SIGNAL_STATUSES.received : SIGNAL_STATUSES.unexecuted, JSON.stringify(override));
+    assert.equal(outcome.queue, false);
+    assert.match(outcome.note, pattern);
+  }
+});
+
+test('only a fully eligible Telegram signal is queued, and a hand-written note never is', () => {
+  assert.deepEqual(
+    { ...decideSignalOutcome(eligible), note: undefined },
+    { status: SIGNAL_STATUSES.queued, queue: true, note: undefined },
+  );
+  const manual = decideSignalOutcome({ ...eligible, manual: true });
+  assert.equal(manual.status, SIGNAL_STATUSES.received);
+  assert.equal(manual.note, null);
+  assert.equal(manual.queue, false);
+  const unparsed = decideSignalOutcome({ ...eligible, executionReady: false });
+  assert.equal(unparsed.status, SIGNAL_STATUSES.unparsed);
+  assert.equal(unparsed.note, null);
+});
+
+test('capture runs before any execution decision, so a signal cannot be lost to a plan or an account', () => {
+  assert.ok(saveSignalBody.includes('INSERT INTO signals'), 'the signal must be inserted');
+  assert.ok(saveSignalBody.includes('ON CONFLICT DO NOTHING'), 'a redelivered Telegram message stays a single row');
+  assert.equal(
+    saveSignalBody.indexOf('INSERT INTO signals') < saveSignalBody.indexOf('decideSignalOutcome'),
+    true,
+    'the execution outcome is recorded after the message is already saved, never as a condition for saving it',
+  );
+  // No branch may skip the insert because of plan, accounts, the runtime or the kill switch.
+  const beforeInsert = saveSignalBody.slice(0, saveSignalBody.indexOf('INSERT INTO signals'));
+  for (const blocked of ['isPaidSubscriber', 'subscription_status', 'metaapi_accounts', 'platformControls', 'autoTradingRuntimeEnabled']) {
+    assert.equal(beforeInsert.includes(blocked), false, `${blocked} must not gate whether a signal is stored`);
+  }
+  assert.doesNotMatch(saveSignalBody, /return fail\(/, 'saving a signal never answers with an error');
+});
+
+test('the Telegram listener only needs an enabled channel, never a plan or a connected broker', () => {
+  assert.match(listenerBody, /FROM channels WHERE user_id=\$1 AND channel_id=\$2 AND enabled=TRUE/);
+  for (const blocked of ['isPaidSubscriber', 'subscription', 'metaapi', 'planLimits', 'platformControls', 'auto_trading_enabled']) {
+    assert.equal(listenerBody.includes(blocked), false, `the listener must not consult ${blocked}`);
+  }
+  assert.ok(listenerBody.includes('await saveSignal('), 'a matching channel message is saved unconditionally');
+});
+
+test('the outcome is read back by every surface that lists signals', () => {
+  assert.equal((index.match(/execution_note AS "executionNote"/g) || []).length >= 3, true, 'signals list, dashboard and the save path all carry the note');
+  assert.match(index, /const queued = outcome\.queue === true|if \(outcome\.queue\) \{/);
+  assert.match(index, /UPDATE signals SET status=\$2,execution_note=\$3 WHERE id=\$1 RETURNING status,execution_note AS "executionNote"/);
+});
+
+test('a skipped job is an unexecuted signal, and a trade clears the stale reason', () => {
+  assert.equal(signalStatusForJobStatus('skipped'), SIGNAL_STATUSES.unexecuted);
+  assert.equal(signalStatusForJobStatus('expired'), SIGNAL_STATUSES.expired);
+  assert.equal(signalStatusForJobStatus('unknown'), SIGNAL_STATUSES.unknown);
+  assert.equal(signalStatusForJobStatus('executed'), 'executed');
+  assert.equal(signalStatusForJobStatus(undefined), SIGNAL_STATUSES.received);
+  assert.match(engineSource, /UPDATE signals SET status=\$1,execution_note=\$2 WHERE id=\(SELECT signal_id FROM execution_jobs WHERE id=\$3 AND user_id=\$4\)/);
+});
+
+const baseItem = {
+  job_id: 'job-1', user_id: 'user-1', job_status: 'processing', expires_at: new Date(Date.now() + 120000),
+  signal_id: 'signal-1', source: 'telegram', signal_created_at: new Date(), symbol: 'EURUSD', side: 'buy',
+  entry_price: null, stop_loss: 1.09, take_profit: 1.12, execution_ready: true, parse_error: null,
+  auto_trading_enabled: true, lot_size_mode: 'fixed', fixed_lot_size: 0.01, risk_percent: 1,
+  max_open_positions: 3, max_daily_trades: 10, daily_loss_limit: 5, execution_account_id: 'account-1',
+  metaapi_account_id: 'account-1', managed_by_app: true, account_state: 'DEPLOYED',
+  subscription_status: 'active', subscription_plan: 'pro',
+};
+
+function fakePool(subscriptionStatus) {
+  const calls = [];
+  return {
+    calls,
+    async query(sql, params = []) {
+      calls.push({ sql, params });
+      if (sql.includes('SELECT ej.id AS job_id')) return { rows: [{ ...baseItem, subscription_status: subscriptionStatus }] };
+      if (sql.includes('SELECT auto_trading_enabled AS "autoTradingEnabled"')) return { rows: [{ autoTradingEnabled: true, executionAccountId: 'account-1' }] };
+      if (sql.includes('SELECT baseline_equity')) return { rows: [{ baseline_equity: 1000 }] };
+      if (sql.includes('SELECT COUNT(*)::int AS count FROM trades')) return { rows: [{ count: 0 }] };
+      if (sql.includes('INSERT INTO trades')) return { rows: [{ id: 'trade-1' }] };
+      return { rows: [], rowCount: 1 };
+    },
+  };
+}
+
+function fakeTrading() {
+  const calls = [];
+  return {
+    calls,
+    async getAccountState() {
+      return {
+        account: { state: 'DEPLOYED' }, accountInformation: { balance: 1000, equity: 1000 },
+        positions: [], orders: [], deals: [],
+        specification: { symbol: 'EURUSD', minVolume: 0.01, maxVolume: 20, volumeStep: 0.01, tickSize: 0.0001 },
+        price: { bid: 1.1, ask: 1.1002, lossTickValue: 1, time: new Date().toISOString() },
+      };
+    },
+    async createMarketOrder(order) {
+      calls.push(order);
+      return { stringCode: 'TRADE_RETCODE_DONE', numericCode: 10009, orderId: 'broker-order-1', positionId: 'broker-position-1' };
+    },
+  };
+}
+
+test('the engine records why a free plan was not executed, on the signal the user reads', async () => {
+  const pool = fakePool('incomplete');
+  const trading = fakeTrading();
+  const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true, isTradingPaused: async () => false });
+  const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.equal(result.status, 'skipped');
+  assert.equal(trading.calls.length, 0, 'a free plan never reaches the broker');
+  const signalUpdate = pool.calls.find(({ sql }) => sql.includes('UPDATE signals SET status'));
+  assert.ok(signalUpdate, 'the signal row is updated with the outcome');
+  assert.equal(signalUpdate.params[0], 'unexecuted');
+  assert.match(signalUpdate.params[1], /needs a paid plan|paid plan/);
+  const jobUpdate = pool.calls.find(({ sql }) => sql.includes('UPDATE execution_jobs'));
+  assert.equal(jobUpdate.params[0], 'skipped', 'the job keeps its own vocabulary');
+});
+
+test('a paid workspace that does reach the broker has no warning note left on the signal', async () => {
+  const pool = fakePool('active');
+  const trading = fakeTrading();
+  const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true, isTradingPaused: async () => false });
+  await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  const signalUpdate = pool.calls.filter(({ sql }) => sql.includes('UPDATE signals SET status')).pop();
+  assert.equal(signalUpdate.params[0], 'executed');
+  assert.equal(signalUpdate.params[1], null);
+  assert.equal(trading.calls.length, 1);
+});
+
+test('the execution switches belong to every workspace, with the live-money acknowledgement as the only gate', () => {
+  assert.doesNotMatch(settingsPut, /isPaidSubscriber/, 'no plan check may stand between a user and their own switches');
+  assert.doesNotMatch(settingsPut, /PLAN_REQUIRED/);
+  assert.match(settingsPut, /hasAcceptedRiskWarning/);
+  assert.match(settingsPut, /Confirm the live-trading warning before Auto-Trading is turned on\. Nothing has been changed\./);
+  assert.match(settingsPut, /has_accepted_risk_warning=EXCLUDED\.has_accepted_risk_warning/);
+  assert.match(settingsPut, /if \(previousRows\[0\]\?\.hasAcceptedRiskWarning === true\) hasAcceptedRiskWarning = true;/);
+  // The engine still refuses the order itself, which is where the plan limit actually lives.
+  assert.match(engineSource, /if \(!isPaidSubscriber\(\{ subscription_status: item\.subscription_status \}\)\) \{/);
+});

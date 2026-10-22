@@ -18,6 +18,8 @@ A deployable React/Vite and Express app for capturing Telegram channel messages,
 ## Important safety and data notes
 
 - **Live orders are only ever placed for a user who switched Auto-Trading on.** Every new workspace starts with the setting on so the feature is usable immediately, but nothing is submitted until that user also selects an owned, deployed trading account, is on a paid plan, and every safety gate passes. Turning Auto-Trading off is immediate and stops *all* writes to the broker, including break-even stop moves.
+- **Capturing signals is not a paid feature and is never a trading decision.** A workspace that has connected Telegram and chosen at least one channel receives and stores every message from those channels, whatever its plan and whether or not it has a MetaAPI account at all. What a plan decides is whether the stored signal is *queued* for the broker; a signal that could not be executed is saved with the reason written next to it (`Not executed`, with the upgrade sentence where a plan is what is missing), so an inactive workspace reads an explanation instead of an empty panel.
+- **The live-trading warning is a decision, not wallpaper.** The first time a workspace switches Auto-Trading on, a dialog states that live orders will be placed and that the losses are theirs, and asks for `I Understand`; the answer is stored on the workspace (`settings.has_accepted_risk_warning`) and the panel afterwards carries one quiet line under the switch. `Cancel` leaves the switch exactly where it was and is never reported as a failure.
 - Signal Desk never closes or partially closes a position and never widens a stop loss. It places market orders and, when break even or a trailing stop is enabled, moves the stop of a position it opened itself to a price that reduces risk — once, or repeatedly at a fixed distance.
 - An ambiguous broker or network failure on an order or a stop move is recorded as `unknown` and is **not** retried automatically, because the broker may already have accepted the first request. The activity list says so; reconcile that position on the broker account.
 - The API uses `METAAPI_PROVISIONING_TOKEN` only on the server. Users enter their broker login and password on MetaAPI's HTTPS setup page; Signal Desk does not receive or store those credentials.
@@ -156,7 +158,7 @@ Signal Desk sells a free tier and three paid plans. Every price, limit, and labe
 | Pro | ₦105,000 / month | 3 | 50 | 500 |
 | Premium | ₦150,000 / month | 5 | 100 | 2,000 |
 
-The paid prices are set against what a MetaAPI account costs this workspace each month, so one automated account is the cheapest paid tier and every step up pays for more accounts and more traffic. **Free cannot execute at all**, which is enforced in two places rather than one: `maxTradingAccounts: 0` blocks a new link, and the execution worker plus the Auto-Trading and Break-even switches require a paid subscription — so a workspace that connected an account while it was paying and later lapsed still cannot place orders.
+The paid prices are set against what a MetaAPI account costs this workspace each month, so one automated account is the cheapest paid tier and every step up pays for more accounts and more traffic. **Free cannot execute at all**, and that is enforced where an order would be created rather than where a preference is stored: `maxTradingAccounts: 0` blocks a new link, the execution worker refuses an order for an unpaid workspace, and the same refusal is re-checked immediately before the broker call — so a workspace that connected an account while it was paying and later lapsed still cannot place orders. Signal capture and the workspace's own switches (Auto-Trading, break even, trailing stop) are *not* plan-gated: a Free user can state their intent, sees every captured signal, and is told per signal that execution needs an upgrade. Gating the switches themselves produced a red banner for a setting nobody could change and added no safety.
 
 A limit of `0` is a real limit, not "unset": it survives the `plan_limits` snapshot, and the error says the tier does not include that thing rather than announcing a zero allowance. For any plan the catalogue still lists, the deployed definition outranks the snapshot stored at purchase, so re-pricing or re-limiting a tier cannot leave existing subscribers on allowances nobody advertises; a snapshot only carries a retired plan key.
 
@@ -201,6 +203,14 @@ Configure in Render → API service → Environment:
 | `PAYSTACK_API_URL` | No | HTTPS base URL override; defaults to `https://api.paystack.co`. |
 
 Then add the webhook URL in the Paystack dashboard (Settings → API Keys & Webhooks), in the same mode as the key (test or live): `https://<api-service-host>/api/billing/webhook`, with `charge.success` and the `invoice.*` and `subscription.*` events above enabled (renewals and cancellations arrive through them). The callback URL is derived from `CLIENT_URL`, so that variable must be the exact public frontend origin.
+
+## Failure messages that survive the round trip
+
+Any request can fail for a reason the frontend has no way to invent, so the rule in `client/src/lib/api.js` is that the server's own sentence is what the user reads. Three cases are told apart, because they need different advice:
+
+- **A refusal with a status** (`400`, `402`, `409`, `429`) keeps its message, since that sentence was written for the person who just pressed the button.
+- **A server error with a body** returns `userMessage` when the route set one — administrative mutations do, through `adminActionError(action, error)` in `server/services/admin.js`, which names the action that failed (`Adjusting that plan did not complete: …`) — plus a `code` (`UNEXPECTED` when nothing chose one) and a short `requestId`. The same reference is on the `Request failed` log line, together with the method and path, so "the admin panel said no" becomes a searchable line instead of a screenshot. The raw internal message is never the headline for a status-less failure, because it can name a table or a column.
+- **A response that never came from the app** — an empty body or an HTML error page from the proxy, typical of a service that is waking up — is described as that, and says plainly that the change may not have been applied. `error.retryable` is set so a panel can offer a retry instead of implying the user's data is wrong.
 
 ## Admin panel
 
@@ -262,6 +272,8 @@ The server enforces what the banner promises:
 Paystack is not touched: the response says so, and says so again when a gateway subscription is attached, because that renewal keeps its own schedule until it is cancelled in Payments. Every adjustment is written to `admin_audit_logs` (`subscription.grant`, `subscription.extend`, `subscription.clear`).
 
 ### Announcements
+
+Publishing is one insert, answered with the stored row, then audited with the target id. A failed publish answers with `Publishing that announcement did not complete: …` — the action named, the cause quoted, and the reference that ties it to a log line — and the panel keeps what was typed so the retry is one click.
 
 `announcements` rows carry the message, a severity (`info`, `warning`, `critical`), an optional start and end window, and an active flag. A user's dashboard shows up to three live banners at the top of the workspace through `GET /api/announcements/active`, and dismissal is stored per user in `announcement_dismissals` - dismissing on one device does not dismiss it for anybody else, and it does not come back on reload. Retiring an announcement keeps the row (with its dismissal counts and audit trail) instead of deleting it. Severity only changes presentation, except `critical`, which is announced to screen readers as an alert.
 
@@ -337,7 +349,7 @@ The static site is served over HTTPS and includes a linked web app manifest, 192
 - `POST /api/billing/webhook` – Paystack callback, authenticated by signature only
 - `GET /api/dashboard`
 - `GET/POST /api/channels`, `DELETE /api/channels/:id`
-- `GET/POST /api/signals`
+- `GET/POST /api/signals` — every stored message with its outcome: `status` (`received`, `queued`, `unexecuted`, `expired`, `unparsed`, `executed`) and `executionNote`, the sentence explaining an outcome that was not a trade
 - `GET/POST /api/accounts`, `DELETE /api/accounts/:id`
 - `GET/PUT /api/settings` – risk limits, lot sizing, selected execution account, break-even trigger/offset, and trailing distance; `GET` also reports the platform's own execution switch so the panel can explain a pause instead of leaving a user to hunt for a toggle that is already on
 - `GET /api/trades` – execution activity, including the break-even outcome for each position

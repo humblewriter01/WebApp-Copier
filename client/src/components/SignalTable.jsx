@@ -1,5 +1,6 @@
 import React from 'react';
 import { useTelegramStatus, WAITING_FOR_MESSAGES_MESSAGE } from './TelegramStatus.jsx';
+import { signalOutcomeView } from '../lib/signal-outcome.js';
 
 /**
  * What the signal list says when it is empty — decided entirely by the confirmed Telegram
@@ -48,12 +49,21 @@ function SignalEmpty({ channelCount, onOpenTelegram, view }) {
   </div>;
 }
 
-export default function SignalTable({ signals, channelCount = 0, onOpenTelegram }) {
+/**
+ * Every captured message is shown with what became of it. A free workspace, or one with no trading
+ * account connected, is exactly the case where silence reads as failure: the signal is there, and
+ * the reason it was not traded has to be as visible as the signal itself.
+ */
+export default function SignalTable({ signals, channelCount = 0, onOpenTelegram, onUpgrade }) {
   const { view } = useTelegramStatus();
   if (!signals?.length) return <SignalEmpty channelCount={channelCount} onOpenTelegram={onOpenTelegram} view={view} />;
-  return <div className="signal-list">{signals.map((signal) => <article className="signal-item" key={signal.id}>
-    <div className="signal-top"><div><strong>{signal.symbol || 'Signal message'}</strong><span className="signal-source">{signal.channelTitle || 'Telegram chat'}</span></div><span className={`badge ${signal.side === 'buy' ? 'badge-buy' : signal.side === 'sell' ? 'badge-sell' : ''}`}>{signal.side || 'received'}</span></div>
+  return <div className="signal-list">{signals.map((signal) => {
+    const outcome = signalOutcomeView(signal);
+    return <article className={`signal-item outcome-${outcome.tone}`} key={signal.id}>
+    <div className="signal-top"><div><strong>{signal.symbol || 'Signal message'}</strong><span className="signal-source">{signal.channelTitle || 'Telegram chat'}</span></div><div className="signal-flags"><span className={`badge ${signal.side === 'buy' ? 'badge-buy' : signal.side === 'sell' ? 'badge-sell' : ''}`}>{signal.side || 'received'}</span><span className={`badge signal-outcome tone-${outcome.tone}`}>{outcome.label}</span></div></div>
     <p className="signal-message">{signal.message}</p>
     <div className="signal-meta">{signal.entryPrice != null && <span>Entry {signal.entryPrice}</span>}{signal.stopLoss != null && <span>SL {signal.stopLoss}</span>}{signal.takeProfit != null && <span>TP {signal.takeProfit}</span>}<time>{signal.createdAt ? new Date(signal.createdAt).toLocaleString() : ''}</time></div>
-  </article>)}</div>;
+    {outcome.showNote ? <p className="signal-outcome-note"><span>{outcome.note}</span>{outcome.upgradeRequired && onUpgrade ? <button className="text-button" type="button" onClick={onUpgrade}>See plans</button> : null}</p> : null}
+  </article>;
+})}</div>;
 }

@@ -173,6 +173,13 @@ export async function initializeDatabase() {
      * "never widen a stop" and "never act on a stale quote" are enforced once, not per mode. */
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS trailing_stop_enabled BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS trailing_stop_distance_points NUMERIC NOT NULL DEFAULT 10;
+    /* The signal row carries the reason nothing was sent to your broker, not just a status code,
+     * so "saved but not executed" is explainable to the user long after the worker moved on.
+     * Capture itself never depends on this: the message is stored before any of it is consulted. */
+    ALTER TABLE signals ADD COLUMN IF NOT EXISTS execution_note TEXT;
+    /* The live-trading warning is shown once per workspace and the answer is remembered here, so
+     * the settings panel can keep a one-line reminder instead of a permanent wall of red. */
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS has_accepted_risk_warning BOOLEAN NOT NULL DEFAULT FALSE;
     CREATE TABLE IF NOT EXISTS break_even_moves (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
