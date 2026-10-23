@@ -434,6 +434,14 @@ export async function initializeDatabase() {
      * Turning it off changes what is sent to the broker, so it is stored beside the other execution
      * limits and read on every capture instead of being remembered in memory. */
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS block_execution_without_stop_loss BOOLEAN NOT NULL DEFAULT TRUE;
+    /* Fallback safety nets. A provider that forgets a stop is not a reason to trade naked, so a
+     * workspace may state its own distance - in broker points, the same unit as the break-even and
+     * trailing settings - which is applied to whichever leg the signal did not carry. NULL means "no
+     * net", which is every workspace's starting state, and a distance is validated by the settings
+     * route rather than clamped here, so a typo can never silently become somebody's stop. */
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS fallback_stop_loss_points NUMERIC;
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS fallback_take_profit_points NUMERIC;
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS block_execution_without_take_profit BOOLEAN NOT NULL DEFAULT TRUE;
   `);
   const adminAccess = createAdminAccess();
   if (adminAccess.emails.length) {

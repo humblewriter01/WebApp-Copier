@@ -72,6 +72,10 @@ export default function ExecutionSettings({ settings, accounts = [], trades = []
   // Absent means on: the guard is the safe reading, and a settings object that has not been saved since
   // this switch existed must not silently become the permissive one.
   const blockMissingStop = settings.blockExecutionWithoutStopLoss !== false;
+  const blockMissingTarget = settings.blockExecutionWithoutTakeProfit !== false;
+  /* Either rule being on is worth saying on the folded header: a reader who switched the stop block off
+     must not conclude from "Allowed" that nothing here refuses an order any more. */
+  const safetyBlocking = blockMissingStop || blockMissingTarget;
   const set = (key, value) => onChange({ ...settings, [key]: value });
 
   return (
@@ -185,8 +189,8 @@ export default function ExecutionSettings({ settings, accounts = [], trades = []
           <details className="execution-advanced">
             <summary>
               <span className="execution-advanced-title">Advanced Safety</span>
-              <span className={`badge execution-advanced-state ${blockMissingStop ? 'on' : 'off'}`}>{blockMissingStop ? 'Blocking' : 'Allowed'}</span>
-              <span className="execution-advanced-hint">What Signal Desk refuses to send</span>
+              <span className={`badge execution-advanced-state ${safetyBlocking ? 'on' : 'off'}`}>{safetyBlocking ? 'Blocking' : 'Allowed'}</span>
+              <span className="execution-advanced-hint">What Signal Desk refuses to send, and what it supplies itself</span>
             </summary>
             <p className="execution-advanced-intro">These are the rules that decide whether a captured signal is ever allowed to become an order. They are folded away because most workspaces never need to change them &mdash; the default is the strictest reading.</p>
             <label className="execution-toggle-row" htmlFor="block-missing-stop">
@@ -196,11 +200,30 @@ export default function ExecutionSettings({ settings, accounts = [], trades = []
                 <small>While this is on, a signal with no stop loss is saved for review and never sent to your broker. Turning it off lets a signal without a stop be executed &mdash; only in Fixed Lot mode, because a Risk-Based size is calculated from the distance to a stop that would not exist. Nothing else is relaxed: a signal still needs a symbol, a direction the channel actually stated (or an inferred one, which is never traded), a fresh price, your own Auto-Trading switch, and an account Signal Desk manages.</small>
               </span>
             </label>
+            <label className="execution-toggle-row" htmlFor="block-missing-target">
+              <input id="block-missing-target" type="checkbox" checked={blockMissingTarget} disabled={saving} onChange={(event) => set('blockExecutionWithoutTakeProfit', event.target.checked)} />
+              <span>
+                <strong>Block execution if Take Profit is missing {blockMissingTarget ? 'ON' : 'OFF'}</strong>
+                <small>A position with no target has nothing that closes it: it runs until you, the market, or its stop does. While this is on, a signal with no take-profit target is saved for review and never sent to your broker. Turning it off is the deliberate choice to hold an open trade with no exit planned &mdash; and with the stop-loss block off as well, that trade is naked on both sides, which Signal Desk marks as an override wherever it can be read afterwards.</small>
+              </span>
+            </label>
+            <div className="form-row execution-fallback-fields">
+              <label htmlFor="fallback-stop-loss">Fallback Stop Loss (points)
+                <input id="fallback-stop-loss" type="number" min="1" max="1000000" step="1" placeholder="None" value={settings.fallbackStopLossPoints ?? ''} disabled={saving} onChange={(event) => set('fallbackStopLossPoints', event.target.value === '' ? null : event.target.value)} />
+                <small>We cannot let a trade run naked because the provider forgot. This distance is used only when a signal states no stop loss of its own &mdash; what the channel wrote always wins. It is measured from the price the order is sent at and aligned onto the symbol&rsquo;s tick grid away from the market, so rounding can never tighten your risk. On most FX pairs 10 points is one pip. Blank means no fallback.</small>
+              </label>
+              <label htmlFor="fallback-take-profit">Fallback Take Profit (points)
+                <input id="fallback-take-profit" type="number" min="1" max="1000000" step="1" placeholder="None" value={settings.fallbackTakeProfitPoints ?? ''} disabled={saving} onChange={(event) => set('fallbackTakeProfitPoints', event.target.value === '' ? null : event.target.value)} />
+                <small>The same rescue for the other leg: a target placed this far beyond the order price when the channel stated none. A fallback that this symbol&rsquo;s broker would refuse is reported as unusable rather than ignored, and the block above then decides. Blank means no fallback.</small>
+              </label>
+            </div>
             <ul className="execution-advanced-facts">
-              <li>Only new, clearly parsed Telegram signals with a valid stop loss can be considered while this is on.</li>
+              <li>Only new, clearly parsed Telegram signals are considered at all; while a block is on, a signal missing that leg needs a fallback distance to be sent.</li>
               <li>A signal whose direction had to be inferred from its prices is never executed, whatever this switch says.</li>
               <li>Changing this applies to signals captured after it is saved; a trade already open keeps its own stop.</li>
-              <li>Missing or multiple targets are shown as they are, and never decide on their own whether an order is sent.</li>
+              <li>Missing or multiple targets are shown as they are; the block above is what decides, not the parser.</li>
+              <li>A fallback prices the missing leg when the order is sent, from a live quote &mdash; never from the signal&rsquo;s entry price, which may be hours old.</li>
+              <li>A trade sent without a leg because a block is off is logged as a User Override and left with a note on the signal, so it can be found afterwards.</li>
             </ul>
             <p className="field-help">Saved with the rest of these settings, when you press Save settings below.</p>
           </details>

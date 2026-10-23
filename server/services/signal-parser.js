@@ -120,11 +120,6 @@ export function parseSignal(message) {
   };
 }
 
-/** Whether a parse result is blocked only by a missing stop loss (the case the safety toggle governs). */
-export function isBlockedOnlyByStopLoss(parsed) {
-  const blockers = parsed?.blockers ?? [];
-  return blockers.length > 0 && blockers.every((blocker) => blocker.code === 'stop-loss-missing');
-}
 
 export function resolveBrokerSymbol(signalSymbol, specifications) {
   const candidate = normalizeSymbol(signalSymbol);

@@ -7,7 +7,8 @@ const baseItem = {
   signal_id: 'signal-1', source: 'telegram', signal_created_at: new Date(), symbol: 'EURUSD', side: 'buy',
   entry_price: null, stop_loss: 1.09, take_profit: 1.12, execution_ready: true, parse_error: null,
   auto_trading_enabled: true, lot_size_mode: 'fixed', fixed_lot_size: 0.01, risk_percent: 1,
-  block_execution_without_stop_loss: true,
+  block_execution_without_stop_loss: true, block_execution_without_take_profit: true,
+  fallback_stop_loss_points: null, fallback_take_profit_points: null,
   max_open_positions: 3, max_daily_trades: 10, daily_loss_limit: 5, execution_account_id: 'account-1',
   metaapi_account_id: 'account-1', managed_by_app: true, account_state: 'DEPLOYED',
   subscription_status: 'active', subscription_plan: 'pro',
@@ -34,7 +35,8 @@ function orderCalls(trading) {
   return trading.calls.filter((call) => call?.order);
 }
 
-function fakeTrading() {
+/** `stopsLevel` is only ever set by the tests that need a broker with a minimum stop distance. */
+function fakeTrading({ stopsLevel } = {}) {
   const calls = [];
   return {
     calls,
@@ -43,7 +45,7 @@ function fakeTrading() {
       return {
         account: { state: 'DEPLOYED' }, accountInformation: { balance: 1000, equity: 1000 },
         positions: [], orders: [], deals: [],
-        specification: { symbol: 'EURUSD', minVolume: 0.01, maxVolume: 20, volumeStep: 0.01, tickSize: 0.0001 },
+        specification: { symbol: 'EURUSD', minVolume: 0.01, maxVolume: 20, volumeStep: 0.01, tickSize: 0.0001, ...(stopsLevel ? { stopsLevel } : {}) },
         price: { bid: 1.1, ask: 1.1002, lossTickValue: 1, time: new Date().toISOString() },
       };
     },
@@ -89,6 +91,98 @@ test('the guard cannot be switched off into risk-based sizing, which is calculat
   assert.equal(result.status, 'skipped');
   assert.match(result.message, /cannot be sized safely/);
   assert.equal(orderCalls(trading).length, 0);
+});
+
+/* The take-profit block, the second half of the same idea: a provider that forgot a target used to be
+   able to leave a filled position running with nothing to close it. */
+test('a signal with no take-profit target is refused while the workspace guard is on', async () => {
+  const pool = fakePool({ item: { take_profit: null, block_execution_without_stop_loss: true, block_execution_without_take_profit: true } });
+  const trading = fakeTrading();
+  const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true });
+  const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.equal(result.status, 'skipped');
+  assert.match(result.message, /require a take-profit target/);
+  assert.equal(orderCalls(trading).length, 0, 'a position with nothing to close it is not sent because the stop is fine');
+});
+
+test('the target block is independent of the stop block', async () => {
+  // The stop is present, the target is not, and only the second one is switched off: the order goes out
+  // protected on the side the signal stated and naked on the side the user chose to allow.
+  const pool = fakePool({ item: { take_profit: null, block_execution_without_stop_loss: true, block_execution_without_take_profit: false } });
+  const trading = fakeTrading();
+  const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true });
+  const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.equal(result.status, 'executed');
+  const order = trading.calls.find((call) => call?.order)?.order;
+  assert.equal(order.stopLoss, 1.09, 'the signal\'s own stop still goes out');
+  // `null` is what the order carries for a leg that does not exist, which the broker adapter turns into
+  // an omitted field. Neither is allowed to become 0, the number that means "stop at zero".
+  assert.equal(order.takeProfit, null, 'a missing target is never sent as 0');
+});
+
+test('a missing leg is completed from the workspace fallback distance', async () => {
+  // 100 points under the order price and 200 above it, measured from the quote this order is sent at
+  // (ask 1.1002) on a 0.0001 tick - not from the signal's entry price, which may be hours old.
+  const pool = fakePool({ item: { stop_loss: null, take_profit: null, fallback_stop_loss_points: 100, fallback_take_profit_points: 200 } });
+  const trading = fakeTrading();
+  const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true });
+  const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.equal(result.status, 'executed', 'a fallback is a stop, so the block is satisfied rather than overridden');
+  const order = trading.calls.find((call) => call?.order)?.order;
+  assert.equal(order.stopLoss, 1.0902);
+  assert.equal(order.takeProfit, 1.1202);
+  const inserted = pool.calls.find(({ sql }) => sql.includes('INSERT INTO trades'));
+  assert.ok(inserted.params.includes(1.0902) && inserted.params.includes(1.1202), 'the trade row stores the legs that were actually sent');
+  const mirrored = pool.calls.find(({ sql }) => sql.includes('UPDATE signals SET status='));
+  assert.ok(mirrored.params.some((value) => String(value).includes('Your Safety fallback distances were used')), 'the signal explains where its stop came from');
+  assert.match(mirrored.params.find((value) => String(value).startsWith('Your Safety')), /stop loss 100 points below the order price and target 200 points above it\./);
+});
+
+test("the signal's own levels win over the fallback", async () => {
+  const pool = fakePool({ item: { fallback_stop_loss_points: 1, fallback_take_profit_points: 1 } });
+  const trading = fakeTrading();
+  const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true });
+  const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.equal(result.status, 'executed');
+  const order = trading.calls.find((call) => call?.order)?.order;
+  assert.equal(order.stopLoss, 1.09, 'a provider that stated its stop is never overwritten by the workspace');
+  assert.equal(order.takeProfit, 1.12);
+  const mirrored = pool.calls.find(({ sql }) => sql.includes('UPDATE signals SET status='));
+  assert.equal(mirrored.params.includes(null), true, 'nothing was borrowed, so nothing is explained on the row');
+  assert.equal(mirrored.params.some((value) => String(value).includes('fallback')), false);
+});
+
+test('a fallback the broker would refuse stops the order instead of being dropped', async () => {
+  /* Sending a 10-point stop to a symbol whose broker demands 50 is how a request comes back
+     INVALID_STOPS - or, worse, fills and is closed by a level nobody chose. The distance is reported as
+     unusable and the block applies to the leg as if no fallback existed. */
+  const pool = fakePool({ item: { stop_loss: null, block_execution_without_stop_loss: true, fallback_stop_loss_points: 10 } });
+  const trading = fakeTrading({ stopsLevel: 50 });
+  const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true });
+  const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.equal(result.status, 'skipped');
+  assert.match(result.message, /requires stops at least 50 points from the market, and the fallback distance is 10/);
+  assert.equal(orderCalls(trading).length, 0);
+});
+
+test('an override is logged as one, with the account it happened on', async () => {
+  const warnings = [];
+  const pool = fakePool({ item: { stop_loss: null, take_profit: null, block_execution_without_stop_loss: false, block_execution_without_take_profit: false } });
+  const trading = fakeTrading();
+  const engine = createExecutionEngine({
+    pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true,
+    logger: { warn: (line) => warnings.push(JSON.parse(line)), error: () => {}, info: () => {} },
+  });
+  const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.equal(result.status, 'executed');
+  assert.deepEqual(warnings.map((warning) => warning.message), [
+    'Trade executed without Stop Loss (User Override). No fallback distance is configured.',
+    'Trade executed without Take Profit (User Override). No fallback distance is configured.',
+  ]);
+  assert.equal(warnings[0].userId, 'user-1');
+  assert.equal(warnings[0].jobId, 'job-1');
+  assert.equal(warnings[0].symbol, 'EURUSD');
+  assert.equal(warnings.every((warning) => warning.level === 'warn'), true);
 });
 
 test('runtime OFF is a hard gate and cannot call the broker adapter', async () => {
