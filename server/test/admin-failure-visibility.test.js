@@ -57,11 +57,17 @@ test('a failure after the write stops promising that nothing was changed', () =>
   assert.match(after.userMessage, /^Suspend that account did not complete: connection terminated\. /, 'the action and the cause are still named');
 });
 
-test('each of the three routes marks the moment its write landed, and not before', () => {
+test('each admin mutation route marks the moment its write landed, and not before', () => {
   const routes = [
     ["app.patch('/api/admin/users/:id', authenticate", 'markApplied(req)', 'const { rows } = await pool.query(statement.sql, statement.params);'],
     ["app.post('/api/admin/announcements', authenticate", 'markApplied(req)', 'announcement = await announcementService.publish({ draft, actorId: req.userId });'],
     ["app.patch('/api/admin/users/:id/subscription', authenticate", 'markApplied(req)', "await client.query('COMMIT');"],
+    /* The three clears. They are in this list because a delete is the worst case for the sentence
+     * "Nothing was changed": if the audit write fails after a wipe, an answer that still promises that
+     * nothing happened tells the administrator to do the destructive thing again. */
+    ["app.delete('/api/admin/health/errors', authenticate", 'markApplied(req)', 'const { rowCount } = await pool.query(statement.sql, statement.params);'],
+    ["app.delete('/api/admin/audit-logs', authenticate", 'markApplied(req)', 'const { rowCount } = await pool.query(statement.sql, statement.params);'],
+    ["app.delete('/api/admin/announcements/history', authenticate", 'markApplied(req)', 'const { rowCount } = await pool.query(statement.sql, statement.params);'],
   ];
   for (const [start, marker, write] of routes) {
     const from = index.indexOf(start);
@@ -82,6 +88,9 @@ test('every admin mutation the panel exposes runs through the naming wrapper', (
     "app.patch('/api/admin/users/:id', authenticate, requireAdmin, adminRoute('Updating that account'",
     "app.patch('/api/admin/users/:id/subscription', authenticate, requireAdmin, adminRoute('Adjusting that plan'",
     "app.post('/api/admin/announcements', authenticate, requireAdmin, adminRoute('Publishing that announcement'",
+    "app.delete('/api/admin/health/errors', authenticate, requireAdmin, adminRoute('Clearing the Telegram parsing errors'",
+    "app.delete('/api/admin/audit-logs', authenticate, requireAdmin, adminRoute('Clearing the audit log'",
+    "app.delete('/api/admin/announcements/history', authenticate, requireAdmin, adminRoute('Clearing the banner history'",
   ]) {
     assert.ok(index.includes(route), `${route} is wrapped`);
   }

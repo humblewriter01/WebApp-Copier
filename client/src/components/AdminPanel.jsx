@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { request } from '../lib/api.js';
 import { healthCheckTone, killSwitchView } from '../lib/platform-view.js';
 import ConfirmModal from './ConfirmModal.jsx';
+import AdminActionModal from './AdminActionModal.jsx';
 
 const PAGE_SIZE = 25;
 const SECTIONS = [
@@ -27,6 +28,38 @@ const SYNC_COPY = {
   not_configured: 'Paystack not configured',
   pending: 'Not synced yet',
 };
+
+/**
+ * What each "Clear history" button asks before it asks the server, and what it says it removed.
+ *
+ * They share one state slot, one modal, and one handler on purpose: a destructive admin button that
+ * reaches the network without going through this map is the bug, so the endpoints live here and the
+ * handler has nothing to special-case. The first sentence of each body is the one the user has to
+ * answer to; it names what is permanently deleted, in the words the panel already uses for that list.
+ */
+const CLEAR_HISTORY = Object.freeze({
+  errors: {
+    endpoint: '/api/admin/health/errors',
+    title: 'Clear the recorded parsing errors?',
+    confirmLabel: 'Clear parsing errors',
+    first: 'Are you sure you want to permanently delete all Telegram parsing errors? This cannot be undone.',
+    rest: 'Only the reason recorded against a captured message is removed. The message itself stays in that workspace\'s Signal History, so anything misread can still be reviewed or deleted one by one.',
+  },
+  audit: {
+    endpoint: '/api/admin/audit-logs',
+    title: 'Clear the administrator audit log?',
+    confirmLabel: 'Delete every entry',
+    first: 'Are you sure you want to permanently delete all audit entries? This cannot be undone.',
+    rest: 'Every row leaves the table, including the ones about your own changes. The clear is written as the only entry that remains, so the log cannot be emptied quietly.',
+  },
+  banners: {
+    endpoint: '/api/admin/announcements/history',
+    title: 'Clear the banner history?',
+    confirmLabel: 'Delete retired banners',
+    first: 'Are you sure you want to permanently delete the retired banners? This cannot be undone.',
+    rest: 'Banners that were retired and banners whose end date has passed are deleted, with the per-user dismissals recorded against them. Live and upcoming banners are kept.',
+  },
+});
 
 function formatDate(value) {
   if (!value) return '—';
@@ -114,7 +147,10 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const [signalConfirm, setSignalConfirm] = useState(null);
   const [purgeDays, setPurgeDays] = useState(30);
   const [purge, setPurge] = useState(null);
-  const [supportFor, setSupportFor] = useState({ userId: '', reason: '' });
+  // Which "Clear history" confirmation is open, by key in CLEAR_HISTORY. Null means no dialog is open.
+  const [clearConfirm, setClearConfirm] = useState(null);
+  const [clearing, setClearing] = useState(false);
+  const [supportFor, setSupportFor] = useState({ userId: '', name: '', reason: '' });
   const [supportBusy, setSupportBusy] = useState('');
   const [adjustFor, setAdjustFor] = useState(null);
   const [error, setError] = useState('');
@@ -289,6 +325,30 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     await loadEverything(nextSearch, 0);
   };
 
+  /** One path for all three clears: confirm, delete, then reload the list the button sits above. */
+  const runClearHistory = async () => {
+    const entry = clearConfirm ? CLEAR_HISTORY[clearConfirm.key] : null;
+    if (!entry || clearing) return;
+    const key = clearConfirm.key;
+    setClearing(true);
+    setError('');
+    setNotice('');
+    try {
+      const data = await request(entry.endpoint, token, { method: 'DELETE', retryWhenUnanswered: true });
+      // The server's count, quoted back: "it looks cleared" is not an answer an admin can act on.
+      setNotice(data?.notice || 'History cleared.');
+      setClearConfirm(null);
+      if (key === 'errors') await loadHealth(healthHours);
+      else if (key === 'audit') await loadAudit({ action: auditAction, search: auditSearch, offset: 0 });
+      else await loadAnnouncements();
+    } catch (clearError) {
+      setError(clearError.message || 'That history could not be cleared.');
+      setClearConfirm(null);
+    } finally {
+      setClearing(false);
+    }
+  };
+
   const changePage = async (direction) => {
     const nextOffset = Math.max(0, offset + direction * PAGE_SIZE);
     if (nextOffset === offset) return;
@@ -459,22 +519,26 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const openSupportAccess = (user) => {
     setError('');
     setNotice('');
-    setSupportFor({ userId: user.id, reason: '' });
+    setSupportFor({ userId: user.id, name: user.name || user.email, reason: '' });
   };
-  const closeSupportAccessForm = () => setSupportFor({ userId: '', reason: '' });
+  const closeSupportAccessForm = () => setSupportFor({ userId: '', name: '', reason: '' });
 
-  const startImpersonation = async (user) => {
+  /* The account is read from the state that opened the dialog, never looked up in `users` again: the
+     list can be paged or searched while the dialog is open, and a lookup that missed would silently
+     target whoever happens to be on screen. */
+  const startImpersonation = async () => {
+    if (!supportFor.userId) return;
     const reason = supportFor.reason.trim();
     if (reason.length < 3) {
       setError('Say why you need support access - it is written to the audit log.');
       return;
     }
-    setSupportBusy(user.id);
+    setSupportBusy(supportFor.userId);
     setError('');
     setNotice('');
     try {
-      const data = await request(`/api/admin/users/${user.id}/impersonate`, token, { method: 'POST', body: { reason } });
-      setSupportFor({ userId: '', reason: '' });
+      const data = await request(`/api/admin/users/${supportFor.userId}/impersonate`, token, { method: 'POST', body: { reason } });
+      setSupportFor({ userId: '', name: '', reason: '' });
       setNotice(data.notice || 'Support view opened.');
       await loadAudit({ action: auditAction, search: auditSearch, offset: auditOffset });
       onImpersonate?.(data);
@@ -490,6 +554,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     setNotice('');
     setAdjustFor({
       userId: user.id,
+      name: user.name || user.email,
       plan: '',
       days: '',
       endsAt: '',
@@ -502,9 +567,9 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   };
   const cancelAdjustment = () => setAdjustFor(null);
 
-  const saveAdjustment = async (user) => {
-    const form = adjustFor?.userId === user.id ? adjustFor : null;
-    if (!form) return;
+  const saveAdjustment = async () => {
+    const form = adjustFor;
+    if (!form?.userId) return;
     const reason = form.reason.trim();
     if (reason.length < 5) {
       setError('Add a short reason for this adjustment (at least 5 characters).');
@@ -522,11 +587,11 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     if (form.plan) body.plan = form.plan;
     if (form.days) body.days = Number(form.days);
     if (form.endsAt) body.endsAt = new Date(form.endsAt).toISOString();
-    setBusyUser(user.id);
+    setBusyUser(form.userId);
     setError('');
     setNotice('');
     try {
-      const data = await request(`/api/admin/users/${user.id}/subscription`, token, { method: 'PATCH', body });
+      const data = await request(`/api/admin/users/${form.userId}/subscription`, token, { method: 'PATCH', body });
       setNotice(data.notice || 'Subscription adjusted.');
       setAdjustFor(null);
       await Promise.all([loadUsers(), loadOverview(), loadBilling(), loadAudit({ action: auditAction, search: auditSearch, offset: auditOffset })]);
@@ -770,8 +835,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
                   const busy = busyUser === user.id;
                   const supporting = supportFor.userId === user.id;
                   const adjusting = adjustFor?.userId === user.id;
-                  return <React.Fragment key={user.id}>
-                  <tr className={isSuspended ? 'admin-row-suspended' : undefined}>
+                  return <tr key={user.id} className={isSuspended ? 'admin-row-suspended' : undefined}>
                     <td data-label="User">
                       <strong>{user.name}{isSelf ? ' (you)' : ''}</strong>
                       <small>{user.email}</small>
@@ -801,72 +865,15 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
                         {isSelf ? <span className="muted">—</span> : isSuspended
                           ? <button type="button" className="button button-secondary button-small" disabled={busy} onClick={() => liftSuspension(user)}>{busy ? 'Saving…' : 'Restore access'}</button>
                           : <button type="button" className="button button-danger button-small" disabled={busy} onClick={() => startSuspension(user)}>Suspend</button>}
-                        <button type="button" className="button button-secondary button-small" disabled={busy || isSelf || supporting || adjusting} onClick={() => (supporting ? closeSupportAccessForm() : openSupportAccess(user))}>{supporting ? 'Cancel' : 'Impersonate'}</button>
-                        <button type="button" className="button button-secondary button-small" disabled={busy || adjusting} onClick={() => (adjusting ? cancelAdjustment() : openAdjustment(user))}>{adjusting ? 'Cancel' : 'Adjust plan'}</button>
+                        <button type="button" className="button button-secondary button-small" disabled={busy || isSelf} onClick={() => (supporting ? closeSupportAccessForm() : openSupportAccess(user))}>Impersonate</button>
+                        <button type="button" className="button button-secondary button-small" disabled={busy} onClick={() => (adjusting ? cancelAdjustment() : openAdjustment(user))}>Adjust plan</button>
                       </div>
                     </td>
-                  </tr>
-                  {supporting && <tr className="admin-tools-row">
-                    <td colSpan={7}>
-                      <form className="admin-support-form" onSubmit={(event) => { event.preventDefault(); startImpersonation(user); }}>
-                        <strong>Open a one-hour read-only support session</strong>
-                        <p className="muted">You will see this workspace exactly as {user.name} does - signals, settings, accounts, and notices. Their password is never read or changed, nothing here can be written, admin tools stay unavailable, and the session ends by itself in one hour.</p>
-                        <label>Why do you need this? (written to the audit log)
-                          <input value={supportFor.reason} onChange={(event) => setSupportFor({ ...supportFor, reason: event.target.value })} maxLength={200} required placeholder="For example: investigating a signal that did not execute on 3 Mar" />
-                        </label>
-                        <div className="button-row">
-                          <button type="submit" className="button button-primary" disabled={supportBusy === user.id}>{supportBusy === user.id ? 'Opening…' : 'Open support view'}</button>
-                          <button type="button" className="button button-secondary" onClick={closeSupportAccessForm}>Cancel</button>
-                        </div>
-                      </form>
-                    </td>
-                  </tr>}
-                  {adjusting && <tr className="admin-tools-row">
-                    <td colSpan={7}>
-                      <form className="admin-adjust-form" onSubmit={(event) => { event.preventDefault(); saveAdjustment(user); }}>
-                        <strong>Manual adjustment for {user.name}</strong>
-                        <p className="muted">Currently {adjustFor.currentPlan} ({adjustFor.currentStatus}), {adjustFor.periodEnd ? `paid until ${formatDate(adjustFor.periodEnd)}` : 'no paid period'}. {adjustFor.hasProviderSubscription ? 'This workspace renews through Paystack, so a gateway subscription keeps billing on its own schedule until it is cancelled there.' : 'No gateway subscription is attached to this workspace.'}</p>
-                        <div className="form-row">
-                          <label>Grant plan for free
-                            <select value={adjustFor.plan} onChange={(event) => setAdjustFor({ ...adjustFor, plan: event.target.value })} aria-label={`Plan to grant to ${user.name}`}>
-                              <option value="">Leave the plan as it is</option>
-                              <option value="starter">Starter</option>
-                              <option value="pro">Pro</option>
-                              <option value="premium">Premium</option>
-                              <option value="free">Free (remove the paid plan)</option>
-                            </select>
-                          </label>
-                          <label>Add days
-                            <input type="number" min="1" max="365" step="1" value={adjustFor.days} onChange={(event) => setAdjustFor({ ...adjustFor, days: event.target.value })} placeholder="14" disabled={adjustFor.plan === 'free'} />
-                          </label>
-                          <label>Or set an expiry date
-                            <input type="date" value={adjustFor.endsAt} onChange={(event) => setAdjustFor({ ...adjustFor, endsAt: event.target.value })} disabled={adjustFor.plan === 'free' || Boolean(adjustFor.days)} />
-                          </label>
-                        </div>
-                        <label>Reason (written to the audit log)
-                          <input value={adjustFor.reason} onChange={(event) => setAdjustFor({ ...adjustFor, reason: event.target.value })} maxLength={200} required placeholder="For example: goodwill after the MetaAPI outage on 2 March" />
-                        </label>
-                        <div className="button-row">
-                          <button type="submit" className="button button-primary" disabled={busy}>{busy ? 'Saving…' : 'Save adjustment'}</button>
-                          <button type="button" className="button button-secondary" onClick={cancelAdjustment}>Cancel</button>
-                        </div>
-                      </form>
-                    </td>
-                  </tr>}
-                  </React.Fragment>;
+                  </tr>;
                 })}
               </tbody>
             </table>
           </div>
-
-          {suspension.userId && <form className="admin-suspend" onSubmit={(event) => { event.preventDefault(); void confirmSuspension(); }}>
-            <strong>Suspend {suspension.name || 'this account'}</strong>
-            <label>Reason shown to the user<input value={suspension.reason} onChange={(event) => setSuspension({ ...suspension, reason: event.target.value })} maxLength={200} required placeholder="For example: chargeback on subscription" /></label>
-            <div className="button-row">
-              <button type="submit" className="button button-danger" disabled={busyUser === suspension.userId}>Suspend user</button>
-              <button type="button" className="button button-secondary" onClick={cancelSuspension}>Cancel</button>
-            </div>
-          </form>}
 
           <div className="admin-pagination">
             <button type="button" className="button button-secondary button-small" onClick={() => changePage(-1)} disabled={offset === 0 || loading}>Previous</button>
@@ -1112,11 +1119,14 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
       <section className="panel admin-panel health-panel">
         <div className="panel-heading">
           <div><p className="eyebrow">LATEST SYSTEM ERRORS</p><h2>MetaAPI and Telegram checks</h2></div>
-          <label className="health-window">Window
-            <select value={healthHours} onChange={(event) => changeHealthWindow(Number(event.target.value))} aria-label="Error window">
-              {HEALTH_WINDOWS.map((entry) => <option key={entry.hours} value={entry.hours}>{entry.label}</option>)}
-            </select>
-          </label>
+          <div className="panel-heading-actions">
+            <label className="health-window">Window
+              <select value={healthHours} onChange={(event) => changeHealthWindow(Number(event.target.value))} aria-label="Error window">
+                {HEALTH_WINDOWS.map((entry) => <option key={entry.hours} value={entry.hours}>{entry.label}</option>)}
+              </select>
+            </label>
+            <button type="button" className="button button-secondary button-small" disabled={clearing || !health || health.errorsAvailable === false} onClick={() => setClearConfirm({ key: 'errors' })}>Clear parsing errors</button>
+          </div>
         </div>
         {!health ? <div className="loading-shell inline-loading"><div className="spinner" /><span>Reading the platform state…</span></div> : <>
           <ul className="health-checks">
@@ -1131,7 +1141,6 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
               <span className={`count-badge ${healthCheckTone(health.capture.state)}`}>{health.capture.headline}</span>
             </div>
             <p>{health.capture.detail}</p>
-            {health.capture.sleepSuspected ? <p className="health-capture-sleep">A Telegram session only exists while this process is running, and Render's free tier stops it between visitors. If channels are monitored but "messages seen" is 0, the instance was asleep when the channel posted - not a fault in the listener.</p> : null}
             <div className="health-queue">
               <div><span>Sessions held</span><strong>{health.capture.sessionsInMemory}</strong></div>
               <div><span>Listening</span><strong>{health.capture.listening}</strong></div>
@@ -1218,7 +1227,12 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
       </section>
 
       <section className="panel admin-panel">
-        <div className="panel-heading"><div><p className="eyebrow">PUBLISHED</p><h2>Banner history</h2></div></div>
+        <div className="panel-heading">
+          <div><p className="eyebrow">PUBLISHED</p><h2>Banner history</h2></div>
+          <div className="panel-heading-actions">
+            <button type="button" className="button button-secondary button-small" disabled={clearing} onClick={() => setClearConfirm({ key: 'banners' })}>Clear history</button>
+          </div>
+        </div>
         {!announcements.length ? <div className="empty-state"><strong>No announcements yet</strong><span>Publish one to put a banner on every dashboard.</span></div> : <div className="chat-list">
           {announcements.map((item) => <div className="announcement-row" key={item.id}>
             <div className="announcement-row-main">
@@ -1254,9 +1268,12 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
       <section className="panel admin-panel audit-panel">
         <div className="panel-heading">
           <div><p className="eyebrow">WHO DID WHAT</p><h2>Administrator audit log</h2></div>
-          <span className="count-badge">{audit.total}</span>
+          <div className="panel-heading-actions">
+            <span className="count-badge">{audit.total}</span>
+            <button type="button" className="button button-secondary button-small" disabled={clearing || !audit.totalEntries} onClick={() => setClearConfirm({ key: 'audit' })}>Clear history</button>
+          </div>
         </div>
-        <p className="muted">Every price change, promo code edit, suspension, manual subscription adjustment, kill-switch movement, announcement, and support session is written here with the admin's email address and the timestamp. Entries are never edited or deleted by the application.</p>
+        <p className="muted">Every price change, promo code edit, suspension, manual subscription adjustment, kill-switch movement, announcement, and support session is written here with the admin's email address and the timestamp. No entry is ever edited, and the only way one leaves the table is the Clear history button above - which records itself, so an emptied log still says when and by whom.</p>
         <form className="admin-search" role="search" onSubmit={(event) => { event.preventDefault(); applyAuditFilter(auditAction, auditSearchInput.trim()); }}>
           <label htmlFor="audit-search" className="sr-only">Search the audit log by admin email or summary</label>
           <input id="audit-search" type="search" value={auditSearchInput} onChange={(event) => setAuditSearchInput(event.target.value)} placeholder="Search by admin email or wording" maxLength={100} />
@@ -1380,5 +1397,82 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
         <p>Deleting does not touch the account, its plan, its channels, its Telegram session, or any trade row.</p>
       </ConfirmModal>
     </div>}
+
+    {/* Three tools that used to be a form squeezed under a table row. As dialogs they get the width the
+        explanation needs, they cannot be pushed around by the row's column sizes, and on a phone they are
+        the same screen rather than a 300px strip inside a scrolled table. */}
+    <AdminActionModal
+      open={Boolean(suspension.userId)}
+      title={`Suspend ${suspension.name || 'this account'}`}
+      intro="They cannot sign in while the suspension stands, and a support session open on their workspace is closed. Nothing is deleted - restoring the account brings it back as it was."
+      confirmLabel="Suspend user"
+      tone="danger"
+      busy={Boolean(suspension.userId) && busyUser === suspension.userId}
+      onCancel={cancelSuspension}
+      onSubmit={() => { void confirmSuspension(); }}
+    >
+      <label>Reason shown to the user
+        <input value={suspension.reason} onChange={(event) => setSuspension({ ...suspension, reason: event.target.value })} maxLength={200} required placeholder="For example: chargeback on subscription" />
+      </label>
+    </AdminActionModal>
+
+    <AdminActionModal
+      open={Boolean(supportFor.userId)}
+      title="Open a one-hour read-only support session"
+      intro={`You will see this workspace exactly as ${supportFor.name || 'this account'} does - signals, settings, accounts, and notices. Their password is never read or changed, nothing here can be written, admin tools stay unavailable, and the session ends by itself in one hour.`}
+      confirmLabel="Open support view"
+      busy={Boolean(supportFor.userId) && supportBusy === supportFor.userId}
+      onCancel={closeSupportAccessForm}
+      onSubmit={() => { void startImpersonation(); }}
+    >
+      <label>Why do you need this? (written to the audit log)
+        <input value={supportFor.reason} onChange={(event) => setSupportFor({ ...supportFor, reason: event.target.value })} maxLength={200} required placeholder="For example: investigating a signal that did not execute on 3 Mar" />
+      </label>
+    </AdminActionModal>
+
+    <AdminActionModal
+      open={Boolean(adjustFor)}
+      title={`Manual adjustment for ${adjustFor?.name || 'this account'}`}
+      intro={`Currently ${adjustFor?.currentPlan || 'free'} (${adjustFor?.currentStatus || 'free'}), ${adjustFor?.periodEnd ? `paid until ${formatDate(adjustFor.periodEnd)}` : 'no paid period'}. ${adjustFor?.hasProviderSubscription ? 'This workspace renews through Paystack, so a gateway subscription keeps billing on its own schedule until it is cancelled there.' : 'No gateway subscription is attached to this workspace.'}`}
+      confirmLabel="Save adjustment"
+      busy={Boolean(adjustFor) && busyUser === adjustFor.userId}
+      onCancel={cancelAdjustment}
+      onSubmit={() => { void saveAdjustment(); }}
+    >
+      <div className="form-row">
+        <label>Grant plan for free
+          <select value={adjustFor?.plan || ''} onChange={(event) => setAdjustFor({ ...adjustFor, plan: event.target.value })} aria-label={`Plan to grant to ${adjustFor?.name || 'this account'}`}>
+            <option value="">Leave the plan as it is</option>
+            <option value="starter">Starter</option>
+            <option value="pro">Pro</option>
+            <option value="premium">Premium</option>
+            <option value="free">Free (remove the paid plan)</option>
+          </select>
+        </label>
+        <label>Add days
+          <input type="number" min="1" max="365" step="1" value={adjustFor?.days || ''} onChange={(event) => setAdjustFor({ ...adjustFor, days: event.target.value })} placeholder="14" disabled={adjustFor?.plan === 'free'} />
+        </label>
+        <label>Or set an expiry date
+          <input type="date" value={adjustFor?.endsAt || ''} onChange={(event) => setAdjustFor({ ...adjustFor, endsAt: event.target.value })} disabled={adjustFor?.plan === 'free' || Boolean(adjustFor?.days)} />
+        </label>
+      </div>
+      <label>Reason (written to the audit log)
+        <input value={adjustFor?.reason || ''} onChange={(event) => setAdjustFor({ ...adjustFor, reason: event.target.value })} maxLength={200} required placeholder="For example: goodwill after the MetaAPI outage on 2 March" />
+      </label>
+    </AdminActionModal>
+
+    <ConfirmModal
+      open={Boolean(clearConfirm)}
+      busy={clearing}
+      title={clearConfirm ? CLEAR_HISTORY[clearConfirm.key].title : ''}
+      confirmLabel={clearConfirm ? CLEAR_HISTORY[clearConfirm.key].confirmLabel : 'Delete'}
+      onCancel={() => (clearing ? null : setClearConfirm(null))}
+      onConfirm={() => { void runClearHistory(); }}
+    >
+      {clearConfirm ? <>
+        <p className="confirm-modal-count">{CLEAR_HISTORY[clearConfirm.key].first}</p>
+        <p>{CLEAR_HISTORY[clearConfirm.key].rest}</p>
+      </> : null}
+    </ConfirmModal>
   </>;
 }

@@ -202,12 +202,6 @@ button,input,textarea,select{touch-action:manipulation}
 .admin-reason{color:#b74239}
 .admin-row-actions{display:flex;flex-wrap:wrap;gap:10px}
 .admin-pagination{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;margin-top:14px}
-.admin-suspend{margin-top:16px;padding:14px;border:1px solid #f4d1ce;border-radius:10px;background:#fff8f7;display:flex;flex-direction:column;gap:11px}
-.admin-suspend strong{font-size:12px;color:#8d2f29}
-.admin-suspend label{display:flex;flex-direction:column;gap:7px;font-size:11px;font-weight:700;color:#344258}
-.admin-suspend input{min-height:44px;border:1px solid #e3c9c6;border-radius:9px;padding:10px 12px;background:#fff;color:#172338;outline:none}
-.admin-suspend input:focus{border-color:#b74239;box-shadow:0 0 0 3px #b742391a}
-.admin-suspend .button-row{margin:0}
 .badge-suspended{background:#fff0ed;color:#b74239}
 .admin-denied{max-width:640px}
 .admin-denied .button{margin-top:8px}
@@ -398,7 +392,6 @@ button,input,textarea,select{touch-action:manipulation}
 .health-capture { border: 1px solid #e3e8ef; border-radius: 10px; padding: 12px 14px; margin: 14px 0 4px; }
 .health-capture-head { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
 .health-capture > p { margin: 6px 0 0; font-size: 13px; color: #40506a; }
-.health-capture-sleep { background: #fff7e6; border-left: 3px solid #d99b2b; padding: 8px 10px; border-radius: 0 8px 8px 0; }
 .health-capture .health-queue { margin: 12px 0 0; grid-template-columns: repeat(4,minmax(0,1fr)); }
 .health-capture-foot { font-size: 11px; color: #7f8ca0; margin-top: 8px; }
 .health-queue span { font-size: 9px; font-weight: 700; letter-spacing: .5px; text-transform: uppercase; color: #7f8ca0; }
@@ -409,13 +402,6 @@ button,input,textarea,select{touch-action:manipulation}
 .health-kind-telegram_parse { background: #eef6fb; color: #486a80; }
 
 .admin-row-actions { display: flex; flex-wrap: wrap; gap: 6px; }
-.admin-tools-row > td { background: #f8fafc; }
-.admin-support-form,.admin-adjust-form { display: grid; gap: 10px; padding: 6px 0 10px; }
-.admin-support-form strong,.admin-adjust-form strong { font-size: 12px; color: #1b2a40; }
-.admin-support-form p,.admin-adjust-form p { margin: 0; font-size: 11px; line-height: 1.55; max-width: 780px; }
-.admin-support-form label,.admin-adjust-form label { display: grid; gap: 6px; font-size: 11px; font-weight: 700; color: #344258; }
-.admin-support-form input,.admin-adjust-form input,.admin-adjust-form select { border: 1px solid #dce2ea; border-radius: 8px; padding: 10px 11px; font-size: 12px; background: #fff; color: #172338; }
-.admin-adjust-form .form-row { grid-template-columns: repeat(3,minmax(0,1fr)); }
 .admin-panel .admin-table td small { display: block; color: #66758a; font-size: 9px; margin-top: 3px; }
 
 .announcement-form { display: grid; gap: 12px; margin-top: 6px; }
@@ -449,7 +435,6 @@ button,input,textarea,select{touch-action:manipulation}
   .announcement-dismiss { flex: 1 1 100%; }
   .support-banner { padding: 12px 14px; }
   .health-queue { grid-template-columns: repeat(2,minmax(0,1fr)); }
-  .admin-adjust-form .form-row { grid-template-columns: 1fr; }
 }
 /* Live-trading warning: asked once in a dialog, then kept as one quiet line under the switch. */
 .modal-backdrop{position:fixed;inset:0;z-index:60;background:rgba(16,26,38,.5);display:grid;place-items:center;padding:20px;backdrop-filter:blur(2px)}.modal{max-width:480px;width:100%;box-shadow:0 24px 60px rgba(13,25,38,.28)}.risk-warning-modal h3{margin:0 0 10px;font:700 16px Manrope,sans-serif;color:#22344b}.risk-warning-body{border-left:4px solid #c7352b;background:#fff6f5;color:#7c2e29;border-radius:8px;padding:12px 14px;margin:0 0 12px;font-size:13px;font-weight:700;line-height:1.55}.risk-warning-points{margin:0 0 16px;padding-left:18px;display:flex;flex-direction:column;gap:6px}.risk-warning-points li{font-size:12px;color:#59697e;line-height:1.5}.modal-actions{display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}.risk-reminder{display:flex;flex-direction:column;gap:6px;margin:10px 0 0;padding:10px 12px;border:1px solid #e6ebf0;background:#f8fafb;border-radius:9px;font-size:12px;color:#4f5f74;line-height:1.5}.risk-reminder>span{font-weight:600;color:#5a4a24}.risk-reminder-details summary{cursor:pointer;font-size:11px;color:#657286}.risk-reminder-details ul{margin:7px 0 0;padding-left:16px;display:flex;flex-direction:column;gap:5px}.risk-reminder-details li{font-size:11px;color:#657286;line-height:1.5}.risk-reminder-compact{margin:0 0 14px}.signal-flags{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}.signal-outcome{font-size:9px;text-transform:uppercase;letter-spacing:.04em;background:#f1f4f7;color:#5d6a7d}.signal-outcome.tone-good{background:#e6f7ef;color:#207554}.signal-outcome.tone-busy{background:#eaf2fb;color:#2c5c86}.signal-outcome.tone-bad{background:#fff0ed;color:#a43f35}.signal-outcome-note{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin:6px 0 0;font-size:11px;color:#7a6a3f;background:#fdf8ec;border-left:3px solid #d9b45c;border-radius:0 7px 7px 0;padding:7px 10px;line-height:1.5}.signal-item.outcome-bad .signal-outcome-note{color:#8d362f;background:#fdf1ef;border-left-color:#c7352b}.signal-capture-note{margin:0 0 12px}
@@ -458,6 +443,9 @@ button,input,textarea,select{touch-action:manipulation}
 .panel-heading-actions{display:flex;align-items:center;gap:14px}.signal-flag-badge{font-size:9px;letter-spacing:.04em;text-transform:uppercase;background:#f1f4f7;color:#5d6a7d}.signal-flag-badge.tone-warn{background:#fdf6e6;color:#8a6a1f}.signal-flag-badge.tone-good{background:#e6f7ef;color:#207554}.signal-item{position:relative}.signal-delete-button{border:1px solid #e8ebf0;background:#fff;color:#a85049;border-radius:8px;width:26px;height:26px;line-height:1;font-size:13px;flex:0 0 auto;margin-left:10px;transition:.15s}.signal-delete-button:hover:not(:disabled){background:#fff0ed;border-color:#f0c8c2;color:#8d362f}.signal-delete-button:disabled{opacity:.55}
 /* ---- the confirm step before anything is removed ---- */
 .confirm-modal{max-width:520px}.confirm-modal h3{margin:0 0 10px;font:700 16px Manrope,sans-serif;color:#22344b}.confirm-modal-body{margin:0 0 16px}.confirm-modal-body p{margin:0;font-size:12.5px;line-height:1.6;color:#59697e}.confirm-modal-body p+p{margin-top:10px}.confirm-modal-count{border-left:3px solid #c7352b;background:#fff6f5;color:#7c2e29;border-radius:0 8px 8px 0;padding:10px 12px;font-size:12px;line-height:1.5}.confirm-modal .button-danger{background:#b63e35;color:#fff}.confirm-modal .button-danger:hover:not(:disabled){background:#962f28}
+/* ---- the administrator's tools, opened as dialogs instead of inside a table row ---- */
+.admin-action-modal{margin:0;max-width:min(620px,100%);max-height:calc(100vh - 40px);overflow-y:auto;display:flex;flex-direction:column;gap:13px}.admin-action-modal h3{margin:0;font:700 16px Manrope,sans-serif;color:#22344b}.admin-action-modal-intro{margin:0;font-size:12.5px;line-height:1.6;color:#59697e}.admin-action-modal-body{display:grid;gap:12px}.admin-action-modal-body label{display:grid;gap:7px;font-size:11.5px;font-weight:700;color:#344258}.admin-action-modal-body input,.admin-action-modal-body select,.admin-action-modal-body textarea{min-height:44px;border:1px solid #dce2ea;border-radius:9px;padding:10px 12px;font-size:12px;background:#fff;color:#172338;outline:none;transition:.15s}.admin-action-modal-body input:focus,.admin-action-modal-body select:focus,.admin-action-modal-body textarea:focus{border-color:#428c9f;box-shadow:0 0 0 3px #438c9f1e}.admin-action-modal-body .form-row{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}.admin-action-modal .modal-actions{margin-top:2px}
+@media(max-width:700px){.modal-backdrop{padding:12px}.admin-action-modal{padding:18px;max-height:calc(100vh - 24px);gap:12px}.admin-action-modal .modal-actions .button{flex:1 1 auto;width:100%}.panel-heading{flex-wrap:wrap}.panel-heading-actions{margin-left:auto;flex-wrap:wrap;justify-content:flex-end;gap:8px}}
 /* ---- advanced settings: automation, trade management, and the strict group folded away ---- */
 /* The two longer passages inside the Advanced Safety bar. They kept their class names when the page became three folded bars, because they describe the reading order inside a bar, not the old wrapper. */.execution-advanced-intro{margin:0;font-size:11.5px;color:#65728a;line-height:1.55}.execution-advanced-facts{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:5px}.execution-advanced-facts li{font-size:11.5px;color:#65728a;line-height:1.55}.risk-settings-intro{margin:0;color:#778398;font-size:12.5px;line-height:1.55}
 .risk-settings-form{margin-top:18px}
