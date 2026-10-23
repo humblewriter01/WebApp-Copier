@@ -140,17 +140,33 @@ const renderSettings = (settings) => render(AdvancedSettings, {
   saving: false,
 });
 
-test('the advanced page is grouped by what a value decides, and the strict group is folded away', () => {
+test('the advanced page is three folded bars that each state their own state, in the order a decision is made', () => {
   const markup = renderSettings(settingsBase);
-  assert.match(markup, /<h3>Auto-Trading<\/h3>/);
+  // A bar is a `<details>` element, so it folds with no script, is keyboard-operable, and reports its
+  // own state to a screen reader; the title lives in the bar and every control sits under it.
+  assert.match(markup, /<h3>Core Execution<\/h3>/);
+  assert.match(markup, /<h4>Auto-Trading<\/h4>/, 'the switch is named inside the bar that leads the page');
   assert.match(markup, /<h3>Trade Management<\/h3>/);
-  assert.match(markup, /Advanced Safety/);
-  // The grouping has to be real, not three headings over one undifferentiated stack.
-  assert.ok(markup.indexOf('Auto-Trading') < markup.indexOf('Trade Management'), 'the switch that decides whether anything is sent leads the page');
+  assert.match(markup, /<h3>Advanced Safety Nets<\/h3>/);
+  assert.ok(markup.indexOf('Core Execution') < markup.indexOf('Trade Management'), 'what decides whether anything is sent comes first');
   assert.ok(markup.indexOf('Trade Management') < markup.indexOf('Advanced Safety'), 'the strictest rules come last');
-  assert.ok(markup.indexOf('id="execution-account"') > markup.indexOf('Trade Management'), 'the account and lot sizing sit under Trade Management');
-  assert.match(markup, /<details class="execution-advanced">/, 'Advanced Safety is a closed disclosure, not open by default');
-  assert.equal(markup.includes('<details class="execution-advanced" open'), false, 'nothing about this group is switched on for the reader');
+  // The account and the lot size travel with the switch they are conditions of, not with the trade they
+  // produce: an order cannot exist without all three, so splitting them across bars split one decision.
+  assert.ok(markup.indexOf('id="execution-account"') < markup.indexOf('Trade Management'), 'the connected account sits in Core Execution');
+  assert.ok(markup.indexOf('id="lot-size-mode"') < markup.indexOf('Trade Management'), 'and so does the lot size');
+  assert.ok(markup.indexOf('id="execution-account"') > markup.indexOf('Core Execution'));
+  // Exactly one bar is open for the reader: the one most often changed. The other two explain themselves
+  // on expand, which is what keeps the page to three lines instead of three screens.
+  const openBars = markup.match(/<details[^>]*class="[^"]*settings-section[^"]*"[^>]*open=""/g) || [];
+  assert.equal(openBars.length, 1, `one bar open, found ${openBars.length}`);
+  assert.match(openBars[0], /settings-section-core-execution/);
+  assert.equal(markup.includes('settings-section-trade-management" open'), false, 'how a trade is looked after is read by whoever asks for it');
+  assert.equal(markup.includes('settings-section-advanced-safety" open'), false, 'nothing about the strictest group is switched on for the reader');
+  // A header that only named its section would be a click to learn whether anything is protecting a trade.
+  assert.match(markup, /No stop moves · First Target Only/, 'the folded bar states both halves of what it governs');
+  assert.match(markup, /settings-section-state-bad">Blocking</, 'and the state is a badge, not a colour nobody can read');
+  // Every bar turns its chevron: the rotation is a CSS transform on the open state, not a second icon.
+  assert.equal((markup.match(/class="settings-section-chevron"/g) || []).length, 3, 'one chevron per bar');
   // What moved out stays out: the panel used to carry these between the risk percent and the safety
   // blocks, which is exactly the mixing this split exists to end.
   for (const absent of ['id="risk-percent"', 'id="max-open-trades"', 'id="max-daily-trades"', 'id="daily-loss-limit"', 'Delete My Account', 'account-danger-zone']) {

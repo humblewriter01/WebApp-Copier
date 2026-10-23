@@ -68,6 +68,21 @@ export function createExecutionWorker({ pool, engine, pollIntervalMs = 1200, sta
     }
   }
 
+  /**
+   * One protection sweep, logged and swallowed if it fails. A sweep that cannot run is a position left
+   * without its protection for a few seconds; a sweep whose error escapes is the whole worker loop
+   * stopped, which is every position left without it indefinitely.
+   */
+  async function runSweep(message, sweep, countedKey) {
+    if (typeof sweep !== 'function') return;
+    try {
+      const result = await sweep.call(engine);
+      if (result?.[countedKey]) logger.info?.(JSON.stringify({ level: 'info', message, ...result }));
+    } catch (error) {
+      logger.error?.(JSON.stringify({ level: 'error', message: `${message} sweep failed`, error: safeWorkerError(error) }));
+    }
+  }
+
   async function runOnce() {
     try {
       await expireOldJobs();
@@ -85,10 +100,14 @@ export function createExecutionWorker({ pool, engine, pollIntervalMs = 1200, sta
       // never delay a fresh signal, but a busy stream of signals cannot starve protection
       // either: every fifth iteration also attempts a sweep (the engine's own throttle decides). The engine throttles the sweep itself,
       // so calling it often costs nothing.
-      if (engine.sweepBreakEven && (!job || jobsSinceSweep >= 5)) {
-        const sweep = await engine.sweepBreakEven();
-        if (sweep?.moved) logger.info?.(JSON.stringify({ level: 'info', message: 'Break-even stop moved', ...sweep }));
+      const sweepDue = !job || jobsSinceSweep >= 5;
+      if (sweepDue) {
+        // Decided once, for both sweeps. Reading the counter again after the first sweep would starve
+        // the second one, because the first resets it - which is how a plan would end up never swept on
+        // a busy signal stream while open positions kept getting their stops moved.
         jobsSinceSweep = 0;
+        await runSweep('Break-even stop moved', engine.sweepBreakEven, 'moved');
+        await runSweep('Scale-out target closed', engine.sweepTakeProfitLevels, 'closed');
       }
     } catch (error) {
       logger.error?.(JSON.stringify({ level: 'error', message: 'Execution worker iteration failed', error: safeWorkerError(error) }));

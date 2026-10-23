@@ -309,12 +309,15 @@ test('the settings route reads, validates and stores all three safety nets', () 
 });
 
 test('the worker reads the nets in the same query that claims the job', () => {
-  assert.match(engine, /st\.block_execution_without_stop_loss,\s+st\.block_execution_without_take_profit,st\.fallback_stop_loss_points,st\.fallback_take_profit_points,/);
+  assert.match(engine, /st\.block_execution_without_stop_loss,\s+st\.block_execution_without_take_profit,st\.fallback_stop_loss_points,st\.fallback_take_profit_points,\s+st\.multiple_target_handling AS "multipleTargetHandling",s\.take_profit_levels AS "takeProfitLevels",/);
   assert.match(engine, /const safety = applySafetyNets\(\{[\s\S]*?fallbackStopLossPoints: item\.fallback_stop_loss_points,[\s\S]*?blockExecutionWithoutTakeProfit: item\.block_execution_without_take_profit,[\s\S]*?lotSizeMode: item\.lot_size_mode,/);
   assert.match(engine, /if \(safety\.blocking\) return stop\(job, 'skipped', safety\.reason\)/, 'the refusal is one sentence, not a re-derivation');
   assert.match(engine, /for \(const warning of safety\.warnings\)/, 'an override is logged every time it happens');
   assert.equal(engine.includes('block_execution_without_take_profit ?'), false, 'the gate must not be re-implemented in the engine');
   // An executed job that borrowed a leg leaves the explanation on the signal row, which is where a
   // reader looks for it; an ordinary trade leaves the note empty as before.
-  assert.match(engine, /await updateJob\(job\.id, job\.user_id, 'executed', null, safetyNoteText\)/);
+  assert.match(engine, /await updateJob\(job\.id, job\.user_id, 'executed', null, \[safetyNoteText, planNote\]\.filter\(Boolean\)\.join\(' '\) \|\| null\)/, 'a borrowed leg and a scale-out plan share the one note a reader finds later');
+  // The ladder travels with the same read that claims the job, so an order can never be sized under one
+  // policy and executed under another because a second query agreed at a different moment.
+  assert.ok(engine.lastIndexOf('recordScaleOutPlan({') > engine.indexOf('await trading.createMarketOrder'), 'the plan is written after the order reaches the broker, never before');
 });

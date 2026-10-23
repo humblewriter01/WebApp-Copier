@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { countSignalEntryDeals as countDailySignalEntryDeals, resolveBrokerSymbol } from './signal-parser.js';
 import { applySafetyNets, safetyNote } from './signal-safety.js';
+import { planScaleOutLevels, resolveCloseVolume, selectTarget, targetReached } from './scale-out.js';
 import { isPaidSubscriber, PAID_STATUSES } from './plan-limits.js';
 import { signalStatusForJobStatus } from './signal-outcome.js';
 
@@ -366,7 +367,7 @@ export function classifyBreakEvenFailure(error) {
   return { status: 'failed', retry: true, message: message || 'The broker rejected the stop-loss change.' };
 }
 
-export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnabled = false, isTradingPaused = async () => false, now = () => Date.now(), breakEvenIntervalMs = 5_000, breakEvenMaxAttempts = BREAK_EVEN_MAX_ATTEMPTS, logger = console } = {}) {
+export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnabled = false, isTradingPaused = async () => false, now = () => Date.now(), breakEvenIntervalMs = 5_000, takeProfitSweepIntervalMs = 5_000, breakEvenMaxAttempts = BREAK_EVEN_MAX_ATTEMPTS, logger = console } = {}) {
   if (!pool?.query || !trading?.getAccountState || !trading?.createMarketOrder || typeof resolveToken !== 'function') {
     throw new TypeError('Execution engine dependencies are incomplete.');
   }
@@ -440,6 +441,33 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
     );
   }
 
+  /**
+   * One row per swept target, so that a partial close is a fact the database holds rather than a
+   * sequence the next restart has to re-derive. `UNIQUE(trade_id,level_index)` is what makes a retry of
+   * this write harmless, and the break-even flag travels on the first level because the instruction to
+   * protect the ride belongs to the moment the first piece was taken off, not to a setting.
+   */
+  async function recordScaleOutPlan({ userId, tradeId, accountId, brokerPositionId, symbol, side, plan }) {
+    for (const level of plan.levels) {
+      await pool.query(
+        `INSERT INTO trade_tp_levels(
+           user_id,trade_id,metaapi_account_id,broker_position_id,symbol,side,level_index,target_price,
+           close_percent,planned_volume,break_even,status)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending')
+         ON CONFLICT(trade_id,level_index) DO NOTHING`,
+        [userId, tradeId, accountId, brokerPositionId, symbol || null, side || null, level.level, level.price,
+          level.closePercent, level.volume, level.breakEven === true],
+      );
+    }
+    await pool.query('UPDATE trades SET remaining_volume=$1 WHERE id=$2 AND user_id=$3', [Number(plan.rideVolume) + plan.levels.reduce((sum, item) => sum + Number(item.volume), 0), tradeId, userId]);
+    const parts = plan.levels.map((level) => `${level.closePercent}% at ${level.price}`);
+    parts.push(`${plan.ridePercent}% rides to ${plan.takeProfit}`);
+    const dropped = plan.dropped?.length
+      ? ` ${plan.dropped.length} level(s) the message named could not be traded and were left out (${plan.dropped[0].reason}).`
+      : '';
+    return `Scale-out plan: ${parts.join(', ')}.${dropped}`;
+  }
+
   async function stop(job, status, message) {
     const reason = safeText(message);
     await updateJob(job.id, job.user_id, status, reason);
@@ -459,6 +487,7 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
                 st.auto_trading_enabled,st.lot_size_mode,st.fixed_lot_size,st.risk_percent,st.max_open_positions,
                 st.max_daily_trades,st.daily_loss_limit,st.execution_account_id,st.block_execution_without_stop_loss,
                 st.block_execution_without_take_profit,st.fallback_stop_loss_points,st.fallback_take_profit_points,
+                st.multiple_target_handling AS "multipleTargetHandling",s.take_profit_levels AS "takeProfitLevels",
                 ma.metaapi_account_id,ma.managed_by_app,ma.state AS account_state,
                 u.subscription_status,u.subscription_plan
          FROM execution_jobs ej
@@ -597,6 +626,33 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
         specification: state.specification,
         price: quote,
       });
+      /* Which of the channel's prices the position itself carries, and whether the rest of the ladder
+         becomes a plan. Both are decided from the stored level list rather than by re-reading the
+         message, so a parser change can never move the target of a signal somebody had already reviewed. */
+      const target = selectTarget({ mode: item.multipleTargetHandling, takeProfit, levels: item.takeProfitLevels });
+      let scaleOut = { eligible: false, reason: 'mode' };
+      /* Scale-out starts from the first target and only moves the exit out once the plan is known to be
+         tradeable, because the plan needs the volume the sizing just produced. That order matters: if the
+         position is too small to split, a workspace that asked to scale out is left holding the *earlier*
+         exit rather than a target nobody will be swept into. */
+      let sendTakeProfit = target.mode === 'scale_out' ? takeProfit : target.takeProfit;
+      if (target.mode === 'scale_out' && takeProfit != null) {
+        scaleOut = planScaleOutLevels({
+          levels: item.takeProfitLevels,
+          side: item.side,
+          bid,
+          ask,
+          volume,
+          specification: state.specification,
+        });
+        if (scaleOut.eligible) sendTakeProfit = scaleOut.takeProfit;
+        else logger?.info?.(JSON.stringify({ level: 'info', message: `Scale-out plan not usable (${scaleOut.reason}); the trade carries its first target`, userId: job.user_id, jobId: job.id }));
+      }
+      // The price the position will actually exit at has to clear the same test the channel's first
+      // target cleared: a final target is only an exit if the market can be reached from this side.
+      if (sendTakeProfit != null && (!Number.isFinite(sendTakeProfit) || (item.side === 'buy' ? sendTakeProfit <= ask : sendTakeProfit >= bid))) {
+        return stop(job, 'skipped', 'The signal take profit is on the wrong side of the market.');
+      }
       const { rows: latestSettings } = await pool.query(
         'SELECT auto_trading_enabled AS "autoTradingEnabled",execution_account_id AS "executionAccountId" FROM settings WHERE user_id=$1 LIMIT 1',
         [job.user_id],
@@ -614,13 +670,13 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'submitting',$11)
          ON CONFLICT(execution_job_id) WHERE execution_job_id IS NOT NULL DO NOTHING
          RETURNING id`,
-        [job.user_id, item.signal_id, job.id, item.metaapi_account_id, resolved.symbol, item.side, volume, marketPrice, hasStopLoss ? stopLoss : null, takeProfit, clientId],
+        [job.user_id, item.signal_id, job.id, item.metaapi_account_id, resolved.symbol, item.side, volume, marketPrice, hasStopLoss ? stopLoss : null, sendTakeProfit, clientId],
       );
       if (!tradeRows[0]) return stop(job, 'unknown', 'A trade record already exists for this job; automatic retry was blocked for safety.');
       tradeId = tradeRows[0].id;
 
       orderSubmitted = true;
-      const result = await trading.createMarketOrder({ token, accountId: item.metaapi_account_id, side: item.side, symbol: resolved.symbol, volume, stopLoss: hasStopLoss ? stopLoss : undefined, takeProfit, clientId });
+      const result = await trading.createMarketOrder({ token, accountId: item.metaapi_account_id, side: item.side, symbol: resolved.symbol, volume, stopLoss: hasStopLoss ? stopLoss : undefined, takeProfit: sendTakeProfit, clientId });
       const providerResponse = safeProviderResponse(result, token);
       if (!successfulTradeResponse(result)) {
         const message = safeText(result?.message || result?.description || `MetaAPI rejected the order (${result?.stringCode || result?.numericCode || 'unknown provider code'}).`, [token]);
@@ -632,9 +688,23 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
         `UPDATE trades SET status='executed',provider_response=$1,broker_order_id=$2,broker_position_id=$3,executed_at=NOW() WHERE id=$4 AND user_id=$5`,
         [providerResponse, result?.orderId ? String(result.orderId) : null, result?.positionId ? String(result.positionId) : null, tradeId, job.user_id],
       );
+      /* Only now is the ladder written down: a trade that was never opened owns no plan, and a rejected
+         order must not leave pending closes for a position that does not exist. A rejected plan write
+         cannot undo the order either, so it is logged and the sweep simply has nothing to act on. */
+      let planNote = null;
+      if (scaleOut.eligible && result?.positionId) {
+        try {
+          planNote = await recordScaleOutPlan({
+            userId: job.user_id, tradeId, accountId: item.metaapi_account_id,
+            brokerPositionId: String(result.positionId), symbol: resolved.symbol, side: item.side, plan: scaleOut,
+          });
+        } catch (error) {
+          logger?.error?.(JSON.stringify({ level: 'error', message: 'Scale-out plan could not be recorded', userId: job.user_id, jobId: job.id, error: safeText(error?.message || error) }));
+        }
+      }
       // A completed order normally clears the row's note; when a leg came from the workspace rather than
       // from the channel, that is the one thing worth leaving on the signal for the reader to find later.
-      await updateJob(job.id, job.user_id, 'executed', null, safetyNoteText);
+      await updateJob(job.id, job.user_id, 'executed', null, [safetyNoteText, planNote].filter(Boolean).join(' ') || null);
       // Executing for a user counts as activity, so an account that is trading is never
       // swept up by the inactivity policy.
       await pool.query('UPDATE users SET last_active_at=NOW() WHERE id=$1', [job.user_id]).catch(() => {});
@@ -919,7 +989,329 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
     return summary;
   }
 
-  return { processJob, captureDailyBaseline, captureUtcDayBaselines, sweepBreakEven, runtimeEnabled: Boolean(runtimeEnabled) };
+  /* --------------------- scale-out: closing a piece of the trade at each named target ---------------------
+   * The sweep reads one account snapshot per account and symbol, the same discipline the stop sweep
+   * uses, so a price is never paired with a position size from a different moment. Three properties
+   * carry the whole risk of this feature:
+   *  - a close is claimed in the database before it reaches the broker, so two sweeps, or a sweep and
+   *    a restart, cannot both take the same piece out;
+   *  - a refusal that is the broker's own rule (a stop distance, a size it will not hold) is deferred
+   *    or skipped with the reason kept, never retried into a loop;
+   *  - an ambiguous transport failure is `unknown` and stops, because the broker may already have
+   *    closed the volume and a second close would be a trade nobody asked for.
+   * A platform pause stops new orders, not this: taking profit and moving a stop to entry reduce
+   * exposure, which is the same reasoning that keeps break-even moves running while paused.
+   */
+  let lastTakeProfitSweep = 0;
+  const TP_LEVEL_TRACKING_DAYS = 30;
+  const TP_LEVEL_SWEEP_LIMIT = 20;
+  const TP_CLAIM_STALE_MS = 5 * 60_000;
+
+  async function levelCandidates() {
+    const { rows } = await pool.query(
+      `SELECT l.id,l.status,l.user_id,l.trade_id,l.metaapi_account_id,l.broker_position_id,l.symbol,l.side,
+              l.level_index,l.target_price,l.close_percent,l.planned_volume,l.closed_volume,
+              l.break_even,l.break_even_status,l.attempt_count,
+              t.entry_price,t.quantity,t.remaining_volume,t.user_id AS trade_user_id,
+              s.break_even_enabled AS break_even_enabled,s.break_even_offset_points AS offset_points,
+              s.trailing_stop_enabled AS trailing_enabled,s.trailing_stop_distance_points AS trailing_distance_points,
+              ma.managed_by_app
+       FROM trade_tp_levels l
+       JOIN trades t ON t.id=l.trade_id
+       JOIN settings s ON s.user_id=l.user_id
+       JOIN users u ON u.id=l.user_id
+       JOIN metaapi_accounts ma ON ma.user_id=l.user_id AND ma.metaapi_account_id=l.metaapi_account_id
+       WHERE (
+               (l.status IN ('pending','deferred','failed')
+                 AND (l.next_attempt_at IS NULL OR l.next_attempt_at <= NOW())
+                 AND l.attempt_count < $2)
+               OR (l.status='filled' AND l.break_even=TRUE
+                   AND (l.break_even_status IS NULL OR l.break_even_status IN ('pending','deferred'))
+                   AND l.break_even_attempts < $2)
+             )
+         AND t.status='executed' AND t.broker_position_id IS NOT NULL
+         AND s.auto_trading_enabled=TRUE AND s.execution_account_id=l.metaapi_account_id
+         AND UPPER(COALESCE(ma.state,''))='DEPLOYED'
+         AND u.subscription_status = ANY($3::text[])
+         AND t.created_at >= NOW() - ($1::text || ' days')::interval
+       ORDER BY t.created_at ASC,l.level_index ASC
+       LIMIT $4`,
+      [String(TP_LEVEL_TRACKING_DAYS), Number(breakEvenMaxAttempts) || BREAK_EVEN_MAX_ATTEMPTS, [...PAID_STATUSES], TP_LEVEL_SWEEP_LIMIT],
+    );
+    return rows;
+  }
+
+  /** Re-read immediately before a write, in the sweep's own terms: the plan belongs to this account. */
+  async function planStillArmed(userId, accountId) {
+    const { rows } = await pool.query(
+      'SELECT auto_trading_enabled AS "autoTradingEnabled",execution_account_id AS "executionAccountId" FROM settings WHERE user_id=$1 LIMIT 1',
+      [userId],
+    );
+    const latest = rows[0];
+    return Boolean(latest && latest.autoTradingEnabled === true && latest.executionAccountId === accountId);
+  }
+
+  async function settleLevel(levelId, patch) {
+    const {
+      status, closedVolume = null, remainingVolume = null, message = null, providerResponse = null,
+      retryInMs = null, marketBid = null, marketAsk = null,
+    } = patch;
+    await pool.query(
+      `UPDATE trade_tp_levels SET status=$2,closed_volume=CASE WHEN $3::numeric IS NULL THEN closed_volume ELSE $3 END,
+              remaining_volume=COALESCE($4,remaining_volume),provider_response=COALESCE($5,provider_response),
+              error_message=$6,market_bid=COALESCE($7,market_bid),market_ask=COALESCE($8,market_ask),
+              filled_at=CASE WHEN $2='filled' THEN NOW() ELSE filled_at END,
+              next_attempt_at=CASE WHEN $9::text IS NULL THEN NULL ELSE NOW() + ($9::text || ' milliseconds')::interval END,
+              updated_at=NOW()
+       WHERE id=$1`,
+      [levelId, status, closedVolume, remainingVolume, providerResponse, message ? safeText(message) : null,
+        marketBid, marketAsk, retryInMs == null ? null : String(retryInMs)],
+    );
+  }
+
+  /**
+   * Break even, forced by the plan rather than by the workspace's trigger distance: the moment a piece of
+   * the trade is banked, the ride must not be able to give it all back. `triggerPoints: 0` is what says
+   * "now", and every other rule - never widen, honour the symbol's stop and freeze distances, defer
+   * rather than force - is the same function the break-even sweep uses, so the two can never disagree
+   * about what a safe stop is.
+   */
+  async function applyPlanBreakEven(candidate, context) {
+    const { state, spec, position, token, accountId, logger } = context;
+    const offsetPoints = candidate.break_even_enabled === true ? candidate.offset_points : 0;
+    const decision = calculateStopGuard({
+      side: position.type ?? candidate.side,
+      openPrice: position.openPrice ?? candidate.entry_price,
+      bid: state.price?.bid,
+      ask: state.price?.ask,
+      stopLoss: position.stopLoss,
+      tickSize: spec?.tickSize,
+      stopsLevelPoints: spec?.stopsLevel,
+      freezeLevelPoints: spec?.freezeLevel,
+      breakEven: { triggerPoints: 0, offsetPoints: Number(offsetPoints) || 0 },
+      trailing: candidate.trailing_enabled === true ? { distancePoints: candidate.trailing_distance_points } : null,
+    });
+    const ledger = {
+      user_id: candidate.user_id, trade_id: candidate.trade_id, metaapi_account_id: candidate.metaapi_account_id,
+      broker_position_id: candidate.broker_position_id, symbol: candidate.symbol, side: candidate.side,
+    };
+    if (decision.action === 'already_beyond') {
+      await pool.query(`UPDATE trade_tp_levels SET break_even_status='already_beyond',break_even_stop_loss=COALESCE($2,break_even_stop_loss),updated_at=NOW() WHERE id=$1`, [candidate.id, decision.stopLoss ?? null]);
+      return 'already_beyond';
+    }
+    if (decision.action !== 'move') {
+      await pool.query(
+        `UPDATE trade_tp_levels SET break_even_status='deferred',break_even_attempts=break_even_attempts+1,
+                break_even_error=$2,updated_at=NOW() WHERE id=$1`,
+        [candidate.id, safeText(decision.message || 'The stop could not be moved to break yet.')],
+      );
+      await recordMove(ledger, { triggerPoints: 0, offsetPoints: Number(offsetPoints) || 0, ratchet: false, status: 'deferred', message: `Scale-out break even: ${decision.message || 'the price is not usable yet'}`, retryInMs: BREAK_EVEN_FAILED_RETRY_MS, incrementAttempt: false }).catch(() => {});
+      return 'deferred';
+    }
+    if (!(await planStillArmed(candidate.user_id, candidate.metaapi_account_id))) return 'skipped';
+    const result = await trading.modifyPosition({ token, accountId, positionId: String(candidate.broker_position_id), stopLoss: decision.stopLoss });
+    const providerResponse = safeProviderResponse(result, token);
+    if (noChangeReported(result)) {
+      await pool.query(`UPDATE trade_tp_levels SET break_even_status='already_beyond',break_even_stop_loss=$2,updated_at=NOW() WHERE id=$1`, [candidate.id, decision.stopLoss]);
+      return 'already_beyond';
+    }
+    if (!successfulTradeResponse(result)) {
+      const message = safeText(result?.message || `MetaAPI rejected the break-even move (${result?.stringCode || result?.numericCode || 'unknown provider code'}).`, [token]);
+      await pool.query(`UPDATE trade_tp_levels SET break_even_status='deferred',break_even_attempts=break_even_attempts+1,break_even_error=$2,updated_at=NOW() WHERE id=$1`, [candidate.id, message]);
+      await recordMove(ledger, { triggerPoints: 0, offsetPoints: Number(offsetPoints) || 0, ratchet: false, status: 'failed', message: `Scale-out break even refused: ${message}`, providerResponse, retryInMs: BREAK_EVEN_FAILED_RETRY_MS }).catch(() => {});
+      return 'failed';
+    }
+    await pool.query(
+      `UPDATE trade_tp_levels SET break_even_status='moved',break_even_stop_loss=$2,break_even_error=NULL,updated_at=NOW() WHERE id=$1`,
+      [candidate.id, decision.stopLoss],
+    );
+    await pool.query('UPDATE trades SET stop_loss=$1 WHERE id=$2 AND user_id=$3', [decision.stopLoss, candidate.trade_id, candidate.user_id]);
+    await recordMove(ledger, {
+      triggerPoints: 0, offsetPoints: Number(offsetPoints) || 0, ratchet: candidate.trailing_enabled === true,
+      status: 'moved', stopLoss: decision.stopLoss, previousStopLoss: decision.previousStopLoss,
+      openPrice: decision.openPrice, marketBid: state.price?.bid ?? null, marketAsk: state.price?.ask ?? null,
+      providerResponse, incrementAttempt: false, message: 'Break even applied by the scale-out plan when its first target was reached.',
+    }).catch(() => {});
+    logger?.info?.(JSON.stringify({ level: 'info', message: 'Scale-out stop moved to break even', userId: candidate.user_id, levelId: candidate.id, stopLoss: decision.stopLoss }));
+    return 'moved';
+  }
+
+  async function sweepTakeProfitLevels() {
+    const summary = { attempted: 0, closed: 0, deferred: 0, failed: 0, skipped: 0, waited: 0, breakEvenMoved: 0 };
+    if (!runtimeEnabled) return { ...summary, reason: 'runtime-disabled' };
+    if (typeof trading.closePositionPartially !== 'function') return { ...summary, reason: 'provider-unsupported' };
+    const timestamp = now();
+    const intervalMs = Math.max(1_000, Number(takeProfitSweepIntervalMs) || 5_000);
+    if (timestamp - lastTakeProfitSweep < intervalMs) return { ...summary, reason: 'throttled' };
+    lastTakeProfitSweep = timestamp;
+
+    // A close that was claimed and never settled means this process died mid-call. Recording it as
+    // unknown is the only honest answer: the broker may have closed the volume, and a retry could take
+    // out the same piece twice.
+    await pool.query(
+      `UPDATE trade_tp_levels SET status='unknown',
+              error_message='The sweep stopped while a partial close may have been in progress. Reconcile the position on the broker account before changing this plan.',
+              updated_at=NOW()
+       WHERE status='submitting' AND updated_at < NOW() - ($1::text || ' milliseconds')::interval`,
+      [String(TP_CLAIM_STALE_MS)],
+    ).catch(() => {});
+
+    let rows;
+    try {
+      rows = await levelCandidates();
+    } catch (error) {
+      logger.error?.(JSON.stringify({ level: 'error', message: 'Scale-out plan rows could not be read', error: safeText(error?.message || error) }));
+      return { ...summary, reason: 'candidates-unavailable' };
+    }
+    if (!rows.length) return summary;
+
+    const groups = new Map();
+    for (const row of rows) {
+      const key = `${row.user_id}|${row.metaapi_account_id}|${row.symbol || ''}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(row);
+    }
+
+    for (const group of groups.values()) {
+      const [{ user_id: userId, metaapi_account_id: accountId, symbol }] = group;
+      let state = null;
+      let token = null;
+      try {
+        const { rows: accountRows } = await pool.query(
+          'SELECT managed_by_app,state FROM metaapi_accounts WHERE user_id=$1 AND metaapi_account_id=$2 LIMIT 1',
+          [userId, accountId],
+        );
+        if (!accountRows[0] || String(accountRows[0].state || '').toUpperCase() !== 'DEPLOYED') {
+          for (const candidate of group) summary.skipped += 1;
+          continue;
+        }
+        token = await resolveToken(userId, accountId, accountRows[0].managed_by_app);
+        if (!token) throw new Error('The trading account access token is unavailable.');
+        state = await trading.getAccountState({ token, accountId, symbol });
+      } catch (error) {
+        const message = safeText(error?.message || error, [token]);
+        for (const candidate of group) {
+          // Inability to look is not the broker refusing a close, so no attempt is consumed and the
+          // plan resumes as soon as the account synchronizes again.
+          summary.deferred += 1;
+          await settleLevel(candidate.id, { status: 'deferred', message: `Account data was not available: ${message}`, retryInMs: BREAK_EVEN_FAILED_RETRY_MS }).catch(() => {});
+        }
+        continue;
+      }
+
+      const spec = state.specification;
+      for (const candidate of group) {
+        const position = (state.positions || []).find((item) => String(item.id) === String(candidate.broker_position_id));
+        if (!position) {
+          summary.skipped += 1;
+          await settleLevel(candidate.id, { status: 'closed', message: 'The position is no longer open on the broker account.' });
+          continue;
+        }
+        const context = { state, spec, position, token, accountId, logger };
+        summary.attempted += 1;
+        // Set the moment a close is recorded as filled: from then on nothing may rewrite the level's
+        // status from an error handler, because the volume really has left the position and a later
+        // failure belongs to the stop move alone.
+        let closeSettled = false;
+        try {
+          if (candidate.status !== 'filled') {
+            const side = normalizePositionSide(position.type ?? candidate.side);
+            const reached = targetReached({ side, bid: state.price?.bid, ask: state.price?.ask, target: candidate.target_price });
+            if (!reached.reached) {
+              summary.waited += 1;
+              if (reached.reason === 'price-unavailable') {
+                await settleLevel(candidate.id, { status: 'deferred', message: 'A fresh quote was not available for this symbol.', retryInMs: BREAK_EVEN_DEFERRED_RETRY_MS });
+              }
+              continue;
+            }
+            const sizing = resolveCloseVolume({
+              plannedVolume: candidate.planned_volume,
+              liveVolume: position.volume,
+              minVolume: spec?.minVolume,
+              volumeStep: spec?.volumeStep,
+            });
+            if (sizing.reason === 'position-gone') {
+              summary.skipped += 1;
+              await settleLevel(candidate.id, { status: 'closed', message: 'The position had no volume left to close.' });
+              continue;
+            }
+            if (sizing.error) {
+              // A level the broker cannot honour is settled, not retried: nothing about waiting for a
+              // better quote changes a minimum lot size, and the ride keeps the volume instead.
+              summary.skipped += 1;
+              await settleLevel(candidate.id, { status: 'skipped', message: sizing.error, marketBid: state.price?.bid ?? null, marketAsk: state.price?.ask ?? null });
+              continue;
+            }
+            const { rows: claimed } = await pool.query(
+              `UPDATE trade_tp_levels SET status='submitting',attempt_count=attempt_count+1,market_bid=$2,market_ask=$3,updated_at=NOW()
+               WHERE id=$1 AND status IN ('pending','deferred','failed') RETURNING id`,
+              [candidate.id, state.price?.bid ?? null, state.price?.ask ?? null],
+            );
+            if (!claimed[0]) { summary.skipped += 1; continue; }
+            if (!(await planStillArmed(userId, accountId))) {
+              await settleLevel(candidate.id, { status: 'pending', message: 'Auto-Trading was switched off or the account changed before the close was sent.' });
+              summary.skipped += 1;
+              continue;
+            }
+            const result = await trading.closePositionPartially({
+              token, accountId, positionId: String(candidate.broker_position_id), volume: sizing.volume,
+              clientId: stableClientId(`${candidate.id}:${candidate.level_index}`),
+            });
+            const providerResponse = safeProviderResponse(result, token);
+            if (!successfulTradeResponse(result)) {
+              const message = safeText(result?.message || `MetaAPI rejected the partial close (${result?.stringCode || result?.numericCode || 'unknown provider code'}).`, [token]);
+              summary.failed += 1;
+              await settleLevel(candidate.id, { status: 'deferred', message, providerResponse, retryInMs: BREAK_EVEN_FAILED_RETRY_MS, marketBid: state.price?.bid ?? null, marketAsk: state.price?.ask ?? null });
+              continue;
+            }
+            const filled = Number(result?.filledVolume);
+            const closedVolume = Number.isFinite(filled) && filled > 0 ? Math.min(filled, Number(position.volume)) : sizing.volume;
+            const remaining = Math.max(0, Number((Number(position.volume) - closedVolume).toFixed(8)));
+            summary.closed += 1;
+            await settleLevel(candidate.id, {
+              status: 'filled', closedVolume, remainingVolume: remaining, providerResponse,
+              message: sizing.note ? `Closed ${closedVolume} lots (${sizing.note}).` : null,
+              marketBid: state.price?.bid ?? null, marketAsk: state.price?.ask ?? null,
+            });
+            closeSettled = true;
+            await pool.query(
+              'UPDATE trades SET remaining_volume=$1 WHERE id=$2 AND user_id=$3 AND (remaining_volume IS NULL OR remaining_volume > $1)',
+              [remaining, candidate.trade_id, userId],
+            );
+          }
+          if (candidate.break_even === true && (candidate.break_even_status === null || candidate.break_even_status === undefined || candidate.break_even_status === 'pending' || candidate.break_even_status === 'deferred')) {
+            const moved = await applyPlanBreakEven(candidate, context);
+            if (moved === 'moved') summary.breakEvenMoved += 1;
+            if (moved === 'deferred' || moved === 'failed') summary.deferred += 1;
+          }
+        } catch (error) {
+          const outcome = classifyBreakEvenFailure(error);
+          const message = safeText(outcome.message || error?.message || error, [token]);
+          if (closeSettled || candidate.status === 'filled' || candidate.break_even_status === 'pending') {
+            // The volume is already out of the position; only the stop move is in question, and the
+            // level row itself stays settled so no close is ever re-sent.
+            summary.deferred += 1;
+            await pool.query(
+              `UPDATE trade_tp_levels SET break_even_status=$2,break_even_attempts=break_even_attempts+1,break_even_error=$3,updated_at=NOW()
+               WHERE id=$1`,
+              [candidate.id, outcome.status === 'unknown' ? 'unknown' : 'deferred', outcome.status === 'unknown' ? `${message} Reconcile the position before changing this plan.` : message],
+            ).catch(() => {});
+            continue;
+          }
+          if (outcome.status === 'unknown') {
+            summary.failed += 1;
+            await settleLevel(candidate.id, { status: 'unknown', message: `${message} The partial close may already have been applied; reconcile the position on the broker account before retrying this plan.` });
+            continue;
+          }
+          summary.deferred += 1;
+          await settleLevel(candidate.id, { status: 'deferred', message, retryInMs: BREAK_EVEN_FAILED_RETRY_MS });
+        }
+      }
+    }
+    return summary;
+  }
+
+  return { processJob, captureDailyBaseline, captureUtcDayBaselines, sweepBreakEven, sweepTakeProfitLevels, runtimeEnabled: Boolean(runtimeEnabled) };
 }
 
 export function stableClientId(jobId) {
