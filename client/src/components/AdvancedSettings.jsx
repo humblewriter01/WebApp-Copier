@@ -144,7 +144,7 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
         <SettingsSection
           id="core-execution"
           title="Core Execution"
-          subtitle="Whether a signal may become an order, on which account, and at what size."
+          subtitle="Decide if and how signals become orders."
           state={settings.autoTradingEnabled ? 'Auto-Trading ON' : 'Auto-Trading OFF'}
           tone={settings.autoTradingEnabled ? 'good' : 'neutral'}
           defaultOpen
@@ -202,7 +202,7 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
         <SettingsSection
           id="trade-management"
           title="Trade Management"
-          subtitle="How an open trade is looked after, and what a signal with several targets means."
+          subtitle="Manage Break Even, Trailing Stops, and Multiple Targets."
           state={`${protecting ? 'Stop moves on' : 'No stop moves'} · ${targetModeLabel}`}
           tone={protecting ? 'good' : 'neutral'}
         >
@@ -270,7 +270,7 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
         <SettingsSection
           id="advanced-safety"
           title="Advanced Safety Nets"
-          subtitle="Which signals may be sent at all, and what fills a leg the channel forgot."
+          subtitle="Configure fallback SL/TP and safety blocks."
           state={safetyBlocking ? 'Blocking' : 'Allowed'}
           tone={safetyBlocking ? 'bad' : 'good'}
         >
