@@ -69,6 +69,9 @@ export default function ExecutionSettings({ settings, accounts = [], trades = []
     else set('autoTradingEnabled', true);
   };
   const connectedAccounts = accounts.filter((account) => String(account.state || '').toUpperCase() === 'DEPLOYED');
+  // Absent means on: the guard is the safe reading, and a settings object that has not been saved since
+  // this switch existed must not silently become the permissive one.
+  const blockMissingStop = settings.blockExecutionWithoutStopLoss !== false;
   const set = (key, value) => onChange({ ...settings, [key]: value });
 
   return (
@@ -85,9 +88,12 @@ export default function ExecutionSettings({ settings, accounts = [], trades = []
       {runtimeAvailable && <p className="field-help execution-runtime-note">The worker runs while Signal Desk is online. If the service is offline, new signals may be missed; stale signals are never executed after it returns.</p>}
 
       <form className="form-stack execution-settings-form" onSubmit={onSubmit} aria-busy={saving}>
+        {/* Three groups, because the panel used to mix what to risk with where to send it with what to
+            refuse outright. Only the last of those can change what reaches a broker without a stop. */}
+        <section className="execution-group">
         <div className="execution-section-heading">
-          <h3>Risk Settings</h3>
-          <p>Limits are checked against the selected connected account before every order.</p>
+          <h3>Core Risk</h3>
+          <p>How much a trade may cost you. Limits are checked against the selected connected account before every order.</p>
         </div>
         <label htmlFor="risk-percent">Risk percent per position
           <input id="risk-percent" type="number" min="0.1" max="5" step="0.1" value={settings.riskPercent} onChange={(event) => set('riskPercent', event.target.value)} required />
@@ -103,10 +109,12 @@ export default function ExecutionSettings({ settings, accounts = [], trades = []
         <label htmlFor="daily-loss-limit">Daily loss limit (%)
           <input id="daily-loss-limit" type="number" min="1" max="25" step="0.5" value={settings.dailyLossLimit} onChange={(event) => set('dailyLossLimit', event.target.value)} required />
         </label>
+        </section>
 
+        <section className="execution-group">
         <div className="execution-section-heading">
-          <h3>Execution Settings</h3>
-          <p>Only new, clearly parsed Telegram signals with a valid stop loss can be considered.</p>
+          <h3>Trade Management</h3>
+          <p>Where an order goes, how big it is, and how its stop is looked after afterwards.</p>
         </div>
         <label htmlFor="execution-account">Connected trading account
           <select id="execution-account" value={settings.executionAccountId || ''} onChange={(event) => set('executionAccountId', event.target.value || null)}>
@@ -131,7 +139,7 @@ export default function ExecutionSettings({ settings, accounts = [], trades = []
         {settings.lotSizeMode === 'risk_based' && <p className="field-help">Risk-Based sizing uses your account balance, risk percent, stop-loss distance, and the broker's current symbol tick values. If the safe size is below the broker minimum, the signal is skipped rather than rounded up.</p>}
 
         <div className="execution-section-heading">
-          <h3>Break Even</h3>
+          <h4>Break Even</h4>
           <p>Once the market moves far enough in favour of a trade Signal Desk opened, its stop loss is moved to the entry price so a reversal cannot turn the trade into a loss.</p>
         </div>
         <div className="form-row">
@@ -154,7 +162,7 @@ export default function ExecutionSettings({ settings, accounts = [], trades = []
         {!runtimeAvailable && <p className="field-help">Break-even moves are unavailable while automatic execution is unavailable on this service.</p>}
 
         <div className="execution-section-heading">
-          <h3>Trailing Stop</h3>
+          <h4>Trailing Stop</h4>
           <p>Break even moves a stop once. A trailing stop keeps moving it: the stop stays a fixed distance from the market as the trade runs, and never slips back when the price retraces.</p>
         </div>
         <label htmlFor="trailing-distance">Trailing distance (points)
@@ -170,6 +178,33 @@ export default function ExecutionSettings({ settings, accounts = [], trades = []
         </label>
         <p className="field-help">Trailing stops are checked on the same sweep as break-even moves, and only for trades Signal Desk opened. Distances are MetaTrader points, aligned onto the symbol&rsquo;s tick size, so a stop lands on a price the broker accepts rather than between ticks. A position whose move the broker could not confirm is left alone until you reconcile it, rather than being sent again.</p>
         {!runtimeAvailable && <p className="field-help">Trailing stop moves are unavailable while automatic execution is unavailable on this service.</p>}
+
+        </section>
+
+        <section className="execution-group execution-group-safety">
+          <details className="execution-advanced">
+            <summary>
+              <span className="execution-advanced-title">Advanced Safety</span>
+              <span className={`badge execution-advanced-state ${blockMissingStop ? 'on' : 'off'}`}>{blockMissingStop ? 'Blocking' : 'Allowed'}</span>
+              <span className="execution-advanced-hint">What Signal Desk refuses to send</span>
+            </summary>
+            <p className="execution-advanced-intro">These are the rules that decide whether a captured signal is ever allowed to become an order. They are folded away because most workspaces never need to change them &mdash; the default is the strictest reading.</p>
+            <label className="execution-toggle-row" htmlFor="block-missing-stop">
+              <input id="block-missing-stop" type="checkbox" checked={blockMissingStop} disabled={saving} onChange={(event) => set('blockExecutionWithoutStopLoss', event.target.checked)} />
+              <span>
+                <strong>Block execution if Stop Loss is missing {blockMissingStop ? 'ON' : 'OFF'}</strong>
+                <small>While this is on, a signal with no stop loss is saved for review and never sent to your broker. Turning it off lets a signal without a stop be executed &mdash; only in Fixed Lot mode, because a Risk-Based size is calculated from the distance to a stop that would not exist. Nothing else is relaxed: a signal still needs a symbol, a direction the channel actually stated (or an inferred one, which is never traded), a fresh price, your own Auto-Trading switch, and an account Signal Desk manages.</small>
+              </span>
+            </label>
+            <ul className="execution-advanced-facts">
+              <li>Only new, clearly parsed Telegram signals with a valid stop loss can be considered while this is on.</li>
+              <li>A signal whose direction had to be inferred from its prices is never executed, whatever this switch says.</li>
+              <li>Changing this applies to signals captured after it is saved; a trade already open keeps its own stop.</li>
+              <li>Missing or multiple targets are shown as they are, and never decide on their own whether an order is sent.</li>
+            </ul>
+            <p className="field-help">Saved with the rest of these settings, when you press Save settings below.</p>
+          </details>
+        </section>
 
         <label className="execution-toggle-row" htmlFor="auto-trading-enabled">
           <input id="auto-trading-enabled" type="checkbox" checked={Boolean(settings.autoTradingEnabled)} disabled={saving || (!settings.autoTradingEnabled && !runtimeAvailable)} onChange={(event) => requestAutoTrading(event.target.checked)} />

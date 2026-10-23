@@ -99,11 +99,48 @@ test('capture runs before any execution decision, so a signal cannot be lost to 
 });
 
 test('the Telegram listener only needs an enabled channel, never a plan or a connected broker', () => {
-  assert.match(listenerBody, /FROM channels WHERE user_id=\$1 AND channel_id=\$2 AND enabled=TRUE/);
+  // The chat is matched by every spelling of its id, because a monitored channel row and an incoming
+  // message do not reliably agree on whether the `-100` mark is present.
+  assert.match(listenerBody, /FROM channels\b[\s\S]*WHERE user_id=\$1 AND enabled=TRUE AND channel_id = ANY\(\$2::text\[\]\)/);
   for (const blocked of ['isPaidSubscriber', 'subscription', 'metaapi', 'planLimits', 'platformControls', 'auto_trading_enabled']) {
     assert.equal(listenerBody.includes(blocked), false, `the listener must not consult ${blocked}`);
   }
   assert.ok(listenerBody.includes('await saveSignal('), 'a matching channel message is saved unconditionally');
+});
+
+/* The defect these tests exist for: the listener read one accessor for the chat id, compared it with one
+   exact string, and returned. Every live message was dropped with no row, no error, and no log line - so
+   the panel said "Waiting for signals" forever while manual entry kept working. */
+test('a live message is never dropped without saying where it went', () => {
+  assert.match(listenerBody, /resolveTelegramChatId\(message, event\)/, 'the id is read from every accessor GramJS fills in');
+  assert.match(listenerBody, /const text = telegramMessageText\(message\)/, 'the body is read from every field this update type carries');
+  assert.equal(/const chatId = message\?\.chatId\?\.toString\(\)/.test(listenerBody), false, 'one accessor is exactly how every message went missing');
+  assert.equal(/if \(!chatId \|\| !text\) return;/.test(listenerBody), false, 'an unreadable message is logged, not abandoned');
+  for (const line of [
+    "'Telegram message captured'",
+    "'Telegram message ignored: that chat is not monitored'",
+    "'Telegram message carried no text to read'",
+    "'Telegram message had no chat id to match on'",
+  ]) {
+    assert.ok(listenerBody.includes(line), `the listener states what it did with the message: ${line}`);
+  }
+  // and the counters survive into the status route, so "is it even listening?" has an answer
+  const statusRoute = section(index, "app.get('/api/telegram/status'", 'async function persistTelegramLoginAttempt');
+  assert.match(statusRoute, /listening: Boolean\(entry\?\.handler && entry\.client\?\.connected\)/);
+  assert.match(statusRoute, /messagesSeen|signalsSaved/, 'the panel can tell a silent listener from a quiet channel');
+  assert.match(statusRoute, /if \(entry\?\.client\?\.connected && !entry\.handler\) await startTelegramListener/, 'a connected client with no handler is attached on the spot');
+});
+
+test('the stop-loss guard is read before the row is written, and nothing else is', () => {
+  assert.match(saveSignalBody, /isBlockedOnlyByStopLoss\(parsed\)/, 'a message blocked only by its missing stop is the case the setting governs');
+  assert.match(saveSignalBody, /guard\.blockWithoutStopLoss === false/, 'the workspace has to have switched the guard off');
+  assert.match(saveSignalBody, /String\(guard\.lotSizeMode \|\| 'fixed'\) === 'fixed'/, 'risk-based sizing cannot be computed without a stop to size from');
+  const beforeInsert = saveSignalBody.slice(0, saveSignalBody.indexOf('INSERT INTO signals'));
+  assert.match(beforeInsert, /block_execution_without_stop_loss/, 'the eligibility decision needs the workspace setting');
+  assert.equal(beforeInsert.includes('auto_trading_enabled'), false, 'the capture decision never reads the trading switch');
+  // The inferred direction is stored with the signal, so the badge survives a reload.
+  assert.match(saveSignalBody, /direction_inferred AS "directionInferred"/);
+  assert.match(saveSignalBody, /parsed\.directionInferred === true/);
 });
 
 test('the outcome is read back by every surface that lists signals', () => {

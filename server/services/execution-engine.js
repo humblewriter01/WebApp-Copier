@@ -456,7 +456,7 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
                 s.id AS signal_id,s.source,s.created_at AS signal_created_at,s.symbol,s.side,s.entry_price,s.stop_loss,s.take_profit,
                 s.execution_ready,s.parse_error,
                 st.auto_trading_enabled,st.lot_size_mode,st.fixed_lot_size,st.risk_percent,st.max_open_positions,
-                st.max_daily_trades,st.daily_loss_limit,st.execution_account_id,
+                st.max_daily_trades,st.daily_loss_limit,st.execution_account_id,st.block_execution_without_stop_loss,
                 ma.metaapi_account_id,ma.managed_by_app,ma.state AS account_state,
                 u.subscription_status,u.subscription_plan
          FROM execution_jobs ej
@@ -532,9 +532,25 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
         const desired = Number(item.entry_price);
         if (!Number.isFinite(desired) || (item.side === 'buy' && ask > desired) || (item.side === 'sell' && bid < desired)) return stop(job, 'skipped', 'The current market price is worse than the signal entry price.');
       }
-      const stopLoss = Number(item.stop_loss);
+      /* A signal with no stop arrives here as SQL NULL, and `Number(null)` is 0 - a number that is on
+         the correct side of any price, so the old check read it as a stop at zero and sent 0 to both
+         the trade row and the broker. Null and 0 are now told apart before anything is decided. */
+      const stopLoss = item.stop_loss == null ? null : Number(item.stop_loss);
+      const hasStopLoss = stopLoss !== null && Number.isFinite(stopLoss);
       const takeProfit = item.take_profit == null ? null : Number(item.take_profit);
-      if (!Number.isFinite(stopLoss) || (item.side === 'buy' ? stopLoss >= bid : stopLoss <= ask)) return stop(job, 'skipped', 'The signal stop loss is missing or on the wrong side of the market.');
+      /* A signal without a stop is refused here unless the workspace switched its own Advanced Safety
+         guard off, and even then only where a size can be computed without one: risk-based sizing is
+         arithmetic on the distance to a stop that does not exist. Each refusal names which rule applied,
+         because after the fact "no stop loss" and "you allowed no stop loss" are different sentences. */
+      if (!hasStopLoss && item.block_execution_without_stop_loss !== false) {
+        return stop(job, 'skipped', 'The signal has no stop loss, and your workspace requires one before an order is sent.');
+      }
+      if (hasStopLoss && (item.side === 'buy' ? stopLoss >= bid : stopLoss <= ask)) {
+        return stop(job, 'skipped', 'The signal stop loss is on the wrong side of the market.');
+      }
+      if (!hasStopLoss && String(item.lot_size_mode) !== 'fixed') {
+        return stop(job, 'skipped', 'Risk-based sizing is calculated from the stop loss, so a signal without one cannot be sized safely.');
+      }
       if (takeProfit != null && (!Number.isFinite(takeProfit) || (item.side === 'buy' ? takeProfit <= ask : takeProfit >= bid))) return stop(job, 'skipped', 'The signal take profit is on the wrong side of the market.');
 
       const volume = calculateOrderVolume({
@@ -544,7 +560,7 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
         riskPercent: item.risk_percent,
         side: item.side,
         entryPrice: marketPrice,
-        stopLoss,
+        stopLoss: hasStopLoss ? stopLoss : null,
         specification: state.specification,
         price: quote,
       });
@@ -565,13 +581,13 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'submitting',$11)
          ON CONFLICT(execution_job_id) WHERE execution_job_id IS NOT NULL DO NOTHING
          RETURNING id`,
-        [job.user_id, item.signal_id, job.id, item.metaapi_account_id, resolved.symbol, item.side, volume, marketPrice, stopLoss, takeProfit, clientId],
+        [job.user_id, item.signal_id, job.id, item.metaapi_account_id, resolved.symbol, item.side, volume, marketPrice, hasStopLoss ? stopLoss : null, takeProfit, clientId],
       );
       if (!tradeRows[0]) return stop(job, 'unknown', 'A trade record already exists for this job; automatic retry was blocked for safety.');
       tradeId = tradeRows[0].id;
 
       orderSubmitted = true;
-      const result = await trading.createMarketOrder({ token, accountId: item.metaapi_account_id, side: item.side, symbol: resolved.symbol, volume, stopLoss, takeProfit, clientId });
+      const result = await trading.createMarketOrder({ token, accountId: item.metaapi_account_id, side: item.side, symbol: resolved.symbol, volume, stopLoss: hasStopLoss ? stopLoss : undefined, takeProfit, clientId });
       const providerResponse = safeProviderResponse(result, token);
       if (!successfulTradeResponse(result)) {
         const message = safeText(result?.message || result?.description || `MetaAPI rejected the order (${result?.stringCode || result?.numericCode || 'unknown provider code'}).`, [token]);

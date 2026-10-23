@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   assertAllowedImpersonation,
   assertAllowedSelfUpdate,
@@ -9,6 +10,11 @@ import {
   normalizePromoCodeUpdate,
   normalizeUserUpdate,
   buildUserAdminUpdate,
+  buildAdminSignalDelete,
+  buildSignalOwnershipDelete,
+  buildSignalsPurgeCount,
+  buildSignalsPurgeForUser,
+  buildSignalsPurgeOlderThan,
 } from '../services/admin.js';
 
 test('admin access uses ADMIN_EMAILS plus the workspace owner address', () => {
@@ -154,4 +160,93 @@ test('support access is refused for the accounts where it would mislead', () => 
   } catch (error) {
     assert.equal(error.status, 409, 'a refusal the panel can show without a guess');
   }
+});
+
+/* Signal history deletion is the one admin surface that removes application data, and its whole
+   guarantee is narrow: a trade is never deleted, only unlinked, and the unlink and the delete are a
+   matched pair of statements. These builders are the only SQL those routes run, so the invariants are
+   asserted here rather than trusted from a route that could drift away from them. */
+const SIGNAL_DELETIONS = {
+  ownership: () => buildSignalOwnershipDelete({ userId: 'user-1', signalId: 'signal-1' }),
+  single: () => buildAdminSignalDelete({ signalId: 'signal-1' }),
+  user: () => buildSignalsPurgeForUser({ userId: 'user-1' }),
+  aged: () => buildSignalsPurgeOlderThan({ days: 30 }),
+};
+
+test('every signal deletion unlinks trades before it removes the signal', () => {
+  for (const [name, build] of Object.entries(SIGNAL_DELETIONS)) {
+    const pair = build();
+    // The alias is allowed: the platform purge updates trades against a joined signals row.
+    assert.match(pair.unlink.sql, /^UPDATE trades( \w+)? SET signal_id=NULL/, `${name} keeps the trade rows`);
+    assert.match(pair.unlink.sql, /signal_id=NULL/, `${name} clears only the pointer`);
+    assert.match(pair.remove.sql, /^DELETE FROM signals/, `${name} deletes only signals`);
+    assert.equal(/\bFROM (trades|users|settings|channels|execution_jobs)\b/.test(pair.remove.sql.replace(/RETURNING.*/s, '')), false, `${name} never deletes another table's rows`);
+    for (const statement of [pair.unlink, pair.remove]) {
+      // Distinct placeholder *numbers*, not occurrences: a scope may be written twice in one statement
+      // and bound once, which is what Postgres does with `user_id=$1 ... WHERE user_id=$1`.
+      const numbers = new Set((statement.sql.match(/\$\d+/g) || []).map((token) => token.slice(1)));
+      assert.equal(statement.params.length, numbers.size, `${name} binds every placeholder exactly once`);
+      assert.deepEqual([...numbers].map(Number), [...numbers].map((_, index) => index + 1), `${name} numbers its placeholders from one, with no gaps`);
+      assert.equal(statement.params.some((value) => value === undefined), false, `${name} never binds a hole`);
+      assert.match(pair.remove.sql, /RETURNING/, `${name} reports what it actually removed`);
+    }
+  }
+});
+
+test('a workspace clearing its own history is bounded to its own rows', () => {
+  const pair = buildSignalOwnershipDelete({ userId: 'user-1', signalId: 'signal-1' });
+  // The owner is part of the delete predicate, not a check in front of it: a route that forgets the
+  // check still cannot reach another account's row.
+  assert.match(pair.remove.sql, /id=\$1 AND user_id=\$2/);
+  assert.match(pair.unlink.sql, /signal_id=\$1 AND user_id=\$2/, 'the unlink is scoped the same way');
+  assert.deepEqual(pair.remove.params, ['signal-1', 'user-1']);
+});
+
+test('bulk purges age in SQL from one expression, so a preview cannot disagree with the delete', () => {
+  const aged = buildSignalsPurgeOlderThan({ days: 30 });
+  const cutoff = /NOW\(\) - \(\$1::int \* INTERVAL '1 day'\)/g;
+  assert.equal((aged.remove.sql.match(cutoff) || []).length, 1);
+  assert.equal((aged.unlink.sql.match(cutoff) || []).length, 1, 'the unlink uses the same age as the delete');
+  assert.deepEqual(aged.remove.params, [30]);
+  const user = buildSignalsPurgeForUser({ userId: 'user-1' });
+  assert.match(user.remove.sql, /user_id=\$1/, 'the per-user clear never escapes that account');
+  assert.match(user.remove.sql, /COALESCE\(\$2::timestamptz,'infinity'::timestamptz\)/, 'no cutoff means everything of theirs, and the placeholder count never changes');
+  assert.equal((user.unlink.sql.match(/\$1/g) || []).length, 2, 'the account is bound in both the unlink and its subquery');
+  assert.equal(user.unlink.params.filter((value) => value === 'user-1').length, 1, 'once per placeholder number, Postgres reuses it');
+});
+
+test('the counts a confirmation quotes come from the same shapes as the deletion', () => {
+  const platform = buildSignalsPurgeCount({ days: 30 });
+  assert.deepEqual(platform.params, [30]);
+  assert.match(platform.sql, /COUNT\(\*\)::int AS signals/);
+  assert.match(platform.sql, /AS unlinkable_trades/, 'the preview says how many trades will be unlinked, not deleted');
+  const perUser = buildSignalsPurgeCount({ userId: 'user-1' });
+  assert.deepEqual(perUser.params, ['user-1', null], 'a null age is a valid "everything" and still binds');
+  assert.equal((perUser.sql.match(/user_id=\$1/g) || []).length >= 3, true, 'every count is scoped to the account');
+});
+
+/* The builders are deliberately dumb: their safety is that a target is *bound*, never concatenated, so
+   the shape of the id cannot change the shape of the statement. Refusing a malformed id is the route's
+   job, which is why that guard is asserted against the route source here rather than invented twice. */
+test('a hostile target cannot widen a delete, because nothing is interpolated into the SQL', () => {
+  const hostile = "1 OR 1=1'; DROP TABLE trades;--";
+  for (const build of [
+    () => buildAdminSignalDelete({ signalId: hostile }),
+    () => buildSignalOwnershipDelete({ userId: hostile, signalId: hostile }),
+    () => buildSignalsPurgeForUser({ userId: hostile }),
+  ]) {
+    const pair = build();
+    for (const statement of [pair.unlink, pair.remove]) {
+      assert.equal(statement.sql.includes(hostile), false, 'the value stays in the bind list');
+      assert.equal(statement.sql.includes(';'), false, 'one statement per call, never a stacked one');
+      assert.match(statement.sql, /\$1/, 'and it reaches the row only as a parameter');
+    }
+  }
+  const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  const routes = index.slice(index.indexOf("app.delete('/api/signals/:id'"), index.indexOf("app.get('/api/accounts'"));
+  const adminRoutes = index.slice(index.indexOf('data management (admin)'), index.indexOf('/api/admin/promo-codes'));
+  for (const block of [routes, adminRoutes]) {
+    assert.match(block, /UUID_PATTERN\.test\((signalId|targetId)\)/, 'the route refuses a non-uuid before the builder is consulted');
+  }
+  assert.match(adminRoutes, /Number\.isInteger\(days\) \|\| days < 1 \|\| days > 3650/, 'the purge age is clamped in the route');
 });

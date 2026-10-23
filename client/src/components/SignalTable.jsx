@@ -1,6 +1,6 @@
 import React from 'react';
-import { useTelegramStatus, WAITING_FOR_MESSAGES_MESSAGE } from './TelegramStatus.jsx';
-import { signalOutcomeView } from '../lib/signal-outcome.js';
+import { LISTENER_NOT_ATTACHED_MESSAGE, useTelegramStatus, WAITING_FOR_MESSAGES_MESSAGE } from './TelegramStatus.jsx';
+import { signalBadges, signalOutcomeView } from '../lib/signal-outcome.js';
 
 /**
  * What the signal list says when it is empty — decided entirely by the confirmed Telegram
@@ -22,7 +22,12 @@ export function signalEmptyState({ view, channelCount = 0 } = {}) {
   }
   if (key === 'connected') {
     return Number(channelCount) > 0
-      ? { tone: 'online', title: 'Waiting for signals', message: WAITING_FOR_MESSAGES_MESSAGE, action: null }
+      ? {
+        tone: 'online',
+        title: view?.listening === false ? 'Signed in, not yet reading' : 'Waiting for signals',
+        message: view?.listening === false ? LISTENER_NOT_ATTACHED_MESSAGE : WAITING_FOR_MESSAGES_MESSAGE,
+        action: null,
+      }
       : { tone: 'online', title: 'Telegram is connected', message: 'Choose the groups and channels to monitor, and new signals will appear here automatically.', action: 'choose' };
   }
   return { tone: 'offline', title: 'No signals yet', message: 'Connect Telegram to collect messages from your selected chats, or add a signal note.', action: 'connect' };
@@ -54,13 +59,15 @@ function SignalEmpty({ channelCount, onOpenTelegram, view }) {
  * account connected, is exactly the case where silence reads as failure: the signal is there, and
  * the reason it was not traded has to be as visible as the signal itself.
  */
-export default function SignalTable({ signals, channelCount = 0, onOpenTelegram, onUpgrade }) {
+export default function SignalTable({ signals, channelCount = 0, onOpenTelegram, onUpgrade, onDeleteSignal, deletingId = null }) {
   const { view } = useTelegramStatus();
   if (!signals?.length) return <SignalEmpty channelCount={channelCount} onOpenTelegram={onOpenTelegram} view={view} />;
   return <div className="signal-list">{signals.map((signal) => {
     const outcome = signalOutcomeView(signal);
+    const badges = signalBadges(signal);
     return <article className={`signal-item outcome-${outcome.tone}`} key={signal.id}>
-    <div className="signal-top"><div><strong>{signal.symbol || 'Signal message'}</strong><span className="signal-source">{signal.channelTitle || 'Telegram chat'}</span></div><div className="signal-flags"><span className={`badge ${signal.side === 'buy' ? 'badge-buy' : signal.side === 'sell' ? 'badge-sell' : ''}`}>{signal.side || 'received'}</span><span className={`badge signal-outcome tone-${outcome.tone}`}>{outcome.label}</span></div></div>
+    <div className="signal-top"><div><strong>{signal.symbol || 'Signal message'}</strong><span className="signal-source">{signal.channelTitle || 'Telegram chat'}</span></div><div className="signal-flags"><span className={`badge ${signal.side === 'buy' ? 'badge-buy' : signal.side === 'sell' ? 'badge-sell' : ''}`}>{signal.side || 'received'}</span><span className={`badge signal-outcome tone-${outcome.tone}`}>{outcome.label}</span>{badges.map((badge) => <span key={badge.key} className={`badge signal-flag-badge tone-${badge.tone}`} title={badge.title}>{badge.label}</span>)}</div>
+      {onDeleteSignal ? <button className="signal-delete-button" type="button" title="Remove this signal from your history" aria-label={`Remove ${signal.symbol || 'this signal'} from your history`} disabled={deletingId === signal.id} onClick={() => onDeleteSignal(signal)}>{deletingId === signal.id ? '…' : '✕'}</button> : null}</div>
     <p className="signal-message">{signal.message}</p>
     <div className="signal-meta">{signal.entryPrice != null && <span>Entry {signal.entryPrice}</span>}{signal.stopLoss != null && <span>SL {signal.stopLoss}</span>}{signal.takeProfit != null && <span>TP {signal.takeProfit}</span>}<time>{signal.createdAt ? new Date(signal.createdAt).toLocaleString() : ''}</time></div>
     {outcome.showNote ? <p className="signal-outcome-note"><span>{outcome.note}</span>{outcome.upgradeRequired && onUpgrade ? <button className="text-button" type="button" onClick={onUpgrade}>See plans</button> : null}</p> : null}

@@ -19,6 +19,7 @@ A deployable React/Vite and Express app for capturing Telegram channel messages,
 
 - **Live orders are only ever placed for a user who switched Auto-Trading on.** Every new workspace starts with the setting on so the feature is usable immediately, but nothing is submitted until that user also selects an owned, deployed trading account, is on a paid plan, and every safety gate passes. Turning Auto-Trading off is immediate and stops *all* writes to the broker, including break-even stop moves.
 - **Capturing signals is not a paid feature and is never a trading decision.** A workspace that has connected Telegram and chosen at least one channel receives and stores every message from those channels, whatever its plan and whether or not it has a MetaAPI account at all. What a plan decides is whether the stored signal is *queued* for the broker; a signal that could not be executed is saved with the reason written next to it (`Not executed`, with the upgrade sentence where a plan is what is missing), so an inactive workspace reads an explanation instead of an empty panel.
+- **A captured signal can be deleted; the trade it produced cannot.** Removing a signal - by its owner from `Signals`, or by an administrator from Data management - unlinks any trade that points at it and leaves that trade's row, entry, and profit and loss exactly where they were, in one transaction, so clearing a history can never orphan or delete order history. A signal still queued for execution loses its pending job, which means an order that had not been sent will not be sent; both confirmations say so. See **Signal history: deletion**.
 - **The live-trading warning is a decision, not wallpaper.** The first time a workspace switches Auto-Trading on, a dialog states that live orders will be placed and that the losses are theirs, and asks for `I Understand`; the answer is stored on the workspace (`settings.has_accepted_risk_warning`) and the panel afterwards carries one quiet line under the switch. `Cancel` leaves the switch exactly where it was and is never reported as a failure.
 - Signal Desk never closes or partially closes a position and never widens a stop loss. It places market orders and, when break even or a trailing stop is enabled, moves the stop of a position it opened itself to a price that reduces risk — once, or repeatedly at a fixed distance.
 - An ambiguous broker or network failure on an order or a stop move is recorded as `unknown` and is **not** retried automatically, because the broker may already have accepted the first request. The activity list says so; reconcile that position on the broker account.
@@ -78,6 +79,8 @@ The rule the state machine enforces is that **the connection is unknown, never `
 | `configured: false` | Telegram unavailable | explains the service is unavailable, no button | note: unavailable |
 | check failed, last answer known | last answer marked stale | unchanged | unchanged |
 | check failed, nothing ever known | Status unavailable + Check again | Check again, no connect button | no note |
+
+`GET /api/telegram/status` answers more than connected/not-connected: along with those flags it returns `listening`, `monitoredChannels`, `messagesSeen`, `signalsSaved`, `lastMessageAt`, `lastChatId`, and `lastError`, read from the live listener for that account. `listening` is the field that makes a silent drop visible - a client can be connected with no event handler attached, which is precisely how every message went missing once - and the endpoint attaches the handler on the spot when it finds that state instead of waiting for a restart. Nothing in the UI infers either fact.
 
 The refresh is deduplicated, re-runs when the tab regains focus or becomes visible again (the API can sleep between visits), and polls every 30 seconds. Connect and disconnect flows publish their outcome through `applyStatus()`/`markDisconnected()` instead of waiting on a second round trip, so the pill, both empty states, and the Trading Accounts note change together. A failed check keeps the last confirmed answer and marks it stale rather than inventing a disconnection, and the `showConnectCallToAction` flag is the only way any component may render a connect prompt — `client/test/telegram-status-ui.test.mjs` asserts that invariant against the source tree, along with the rule that exactly one module may call the status endpoint. The same fetch lifecycle and failure policy are shared with the MetaAPI setup indicator through `client/src/lib/status-resource.js`; see [MetaAPI setup availability](#metaapi-setup-availability).
 
@@ -146,6 +149,40 @@ Before an order is submitted the engine re-reads its inputs and fails closed on 
 - With more open trades than the sweep limit, the queue is ordered so a position that has never been protected goes first, then due retries, then ratchets — a full set of established trails can never starve a fresh move. Within each class the row touched longest ago is served first, which rotates the trails.
 
 The sweep shares the worker's polling loop, and an order always goes first, so protecting an open position can never delay a fresh signal. A busy stream of signals cannot starve protection either: every fifth iteration also attempts a sweep. `BREAK_EVEN_SWEEP_INTERVAL_MS` throttles the sweep itself (default `5000` ms, floor `1000`), so calling it often costs nothing. No test or deployment path places a live order: the broker adapter is always faked.
+
+### Risk settings: three groups, one of them folded
+
+The Risk panel is grouped by what a value decides, because one flat list made a stop-loss policy look as ordinary as a lot size. **Core Risk** holds what a trade may cost (risk percent, maximum open trades, maximum daily trades, daily loss limit). **Trade Management** holds where an order goes and how its stop is looked after (connected account, lot size mode, fixed lot, break-even, trailing stop). **Advanced Safety** is a closed `<details>` holding the rules that decide whether a captured signal may become an order at all, and it states its effect in its own summary line (`Blocking` or `Allowed`) so the setting is readable without opening it.
+
+Inside it: **Block execution if Stop Loss is missing** - on by default, and an absent value reads as on, so a settings object written before the switch existed cannot become the permissive one.
+
+- **On** (default): a signal whose message carries no stop loss is saved for review and never sent, exactly as before this switch existed.
+- **Off**: a stop-less signal may execute **in Fixed Lot mode only**. Risk-Based sizing is arithmetic on the distance from entry to stop, and there is no distance to divide by; those signals are still refused, with the refusal saying so.
+- Switching it off relaxes nothing else. The symbol, the direction, a fresh price inside the capture window, the workspace's own Auto-Trading switch, the runtime switch, the platform kill switch, the plan check, and `DEPLOYED`-and-managed account all still have to hold.
+- A direction that had to be **inferred** from the entry and target prices is never executed whatever this says - see below.
+
+### What a captured message says about itself
+
+The parser returns facts, and the row stores them, so the panel never has to guess: `directionInferred`, and the three `missing` prices are what `Signals` renders as **Inferred**, **Missing SL**, and **Missing TP** badges. A message that yielded no trading data at all reads **No clear signal**; a message that was legible but unusable reads **Needs review** with the server's own sentence under it, because "unclear" was sent to people whose channel had written a perfectly readable note with one line missing.
+
+Direction inference is deliberately narrow and never silent: it runs only when the message names no direction word at all, has an entry and exactly one target, and the two differ - target above entry is a buy, below is a sell. The row is then flagged `direction_inferred = TRUE`, `execution_ready = FALSE`, and a blocker (`The trade direction was inferred…`) that keeps it out of the queue. An inferred direction is shown, never traded.
+
+Channel matching is by *both* spellings of a chat id. A supergroup or channel is `-100xxxxxxxxxx` when marked and `xxxxxxxxxx` when not, and GramJS hands over whichever shape the accessor in use happens to produce, so `channels.channel_id` is compared with the full variant set (`= ANY($2::text[])`); a single exact-string comparison dropped every live message the first time the two sides disagreed. Basic-group ids are never rewritten - only matched - because canonicalising `-7` into `-1007` would create a chat that does not exist.
+
+Nothing a monitored message does is quiet any more: the listener logs an `info`/`warn` line for every update it sees, including the ones it ignores and why (no text, chat not monitored, no id to match on), and a failure while storing is logged rather than swallowed. Unparseable and refused messages are still stored: a captured signal is the record that Telegram said something, not a reward for parsing cleanly.
+
+## Signal history: deletion
+
+Captured messages are removable, by their owner and by an administrator. Trades are not, from either place.
+
+- `DELETE /api/signals/:id` and `DELETE /api/signals` (clear history) for the signed-in workspace; `DELETE /api/admin/signals/:id`, `DELETE /api/admin/users/:id/signals`, and `POST /api/admin/signals/purge` (`olderThanDays`, default 30, with `GET /api/admin/signals/purge-preview` for the count first) for administrators.
+- Every one of them runs a matched **pair** of statements in one transaction: `UPDATE trades SET signal_id=NULL …` then `DELETE FROM signals …`. `trades.signal_id` is `ON DELETE SET NULL`, so the unlink is belt-and-braces, and an executed trade keeps its own row, entry price, profit and loss, and broker ids whatever happens to the message that produced it.
+- `execution_jobs.signal_id` is `ON DELETE CASCADE`, so a signal that was queued but not yet sent loses its pending job: that order will not go out. Both confirmation dialogs say so rather than letting it be discovered.
+- The user-facing delete binds the owner inside the statement (`WHERE id=$1 AND user_id=$2`), so a route that forgot its checks still cannot reach another account's row; support-view tokens are read-only at the authentication layer and the panel renders no delete control in that mode.
+- Every administrator deletion is written to `admin_audit_logs` (`signal.delete`, `signal.clearUser`, `signal.purgeOld`) with the account it touched, the count removed, and the count of trades unlinked, and is logged at `warn` for the bulk forms - the numbers are read back from `rowCount`, not from what was expected.
+- The panel reports what the database actually did: the notice after a delete quotes the `deleted` and `unlinkedTrades` counts from the response.
+
+Two indexes ship with this so a purge stays cheap instead of scanning: `signals(created_at)` and the partial `trades(signal_id) WHERE signal_id IS NOT NULL`.
 
 ## Paystack billing
 
@@ -227,8 +264,9 @@ which query or which value was wrong. So the pair is checked where it is built:
   socket, which is why a mismatch can no longer half-apply anything.
 - The admin statements whose columns or period depend on what the administrator filled in are built by
   `buildUserAdminUpdate`, `buildSubscriptionGrantStatements`, `buildSubscriptionExtendStatement`,
-  `buildSubscriptionReleaseStatements`, and `buildSubscriptionMirrorStatement` in
-  `server/services/admin.js`. Each returns `{ sql, params }` from one expression and asserts them
+  `buildSubscriptionReleaseStatements`, `buildSubscriptionMirrorStatement`, and the five signal-deletion
+  builders (`buildSignalOwnershipDelete`, `buildAdminSignalDelete`, `buildSignalsPurgeForUser`,
+  `buildSignalsPurgeOlderThan`, `buildSignalsPurgeCount`) in `server/services/admin.js`. Each returns `{ sql, params }` from one expression and asserts them
   against each other, so a variant that mentions `$5` only sometimes cannot be written again.
 - `server/test/query-parameter-contract.test.js` reads every `pool.query` / `client.query` call site in
   the server (212 sites, 200 of them statically resolvable, the rest being statements assembled at
@@ -261,12 +299,13 @@ Admin access comes from `ADMIN_EMAILS` (comma-separated). The original workspace
 The panel provides:
 
 - Dashboard totals: total users, administrators, suspended users, new sign-ups (7/30 days), promo codes, linked trading accounts, signals, and trades.
-- User management table: search by name or email, change role, suspend with a required reason, and restore access. An admin cannot demote or suspend their own account.
+- User management table: search by name or email, change role, suspend with a required reason, and restore access. An admin cannot demote or suspend their own account, and that refusal is now visible in three places at once: the panel shows the server's own sentence, `log('warn', 'Admin account edit refused', …)` prints the actor, the target, the status, and the *field names* that arrived (never their values), and a refused suspension writes a `user.suspension.refused` row to the audit trail. Before this, a refused account edit left no server-side trace at all, which is why "Suspend does nothing" could not be answered from the logs.
 - Pricing & Plans: the active Starter, Pro, and Premium prices, how many subscribers a change would affect, whether each plan's Paystack plan is in sync (with its `PLN_…` code and last error), the per-plan price history, the two recurring-billing switches, a "Re-sync all plans with Paystack" action, and the promo-code creator: code, percentage or fixed discount, optional maximum uses, and optional expiry. Existing codes can be paused, re-activated, or deleted. Codes are applied at Paystack checkout, and their `current_uses` increment only after a verified payment.
 - Billing activity: active subscriptions, successful and pending payments, gross collected, discounts given, and the latest customer transactions.
 - System health: the platform switch, the execution queue, and the newest MetaAPI and Telegram errors, with the **global auto-trading kill switch** at the top of the tab.
 - Announcements: publish, correct, schedule, and retire the dashboard banner every signed-in user sees.
 - Audit log: who did what, with the admin's email address and the timestamp, filterable by action and searchable by address or wording.
+- Data management: the captured-signal history of every workspace, searchable by user email or name, monitored channel, symbol, and a date range, with the number of trades each signal is linked to. Three deletions are offered - **Delete signal** (one row), **Delete all for this user**, and a **Purge old signals** retention action defaulting to 30 days - each of which shows a server-read count in its confirmation, and none of which can remove a trade. The purge preview and the purge share one SQL age expression, so the number an administrator confirms is the number that goes.
 
 Suspension blocks new sign-ins with the stored reason. Existing JWT sessions on other devices remain valid until they expire (12 hours, or 30 days with "keep me signed in"), so revoke a role or suspend an account knowing that short window. Suspending an account also closes any open support session on it.
 
@@ -392,6 +431,7 @@ The static site is served over HTTPS and includes a linked web app manifest, 192
 - `GET/PUT /api/admin/pricing`, `POST /api/admin/pricing/sync` – admin-only plan prices, recurring-billing settings, and Paystack Plan Code synchronisation
 - `GET /api/admin/health`, `GET/PUT /api/admin/execution-switch` – recent MetaAPI and Telegram errors with queue state, and the global auto-trading kill switch
 - `GET /api/admin/audit-logs` – the append-only administrator audit trail (filter by action, search by admin email or wording)
+- `GET /api/admin/signals` – captured signals across every workspace, searchable by email, name, channel, or symbol and by date range (`from` inclusive, `to` exclusive at day granularity, each trade-linked count included); `DELETE /api/admin/signals/:id`, `DELETE /api/admin/users/:id/signals`, `GET /api/admin/signals/purge-preview`, `POST /api/admin/signals/purge` – the Data management tab's deletion paths, which unlink trades and never remove them
 - `GET/POST /api/admin/announcements`, `PATCH/DELETE /api/admin/announcements/:id` – banner administration (`DELETE` retires; it does not delete)
 - `POST /api/admin/users/:id/impersonate`, `GET /api/admin/support-sessions`, `POST /api/admin/support/stop` – one-hour read-only support access; `POST /api/auth/support/exit` closes the caller's own session
 - `PATCH /api/admin/users/:id/subscription` – manual plan grant, expiry extension, or removal, with a mandatory reason
@@ -401,12 +441,12 @@ The static site is served over HTTPS and includes a linked web app manifest, 192
 - `POST /api/billing/webhook` – Paystack callback, authenticated by signature only
 - `GET /api/dashboard`
 - `GET/POST /api/channels`, `DELETE /api/channels/:id`
-- `GET/POST /api/signals` — every stored message with its outcome: `status` (`received`, `queued`, `unexecuted`, `expired`, `unparsed`, `executed`) and `executionNote`, the sentence explaining an outcome that was not a trade
+- `GET/POST /api/signals`, `DELETE /api/signals/:id`, `DELETE /api/signals` — every stored message with its outcome: `status` (`received`, `queued`, `unexecuted`, `expired`, `unparsed`, `executed`), `executionNote` (the sentence explaining an outcome that was not a trade), `directionInferred`, and the parsed prices; `DELETE` removes captured messages only and unlinks any trade they produced
 - `GET/POST /api/accounts`, `DELETE /api/accounts/:id`
-- `GET/PUT /api/settings` – risk limits, lot sizing, selected execution account, break-even trigger/offset, and trailing distance; `GET` also reports the platform's own execution switch so the panel can explain a pause instead of leaving a user to hunt for a toggle that is already on
+- `GET/PUT /api/settings` – risk limits, lot sizing, selected execution account, break-even trigger/offset, trailing distance, and `blockExecutionWithoutStopLoss` (Advanced Safety, default `true`); `GET` also reports the platform's own execution switch so the panel can explain a pause instead of leaving a user to hunt for a toggle that is already on
 - `GET /api/trades` – execution activity, including the break-even outcome for each position
 - `GET /api/metaapi/provisioning-status`, `GET /api/metaapi/linked-accounts` (each account also carries its idle age and warning state, plus the workspace's inactivity policy), `POST /api/metaapi/provisioned-accounts`, `POST /api/metaapi/provisioned-accounts/:accountId/configuration-link`, `POST /api/metaapi/provisioned-accounts/:accountId/refresh`, `DELETE /api/metaapi/accounts/:accountId`
-- `GET /api/telegram/status`, `POST /api/telegram/request-code`, `POST /api/telegram/verify-code`, `POST /api/telegram/verify-password`, `GET /api/telegram/chats`, `POST /api/telegram/disconnect`
+- `GET /api/telegram/status` – connection plus listener health (`listening`, `monitoredChannels`, `messagesSeen`, `signalsSaved`, `lastMessageAt`, `lastChatId`, `lastError`), and it re-attaches a missing handler, `POST /api/telegram/request-code`, `POST /api/telegram/verify-code`, `POST /api/telegram/verify-password`, `GET /api/telegram/chats`, `POST /api/telegram/disconnect`
 - `GET /health`
 
 Authenticated endpoints require `Authorization: Bearer <token>`. Every `/api/admin/*` endpoint additionally requires the caller's current database role to be `admin`.

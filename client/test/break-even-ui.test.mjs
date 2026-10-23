@@ -147,7 +147,10 @@ test('the warning is asked for the first time only, and cancelling is never an e
 
 test('the trailing stop section states what it does and what it never does', () => {
   const markup = render();
-  assert.match(markup, /<h3>Trailing Stop<\/h3>/);
+  // The heading level moved when the panel was grouped; what matters is that the section is a heading
+  // inside Trade Management and not a bare paragraph.
+  assert.match(markup, /<h[34]>Trailing Stop<\/h[34]>/);
+  assert.ok(markup.indexOf('<h3>Trade Management</h3>') < markup.indexOf('Trailing Stop'), 'the trail sits under Trade Management');
   assert.match(markup, /Trailing distance \(points\)/);
   assert.match(markup, /Enable Trailing Stop ON/);
   assert.match(markup, /never slips back/, 'the one-way ratchet is explained before it is switched on');

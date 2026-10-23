@@ -391,3 +391,109 @@ export function buildSubscriptionMirrorStatement({ targetId, status, planKey, li
   assertQueryParameters(sql, params, 'Adjusting that plan (mirror)');
   return { sql, params };
 }
+
+/* ----------------------------------------------------------------------------------------------
+ * Signal deletion, as statements rather than string fragments.
+ *
+ * A signal is now removable by its owner and by an administrator, and the one thing that must never
+ * happen is the ledger losing an order because the message that triggered it was cleared away. So
+ * every delete is returned as a *pair* - unlink first, remove second - from the same expression, with
+ * the placeholders and the values asserted against each other before either is sent. The optional age
+ * filter is a `COALESCE($n::timestamptz,'infinity'::timestamptz)` rather than an `if`: a statement that
+ * only sometimes mentions a placeholder is exactly how a bind ends up misaligned.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** Signals older than this instant are in scope; `null` means "everything the filter names". */
+const AGE_FILTER = "created_at < COALESCE($2::timestamptz,'infinity'::timestamptz)";
+
+function assertPair(pair, label) {
+  assertQueryParameters(pair.sql, pair.params, label);
+  return pair;
+}
+
+/** One signal, deleted only by the account that owns it. */
+export function buildSignalOwnershipDelete({ userId, signalId }) {
+  return {
+    unlink: assertPair({
+      sql: 'UPDATE trades SET signal_id=NULL WHERE signal_id=$1 AND user_id=$2',
+      params: [signalId, userId],
+    }, 'Unlinking trades from that signal'),
+    remove: assertPair({
+      sql: 'DELETE FROM signals WHERE id=$1 AND user_id=$2 RETURNING id,created_at AS "createdAt",source',
+      params: [signalId, userId],
+    }, 'Deleting that signal'),
+  };
+}
+
+/** One signal, deleted by an administrator from any workspace. */
+export function buildAdminSignalDelete({ signalId }) {
+  return {
+    unlink: assertPair({
+      sql: 'UPDATE trades SET signal_id=NULL WHERE signal_id=$1',
+      params: [signalId],
+    }, 'Unlinking trades from that signal'),
+    remove: assertPair({
+      sql: 'DELETE FROM signals WHERE id=$1 RETURNING id,user_id AS "userId",created_at AS "createdAt",source',
+      params: [signalId],
+    }, 'Deleting that signal'),
+  };
+}
+
+/**
+ * Every signal of one workspace - the user's own "clear history" and the administrator's per-account
+ * delete, which is the same statement because the scope is the user id either way. Trades keep their
+ * rows and lose only the pointer.
+ */
+export function buildSignalsPurgeForUser({ userId, olderThan = null }) {
+  return {
+    unlink: assertPair({
+      sql: `UPDATE trades SET signal_id=NULL
+            WHERE user_id=$1 AND signal_id IN (SELECT id FROM signals WHERE user_id=$1 AND ${AGE_FILTER})`,
+      params: [userId, olderThan],
+    }, 'Unlinking trades from those signals'),
+    remove: assertPair({
+      sql: `DELETE FROM signals WHERE user_id=$1 AND ${AGE_FILTER} RETURNING id`,
+      params: [userId, olderThan],
+    }, 'Deleting those signals'),
+  };
+}
+
+/** The platform-wide age purge. The cutoff is arithmetic in SQL, so it cannot disagree with a preview. */
+export function buildSignalsPurgeOlderThan({ days }) {
+  const cutoff = "NOW() - ($1::int * INTERVAL '1 day')";
+  return {
+    unlink: assertPair({
+      sql: `UPDATE trades t SET signal_id=NULL
+            FROM signals s
+            WHERE t.signal_id=s.id AND s.created_at < ${cutoff}`,
+      params: [days],
+    }, 'Unlinking trades from the expired signals'),
+    remove: assertPair({
+      sql: `DELETE FROM signals WHERE created_at < ${cutoff} RETURNING id`,
+      params: [days],
+    }, 'Deleting the expired signals'),
+  };
+}
+
+/**
+ * How many rows a purge would take, and how many executed orders it must unlink - read *before* the
+ * write so a confirmation can state real numbers instead of reassuring nobody.
+ */
+export function buildSignalsPurgeCount({ userId = null, days = null }) {
+  if (userId) {
+    return assertPair({
+      sql: `SELECT COUNT(*)::int AS signals,
+                   (SELECT COUNT(*)::int FROM trades t
+                     WHERE t.user_id=$1 AND t.signal_id IN (SELECT id FROM signals WHERE user_id=$1)) AS unlinkable_trades
+              FROM signals WHERE user_id=$1 AND created_at < COALESCE($2::timestamptz,'infinity'::timestamptz)`,
+      params: [userId, days],
+    }, 'Counting the signals to clear');
+  }
+  return assertPair({
+    sql: `SELECT COUNT(*)::int AS signals,
+                 (SELECT COUNT(*)::int FROM trades t
+                   WHERE t.signal_id IN (SELECT id FROM signals WHERE created_at < NOW() - ($1::int * INTERVAL '1 day'))) AS unlinkable_trades
+            FROM signals WHERE created_at < NOW() - ($1::int * INTERVAL '1 day')`,
+    params: [days],
+  }, 'Counting the expired signals');
+}
