@@ -298,6 +298,9 @@ button,input,textarea,select{touch-action:manipulation}
 .idle-warning-card ul{margin:0;padding-left:18px;display:grid;gap:4px}
 .idle-warning-card li{font-size:12.5px;line-height:1.5}
 .idle-warning-card p{margin:8px 0 0;font-size:12px;line-height:1.5;color:#8a5a2b}
+/* A trading account that cannot trade says so on the account row itself, in the panel where the account is
+   managed. The sentence is the server's, because the server is the only thing that knows why. */
+.account-execution-note{margin:6px 0 0;padding:8px 10px;border-left:3px solid #b3261e;border-radius:8px;background:#fdf2f2;color:#8c1d18;font-size:12.5px;line-height:1.5}
 .billing-plan-card ul li.billing-plan-absent{color:#8a5a55}
 .skeleton{position:relative;overflow:hidden;background:#e9edf3;border-radius:6px;display:block}
 .skeleton:after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent,#f8fafc,transparent);animation:skeleton-sweep 1.4s ease-in-out infinite}

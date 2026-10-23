@@ -239,7 +239,13 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
       </div>}
       {loading && !accounts.length ? <p className="muted" role="status">Loading your trading accounts…</p> : !accounts.length ? <div className="empty-state compact-empty"><strong>No trading accounts connected</strong><span>Add an MT4 or MT5 account to get started.</span></div> : <div className="chat-list">
         {provisionedAccounts.map((account) => <div className="chat-row account-row" key={account.id}>
-          <div><strong>{account.name || 'Trading account'}</strong><small>{[account.platform?.toUpperCase(), account.server, account.login && `Login ${account.login}`, accountStateLabel(account.state)].filter(Boolean).join(' · ')}</small></div>
+          <div>
+            <strong>{account.name || 'Trading account'}</strong>
+            <small>{[account.platform?.toUpperCase(), account.server, account.login && `Login ${account.login}`, accountStateLabel(account.state)].filter(Boolean).join(' · ')}</small>
+            {/* The server's own sentence, in the one place an account is managed. Auto-Trading would keep
+                skipping signals silently otherwise, and "why is nothing trading" would have no answer here. */}
+            {account.executionNote ? <p className="account-execution-note" role="alert">{account.executionNote}</p> : null}
+          </div>
           <div className="account-actions">
             <button type="button" className="button button-secondary button-small" disabled={busy} onClick={() => refreshAccount(account)}>Refresh status</button>
             <button type="button" className="button button-small" disabled={busy} onClick={() => createLink(account)}>New setup link</button>

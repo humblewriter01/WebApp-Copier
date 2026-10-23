@@ -45,8 +45,13 @@ export function createExecutionWorker({ pool, engine, pollIntervalMs = 1200, sta
     try {
       await client.query('BEGIN');
       const { rows } = await client.query(
+        /* A job whose `next_attempt_at` is in the future is waiting out a backoff, and claiming it early is
+         * how a broker that asked for fewer requests gets a request anyway. `expires_at` is still the hard
+         * bound, so a retry can never resurrect a signal past its own window: the deadline wins, the job
+         * expires, and the reason the user reads is the one the expiry sweep wrote. */
         `SELECT id,user_id,signal_id FROM execution_jobs
          WHERE status='queued' AND expires_at > NOW()
+           AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
          ORDER BY created_at ASC FOR UPDATE SKIP LOCKED LIMIT 1`,
       );
       if (!rows[0]) {
