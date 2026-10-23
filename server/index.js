@@ -2034,6 +2034,42 @@ app.post('/api/admin/announcements', authenticate, requireAdmin, adminRoute('Pub
   });
 }));
 
+/* Retiring keeps the row on purpose, so the history list is the one place that only ever grows. This
+ * route deletes from it: everything no user can still see and never will again, which is `retired` plus
+ * `ended` as `announcementState` defines them. Live and upcoming banners are outside the predicate, and a
+ * banner's per-user dismissals follow their banner (`ON DELETE CASCADE`) rather than orphaning.
+ *
+ * It is mounted BEFORE the `/api/admin/announcements/:id` routes, and that is not a style choice. Express
+ * matches in registration order, so `DELETE /api/admin/announcements/history` declared after
+ * `DELETE /api/admin/announcements/:id` is a route that can never be reached: `history` becomes `:id`, the
+ * UUID check refuses it, and the administrator who pressed one button is handed back
+ * `Choose a valid announcement.` - a sentence about a row they were not trying to touch, from the endpoint
+ * that retires one. `test/route-order.test.js`, required by `test/admin-clear-history.test.js`, walks
+ * every literal route in this file for that shadowing, so grouping the two deletes together "for tidiness"
+ * fails a test rather than shipping.
+ */
+app.delete('/api/admin/announcements/history', authenticate, requireAdmin, adminRoute('Clearing the banner history', async (req, res) => {
+  const statement = buildRetiredAnnouncementClear();
+  const { rowCount } = await pool.query(statement.sql, statement.params);
+  markApplied(req);
+  const removed = Number(rowCount || 0);
+  await auditLog.record({
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+    action: 'announcement.purgeHistory',
+    targetType: 'announcement',
+    targetId: 'history',
+    summary: `Deleted ${removed} banner(s) that were retired or past their end date.`,
+    metadata: { removed },
+  });
+  res.set('Cache-Control', 'no-store').json({
+    removed,
+    notice: removed
+      ? `${removed} banner(s) deleted. Live and upcoming banners were kept.`
+      : 'Nothing to delete - every banner in the history is live or still scheduled.',
+  });
+}));
+
 app.patch('/api/admin/announcements/:id', authenticate, requireAdmin, asyncRoute(async (req, res) => {
   const id = String(req.params.id || '').trim();
   if (!UUID_PATTERN.test(id)) return fail(res, 400, 'Choose a valid announcement.');
@@ -2075,33 +2111,6 @@ app.delete('/api/admin/announcements/:id', authenticate, requireAdmin, asyncRout
     metadata: { message: announcement.message },
   });
   res.set('Cache-Control', 'no-store').json({ announcement, notice: 'Retired - it no longer appears on dashboards, and the record stays for audit.' });
-}));
-
-/* Retiring keeps the row on purpose, so the history list is the one place that only ever grows. This
- * route deletes from it: everything no user can still see and never will again, which is `retired` plus
- * `ended` as `announcementState` defines them. Live and upcoming banners are outside the predicate, and a
- * banner's per-user dismissals follow their banner (`ON DELETE CASCADE`) rather than orphaning.
- */
-app.delete('/api/admin/announcements/history', authenticate, requireAdmin, adminRoute('Clearing the banner history', async (req, res) => {
-  const statement = buildRetiredAnnouncementClear();
-  const { rowCount } = await pool.query(statement.sql, statement.params);
-  markApplied(req);
-  const removed = Number(rowCount || 0);
-  await auditLog.record({
-    actorId: req.userId,
-    actorEmail: req.userEmail,
-    action: 'announcement.purgeHistory',
-    targetType: 'announcement',
-    targetId: 'history',
-    summary: `Deleted ${removed} banner(s) that were retired or past their end date.`,
-    metadata: { removed },
-  });
-  res.set('Cache-Control', 'no-store').json({
-    removed,
-    notice: removed
-      ? `${removed} banner(s) deleted. Live and upcoming banners were kept.`
-      : 'Nothing to delete - every banner in the history is live or still scheduled.',
-  });
 }));
 
 /* ---------------------------- Admin: support access ----------------------------
