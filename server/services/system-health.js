@@ -81,6 +81,20 @@ export const RECENT_ERROR_COUNTS_SELECT = `WITH ${RECENT_ERRORS_CTE}
 SELECT kind,COUNT(*)::int AS count,COUNT(DISTINCT user_id)::int AS "affectedUsers",MAX(occurred_at) AS "lastSeen"
 FROM recent GROUP BY kind`;
 
+/**
+ * The statement behind the panel's "Clear history" button on the errors list.
+ *
+ * The `telegram_parse` rows in `RECENT_ERRORS_CTE` are defined by one condition - a non-empty
+ * `signals.parse_error` - so clearing exactly that condition is what empties that tab, and nothing
+ * else. `execution_note` is deliberately untouched even though the list falls back to it for the
+ * wording: it is written by the execution engine about a trade attempt, so erasing it would remove
+ * a workspace's own record of what happened to their signal in order to tidy an admin screen. The
+ * captured message itself is never deleted either, so the parse can be re-run from the original text.
+ */
+export function buildParseErrorClear() {
+  return { sql: "UPDATE signals SET parse_error=NULL WHERE parse_error IS NOT NULL AND parse_error <> ''", params: [] };
+}
+
 export const EXECUTION_STATE_SELECT = `SELECT
   (SELECT COUNT(*)::int FROM execution_jobs WHERE status='queued') AS queued_jobs,
   (SELECT COUNT(*)::int FROM execution_jobs WHERE status='processing') AS processing_jobs,

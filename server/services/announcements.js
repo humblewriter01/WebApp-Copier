@@ -135,6 +135,22 @@ export function announcementState(row, now = new Date()) {
   return 'live';
 }
 
+/**
+ * The statement behind the banner panel's "Clear history" button.
+ *
+ * Retiring a banner has always been a soft change - `active=FALSE`, the row kept - which is why the
+ * history list only ever grows. This deletes the two states a row cannot come back from: retired ones,
+ * and ones whose end date has passed. Those two terms are exactly `announcementState`'s `retired` and
+ * `ended` branches: `announcements_window_check` forbids a banner from ending before it starts, so a row
+ * with a past `ends_at` can never be `scheduled`, and everything left standing (active, with an open or
+ * future window) is a banner somebody can still see. `announcement_dismissals` hangs off these ids
+ * with `ON DELETE CASCADE`, so each user's "I've seen this" record goes with its banner rather than
+ * orphaning.
+ */
+export function buildRetiredAnnouncementClear() {
+  return { sql: 'DELETE FROM announcements WHERE active = FALSE OR ends_at <= NOW()', params: [] };
+}
+
 export function createAnnouncementService({ pool, logger = console, now = () => new Date() } = {}) {
   if (!pool?.query) throw new TypeError('Announcements need a database pool.');
   const log = (level, message, extra = {}) => logger?.[level]?.(message, extra);

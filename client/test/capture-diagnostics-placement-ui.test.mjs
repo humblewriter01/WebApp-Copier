@@ -55,12 +55,15 @@ test('no user-facing surface explains the host to the person using it', () => {
   assert.deepEqual(offenders, [], 'a sleep warning in a user dashboard is a fault of ours dressed up as theirs');
 });
 
-test('the admin panel is where the capture diagnostic lives, and it says the mechanism out loud', () => {
+test('the admin panel keeps the capture counters, and says nothing about the host', () => {
   const admin = renderedText(readFileSync(path.join(srcDir, ADMIN_PANEL), 'utf8'));
-  assert.match(admin, BRAND, 'the administrator is told which host this is about');
-  assert.match(admin, /free tier|asleep|sleeps/i);
-  assert.match(admin, /messages seen|Messages seen/i, 'and the counter that distinguishes a quiet channel from a deaf listener');
+  assert.match(admin, /messages seen|Messages seen/i, 'the counter that distinguishes a quiet channel from a deaf listener');
+  assert.match(admin, /sessions held/i, 'with the count of sessions this process holds beside it, which is the pair an operator acts on');
   const source = readFileSync(path.join(srcDir, ADMIN_PANEL), 'utf8');
   assert.match(source, /health\.capture/, 'the numbers come from the server, never from a guess here');
-  assert.match(source, /sleepSuspected/, 'and the derived flag is what turns the sentence on');
+  // The paragraph that explained why a session can be missing was removed at the administrator's request:
+  // the numbers below it were the part they read. It is not a fact about this deployment that anybody has
+  // to be told in prose, so no panel - user or admin - states it any more.
+  assert.equal(/sleepSuspected/.test(source), false, 'the flag no longer switches a sentence on in the panel');
+  assert.equal(BRAND.test(admin) || /free tier|asleep|sleeps/i.test(admin), false, 'the mechanism is not spelled out anywhere in the panel either');
 });

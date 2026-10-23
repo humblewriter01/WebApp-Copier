@@ -2,11 +2,13 @@
  * Administrator audit trail.
  *
  * One row per administrator action: what was done, the admin's email address at the time,
- * and when. The trail is append-only as far as the application is concerned - there is no
- * update or delete path - and a write failure is logged loudly but never turns a successful
- * admin action into an error, because "the price was saved but the response was a 500"
- * is worse than a gap in the log. Metadata is scrubbed of anything credential-shaped before
- * it is stored, since these rows are read back by a browser.
+ * and when. The trail is append-only as far as the application is concerned - no route updates a
+ * row, and the one way rows leave the table is the administrator pressing "Clear history" and
+ * confirming it - and that is recorded too, so the trail never goes silent about its own deletion.
+ * A write failure is logged
+ * loudly but never turns a successful admin action into an error, because "the price was saved but the
+ * response was a 500" is worse than a gap in the log. Metadata is scrubbed of anything credential-shaped
+ * before it is stored, since these rows are read back by a browser.
  */
 import { validationError } from './admin.js';
 
@@ -48,6 +50,12 @@ export const AUDIT_ACTIONS = Object.freeze({
   'signal.delete': 'Captured signal removed',
   'signal.clearUser': 'Signal history cleared for one workspace',
   'signal.purgeOld': 'Old captured signals purged platform-wide',
+  /* The three history-clearing buttons, on panels that used to be read-only. The list above is closed on
+     purpose, so a route whose action key is misspelled is refused only after its rows are gone - which is
+     why these three are written here first and asserted by name in the tests. */
+  'health.clearParseErrors': 'Telegram parsing error wording cleared',
+  'audit.clear': 'Admin audit log cleared',
+  'announcement.purgeHistory': 'Retired banners deleted',
   'user.suspend.refused': 'Suspension request refused',
 });
 
@@ -156,6 +164,16 @@ export function auditFilterSql(query) {
 
 export const auditLogColumns = `id,actor_id AS "actorId",actor_email AS "actorEmail",action,target_type AS "targetType",
   target_id AS "targetId",summary,metadata,created_at AS "createdAt"`;
+
+/**
+ * The statement behind the panel's "Clear history" button. There is exactly one, it has no predicate,
+ * and the route that runs it records afterwards what it removed - so a cleared trail is distinguishable
+ * from a trail that was never written, which is the only property that makes this button safe to have.
+ * `rowCount` is what the answer is built from, so the statement does not haul every deleted id back.
+ */
+export function buildAuditLogClear() {
+  return { sql: 'DELETE FROM admin_audit_logs', params: [] };
+}
 
 export function createAuditLogger({ pool, logger = console, now = () => new Date() } = {}) {
   if (!pool?.query) throw new TypeError('The audit logger needs a database pool.');

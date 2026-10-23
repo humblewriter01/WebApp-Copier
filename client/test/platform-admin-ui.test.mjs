@@ -291,8 +291,12 @@ test('the suspend form acts on the account it was opened for, not on whatever th
   // Paging or searching replaces the rows, so an open form pointing at one of them is closed with them.
   assert.match(panel, /closeSuspensionForm\(\);\n\s+setSearch\(nextSearch\);/);
   assert.match(panel, /closeSuspensionForm\(\);\n\s+setOffset\(nextOffset\);/);
-  // And the panel names the account, so an administrator can see who is about to be suspended.
-  assert.match(panel, /<strong>Suspend \{suspension\.name \|\| 'this account'\}<\/strong>/);
+  // And the dialog names the account, so an administrator can see who is about to be suspended.
+  assert.match(panel, /title=\{`Suspend \$\{suspension\.name \|\| 'this account'\}`\}/);
+  // It is a dialog over the panel now: a `<form>` after the table could be scrolled out of sight, while a
+  // row inside the table squeezed the reason field into one column of a seven-column layout.
+  assert.equal(/<form className="admin-suspend"/.test(panel), false, 'the suspend form no longer lives under the table');
+  assert.match(panel, /<AdminActionModal[\s\S]*?open=\{Boolean\(suspension\.userId\)\}[\s\S]*?tone="danger"/);
 });
 
 test('a support token is kept in the tab only and never handed to another origin', () => {

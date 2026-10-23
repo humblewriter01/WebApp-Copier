@@ -35,10 +35,10 @@ import {
   createInactivityService, daysInactiveSince,
   INACTIVITY_WARNING_DAYS, INACTIVITY_DELETION_DAYS, INACTIVITY_SWEEP_LIMIT,
 } from './services/inactivity.js';
-import { createAuditLogger, normalizeAuditQuery } from './services/audit.js';
+import { createAuditLogger, normalizeAuditQuery, buildAuditLogClear } from './services/audit.js';
 import { createPlatformControls, normalizeKillSwitchInput, KILL_SWITCH_SETTING_KEY } from './services/platform-controls.js';
-import { createSystemHealthService, normalizeHealthQuery } from './services/system-health.js';
-import { createAnnouncementService, normalizeAnnouncementDraft, normalizeAnnouncementListQuery } from './services/announcements.js';
+import { createSystemHealthService, normalizeHealthQuery, buildParseErrorClear } from './services/system-health.js';
+import { createAnnouncementService, normalizeAnnouncementDraft, normalizeAnnouncementListQuery, buildRetiredAnnouncementClear } from './services/announcements.js';
 import { createSupportSessionService, normalizeSupportReason, buildSupportClaims, SUPPORT_SESSION_MINUTES } from './services/support-sessions.js';
 
 const app = express();
@@ -1898,6 +1898,34 @@ app.get('/api/admin/health', authenticate, requireAdmin, asyncRoute(async (req, 
   res.set('Cache-Control', 'no-store').json(await systemHealth.snapshot(normalizeHealthQuery(req.query || {})));
 }));
 
+/* The errors list gets a clear button here, because this is the only place the parsing reasons are shown,
+ * and no row is lost by removing one: the captured message stays in `signals`, only the recorded reason
+ * goes. The statement is `buildParseErrorClear`: its WHERE is the condition the list's `telegram_parse`
+ * branch selects on, without that branch's window, so the button clears every recorded reason rather than
+ * only the ones currently on screen - and an emptied tab and a count of zero then always agree.
+ */
+app.delete('/api/admin/health/errors', authenticate, requireAdmin, adminRoute('Clearing the Telegram parsing errors', async (req, res) => {
+  const statement = buildParseErrorClear();
+  const { rowCount } = await pool.query(statement.sql, statement.params);
+  markApplied(req);
+  const cleared = Number(rowCount || 0);
+  await auditLog.record({
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+    action: 'health.clearParseErrors',
+    targetType: 'platform',
+    targetId: 'signals.parse_error',
+    summary: `Cleared the recorded parsing reason from ${cleared} captured message(s).`,
+    metadata: { cleared },
+  });
+  res.set('Cache-Control', 'no-store').json({
+    cleared,
+    notice: cleared
+      ? `${cleared} captured message(s) no longer carry a parsing reason. The messages themselves are untouched.`
+      : 'No captured message carried a parsing reason, so nothing was removed.',
+  });
+}));
+
 app.get('/api/admin/execution-switch', authenticate, requireAdmin, asyncRoute(async (_req, res) => {
   const state = await platformControls.read();
   res.set('Cache-Control', 'no-store').json({
@@ -1934,14 +1962,41 @@ app.put('/api/admin/execution-switch', authenticate, requireAdmin, asyncRoute(as
 }));
 
 /* ----------------------------- Admin: audit trail -----------------------------
- * Read-only from here: the only writer is the record() call each admin mutation makes, and there
- * is deliberately no route that edits or removes an entry.
+ * The only writer of an entry is the record() call each admin mutation makes, and no route edits one.
+ * There is one way rows are removed, below: the administrator clearing the history on purpose, from a
+ * button the panel only renders for an admin, behind a confirmation it has to answer. That route writes
+ * its own entry afterwards, so an emptied table is still evidence of having been emptied - which is the
+ * only difference between this button and a cover-up.
  */
 app.get('/api/admin/audit-logs', authenticate, requireAdmin, asyncRoute(async (req, res) => {
   let query;
   try { query = normalizeAuditQuery(req.query || {}); }
   catch (error) { return fail(res, error.status || 400, error.message); }
   res.set('Cache-Control', 'no-store').json(await auditLog.list(query));
+}));
+
+app.delete('/api/admin/audit-logs', authenticate, requireAdmin, adminRoute('Clearing the audit log', async (req, res) => {
+  const statement = buildAuditLogClear();
+  const { rowCount } = await pool.query(statement.sql, statement.params);
+  markApplied(req);
+  const removed = Number(rowCount || 0);
+  // Recorded after the delete, from the route that deleted: the entry describing the wipe has to survive
+  // it, and it is the row an admin sees when they ask when the history went.
+  await auditLog.record({
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+    action: 'audit.clear',
+    targetType: 'platform',
+    targetId: 'admin_audit_logs',
+    summary: `Cleared the admin audit log - ${removed} entr${removed === 1 ? 'y' : 'ies'} removed.`,
+    metadata: { removed },
+  });
+  res.set('Cache-Control', 'no-store').json({
+    removed,
+    notice: removed
+      ? `${removed} entr${removed === 1 ? 'y' : 'ies'} deleted. This clearing is recorded as the log's only entry.`
+      : 'The audit log was already empty.',
+  });
 }));
 
 /* --------------------------- Admin: announcements --------------------------- */
@@ -2020,6 +2075,33 @@ app.delete('/api/admin/announcements/:id', authenticate, requireAdmin, asyncRout
     metadata: { message: announcement.message },
   });
   res.set('Cache-Control', 'no-store').json({ announcement, notice: 'Retired - it no longer appears on dashboards, and the record stays for audit.' });
+}));
+
+/* Retiring keeps the row on purpose, so the history list is the one place that only ever grows. This
+ * route deletes from it: everything no user can still see and never will again, which is `retired` plus
+ * `ended` as `announcementState` defines them. Live and upcoming banners are outside the predicate, and a
+ * banner's per-user dismissals follow their banner (`ON DELETE CASCADE`) rather than orphaning.
+ */
+app.delete('/api/admin/announcements/history', authenticate, requireAdmin, adminRoute('Clearing the banner history', async (req, res) => {
+  const statement = buildRetiredAnnouncementClear();
+  const { rowCount } = await pool.query(statement.sql, statement.params);
+  markApplied(req);
+  const removed = Number(rowCount || 0);
+  await auditLog.record({
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+    action: 'announcement.purgeHistory',
+    targetType: 'announcement',
+    targetId: 'history',
+    summary: `Deleted ${removed} banner(s) that were retired or past their end date.`,
+    metadata: { removed },
+  });
+  res.set('Cache-Control', 'no-store').json({
+    removed,
+    notice: removed
+      ? `${removed} banner(s) deleted. Live and upcoming banners were kept.`
+      : 'Nothing to delete - every banner in the history is live or still scheduled.',
+  });
 }));
 
 /* ---------------------------- Admin: support access ----------------------------
