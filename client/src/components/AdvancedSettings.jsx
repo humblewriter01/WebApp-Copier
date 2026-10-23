@@ -88,8 +88,8 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
       </div>
 
       {pauseNotice ? <div className="alert alert-info execution-paused-notice" role="alert">{pauseNotice}</div> : null}
-      {!runtimeAvailable && <div className="alert alert-info" role="status">Automatic execution is currently unavailable. You can still turn Auto-Trading off; eligible signals will not place orders while execution is unavailable.</div>}
-      {runtimeAvailable && <p className="field-help execution-runtime-note">The worker runs while Signal Desk is online. If the service is offline, new signals may be missed; stale signals are never executed after it returns.</p>}
+      {!runtimeAvailable && <div className="alert alert-info" role="status">Automatic execution is unavailable here, so no signal will place an order until it returns.</div>}
+      {runtimeAvailable && <p className="field-help execution-runtime-note">The worker runs while Signal Desk is online; signals missed while it was offline are never executed late.</p>}
 
       <form className="form-stack execution-settings-form" onSubmit={onSubmit} aria-busy={saving}>
         {/* What an order does, in three groups: the switch and what guards it, how the trade is looked after
@@ -98,11 +98,11 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
         <section className="execution-group execution-group-automation">
         <div className="execution-section-heading">
           <h3>Auto-Trading</h3>
-          <p>The switch that decides whether a signal may become an order, and everything that guards it. The size of the risk a trade carries is set on the Risk Settings page.</p>
+          <p>The switch that decides whether a signal may become an order, and what guards it. Trade size lives on the Risk Settings page.</p>
         </div>
         <label className="execution-toggle-row" htmlFor="auto-trading-enabled">
           <input id="auto-trading-enabled" type="checkbox" checked={Boolean(settings.autoTradingEnabled)} disabled={saving || (!settings.autoTradingEnabled && !runtimeAvailable)} onChange={(event) => requestAutoTrading(event.target.checked)} />
-          <span><strong>Auto-Trading {settings.autoTradingEnabled ? 'ON' : 'OFF'}</strong><small>This toggle saves immediately. Switch it off whenever you want no new orders to be submitted.</small></span>
+          <span><strong>Auto-Trading {settings.autoTradingEnabled ? 'ON' : 'OFF'}</strong><small>This toggle saves immediately. Turn it off whenever no new orders should be submitted.</small></span>
         </label>
         <p className="risk-reminder">
           <span>{RISK_REMINDER}</span>
@@ -123,7 +123,7 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
         <section className="execution-group">
         <div className="execution-section-heading">
           <h3>Trade Management</h3>
-          <p>Where an order goes, how big it is, and how its stop is looked after afterwards.</p>
+          <p>Where an order goes and how its stop is looked after afterwards.</p>
         </div>
         <label htmlFor="execution-account">Connected trading account
           <select id="execution-account" value={settings.executionAccountId || ''} onChange={(event) => set('executionAccountId', event.target.value || null)}>
@@ -165,7 +165,7 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
           <input id="break-even-enabled" type="checkbox" checked={Boolean(settings.breakEvenEnabled)} disabled={saving || !runtimeAvailable} onChange={(event) => set('breakEvenEnabled', event.target.checked)} />
           <span>
             <strong>Move stops to break even {settings.breakEvenEnabled ? 'ON' : 'OFF'}</strong>
-            <small>Only trades Signal Desk opened are touched, and a stop is only ever moved in the direction that reduces risk &mdash; never widened. The move needs a fresh synchronized quote and must satisfy the broker&rsquo;s own stop and freeze distances, so it is retried while the price is too close to the market. Turning Auto-Trading off also stops these moves: while it is off Signal Desk sends nothing to your broker. Changing either distance re-arms positions that were already handled.</small>
+            <small>Only trades Signal Desk opened are touched, and a stop only ever moves to reduce risk &mdash; never widened. A move needs a fresh quote and the broker&rsquo;s own stop and freeze distances, so it is retried while the price is too close; turning Auto-Trading off also stops these moves, and changing either distance re-arms positions already handled.</small>
           </span>
         </label>
         {!runtimeAvailable && <p className="field-help">Break-even moves are unavailable while automatic execution is unavailable on this service.</p>}
@@ -182,10 +182,10 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
           <input id="trailing-enabled" type="checkbox" checked={Boolean(settings.trailingStopEnabled)} disabled={saving || !runtimeAvailable} onChange={(event) => set('trailingStopEnabled', event.target.checked)} />
           <span>
             <strong>Enable Trailing Stop {settings.trailingStopEnabled ? 'ON' : 'OFF'}</strong>
-            <small>The stop only ever moves in the direction that reduces risk: a buy ratchets up, a sell ratchets down, and a stop you moved yourself to a tighter price is never widened or replaced. Each workspace check uses a fresh synchronized quote and the broker&rsquo;s own stop and freeze distances, so a move that cannot be accepted yet is retried instead of forced. It can run with or without break even &mdash; with both on, the more protective stop wins. Turning Auto-Trading off stops these moves too: while it is off Signal Desk sends nothing to your broker.</small>
+            <small>The stop only ever moves in the direction that reduces risk, and a stop you tightened yourself is never widened or replaced. Each check uses a fresh synchronized quote and the broker&rsquo;s own distances, so a move that cannot be accepted yet is retried rather than forced. It runs with or without break even, and the more protective stop wins. Turning Auto-Trading off stops these moves too.</small>
           </span>
         </label>
-        <p className="field-help">Trailing stops are checked on the same sweep as break-even moves, and only for trades Signal Desk opened. Distances are MetaTrader points, aligned onto the symbol&rsquo;s tick size, so a stop lands on a price the broker accepts rather than between ticks. A position whose move the broker could not confirm is left alone until you reconcile it, rather than being sent again.</p>
+        <p className="field-help">Trailing stops are checked on the same sweep as break-even moves, for trades Signal Desk opened, and distances are MetaTrader points aligned onto the symbol&rsquo;s tick size. A move the broker could not confirm is left alone until you reconcile it, rather than being sent again.</p>
         {!runtimeAvailable && <p className="field-help">Trailing stop moves are unavailable while automatic execution is unavailable on this service.</p>}
 
         </section>
@@ -195,47 +195,46 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
             <summary>
               <span className="execution-advanced-title">Advanced Safety</span>
               <span className={`badge execution-advanced-state ${safetyBlocking ? 'on' : 'off'}`}>{safetyBlocking ? 'Blocking' : 'Allowed'}</span>
-              <span className="execution-advanced-hint">What Signal Desk refuses to send, and what it supplies itself</span>
+              <span className="execution-advanced-hint">Configure fallback SL/TP and the safety blocks that decide what may be sent.</span>
             </summary>
-            <p className="execution-advanced-intro">These are the rules that decide whether a captured signal is ever allowed to become an order. They are folded away because most workspaces never need to change them &mdash; the default is the strictest reading.</p>
+            {/* Everything longer than one sentence belongs inside the disclosure: this section is read
+                by someone deciding whether to change a rule, not by someone looking for it. */}
+            <p className="execution-advanced-intro">The default is the strictest reading, and it is the one to leave alone unless a channel posts signals without stops.</p>
             <label className="execution-toggle-row" htmlFor="block-missing-stop">
               <input id="block-missing-stop" type="checkbox" checked={blockMissingStop} disabled={saving} onChange={(event) => set('blockExecutionWithoutStopLoss', event.target.checked)} />
               <span>
                 <strong>Block execution if Stop Loss is missing {blockMissingStop ? 'ON' : 'OFF'}</strong>
-                <small>While this is on, a signal with no stop loss is saved for review and never sent to your broker. Turning it off lets a signal without a stop be executed &mdash; only in Fixed Lot mode, because a Risk-Based size is calculated from the distance to a stop that would not exist. Nothing else is relaxed: a signal still needs a symbol, a direction the channel actually stated (or an inferred one, which is never traded), a fresh price, your own Auto-Trading switch, and an account Signal Desk manages.</small>
+                <small>While on, a signal with no stop loss is saved for review and never sent to your broker. Turning it off allows one to be executed only in Fixed Lot mode: a Risk-Based size is measured to a stop that would not exist. Nothing else is relaxed &mdash; a stated direction, a fresh price, your own switch and a managed account are still required.</small>
               </span>
             </label>
             <label className="execution-toggle-row" htmlFor="block-missing-target">
               <input id="block-missing-target" type="checkbox" checked={blockMissingTarget} disabled={saving} onChange={(event) => set('blockExecutionWithoutTakeProfit', event.target.checked)} />
               <span>
                 <strong>Block execution if Take Profit is missing {blockMissingTarget ? 'ON' : 'OFF'}</strong>
-                <small>A position with no target has nothing that closes it: it runs until you, the market, or its stop does. While this is on, a signal with no take-profit target is saved for review and never sent to your broker. Turning it off is the deliberate choice to hold an open trade with no exit planned &mdash; and with the stop-loss block off as well, that trade is naked on both sides, which Signal Desk marks as an override wherever it can be read afterwards.</small>
+                <small>While on, a signal with no take-profit target is saved for review and never sent. Turning it off is the deliberate choice to hold a trade with no exit planned; with the stop-loss block off too, that trade is naked on both sides, and it is recorded as a User Override so it can be found afterwards.</small>
               </span>
             </label>
             <div className="form-row execution-fallback-fields">
               <label htmlFor="fallback-stop-loss">Fallback Stop Loss (points)
                 <input id="fallback-stop-loss" type="number" min="1" max="1000000" step="1" placeholder="None" value={settings.fallbackStopLossPoints ?? ''} disabled={saving} onChange={(event) => set('fallbackStopLossPoints', event.target.value === '' ? null : event.target.value)} />
-                <small>We cannot let a trade run naked because the provider forgot. This distance is used only when a signal states no stop loss of its own &mdash; what the channel wrote always wins. It is measured from the price the order is sent at and aligned onto the symbol&rsquo;s tick grid away from the market, so rounding can never tighten your risk. On most FX pairs 10 points is one pip. Blank means no fallback.</small>
+                <small>This distance is used only when a signal states no stop loss of its own &mdash; what the channel wrote always wins. Measured from the price the order is sent at, rounded onto the symbol&rsquo;s tick grid away from the market so rounding never tightens your risk. On most FX pairs 10 points is one pip. Blank means no fallback.</small>
               </label>
               <label htmlFor="fallback-take-profit">Fallback Take Profit (points)
                 <input id="fallback-take-profit" type="number" min="1" max="1000000" step="1" placeholder="None" value={settings.fallbackTakeProfitPoints ?? ''} disabled={saving} onChange={(event) => set('fallbackTakeProfitPoints', event.target.value === '' ? null : event.target.value)} />
-                <small>The same rescue for the other leg: a target placed this far beyond the order price when the channel stated none. A fallback that this symbol&rsquo;s broker would refuse is reported as unusable rather than ignored, and the block above then decides. Blank means no fallback.</small>
+                <small>The same rescue for the other leg, placed this far beyond the order price when the channel stated none. A distance this symbol&rsquo;s broker would refuse is reported as unusable rather than ignored, and the block above then decides. Blank means no fallback.</small>
               </label>
             </div>
             <ul className="execution-advanced-facts">
-              <li>Only new, clearly parsed Telegram signals are considered at all; while a block is on, a signal missing that leg needs a fallback distance to be sent.</li>
-              <li>A signal whose direction had to be inferred from its prices is never executed, whatever this switch says.</li>
-              <li>Changing this applies to signals captured after it is saved; a trade already open keeps its own stop.</li>
-              <li>Missing or multiple targets are shown as they are; the block above is what decides, not the parser.</li>
-              <li>A fallback prices the missing leg when the order is sent, from a live quote &mdash; never from the signal&rsquo;s entry price, which may be hours old.</li>
-              <li>A trade sent without a leg because a block is off is logged as a User Override and left with a note on the signal, so it can be found afterwards.</li>
+              <li>These rules decide only whether a signal may be sent; the parser still reports a missing or multiple target as it is.</li>
+              <li>A fallback is priced from a live quote when the order is sent, never from the signal&rsquo;s entry price, and a signal whose direction had to be inferred is never executed.</li>
+              <li>Changes apply to signals captured afterwards; an open trade keeps its own stop.</li>
             </ul>
             <p className="field-help">Saved with the rest of these settings, when you press Save settings below.</p>
           </details>
         </section>
 
-        <p className="field-help">Break-even moves apply to positions Signal Desk opened; trades you placed yourself in the terminal keep their own stops. Signals without a clear direction, symbol, or stop loss are saved for review but are not traded.</p>
-        <p className="field-help advanced-settings-crosslink">Risk percent per position, the maximum number of open trades, and the daily loss limit are on the <button type="button" className="text-button" onClick={onOpenRiskSettings}>Risk Settings</button> page; a save here writes them as they were last loaded, never as blanks.</p>
+        <p className="field-help">Break-even moves apply to positions Signal Desk opened; your own trades keep their stops.</p>
+        <p className="field-help advanced-settings-crosslink">Position size, open-trade limit and daily loss limit live on the <button type="button" className="text-button" onClick={onOpenRiskSettings}>Risk Settings</button> page.</p>
         <button className="button button-primary" type="submit" disabled={saving}>{saving ? 'Saving settings…' : 'Save settings'}</button>
       </form>
       <RiskWarningModal

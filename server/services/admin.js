@@ -317,9 +317,22 @@ export function buildUserAdminUpdate(update = {}, targetId) {
   if (update.isSuspended !== undefined) push('is_suspended', update.isSuspended);
   if (update.suspensionReason !== undefined) push('suspension_reason', update.suspensionReason || null);
   if (!assignments.length) throw validationError('Choose at least one change to save.');
+  /*
+   * The write returns what it wrote, for one specific reason: the caller used to answer a successful
+   * suspension by running a second SELECT over the whole admin column list, so any failure in that
+   * follow-up - a connection dropped while the host was waking, one missing column - turned an
+   * account that had really been suspended into an error in the panel. The state an administrator is
+   * told about now comes from the statement that changed it, and the richer re-read is an
+   * enhancement the route may skip. Every name in this list is a literal from a closed set, chosen by
+   * which fields were assigned, never by their content.
+   */
+  const returning = ['id AS "userId"'];
+  if (update.role !== undefined) returning.push('role');
+  if (update.isSuspended !== undefined) returning.push('is_suspended AS "isSuspended"');
+  if (update.isSuspended !== undefined || update.suspensionReason !== undefined) returning.push('suspension_reason AS "suspensionReason"');
   values.push(targetId);
   const sql = `UPDATE users SET ${assignments.join(',')} WHERE id=$${values.length}
-     RETURNING id AS "userId"`;
+     RETURNING ${returning.join(',')}`;
   assertQueryParameters(sql, values, 'Updating that account');
   return { sql, params: values };
 }

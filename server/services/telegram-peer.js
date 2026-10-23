@@ -101,24 +101,46 @@ function firstDefined(values) {
 }
 
 /**
- * The body of a message, from whichever field this update type carries it.
+ * The body of a message, from whichever field this update shape actually fills in.
  *
- * `message.message` is where channel posts live in this event shape, `message.text` is the plain
- * accessor, `media.caption` covers a signal posted as an image with the prices underneath, and the
- * whole thing is capped: a session that has been off for a week should not have a megabyte of prose run
- * through the parser, which used to happen for every undelivered update in one go.
+ * This is where the whole product was losing signal #4451, and the reason is a detail of GramJS:
+ * `Message.text` is not a wire field. It is computed by `Message._finishInit()` when the library
+ * decorates a message, and every call site of `_finishInit` in GramJS wraps it in
+ * `try { ... } catch { }` - `events/NewMessage.js` even carries the comment "todo make sure this
+ * never fails". The raw string is only ever in `message.message`. So on any post whose entity
+ * decoration failed - which is normal right after a session is restored, when the entity cache is
+ * empty - `event.message.text` is undefined, the old reader returned null, and the listener logged
+ * "carried no text to read" and moved on. The channel id was found, the row was never written, and a
+ * workspace with 4,451 messages seen had 0 signals to show for it.
+ *
+ * Every field that can hold the text is therefore tried, in the order the library fills them, and a
+ * message is only called empty when all of them are empty. `media.caption` covers a signal posted as
+ * an image with the prices underneath, and the whole thing is capped: a session that has been off for
+ * a week should not have a megabyte of prose run through the parser.
  */
 export function telegramMessageText(message) {
   const candidate = firstDefined([
-    message?.text,
-    message?.message?.text,
-    message?.caption,
-    message?.message?.caption,
-    message?.media?.caption,
-    message?.message?.media?.caption,
+    readText(message?.text),
+    readText(message?.message),
+    readText(message?.rawText),
+    readText(message?.message?.text),
+    readText(message?.caption),
+    readText(message?.message?.caption),
+    readText(message?.media?.caption),
+    readText(message?.message?.media?.caption),
   ]);
   if (!candidate) return null;
   return candidate.slice(0, MAX_SIGNAL_TEXT);
+}
+
+/** A text field is a string here, an object with `text` there, and neither is a reason to give up. */
+function readText(value) {
+  if (typeof value === 'string') return value;
+  if (value && typeof value === 'object') {
+    if (typeof value.text === 'string') return value.text;
+    if (typeof value.message === 'string') return value.message;
+  }
+  return undefined;
 }
 
 /** A pin, a join, a rename: a service notice, not a post to read as a signal. */

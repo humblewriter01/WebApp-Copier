@@ -395,6 +395,12 @@ button,input,textarea,select{touch-action:manipulation}
 .health-check.tone-unknown { border-color: #e2e6ec; background: #f7f8fa; }
 .health-queue { display: grid; grid-template-columns: repeat(6,minmax(0,1fr)); gap: 10px; margin: 16px 0 4px; }
 .health-queue div { display: grid; gap: 3px; background: #f5f7fa; border-radius: 9px; padding: 10px 12px; }
+.health-capture { border: 1px solid #e3e8ef; border-radius: 10px; padding: 12px 14px; margin: 14px 0 4px; }
+.health-capture-head { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+.health-capture > p { margin: 6px 0 0; font-size: 13px; color: #40506a; }
+.health-capture-sleep { background: #fff7e6; border-left: 3px solid #d99b2b; padding: 8px 10px; border-radius: 0 8px 8px 0; }
+.health-capture .health-queue { margin: 12px 0 0; grid-template-columns: repeat(4,minmax(0,1fr)); }
+.health-capture-foot { font-size: 11px; color: #7f8ca0; margin-top: 8px; }
 .health-queue span { font-size: 9px; font-weight: 700; letter-spacing: .5px; text-transform: uppercase; color: #7f8ca0; }
 .health-queue strong { font-size: 13px; color: #1a2a40; }
 .health-table td { vertical-align: top; }

@@ -224,7 +224,7 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
         {sourceNote.action === 'choose' && onOpenTelegram ? <button type="button" className="text-button" onClick={onOpenTelegram}>Choose channels</button> : null}
         {sourceNote.action === 'connect' && onOpenTelegram && view.showConnectCallToAction ? <button type="button" className="text-button" onClick={onOpenTelegram}>Connect Telegram</button> : null}
       </div> : null}
-      <div className="note-box">Adding an account does not place a trade by itself. Auto-Trading is ON by default for new workspaces; after you select a deployed account, new eligible Telegram signals may place orders. Turn it off in Advanced Settings to stop new orders. MetaAPI usage limits or charges may apply when a trading account is connected.</div>
+      <div className="note-box">Adding an account does not place a trade by itself, but Auto-Trading is ON by default for new workspaces: once a deployed account is selected, new eligible signals may place orders. Turn it off in Advanced Settings to stop that. MetaAPI usage limits or charges may apply.</div>
     </section>
 
     <section className="panel" aria-labelledby="metaapi-accounts-title">
@@ -257,7 +257,7 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
         <p>Log in to Signal Desk or execute a trade to keep the account. Accounts that are removed cannot be recovered, and your broker account itself is not touched.</p>
       </div>}
       {(error || notice) && <div className={`alert ${error ? 'alert-error' : 'alert-success'}`} role={error ? 'alert' : 'status'} aria-live="polite">{error || notice}</div>}
-      <p className="field-help account-retention-note">Removing an account you created here deletes it from MetaAPI as well, so provider billing for it stops. Your broker account, open positions, and orders already sent are not affected. Accounts you added with your own MetaAPI token are only unlinked.</p>
+      <p className="field-help account-retention-note">Removing an account you created here deletes it from MetaAPI as well, so provider billing for it stops; your broker account and open positions are untouched. Accounts you added with your own MetaAPI token are only unlinked.</p>
     </section>
   </div>;
 }

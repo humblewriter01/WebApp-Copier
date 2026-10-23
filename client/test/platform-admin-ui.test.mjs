@@ -274,8 +274,10 @@ test('the suspend form sends exactly the fields the endpoint reads, with real bo
   assert.equal(/isSuspended:\s*['"]/.test(panel), false, 'the flag is a boolean, never the text "true"');
   assert.match(panel, /const reason = suspension\.reason\.trim\(\);\n\s+if \(!reason\)/, 'an empty reason is stopped before the request');
 
-  // One request helper for both actions, so a header or a token cannot differ between them.
-  assert.match(panel, /await request\(`\/api\/admin\/users\/\$\{userId\}`, token, \{ method: 'PATCH', body \}\)/);
+  // One request helper for both actions, so a header or a token cannot differ between them - and it
+  // is the call that opts into the single retry for a service that never answered, because a write
+  // that reached nobody is not a refusal and must not be reported as one.
+  assert.match(panel, /await request\(`\/api\/admin\/users\/\$\{userId\}`, token, \{ method: 'PATCH', body, retryWhenUnanswered: true \}\)/);
 });
 
 test('the suspend form acts on the account it was opened for, not on whatever the list holds', () => {

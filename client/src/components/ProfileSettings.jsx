@@ -41,12 +41,12 @@ export default function ProfileSettings({ user, token, onDeleted, readOnly = fal
           <div className="profile-fact"><dt>Role</dt><dd>{ROLE_LABELS[user?.role] || 'Workspace owner'}</dd></div>
           <div className="profile-fact"><dt>Workspace created</dt><dd>{joined && !Number.isNaN(joined.getTime()) ? joined.toLocaleDateString() : '—'}</dd></div>
         </dl>
-        <p className="field-help">The name and email on this row are the ones Signal Desk signs you in with, and they are not editable from inside the workspace: a change to either is a change to the account, not to a setting. Ask support if any of it is wrong.</p>
+        <p className="field-help">The name and email on this row are what Signal Desk signs you in with, so they are not editable from inside the workspace. Ask support if either one is wrong.</p>
       </section>
 
       <section className="panel profile-password-panel" aria-labelledby="profile-password-title">
         <div className="panel-heading"><div><p className="eyebrow">SECURITY</p><h2 id="profile-password-title">Password</h2></div></div>
-        <p className="muted">Signal Desk never stores your password, so it cannot change it for you here. Sending a reset link emails a single-use address that opens a page to choose a new password; it expires, and nothing changes until you use it.</p>
+        <p className="muted">Signal Desk never stores your password, so it cannot change it for you here. The reset email carries a single-use link that expires, and nothing changes until you open it.</p>
         {readOnly
           ? <p className="field-help">You are looking at another workspace through a support session, so no reset link can be sent from it.</p>
           : <>
@@ -57,7 +57,7 @@ export default function ProfileSettings({ user, token, onDeleted, readOnly = fal
             <button type="button" className="button button-primary" onClick={sendResetLink} disabled={state === 'sending' || !email}>
               {state === 'sending' ? 'Sending reset link…' : state === 'sent' ? 'Send another link' : 'Change password'}
             </button>
-            <p className="field-help">Signed in on a shared device? Sign out from the bottom of the navigation when you have finished, and turn Auto-Trading off on Advanced Settings first if you do not want new orders while you are away.</p>
+            <p className="field-help">Signed in on a shared device? Turn Auto-Trading off in Advanced Settings first, then sign out from the bottom of the navigation.</p>
           </>}
       </section>
 
