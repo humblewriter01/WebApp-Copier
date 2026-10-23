@@ -216,6 +216,63 @@ export async function initializeDatabase() {
     ALTER TABLE break_even_moves ADD COLUMN IF NOT EXISTS trailing_distance_points NUMERIC;
     CREATE INDEX IF NOT EXISTS break_even_moves_retry_idx ON break_even_moves(status, next_attempt_at);
     ALTER TABLE break_even_moves ENABLE ROW LEVEL SECURITY;
+    /* ---------------- scale-out on a signal that numbered its targets ----------------
+     * A channel that writes TP 1 / TP 2 / TP 3 is publishing a plan for one trade, and a copier that
+     * holds a single position has to decide what to do with the rest of it. The workspace's answer is a
+     * setting; the ladder itself is stored with the signal, because re-reading the message at execution
+     * time would let a parser change alter a trade someone had already reviewed.
+     */
+    ALTER TABLE signals ADD COLUMN IF NOT EXISTS take_profit_levels JSONB;
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS multiple_target_handling TEXT NOT NULL DEFAULT 'first_target';
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'settings_multiple_target_handling_check' AND conrelid = 'settings'::regclass) THEN
+        ALTER TABLE settings ADD CONSTRAINT settings_multiple_target_handling_check CHECK (multiple_target_handling IN ('first_target', 'final_target', 'scale_out'));
+      END IF;
+    END $$;
+    /* The open trade's share of that plan. One row per numbered target, keyed by the trade it belongs
+     * to, is what makes a partial close idempotent: 'submitting' means a call is in flight and nothing
+     * may send it again, 'unknown' means the broker may already have closed it and a human has to look,
+     * and a filled row keeps the stop-move it triggered retryable without re-closing any volume. */
+    CREATE TABLE IF NOT EXISTS trade_tp_levels (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      trade_id UUID NOT NULL REFERENCES trades(id) ON DELETE CASCADE,
+      metaapi_account_id TEXT NOT NULL,
+      broker_position_id TEXT NOT NULL,
+      symbol TEXT,
+      side TEXT,
+      level_index SMALLINT NOT NULL,
+      target_price NUMERIC NOT NULL,
+      close_percent SMALLINT NOT NULL DEFAULT 0,
+      planned_volume NUMERIC,
+      closed_volume NUMERIC NOT NULL DEFAULT 0,
+      remaining_volume NUMERIC,
+      break_even BOOLEAN NOT NULL DEFAULT FALSE,
+      break_even_status TEXT,
+      break_even_stop_loss NUMERIC,
+      break_even_attempts INTEGER NOT NULL DEFAULT 0,
+      break_even_error TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      market_bid NUMERIC,
+      market_ask NUMERIC,
+      provider_response JSONB,
+      error_message TEXT,
+      next_attempt_at TIMESTAMPTZ,
+      filled_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(trade_id, level_index),
+      CONSTRAINT trade_tp_levels_status_check CHECK (status IN ('pending', 'submitting', 'filled', 'deferred', 'failed', 'unknown', 'skipped', 'closed')),
+      CONSTRAINT trade_tp_levels_break_even_status_check CHECK (break_even_status IS NULL OR break_even_status IN ('pending', 'moved', 'already_beyond', 'deferred', 'failed', 'unknown')),
+      CONSTRAINT trade_tp_levels_percent_check CHECK (close_percent >= 0 AND close_percent <= 100)
+    );
+    CREATE INDEX IF NOT EXISTS trade_tp_levels_sweep_idx ON trade_tp_levels(status, next_attempt_at) WHERE status IN ('pending', 'submitting', 'deferred', 'failed');
+    CREATE INDEX IF NOT EXISTS trade_tp_levels_trade_idx ON trade_tp_levels(trade_id, level_index);
+    /* A trade whose size has been cut down by a partial close. NULL means nothing has been closed yet,
+     * which is the difference between "full size still open" and "we lost count of the plan". */
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS remaining_volume NUMERIC;
+    ALTER TABLE trade_tp_levels ENABLE ROW LEVEL SECURITY;
     /* Inactivity cleanup for MetaAPI accounts the workspace pays for. */
     ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ;
     UPDATE users SET last_active_at = COALESCE(last_login, created_at, NOW()) WHERE last_active_at IS NULL;

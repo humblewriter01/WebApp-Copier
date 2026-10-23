@@ -20,6 +20,8 @@ function mockMetaApi({ state = 'DEPLOYED', brokerConnected = true, accountInform
     subscribeToMarketData: async (symbol) => calls.push(['subscribe', symbol]),
     createMarketBuyOrder: async (...args) => { calls.push(['buy', ...args]); return { stringCode: 'TRADE_RETCODE_DONE', numericCode: 10009 }; },
     createMarketSellOrder: async (...args) => { calls.push(['sell', ...args]); return { stringCode: 'TRADE_RETCODE_DONE', numericCode: 10009 }; },
+    closePositionPartially: async (...args) => { calls.push(['closePartial', ...args]); return { stringCode: 'TRADE_RETCODE_DONE_PARTIAL', numericCode: 10010, positionId: args[0], filledVolume: args[1] }; },
+    modifyPosition: async (...args) => { calls.push(['modify', ...args]); return { stringCode: 'TRADE_RETCODE_DONE', numericCode: 10009 }; },
     close: async () => calls.push(['close']),
   };
   class FakeMetaApi {
@@ -83,4 +85,23 @@ test('rejects an invalid account balance/equity snapshot before use', async () =
   const { FakeMetaApi } = mockMetaApi({ accountInformation: { balance: 0, equity: null } });
   const adapter = createMetaApiTradingAdapter({ MetaApiClass: FakeMetaApi });
   await assert.rejects(adapter.getAccountState({ token: 'ASCII_TEST_TOKEN_0123456789', accountId: 'account-1' }), /balance and equity/i);
+});
+
+test('a partial close is forwarded as a volume, with the comment and client id the terminal expects', async () => {
+  const { FakeMetaApi, calls, connection } = mockMetaApi();
+  const adapter = createMetaApiTradingAdapter({ MetaApiClass: FakeMetaApi });
+  const result = await adapter.closePositionPartially({ token: 'ASCII_TEST_TOKEN_0123456789', accountId: 'account-1', positionId: 'position-9', volume: 0.05, clientId: 'SDabc' });
+  assert.equal(result.stringCode, 'TRADE_RETCODE_DONE_PARTIAL');
+  const sent = calls.find(([name]) => name === 'closePartial');
+  assert.deepEqual(sent, ['closePartial', 'position-9', 0.05, { comment: 'SD', clientId: 'SDabc' }], 'the SDK takes (positionId, volume, options) and nothing else');
+  await adapter.close();
+
+  // The guards are here rather than in the caller because this is the last point that can still refuse:
+  // a zero or negative volume reaches the terminal as a request to close everything, and an empty
+  // position id is a request against whichever position the library happens to resolve.
+  for (const volume of [0, -0.05, 'many', null]) {
+    await assert.rejects(() => adapter.closePositionPartially({ token: 'ASCII_TEST_TOKEN_0123456789', accountId: 'account-1', positionId: 'position-9', volume }), /positive volume/);
+  }
+  await assert.rejects(() => adapter.closePositionPartially({ token: 'ASCII_TEST_TOKEN_0123456789', accountId: 'account-1', positionId: '  ', volume: 0.05 }), /broker position id is required/);
+  assert.equal(calls.filter(([name]) => name === 'closePartial').length, 1, 'a refused request never reached the connection');
 });

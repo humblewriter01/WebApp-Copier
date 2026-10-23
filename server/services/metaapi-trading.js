@@ -138,6 +138,20 @@ export function createMetaApiTradingAdapter({ MetaApiClass = MetaApi, now = () =
     return connection.modifyPosition(id, price);
   }
 
+  /**
+   * Closes part of an open position. MetaAPI's `closePositionPartially(positionId, volume, options)`
+   * takes a volume, not a percentage, so the caller decides how much of the trade leaves the account -
+   * which is why the engine aligns it onto the symbol's lot step before ever getting here.
+   */
+  async function closePositionPartially({ token, accountId, positionId, volume, clientId }) {
+    const id = String(positionId ?? '').trim();
+    if (!id) throw new Error('A broker position id is required to close part of a position.');
+    const lots = Number(volume);
+    if (!Number.isFinite(lots) || lots <= 0) throw new Error('A positive volume is required to close part of a position.');
+    const { connection } = await getConnection(token, accountId);
+    return connection.closePositionPartially(id, lots, { comment: 'SD', ...(clientId ? { clientId } : {}) });
+  }
+
   async function close() {
     const pending = [...connections.values()];
     connections.clear();
@@ -148,5 +162,5 @@ export function createMetaApiTradingAdapter({ MetaApiClass = MetaApi, now = () =
     clients.clear();
   }
 
-  return { getAccountState, createMarketOrder, modifyPosition, close };
+  return { getAccountState, createMarketOrder, modifyPosition, closePositionPartially, close };
 }
