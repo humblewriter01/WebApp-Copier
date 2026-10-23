@@ -242,6 +242,16 @@ This is why the manual subscription adjustment now states its period as
 instead of choosing between two SQL strings: an explicit end date still wins and a number of days is
 still counted from now, but both bindings exist in every branch.
 
+The same scan reads **qualifiers** as well as counts, because a statement can bind perfectly and still
+be illegible to Postgres. `server/services/announcements.js` used to hand its `a.`-qualified column
+list to the `RETURNING` clause of its own inserts and updates, and a write has no `a` to resolve - an
+`INSERT` cannot alias its target at all - so publishing, editing and retiring an announcement all failed
+with `missing FROM-clause entry for table "a"` before anything was stored. `undeclaredQualifiers` now
+lists the relations a statement actually declares (its targets, their aliases, `EXCLUDED`, the trigger
+records) and fails on any `x.column` outside that set, over the same statically resolvable call sites.
+Announcement columns are described once and rendered twice from that single field table - qualified for
+the joined reads, bare for every `RETURNING` - so the two forms cannot drift apart.
+
 ## Admin panel
 
 Administrators see an **Admin Panel** entry in the sidebar and can open it directly at `/admin`. The route is protected twice: the frontend only renders the panel for an `admin` role, and every `/api/admin/*` endpoint re-reads the caller's role from PostgreSQL on each request (a non-admin receives HTTP 403, a signed-out caller HTTP 401).
@@ -259,6 +269,18 @@ The panel provides:
 - Audit log: who did what, with the admin's email address and the timestamp, filterable by action and searchable by address or wording.
 
 Suspension blocks new sign-ins with the stored reason. Existing JWT sessions on other devices remain valid until they expire (12 hours, or 30 days with "keep me signed in"), so revoke a role or suspend an account knowing that short window. Suspending an account also closes any open support session on it.
+
+That edit is a three-field contract between two packages - `client/src/components/AdminPanel.jsx` sends
+`{ role }`, or `{ isSuspended, suspensionReason }`, and `normalizeUserUpdate` in
+`server/services/admin.js` reads exactly those names - so `client/test/platform-admin-ui.test.mjs`
+extracts the field names from the server's reader and requires the panel to send each one. The endpoint
+also accepts a suspension flag that arrived as the text `"true"`/`"false"` (a boolean is what the panel
+sends; the words mean the same and only ever select between two statements that are validated anyway),
+and every rejection names what arrived - `it sent "suspended", "reason"`, `suspensionReason arrived
+blank`, `received a number` - because "Choose at least one change to save." on a filled-in form reads as
+a broken button rather than a naming problem. Field *names* are echoed after an identifier check; values
+never are. The form carries the account it was opened for, so paging or searching with it open closes
+it instead of submitting against a row that is no longer on screen.
 
 ### Global auto-trading kill switch
 

@@ -8,6 +8,7 @@ import {
   normalizePromoCodeInput,
   normalizePromoCodeUpdate,
   normalizeUserUpdate,
+  buildUserAdminUpdate,
 } from '../services/admin.js';
 
 test('admin access uses ADMIN_EMAILS plus the workspace owner address', () => {
@@ -64,6 +65,50 @@ test('user updates require a suspension reason and a valid role', () => {
   assert.throws(() => normalizeUserUpdate({ role: 'owner' }), /valid role|user or admin/);
   assert.throws(() => normalizeUserUpdate({ isSuspended: true }), /reason/);
   assert.throws(() => normalizeUserUpdate({}), /at least one change/);
+});
+
+/* The panel's own guard and the endpoint's must agree, and a rejection has to say what arrived: an
+   administrator staring at "Choose at least one change to save." cannot tell a wrong field name from a
+   form they had not filled in, which is how a payload mismatch ends up reported as a broken button. */
+test('a suspension flag is read from the value, not from its JSON type alone', () => {
+  assert.deepEqual(normalizeUserUpdate({ isSuspended: 'true', suspensionReason: ' Chargeback ' }), { isSuspended: true, suspensionReason: 'Chargeback' });
+  assert.deepEqual(normalizeUserUpdate({ isSuspended: 'FALSE' }), { isSuspended: false, suspensionReason: '' });
+  assert.deepEqual(normalizeUserUpdate({ isSuspended: false, suspensionReason: 'Chargeback' }), { isSuspended: false, suspensionReason: '' });
+  // Anything that is not recognisably a decision is refused rather than guessed at.
+  assert.throws(() => normalizeUserUpdate({ isSuspended: 1 }), /Suspension must be true or false \(received a number\)/);
+  assert.throws(() => normalizeUserUpdate({ isSuspended: { value: true } }), /received an object/);
+  assert.throws(() => normalizeUserUpdate({ isSuspended: null }), /received null/);
+});
+
+test('a rejected account edit names the fields the endpoint writes and the ones that were sent', () => {
+  // A key spelled differently is the failure mode that looks like a dead button, so it must read as a
+  // naming problem in the panel itself.
+  assert.throws(
+    () => normalizeUserUpdate({ suspended: true, reason: 'Chargeback' }),
+    /writes "role", "isSuspended" and "suspensionReason", and it sent "suspended", "reason"/,
+  );
+  assert.throws(() => normalizeUserUpdate({}), /the request arrived with no recognised field/);
+  assert.throws(() => normalizeUserUpdate({ id: 'user-1' }), /it sent "id"/);
+  assert.throws(() => normalizeUserUpdate({ isSuspended: true }), /suspensionReason was not sent/);
+  assert.throws(() => normalizeUserUpdate({ isSuspended: 'true', suspensionReason: '   ' }), /suspensionReason arrived blank/);
+  assert.throws(() => normalizeUserUpdate({ role: 'owner' }), /received the text "owner"/);
+});
+
+test('a crafted field name is not echoed back', () => {
+  const hostile = { 'isSuspended\nSet-Cookie: a=b': true, '<img src=x>': 1, 123: 'numeric' };
+  let message = '';
+  try { normalizeUserUpdate(hostile); } catch (error) { message = error.message; }
+  assert.match(message, /Choose at least one change to save/);
+  assert.equal(message.includes('Set-Cookie'), false, 'only plain identifier-shaped keys are named');
+  assert.equal(message.includes('<img'), false);
+});
+
+test('a suspension that arrived as text writes the same statement as a real boolean', () => {
+  const fromBoolean = buildUserAdminUpdate(normalizeUserUpdate({ isSuspended: true, suspensionReason: 'Chargeback' }), 'user-1');
+  const fromText = buildUserAdminUpdate(normalizeUserUpdate({ isSuspended: 'true', suspensionReason: 'Chargeback' }), 'user-1');
+  assert.deepEqual(fromText, fromBoolean);
+  assert.equal(fromText.params[0], true, 'the column is bound with a boolean, not the string "true"');
+  assert.equal(fromText.params.length, 3);
 });
 
 test('an admin cannot demote or suspend themselves', () => {

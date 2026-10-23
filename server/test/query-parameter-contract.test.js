@@ -18,7 +18,7 @@ import {
   buildSubscriptionMirrorStatement,
   SUBSCRIPTION_PERIOD_EXPRESSION,
 } from '../services/admin.js';
-import { createAnnouncementService } from '../services/announcements.js';
+import { createAnnouncementService, announcementColumns, announcementReturnColumns } from '../services/announcements.js';
 import { createAuditLogger } from '../services/audit.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -368,6 +368,33 @@ function readArray(source, start) {
   return { count: items.length, end: index + 1 };
 }
 
+/**
+ * Which relation names a statement may legally write in front of a column: the tables it names, the
+ * aliases it declares, `EXCLUDED` inside an ON CONFLICT update, and the trigger records. A qualifier
+ * outside this set is not a style problem - Postgres refuses the statement with
+ * `missing FROM-clause entry for table "x"`, which in a write route arrives as a status-less failure.
+ */
+function declaredRelations(sql) {
+  const names = new Set(['excluded', 'new', 'old', 'only']);
+  const keywords = /^(set|where|on|values|returning|select|from|inner|left|right|full|cross|join|order|group|limit|offset|conflict|do|and|or|as|using|with)$/;
+  for (const match of sql.matchAll(/\b(?:FROM|JOIN|UPDATE|INTO|DELETE\s+FROM)\s+([a-z_][\w]*)(?:\s+(?:AS\s+)?([a-z_][\w]*))?/gi)) {
+    names.add(match[1].toLowerCase());
+    if (match[2] && !keywords.test(match[2].toLowerCase())) names.add(match[2].toLowerCase());
+  }
+  for (const match of sql.matchAll(/\b([a-z_][\w]*)\s+AS\s*\(/gi)) names.add(match[1].toLowerCase());
+  return names;
+}
+
+function undeclaredQualifiers(sql) {
+  const stripped = String(sql ?? '').replace(/'(?:[^']|'')*'/g, "''").replace(/"(?:[^"]|"")*"/g, '""');
+  const declared = declaredRelations(stripped);
+  const offenders = [];
+  for (const match of stripped.matchAll(/\b([a-z_][\w]*)\.([a-z_][\w]*)/gi)) {
+    if (!declared.has(match[1].toLowerCase())) offenders.push({ qualifier: match[1], column: match[2] });
+  }
+  return offenders;
+}
+
 function lineOf(source, index) {
   return source.slice(0, index).split('\n').length;
 }
@@ -433,6 +460,37 @@ test('no query in the server supplies a value its statement has no slot for, or 
     [],
     'every statically readable call site binds exactly what its statement asks for',
   );
+});
+
+test('no query qualifies a column with a relation its FROM clause does not declare', () => {
+  const offenders = [];
+  for (const site of checked) {
+    site.variants.forEach((sql, index) => {
+      const bad = undeclaredQualifiers(sql);
+      if (bad.length) offenders.push(`${site.file}:${site.line} branch ${index + 1} -> ${bad.map((entry) => `${entry.qualifier}.${entry.column}`).join(', ')}`);
+    });
+  }
+  assert.deepEqual(offenders, [], 'every alias used in front of a column is declared by the statement that uses it');
+});
+
+test('the RETURNING clause of a write is unqualified, because a write has no alias to use', () => {
+  const broken = "INSERT INTO announcements(message,level) VALUES($1,$2) RETURNING a.id,a.message";
+  const fixed = "INSERT INTO announcements(message,level) VALUES($1,$2) RETURNING id AS \"id\",message";
+  assert.deepEqual(undeclaredQualifiers(broken).map((entry) => entry.qualifier), ['a', 'a'], 'both qualified columns of the RETURNING list are reported');
+  // The two renderings of the same field list have to stay in lockstep: the reads keep their alias,
+  // the writes drop it, and neither may silently gain or lose a column.
+  assert.equal(announcementColumns.split(',').length, announcementReturnColumns.split(',').length);
+  assert.deepEqual(undeclaredQualifiers(`INSERT INTO announcements(message,level,active,starts_at,ends_at,created_by,created_at,updated_at)
+     VALUES($1,$2,$3,$4,$5,$6,NOW(),NOW())
+     RETURNING ${announcementReturnColumns}`), [], 'the write path is legal SQL');
+  assert.deepEqual(undeclaredQualifiers(`SELECT ${announcementColumns} FROM announcements a`), [], 'the read path keeps qualifying against its alias');
+  assert.deepEqual(undeclaredQualifiers(fixed), []);
+  // A read that joins the table under an alias keeps its qualifiers.
+  assert.deepEqual(undeclaredQualifiers('SELECT a.id FROM announcements a WHERE a.active=TRUE'), []);
+  // EXCLUDED and the target table's own name are legal inside ON CONFLICT DO UPDATE.
+  assert.deepEqual(undeclaredQualifiers(`INSERT INTO subscriptions(user_id,plan_key) VALUES($1,$2)
+     ON CONFLICT(user_id) DO UPDATE SET plan_key=EXCLUDED.plan_key,
+       current_period_end=GREATEST(COALESCE(subscriptions.current_period_end,NOW()),$3)`), []);
 });
 
 test('the scan catches the deployed defect, so it is a net and not a comfort', () => {

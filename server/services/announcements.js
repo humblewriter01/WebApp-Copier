@@ -17,8 +17,27 @@ export const ANNOUNCEMENT_MAX_LENGTH = 500;
 export const ANNOUNCEMENT_PAGE_SIZE_MAX = 100;
 export const LIVE_ANNOUNCEMENT_LIMIT = 3;
 
-export const announcementColumns = `a.id,a.message,a.level,a.active,a.starts_at AS "startsAt",a.ends_at AS "endsAt",
-  a.created_at AS "createdAt",a.updated_at AS "updatedAt",a.created_by AS "createdBy"`;
+/**
+ * The announcement columns, described once and rendered two ways.
+ *
+ * The qualified form belongs to the reads, which join `announcements a` to users and dismissal counts.
+ * The unqualified form belongs to every `RETURNING` clause, because an `INSERT` cannot alias its
+ * target at all and an `UPDATE` that does not name an alias has no `a` to resolve: asking for `a.id`
+ * there is not a stylistic slip: Postgres refuses the statement with `missing FROM-clause entry for
+ * table "a"` before a row is written, and all the panel gets to show is that raw sentence.
+ */
+const ANNOUNCEMENT_FIELDS = [
+  ['id'], ['message'], ['level'], ['active'],
+  ['starts_at', 'startsAt'], ['ends_at', 'endsAt'],
+  ['created_at', 'createdAt'], ['updated_at', 'updatedAt'], ['created_by', 'createdBy'],
+];
+
+function announcementSelect(prefix) {
+  return ANNOUNCEMENT_FIELDS.map(([column, alias]) => `${prefix}${column}${alias ? ` AS "${alias}"` : ''}`).join(',');
+}
+
+export const announcementColumns = announcementSelect('a.');
+export const announcementReturnColumns = announcementSelect('');
 
 function clean(value, max) {
   return String(value ?? '')
@@ -124,7 +143,7 @@ export function createAnnouncementService({ pool, logger = console, now = () => 
     const { rows } = await pool.query(
       `INSERT INTO announcements(message,level,active,starts_at,ends_at,created_by,created_at,updated_at)
        VALUES($1,$2,$3,$4,$5,$6,NOW(),NOW())
-       RETURNING ${announcementColumns}`,
+       RETURNING ${announcementReturnColumns}`,
       [draft.message, draft.level, draft.active, draft.startsAt, draft.endsAt, actorId],
     );
     const row = rows[0] || null;
@@ -151,7 +170,7 @@ export function createAnnouncementService({ pool, logger = console, now = () => 
     if (!columns.length) return null;
     params.push(id);
     const { rows } = await pool.query(
-      `UPDATE announcements SET ${columns.join(',')},updated_at=NOW() WHERE id=$${params.length} RETURNING ${announcementColumns}`,
+      `UPDATE announcements SET ${columns.join(',')},updated_at=NOW() WHERE id=$${params.length} RETURNING ${announcementReturnColumns}`,
       params,
     );
     const row = rows[0] || null;
@@ -162,7 +181,7 @@ export function createAnnouncementService({ pool, logger = console, now = () => 
 
   async function retire({ id }) {
     const { rows } = await pool.query(
-      `UPDATE announcements SET active=FALSE,updated_at=NOW() WHERE id=$1 AND active=TRUE RETURNING ${announcementColumns}`,
+      `UPDATE announcements SET active=FALSE,updated_at=NOW() WHERE id=$1 AND active=TRUE RETURNING ${announcementReturnColumns}`,
       [id],
     );
     const row = rows[0] || null;

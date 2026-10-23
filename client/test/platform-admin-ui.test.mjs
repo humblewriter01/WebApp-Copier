@@ -247,6 +247,52 @@ test('only the shared view decides what a platform state looks like', () => {
   assert.equal(/LEVEL_LABELS|const TAGS =/.test(banner), false);
 });
 
+/* ------------------------------------------------------------------------------------------
+ * The suspension form and the endpoint it writes to are two files in two packages, and the only
+ * contract between them is three field names and one JSON type. A key renamed on one side used to
+ * cost the administrator a red badge and nothing else - the endpoint read a body with no fields it
+ * recognised, answered "Choose at least one change to save.", and the panel had no way to say that
+ * the payload, not the click, was the problem. So the pair is pinned here, at the boundary.
+ * ------------------------------------------------------------------------------------------ */
+test('the suspend form sends exactly the fields the endpoint reads, with real booleans', () => {
+  const panel = readSource('components', 'AdminPanel.jsx');
+  const admin = readFileSync(path.join(here, '..', '..', 'server', 'services', 'admin.js'), 'utf8');
+  const reader = /export function normalizeUserUpdate[\s\S]*?\n}/.exec(admin)?.[0] ?? '';
+  const read = [...new Set([...reader.matchAll(/Object\.hasOwn\(input, '([A-Za-z]+)'\)/g)].map((match) => match[1]))].sort();
+  assert.deepEqual(read.sort(), ['isSuspended', 'role', 'suspensionReason'], 'the endpoint reads these fields and no others');
+  for (const field of read) {
+    assert.match(
+      panel,
+      new RegExp(`\\b${field}\\b(?:\\s*:|\\s*\\})`),
+      `the panel has to send ${field}, because the endpoint reads it and nothing else`,
+    );
+  }
+
+  // The whole payload of each action, in one line each, because a stray field is a silent 400.
+  assert.match(panel, /updateUser\(suspension\.userId, \{ isSuspended: true, suspensionReason: reason \}/);
+  assert.match(panel, /updateUser\(user\.id, \{ isSuspended: false \}/);
+  assert.equal(/isSuspended:\s*['"]/.test(panel), false, 'the flag is a boolean, never the text "true"');
+  assert.match(panel, /const reason = suspension\.reason\.trim\(\);\n\s+if \(!reason\)/, 'an empty reason is stopped before the request');
+
+  // One request helper for both actions, so a header or a token cannot differ between them.
+  assert.match(panel, /await request\(`\/api\/admin\/users\/\$\{userId\}`, token, \{ method: 'PATCH', body \}\)/);
+});
+
+test('the suspend form acts on the account it was opened for, not on whatever the list holds', () => {
+  const panel = readSource('components', 'AdminPanel.jsx');
+  assert.match(panel, /setSuspension\(\{ userId: user\.id, name: user\.name \|\| user\.email, reason: '' \}\)/);
+  assert.equal(
+    /users\.find\(\(item\) => item\.id === suspension\.userId\)/.test(panel),
+    false,
+    're-finding the row at submit time does nothing at all once paging or a search replaced that page',
+  );
+  // Paging or searching replaces the rows, so an open form pointing at one of them is closed with them.
+  assert.match(panel, /closeSuspensionForm\(\);\n\s+setSearch\(nextSearch\);/);
+  assert.match(panel, /closeSuspensionForm\(\);\n\s+setOffset\(nextOffset\);/);
+  // And the panel names the account, so an administrator can see who is about to be suspended.
+  assert.match(panel, /<strong>Suspend \{suspension\.name \|\| 'this account'\}<\/strong>/);
+});
+
 test('a support token is kept in the tab only and never handed to another origin', () => {
   const lib = readSource('lib', 'support-session.js');
   assert.equal(/localStorage\.(set|remove|get)Item/.test(lib), false, 'localStorage would survive the tab and outlive the hour it was issued for');
