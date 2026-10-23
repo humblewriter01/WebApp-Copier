@@ -50,14 +50,23 @@ function parseEntry(text) {
   return value ? { value, error: null } : { value: null, error: 'The entry price is not a valid price.' };
 }
 
+/**
+ * What a message says, separated from what Signal Desk is willing to do about it.
+ *
+ * `blockers` is the honest list of reasons a message will not be traded, each with a code, so a
+ * policy can be applied to a *reason* instead of to the wording of a sentence. `missing` says which
+ * prices the message did not carry, which is what the badges on the Signals page read: a message with
+ * an entry and a target but no stop is a usable note to a trader, and calling it "no clear signal"
+ * told them the parser had failed when it had actually done its job. `directionInferred` marks the one
+ * judgement this function makes rather than reads - and a judged direction is never traded, only shown.
+ */
 export function parseSignal(message) {
   const text = String(message || '').slice(0, 5000);
   const directions = [...text.matchAll(DIRECTION_WORDS)].map((match) => ['BUY', 'LONG'].includes(match[1].toUpperCase()) ? 'buy' : 'sell');
   const uniqueDirections = [...new Set(directions)];
-  const side = uniqueDirections.length === 1 ? uniqueDirections[0] : null;
-  const sideError = uniqueDirections.length > 1
-    ? 'More than one trade direction was found.'
-    : !side ? 'A BUY or SELL direction was not found.' : null;
+  let side = uniqueDirections.length === 1 ? uniqueDirections[0] : null;
+  const ambiguousSideError = uniqueDirections.length > 1 ? 'More than one trade direction was found.' : null;
+  const missingSideError = uniqueDirections.length === 0 ? 'A BUY or SELL direction was not found.' : null;
 
   const { symbol, error: symbolError } = findSymbol(text);
   const entry = parseEntry(text);
@@ -66,16 +75,55 @@ export function parseSignal(message) {
   const stopLoss = stopMatches.length === 1 ? stopMatches[0].value : null;
   const takeProfit = takeProfitMatches.length === 1 ? takeProfitMatches[0].value : null;
 
-  let parseError = sideError || symbolError || entry.error;
-  if (!parseError && stopMatches.length === 0) parseError = 'A stop loss is required for automatic execution.';
-  if (!parseError && stopMatches.length > 1) parseError = 'More than one stop loss was found.';
-  if (!parseError && takeProfitMatches.length > 1) parseError = 'Multiple take-profit targets are not supported for automatic execution.';
-  if (!parseError && stopMatches.some((match) => match.range)) parseError = 'Stop-loss ranges are not supported for automatic execution.';
-  if (!parseError && takeProfitMatches.some((match) => match.range)) parseError = 'Take-profit ranges are not supported for automatic execution.';
-  if (!parseError && !stopLoss) parseError = 'The stop loss is not a valid price.';
-  if (!parseError && takeProfitMatches.length === 1 && !takeProfit) parseError = 'The take-profit price is not a valid price.';
+  /* A target above the entry can only be reached by buying; a target below it only by selling. That is
+     arithmetic, not a guess, so the direction is filled in for reading - but it stays out of the
+     execution path, because a published signal that never says BUY or SELL is not an instruction to
+     spend money, and a channel that renames "LONG" as something else should be reviewed, not traded. */
+  let directionInferred = false;
+  if (!side && !ambiguousSideError && entry.value !== null && takeProfit !== null && takeProfit !== entry.value) {
+    side = takeProfit > entry.value ? 'buy' : 'sell';
+    directionInferred = true;
+  }
 
-  return { symbol, side, entryPrice: entry.value, stopLoss, takeProfit, executionReady: !parseError, parseError };
+  const blockers = [];
+  const block = (code, message) => { if (message) blockers.push({ code, message }); };
+  // The order is the old precedence, kept on purpose: direction, then symbol, then entry. Which reason
+  // a panel quotes first is a sentence users have learned to read, and `parseError` is the first one.
+  block('direction-ambiguous', ambiguousSideError);
+  block('direction-missing', side === null ? missingSideError : null);
+  block('symbol', symbolError);
+  block('entry', entry.error);
+  if (stopMatches.length === 0) block('stop-loss-missing', 'A stop loss is required for automatic execution.');
+  if (stopMatches.length > 1) block('stop-loss-multiple', 'More than one stop loss was found.');
+  if (takeProfitMatches.length > 1) block('take-profit-multiple', 'Multiple take-profit targets are not supported for automatic execution.');
+  if (stopMatches.some((match) => match.range)) block('stop-loss-range', 'Stop-loss ranges are not supported for automatic execution.');
+  if (takeProfitMatches.some((match) => match.range)) block('take-profit-range', 'Take-profit ranges are not supported for automatic execution.');
+  if (!blockers.some((item) => item.code.startsWith('stop-loss')) && !stopLoss) block('stop-loss-invalid', 'The stop loss is not a valid price.');
+  if (takeProfitMatches.length === 1 && !takeProfit) block('take-profit-invalid', 'The take-profit price is not a valid price.');
+  if (directionInferred) block('direction-inferred', 'The trade direction was inferred from the entry and target prices, so this signal is saved for review rather than traded.');
+
+  const parseError = blockers[0]?.message ?? null;
+  const hasTradingData = Boolean(symbol || side || entry.value !== null || stopLoss !== null || takeProfit !== null);
+
+  return {
+    symbol,
+    side,
+    entryPrice: entry.value,
+    stopLoss,
+    takeProfit,
+    executionReady: !parseError,
+    parseError,
+    directionInferred,
+    hasTradingData,
+    missing: { entryPrice: entry.value === null, stopLoss: stopLoss === null, takeProfit: takeProfit === null },
+    blockers,
+  };
+}
+
+/** Whether a parse result is blocked only by a missing stop loss (the case the safety toggle governs). */
+export function isBlockedOnlyByStopLoss(parsed) {
+  const blockers = parsed?.blockers ?? [];
+  return blockers.length > 0 && blockers.every((blocker) => blocker.code === 'stop-loss-missing');
 }
 
 export function resolveBrokerSymbol(signalSymbol, specifications) {

@@ -42,6 +42,13 @@ export const AUDIT_ACTIONS = Object.freeze({
   'announcement.retire': 'Announcement retired',
   'impersonation.start': 'Support access opened',
   'impersonation.stop': 'Support access closed',
+  /* Signal history is application data an administrator can remove, so every path that removes it is in
+     the vocabulary: the closed list exists to catch a typo in review, and a route that invents a key is
+     refused *after* the write it was recording has already been committed. */
+  'signal.delete': 'Captured signal removed',
+  'signal.clearUser': 'Signal history cleared for one workspace',
+  'signal.purgeOld': 'Old captured signals purged platform-wide',
+  'user.suspend.refused': 'Suspension request refused',
 });
 
 const MAX_SUMMARY = 400;

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { request } from '../lib/api.js';
 import { healthCheckTone, killSwitchView } from '../lib/platform-view.js';
+import ConfirmModal from './ConfirmModal.jsx';
 
 const PAGE_SIZE = 25;
 const SECTIONS = [
@@ -10,6 +11,7 @@ const SECTIONS = [
   { key: 'billing', label: 'Payments' },
   { key: 'announcements', label: 'Announcements' },
   { key: 'audit', label: 'Audit log' },
+  { key: 'data', label: 'Data management' },
 ];
 const HEALTH_WINDOWS = [
   { hours: 1, label: 'last hour' },
@@ -97,6 +99,21 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const [auditSearchInput, setAuditSearchInput] = useState('');
   const [auditSearch, setAuditSearch] = useState('');
   const [auditOffset, setAuditOffset] = useState(0);
+  /* Data management: captured signals across every workspace, and the three ways they can be removed.
+     The list is read with the same filters it is deleted with, so an administrator is always confirming
+     the count they can see rather than a number that was estimated somewhere else. */
+  const [signals, setSignals] = useState([]);
+  const [signalTotal, setSignalTotal] = useState(0);
+  const [signalSearchInput, setSignalSearchInput] = useState('');
+  const [signalSearch, setSignalSearch] = useState('');
+  const [signalFrom, setSignalFrom] = useState('');
+  const [signalTo, setSignalTo] = useState('');
+  const [signalOffset, setSignalOffset] = useState(0);
+  const [signalsBusy, setSignalsBusy] = useState(false);
+  const [signalError, setSignalError] = useState('');
+  const [signalConfirm, setSignalConfirm] = useState(null);
+  const [purgeDays, setPurgeDays] = useState(30);
+  const [purge, setPurge] = useState(null);
   const [supportFor, setSupportFor] = useState({ userId: '', reason: '' });
   const [supportBusy, setSupportBusy] = useState('');
   const [adjustFor, setAdjustFor] = useState(null);
@@ -157,6 +174,72 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     setAudit({ entries: data.entries || [], total: data.total || 0, totalEntries: data.totalEntries || 0, actions: data.actions || [] });
   }, [token]);
 
+  const loadSignals = useCallback(async ({ search: nextSearch = signalSearch, from = signalFrom, to = signalTo, offset: nextOffset = signalOffset } = {}) => {
+    const query = new URLSearchParams({ search: nextSearch, limit: String(PAGE_SIZE), offset: String(nextOffset) });
+    if (from) query.set('from', from);
+    if (to) query.set('to', to);
+    const data = await request(`/api/admin/signals?${query.toString()}`, token);
+    setSignals(data.signals || []);
+    setSignalTotal(data.total || 0);
+    setSignalOffset(Number(data.offset) || nextOffset);
+  }, [token, signalSearch, signalFrom, signalTo, signalOffset]);
+
+  const loadPurgePreview = useCallback(async (days = purgeDays) => {
+    const query = new URLSearchParams({ olderThanDays: String(days) });
+    const data = await request(`/api/admin/signals/purge-preview?${query.toString()}`, token);
+    setPurge(data);
+    return data;
+  }, [token, purgeDays]);
+
+  const applySignalFilter = async () => {
+    setSignalError('');
+    setSignalsBusy(true);
+    try {
+      await loadSignals({ search: signalSearchInput.trim(), from: signalFrom, to: signalTo, offset: 0 });
+    } catch (filterError) {
+      setSignalError(filterError.message || 'That search could not be read.');
+    } finally {
+      setSignalsBusy(false);
+    }
+  };
+
+  const changeSignalPage = async (direction) => {
+    const nextOffset = Math.max(0, signalOffset + direction * PAGE_SIZE);
+    if (nextOffset === signalOffset) return;
+    setSignalsBusy(true);
+    try {
+      await loadSignals({ offset: nextOffset });
+    } catch (pageError) {
+      setSignalError(pageError.message || 'That page could not be read.');
+    } finally {
+      setSignalsBusy(false);
+    }
+  };
+
+  /** Every deletion goes through one handler, so the sentence after it always quotes the server's counts. */
+  const runSignalDeletion = async () => {
+    if (!signalConfirm || signalsBusy) return;
+    const kind = signalConfirm.kind;
+    setSignalsBusy(true); setSignalError(''); setError('');
+    try {
+      let result = null;
+      if (kind === 'row') result = await request(`/api/admin/signals/${signalConfirm.row.id}`, token, { method: 'DELETE' });
+      else if (kind === 'user') result = await request(`/api/admin/users/${signalConfirm.row.userId}/signals`, token, { method: 'DELETE' });
+      else result = await request('/api/admin/signals/purge', token, { method: 'POST', body: { olderThanDays: Number(purgeDays) } });
+      const deleted = Number(result?.deleted) || 0;
+      const kept = Number(result?.unlinkedTrades) || 0;
+      setNotice(`${deleted} captured signal${deleted === 1 ? '' : 's'} removed; ${kept} trade record${kept === 1 ? '' : 's'} kept and unlinked.`);
+      setSignalConfirm(null);
+      await Promise.all([loadSignals({ offset: kind === 'row' ? signalOffset : 0 }), loadPurgePreview(), loadOverview()]);
+    } catch (deleteError) {
+      // The server's own sentence, verbatim: a blocked delete carries the reason in it, and paraphrasing
+      // it here is how "nothing was deleted" gets read as "it worked".
+      setSignalError(deleteError.message || 'The signal could not be removed.');
+    } finally {
+      setSignalsBusy(false);
+    }
+  };
+
   const loadEverything = useCallback(async (nextSearch = search, nextOffset = offset) => {
     setError('');
     try {
@@ -180,6 +263,14 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     if (loading || section !== 'health') return;
     loadHealth(healthHours).catch((healthError) => setError(healthError.message));
   }, [loading, section, loadHealth, healthHours]);
+
+  useEffect(() => {
+    if (loading || section !== 'data') return;
+    setSignalsBusy(true);
+    Promise.all([loadSignals({ offset: 0 }), loadPurgePreview()])
+      .catch((dataError) => setSignalError(dataError.message))
+      .finally(() => setSignalsBusy(false));
+  }, [loading, section, loadSignals, loadPurgePreview]);
 
   useEffect(() => {
     if (loading || section !== 'audit') return;
@@ -1171,6 +1262,93 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
           </div>
         </>}
       </section>
+    </div>}
+
+    {section === 'data' && <div id="admin-section-data" role="tabpanel" aria-labelledby="admin-tab-data">
+      <section className="panel admin-panel data-management-panel">
+        <div className="panel-heading">
+          <div><p className="eyebrow">CAPTURED SIGNALS</p><h2>Data management</h2></div>
+          <span className="count-badge">{signalTotal}</span>
+        </div>
+        <p className="muted">Search the signal history of every workspace by email, name, monitored channel, or symbol, and within a date range. Removing a signal never removes a trade: a trade that points at it is kept, with its profit and loss and broker records, and only unlinked.</p>
+        <form className="admin-signal-filters" onSubmit={(event) => { event.preventDefault(); void applySignalFilter(); }}>
+          <label htmlFor="signal-filter-search">Search
+            <input id="signal-filter-search" type="search" value={signalSearchInput} onChange={(event) => setSignalSearchInput(event.target.value)} maxLength={100} placeholder="user@email.com, channel, EURUSD…" />
+          </label>
+          <label htmlFor="signal-filter-from">From
+            <input id="signal-filter-from" type="date" value={signalFrom} onChange={(event) => setSignalFrom(event.target.value)} />
+          </label>
+          <label htmlFor="signal-filter-to">To
+            <input id="signal-filter-to" type="date" value={signalTo} onChange={(event) => setSignalTo(event.target.value)} />
+          </label>
+          <button type="submit" className="button button-primary" disabled={signalsBusy}>{signalsBusy ? 'Searching…' : 'Search'}</button>
+        </form>
+        {signalError ? <div className="alert alert-error" role="alert">{signalError}</div> : null}
+        {notice ? <div className="alert alert-success" role="status">{notice}</div> : null}
+        {!signals.length && !signalsBusy ? <div className="empty-state"><strong>Nothing matched</strong><span>No captured signal has that search or date range.</span></div> : (
+          <div className="admin-signal-list">
+            {signals.map((row) => <article className="admin-signal-row" key={row.id}>
+              <div>
+                <strong>{row.symbol || 'Signal message'}{row.side ? ` · ${String(row.side).toUpperCase()}` : ''}</strong>
+                <span className="admin-signal-sub">{row.userEmail || 'unknown workspace'} · {row.channelTitle || row.channelId || 'Manual entry'} · {formatDateTime(row.createdAt)} · {row.status}</span>
+                {row.message ? <p>{row.message}</p> : null}
+              </div>
+              <div className="admin-signal-actions">
+                {Number(row.tradeCount) > 0 ? <span className="admin-signal-linked">{row.tradeCount} trade record{Number(row.tradeCount) === 1 ? '' : 's'} kept, unlinked</span> : null}
+                <button type="button" className="button button-danger button-small" disabled={signalsBusy} onClick={() => setSignalConfirm({ kind: 'row', row })}>Delete signal</button>
+                <button type="button" className="button button-secondary button-small" disabled={signalsBusy} onClick={() => setSignalConfirm({ kind: 'user', row })}>Delete all for this user</button>
+              </div>
+            </article>)}
+            <div className="admin-pagination">
+              <button type="button" className="button button-secondary button-small" onClick={() => changeSignalPage(-1)} disabled={signalOffset === 0 || signalsBusy}>Previous</button>
+              <span className="muted">Showing {signals.length ? signalOffset + 1 : 0}–{signalOffset + signals.length} of {signalTotal}</span>
+              <button type="button" className="button button-secondary button-small" onClick={() => changeSignalPage(1)} disabled={signalOffset + signals.length >= signalTotal || signalsBusy}>Next</button>
+            </div>
+          </div>
+        )}
+      </section>
+
+      <section className="panel admin-panel admin-purge-card">
+        <div className="panel-heading">
+          <div><p className="eyebrow">RETENTION</p><h2>Purge old signals</h2></div>
+          <span className="count-badge">{purge ? purge.signals : '—'}</span>
+        </div>
+        <p className="admin-purge-preview">
+          {purge === null
+            ? 'Reading how many captured signals are older than the chosen age…'
+            : purge.signals === 0
+              ? `Nothing is older than ${purge.olderThanDays} days, so there is nothing to purge.`
+              : `${purge.signals} captured signal(s) are older than ${purge.olderThanDays} days, across every workspace. ${purge.unlinkableTrades} linked trade record(s) would be kept and unlinked.`}
+        </p>
+        <form className="form-row" onSubmit={(event) => { event.preventDefault(); loadPurgePreview(Number(purgeDays)).catch((previewError) => setSignalError(previewError.message)); }}>
+          <label htmlFor="purge-days">Older than (days)
+            <input id="purge-days" type="number" min="1" max="3650" step="1" value={purgeDays} onChange={(event) => setPurgeDays(event.target.value)} required />
+          </label>
+          <button type="submit" className="button button-secondary" disabled={signalsBusy}>Recalculate</button>
+        </form>
+        <p className="muted">A purge deletes every workspace&rsquo;s matching signals at once. A signal that is still queued for execution is dropped along with its pending job, so that order will never be sent. Trades already opened keep their records. This cannot be undone, and it is written to the audit log with the counts it moved.</p>
+        <div className="button-row">
+          <button type="button" className="button button-danger" disabled={signalsBusy || !purge || !purge.signals} onClick={() => setSignalConfirm({ kind: 'purge' })}>
+            {purge && purge.signals ? `Purge ${purge.signals} older than ${purge.olderThanDays} days` : 'Nothing to purge'}
+          </button>
+        </div>
+      </section>
+
+      <ConfirmModal
+        open={Boolean(signalConfirm)}
+        busy={signalsBusy}
+        title={signalConfirm?.kind === 'row' ? 'Delete this captured signal?'
+          : signalConfirm?.kind === 'user' ? `Delete every signal for ${signalConfirm?.row?.userEmail || 'this workspace'}?`
+            : `Purge signals older than ${purgeDays} days?`}
+        confirmLabel={signalConfirm?.kind === 'row' ? 'Delete signal' : signalConfirm?.kind === 'user' ? 'Delete this history' : 'Purge old signals'}
+        onCancel={() => (signalsBusy ? null : setSignalConfirm(null))}
+        onConfirm={runSignalDeletion}
+      >
+        {signalConfirm?.kind === 'purge'
+          ? <p>This removes {purge?.signals ?? 0} captured signal(s) from every workspace, and any order still queued for them is dropped so it will not be sent. {purge?.unlinkableTrades ?? 0} trade record(s) stay, unlinked.</p>
+          : <p>The message is removed from {signalConfirm?.row?.userEmail || 'the workspace'}. {Number(signalConfirm?.row?.tradeCount) > 0 ? `${signalConfirm.row.tradeCount} trade record(s) from it will be kept and unlinked — their profit and loss stay in the user's history.` : 'No trade points at this signal.'}</p>}
+        <p>Deleting does not touch the account, its plan, its channels, its Telegram session, or any trade row.</p>
+      </ConfirmModal>
     </div>}
   </>;
 }

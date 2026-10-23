@@ -16,11 +16,13 @@ import { pool, initializeDatabase } from './db.js';
 import { createMetaApiConfigurationLink, metaApiRequest, toSafeMetaApiAccount } from './services/metaapi.js';
 import { getTelegramErrorCode, isTelegramPasswordNeeded, shouldDiscardTelegramLogin, telegramAuthErrorPayload } from './services/telegram-auth.js';
 import { parseSignal } from './services/signal-parser.js';
+import { isBlockedOnlyByStopLoss } from './services/signal-parser.js';
+import { isTelegramServiceMessage, resolveTelegramChatId, telegramMessageText, telegramPeerIdVariants } from './services/telegram-peer.js';
 import { createMetaApiTradingAdapter } from './services/metaapi-trading.js';
 import { createExecutionEngine, PLATFORM_PAUSE_MESSAGE } from './services/execution-engine.js';
 import { createExecutionWorker } from './services/execution-worker.js';
 import { createSupabaseAuthBridge } from './services/supabase-auth.js';
-import { createAdminAccess, normalizePromoCodeInput, normalizePromoCodeUpdate, normalizeUserUpdate, assertAllowedSelfUpdate, normalizeSubscriptionAdjustment, assertAllowedImpersonation, adminActionError, buildUserAdminUpdate, buildSubscriptionGrantStatements, buildSubscriptionExtendStatement, buildSubscriptionReleaseStatements, buildSubscriptionMirrorStatement } from './services/admin.js';
+import { createAdminAccess, normalizePromoCodeInput, normalizePromoCodeUpdate, normalizeUserUpdate, assertAllowedSelfUpdate, normalizeSubscriptionAdjustment, assertAllowedImpersonation, adminActionError, buildUserAdminUpdate, buildSubscriptionGrantStatements, buildSubscriptionExtendStatement, buildSubscriptionReleaseStatements, buildSubscriptionMirrorStatement, buildSignalOwnershipDelete, buildAdminSignalDelete, buildSignalsPurgeForUser, buildSignalsPurgeOlderThan, buildSignalsPurgeCount } from './services/admin.js';
 import { createAccountCleanup } from './services/account-cleanup.js';
 import { billingConfig, verifyWebhookSignature, normalizeReference, findPlan, FREE_PLAN } from './services/billing.js';
 import { createPaystackClient } from './services/paystack.js';
@@ -275,19 +277,38 @@ async function saveSignal(userId, message, channel = {}) {
   const source = channel.source === 'manual' ? 'manual' : 'telegram';
   const telegramMessageId = source === 'telegram' && channel.telegramMessageId != null ? String(channel.telegramMessageId) : null;
   const savedText = String(message || '').slice(0, 5000);
+  /* The one thing that has to be known before the row is written is how strict this workspace wants
+     capture to be. Nothing about the plan, the trading account, or the runtime belongs here: the
+     message is stored whatever those say, and they decide only what happens afterwards. */
+  const { rows: guardRows } = await pool.query(
+    'SELECT lot_size_mode AS lotSizeMode,block_execution_without_stop_loss AS blockWithoutStopLoss FROM settings WHERE user_id=$1 LIMIT 1',
+    [userId],
+  );
+  const guard = guardRows[0] || {};
+  /* A signal with no stop loss stops here unless the workspace has deliberately switched that guard
+     off - and even then only a fixed lot can be sent, because risk-based sizing is arithmetic on the
+     distance to a stop that does not exist. A direction that was inferred from the prices never becomes
+     eligible at all: reading a channel is not the same as being told to trade. */
+  const allowMissingStopLoss = source === 'telegram'
+    && isBlockedOnlyByStopLoss(parsed)
+    && guard.blockWithoutStopLoss === false
+    && String(guard.lotSizeMode || 'fixed') === 'fixed';
+  const executionReady = allowMissingStopLoss ? true : parsed.executionReady === true;
+  const parseError = allowMissingStopLoss ? null : parsed.parseError || null;
   const { rows } = await pool.query(
-    `INSERT INTO signals(user_id,channel_id,channel_title,telegram_message_id,source,message,symbol,side,entry_price,stop_loss,take_profit,execution_ready,parse_error,status)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+    `INSERT INTO signals(user_id,channel_id,channel_title,telegram_message_id,source,message,symbol,side,entry_price,stop_loss,take_profit,execution_ready,parse_error,status,direction_inferred)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
      ON CONFLICT DO NOTHING
      RETURNING id,channel_id AS "channelId",channel_title AS "channelTitle",telegram_message_id AS "telegramMessageId",source,message,symbol,side,
-       entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt"`,
-    [userId, channel.channelId || null, channel.title || null, telegramMessageId, source, savedText, parsed.symbol, parsed.side, parsed.entryPrice, parsed.stopLoss, parsed.takeProfit, parsed.executionReady, parsed.parseError || null, parsed.executionReady ? 'received' : 'unparsed'],
+       entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt",
+       direction_inferred AS "directionInferred"`,
+    [userId, channel.channelId || null, channel.title || null, telegramMessageId, source, savedText, parsed.symbol, parsed.side, parsed.entryPrice, parsed.stopLoss, parsed.takeProfit, executionReady, parseError, executionReady ? 'received' : 'unparsed', parsed.directionInferred === true],
   );
   let signal = rows[0];
   if (!signal && telegramMessageId) {
     const existing = await pool.query(
       `SELECT id,channel_id AS "channelId",channel_title AS "channelTitle",telegram_message_id AS "telegramMessageId",source,message,symbol,side,
-         entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt"
+         entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",direction_inferred AS "directionInferred",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt"
        FROM signals WHERE user_id=$1 AND channel_id=$2 AND telegram_message_id=$3 AND source='telegram' LIMIT 1`,
       [userId, channel.channelId, telegramMessageId],
     );
@@ -301,7 +322,6 @@ async function saveSignal(userId, message, channel = {}) {
      outcome recorded on the signal row. A free workspace with no MetaAPI account therefore
      captures every message exactly like a paid one and sees it as unexecuted, instead of the
      listener staying quiet because trading could never have started. */
-  const deliverable = source === 'telegram' && Boolean(telegramMessageId) && parsed.executionReady === true;
   const { rows: contextRows } = await pool.query(
     `SELECT s.auto_trading_enabled AS autoTrading,s.execution_account_id AS executionAccountId,
             ma.state AS accountState,u.subscription_status AS subscriptionStatus
@@ -312,9 +332,10 @@ async function saveSignal(userId, message, channel = {}) {
     [userId],
   );
   const context = contextRows[0] || {};
+  const deliverable = source === 'telegram' && Boolean(telegramMessageId) && executionReady;
   const outcome = decideSignalOutcome({
     manual: !deliverable,
-    executionReady: parsed.executionReady === true,
+    executionReady,
     autoTradingEnabled: context.autoTrading === true,
     runtimeEnabled: autoTradingRuntimeEnabled,
     // A pause and an upgrade are only worth mentioning for a signal that could have traded;
@@ -339,26 +360,98 @@ async function saveSignal(userId, message, channel = {}) {
   return signal;
 }
 
+/**
+ * The live capture path, and the reason it used to be invisible.
+ *
+ * This function used to read `message.chatId` and compare it with one exact string. Both halves were
+ * wrong in the same direction: that property is not on every update shape GramJS delivers, and a
+ * channel id has two spellings (`-1001234567890` and `1234567890`) depending on which accessor produced
+ * it - so a message either had no id to read or an id that did not equal the stored one, and the
+ * handler returned. No error, no row, no line in the log: a workspace could monitor a channel for weeks
+ * and see only "Waiting for signals".
+ *
+ * It now reads the id from every place GramJS puts it, matches the monitored channel by any spelling of
+ * that id, and writes down what it saw - including the messages it decided to ignore, which is the only
+ * way a silent drop can be told apart from a quiet channel.
+ */
 async function startTelegramListener(userId, client) {
   const current = telegramClients.get(userId);
-  if (!current || current.handler) return;
+  if (!current) return;
+  if (current.handler) return;
+  const stats = current.stats || { seen: 0, saved: 0, ignored: 0, lastAt: null, lastChatId: null, lastError: null };
+  current.stats = stats;
   const handler = async (event) => {
+    const message = event?.message;
     try {
-      const message = event.message;
-      const chatId = message?.chatId?.toString();
-      const text = message?.message?.trim();
-      if (!chatId || !text) return;
+      stats.seen += 1;
+      const chatId = resolveTelegramChatId(message, event);
+      stats.lastAt = new Date().toISOString();
+      stats.lastChatId = chatId || null;
+      const text = telegramMessageText(message);
+      if (!chatId) {
+        stats.ignored += 1;
+        log('warn', 'Telegram message had no chat id to match on', { userId, messageId: message?.id ?? null, peer: message?.peerId?.className ?? null });
+        return;
+      }
+      if (!text) {
+        // A photo, a poll, a pin, a join notice: nothing to parse, and saying so is what makes
+        // "no new signals" an answer rather than a mystery.
+        stats.ignored += 1;
+        log('info', 'Telegram message carried no text to read', { userId, chatId, service: isTelegramServiceMessage(message) });
+        return;
+      }
+      const variants = telegramPeerIdVariants(chatId);
       const { rows } = await pool.query(
-        'SELECT channel_id AS "channelId",title FROM channels WHERE user_id=$1 AND channel_id=$2 AND enabled=TRUE',
-        [userId, chatId],
+        `SELECT channel_id AS "channelId",title FROM channels
+          WHERE user_id=$1 AND enabled=TRUE AND channel_id = ANY($2::text[])
+          ORDER BY created_at DESC LIMIT 1`,
+        [userId, variants],
       );
-      if (rows.length) await saveSignal(userId, text, { source: 'telegram', channelId: chatId, title: rows[0].title, telegramMessageId: message.id });
+      if (!rows.length) {
+        stats.ignored += 1;
+        log('info', 'Telegram message ignored: that chat is not monitored', { userId, chatId, variants: variants.join('|'), chars: text.length });
+        return;
+      }
+      log('info', 'Telegram message captured', { userId, chatId, channel: rows[0].title, chars: text.length, messageId: message?.id ?? null });
+      // The signal is stored whatever the parser makes of it - a message from a monitored channel that
+      // reads as prose is still a captured message, and it is shown as such instead of vanishing.
+      await saveSignal(userId, text, { source: 'telegram', channelId: rows[0].channelId, title: rows[0].title, telegramMessageId: message?.id ?? null });
+      stats.saved += 1;
     } catch (error) {
+      stats.lastError = `${error.message}`.slice(0, 200);
       log('error', 'Telegram update processing failed', { userId, error: error.message });
     }
   };
   client.addEventHandler(handler, new NewMessage({}));
   current.handler = handler;
+}
+
+/** How far back the platform purge goes unless the administrator says otherwise. */
+const SIGNAL_PURGE_DEFAULT_DAYS = 30;
+
+/**
+ * Unlink first, then delete, inside one transaction.
+ *
+ * Both statements come from the same builder, so the pair cannot drift apart, and the transaction is
+ * what makes "the signal is gone but the order it produced still points at it" impossible: if either
+ * half fails, neither happens. `rowCount` from the delete is the number returned to the panel, so the
+ * panel states what the database actually removed rather than what was expected.
+ */
+async function runSignalDelete(pair) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const unlinked = await client.query(pair.unlink.sql, pair.unlink.params);
+    const removed = await client.query(pair.remove.sql, pair.remove.params);
+    const deleted = removed.rowCount ?? 0;
+    await client.query('COMMIT');
+    return { deleted, unlinked: unlinked.rowCount ?? 0, rows: removed.rows || [] };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function restoreTelegramClient(userId) {
@@ -374,7 +467,7 @@ async function restoreTelegramClient(userId) {
     await pool.query('UPDATE users SET telegram_connected=FALSE,telegram_session=NULL WHERE id=$1', [userId]);
     return null;
   }
-  telegramClients.set(userId, { client, handler: null });
+  telegramClients.set(userId, { client, handler: null, stats: { seen: 0, saved: 0, ignored: 0, lastAt: null, lastChatId: null, lastError: null } });
   await startTelegramListener(userId, client);
   await pool.query('UPDATE users SET telegram_connected=TRUE WHERE id=$1', [userId]);
   return client;
@@ -619,7 +712,7 @@ app.get('/api/dashboard', authenticate, asyncRoute(async (req, res) => {
     pool.query('SELECT COUNT(*)::int AS count FROM signals WHERE user_id=$1', [req.userId]),
     pool.query('SELECT COUNT(*)::int AS count FROM channels WHERE user_id=$1 AND enabled=TRUE', [req.userId]),
     pool.query('SELECT COUNT(*)::int AS count FROM accounts WHERE user_id=$1', [req.userId]),
-    pool.query(`SELECT id,channel_title AS "channelTitle",message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_note AS "executionNote",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT 10`, [req.userId]),
+    pool.query(`SELECT id,channel_title AS "channelTitle",source,message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",direction_inferred AS "directionInferred",execution_note AS "executionNote",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT 10`, [req.userId]),
     pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled" FROM settings WHERE user_id=$1', [req.userId]),
   ]);
   res.json({
@@ -658,7 +751,7 @@ app.delete('/api/channels/:id', authenticate, asyncRoute(async (req, res) => {
 
 app.get('/api/signals', authenticate, asyncRoute(async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
-  const { rows } = await pool.query(`SELECT id,channel_title AS "channelTitle",message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2`, [req.userId, limit]);
+  const { rows } = await pool.query(`SELECT id,channel_title AS "channelTitle",source,message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",direction_inferred AS "directionInferred",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2`, [req.userId, limit]);
   res.json({ signals: rows });
 }));
 app.post('/api/signals', authenticate, asyncRoute(async (req, res) => {
@@ -666,6 +759,31 @@ app.post('/api/signals', authenticate, asyncRoute(async (req, res) => {
   if (!message) return fail(res, 400, 'Enter a signal message.');
   const signal = await saveSignal(req.userId, message, { source: 'manual', title: 'Manual entry' });
   res.status(201).json({ signal });
+}));
+
+/* ------------------------------------------------------------------ signal history deletion
+   *
+   * A captured signal is the message the workspace read; a trade is what it did with that message.
+   * Only the first of those is deletable here, and the unlink runs in the same transaction as the
+   * delete, so a signal can never vanish while an order still points at it - and an order can never
+   * lose its profit and loss because somebody cleared their list. `execution_jobs` is on
+   * ON DELETE CASCADE, so a queued-but-unsent job for a cleared signal disappears with it, which is
+   * the only correct reading of "I do not want that signal".
+   */
+app.delete('/api/signals/:id', authenticate, asyncRoute(async (req, res) => {
+  const signalId = String(req.params.id || '').trim();
+  if (!UUID_PATTERN.test(signalId)) return fail(res, 400, 'Choose a signal to remove.');
+  const pair = buildSignalOwnershipDelete({ userId: req.userId, signalId });
+  const result = await runSignalDelete(pair);
+  if (!result.deleted) return fail(res, 404, 'That signal is not in your history.');
+  res.json({ deleted: result.deleted, unlinkedTrades: result.unlinked });
+}));
+
+app.delete('/api/signals', authenticate, asyncRoute(async (req, res) => {
+  const pair = buildSignalsPurgeForUser({ userId: req.userId });
+  const result = await runSignalDelete(pair);
+  log('info', 'Signal history cleared', { userId: req.userId, deleted: result.deleted, unlinkedTrades: result.unlinked });
+  res.json({ deleted: result.deleted, unlinkedTrades: result.unlinked });
 }));
 
 app.get('/api/accounts', authenticate, asyncRoute(async (req, res) => {
@@ -891,9 +1009,9 @@ app.delete('/api/metaapi/accounts/:accountId', authenticate, asyncRoute(async (r
 }));
 
 app.get('/api/settings', authenticate, asyncRoute(async (req, res) => {
-  const { rows } = await pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",lot_size_mode AS "lotSizeMode",fixed_lot_size AS "fixedLotSize",max_daily_trades AS "maxDailyTrades",execution_account_id AS "executionAccountId",break_even_enabled AS "breakEvenEnabled",break_even_trigger_points AS "breakEvenTriggerPoints",break_even_offset_points AS "breakEvenOffsetPoints",trailing_stop_enabled AS "trailingStopEnabled",trailing_stop_distance_points AS "trailingStopDistancePoints",has_accepted_risk_warning AS "hasAcceptedRiskWarning" FROM settings WHERE user_id=$1', [req.userId]);
+  const { rows } = await pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",lot_size_mode AS "lotSizeMode",fixed_lot_size AS "fixedLotSize",max_daily_trades AS "maxDailyTrades",execution_account_id AS "executionAccountId",break_even_enabled AS "breakEvenEnabled",break_even_trigger_points AS "breakEvenTriggerPoints",break_even_offset_points AS "breakEvenOffsetPoints",trailing_stop_enabled AS "trailingStopEnabled",trailing_stop_distance_points AS "trailingStopDistancePoints",has_accepted_risk_warning AS "hasAcceptedRiskWarning",block_execution_without_stop_loss AS "blockExecutionWithoutStopLoss" FROM settings WHERE user_id=$1', [req.userId]);
   res.set('Cache-Control', 'no-store').json({
-    settings: { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 3, dailyLossLimit: 5, autoTradingEnabled: false, lotSizeMode: 'fixed', fixedLotSize: 0.01, maxDailyTrades: 10, executionAccountId: '', breakEvenEnabled: false, breakEvenTriggerPoints: 20, breakEvenOffsetPoints: 0, trailingStopEnabled: false, trailingStopDistancePoints: 10, hasAcceptedRiskWarning: false, ...(rows[0] || {}) },
+    settings: { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 3, dailyLossLimit: 5, autoTradingEnabled: false, lotSizeMode: 'fixed', fixedLotSize: 0.01, maxDailyTrades: 10, executionAccountId: '', breakEvenEnabled: false, breakEvenTriggerPoints: 20, breakEvenOffsetPoints: 0, trailingStopEnabled: false, trailingStopDistancePoints: 10, hasAcceptedRiskWarning: false, blockExecutionWithoutStopLoss: true, ...(rows[0] || {}) },
     runtimeEnabled: autoTradingRuntimeEnabled,
     // The user's own toggle being on is not the same as orders being possible: if the platform
     // switch is engaged, say so here instead of letting the panel imply their setting is at fault.
@@ -917,6 +1035,9 @@ app.put('/api/settings', authenticate, asyncRoute(async (req, res) => {
   const breakEvenOffsetPoints = Math.trunc(numeric(req.body.breakEvenOffsetPoints, 0));
   const trailingStopEnabled = req.body.trailingStopEnabled === true;
   const trailingStopDistancePoints = Math.trunc(numeric(req.body.trailingStopDistancePoints, 10));
+  // Absent means ON: a client that does not know about the switch cannot silently widen what the
+  // workspace is willing to send to a broker without a stop.
+  const blockExecutionWithoutStopLoss = req.body.blockExecutionWithoutStopLoss !== false;
   if (!lotSizeMode) return fail(res, 400, 'Choose a valid lot size mode.');
   if (!Number.isFinite(riskPercent) || riskPercent < 0.1 || riskPercent > 5) return fail(res, 400, 'Risk percent must be between 0.1 and 5.');
   if (!Number.isInteger(maxOpenPositions) || maxOpenPositions < 1 || maxOpenPositions > 50) return fail(res, 400, 'Maximum open trades must be between 1 and 50.');
@@ -962,10 +1083,10 @@ app.put('/api/settings', authenticate, asyncRoute(async (req, res) => {
     catch { return fail(res, 409, 'A safe daily loss baseline could not be captured. Confirm the account is deployed and connected, then try again. Auto-Trading remains off.'); }
   }
   const { rows } = await pool.query(
-    `INSERT INTO settings(user_id,risk_mode,risk_percent,max_open_positions,daily_loss_limit,auto_trading_enabled,lot_size_mode,fixed_lot_size,max_daily_trades,execution_account_id,break_even_enabled,break_even_trigger_points,break_even_offset_points,trailing_stop_enabled,trailing_stop_distance_points,has_accepted_risk_warning)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) ON CONFLICT(user_id) DO UPDATE SET risk_mode=EXCLUDED.risk_mode,risk_percent=EXCLUDED.risk_percent,max_open_positions=EXCLUDED.max_open_positions,daily_loss_limit=EXCLUDED.daily_loss_limit,auto_trading_enabled=EXCLUDED.auto_trading_enabled,lot_size_mode=EXCLUDED.lot_size_mode,fixed_lot_size=EXCLUDED.fixed_lot_size,max_daily_trades=EXCLUDED.max_daily_trades,execution_account_id=EXCLUDED.execution_account_id,break_even_enabled=EXCLUDED.break_even_enabled,break_even_trigger_points=EXCLUDED.break_even_trigger_points,break_even_offset_points=EXCLUDED.break_even_offset_points,trailing_stop_enabled=EXCLUDED.trailing_stop_enabled,trailing_stop_distance_points=EXCLUDED.trailing_stop_distance_points,has_accepted_risk_warning=EXCLUDED.has_accepted_risk_warning,updated_at=NOW()
-     RETURNING risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",lot_size_mode AS "lotSizeMode",fixed_lot_size AS "fixedLotSize",max_daily_trades AS "maxDailyTrades",execution_account_id AS "executionAccountId",break_even_enabled AS "breakEvenEnabled",break_even_trigger_points AS "breakEvenTriggerPoints",break_even_offset_points AS "breakEvenOffsetPoints",trailing_stop_enabled AS "trailingStopEnabled",trailing_stop_distance_points AS "trailingStopDistancePoints",has_accepted_risk_warning AS "hasAcceptedRiskWarning"`,
-    [req.userId, riskMode, riskPercent, maxOpenPositions, dailyLossLimit, autoTradingEnabled, lotSizeMode, fixedLotSize, maxDailyTrades, executionAccountId || null, breakEvenEnabled, breakEvenTriggerPoints, breakEvenOffsetPoints, trailingStopEnabled, trailingStopDistancePoints, hasAcceptedRiskWarning === true],
+    `INSERT INTO settings(user_id,risk_mode,risk_percent,max_open_positions,daily_loss_limit,auto_trading_enabled,lot_size_mode,fixed_lot_size,max_daily_trades,execution_account_id,break_even_enabled,break_even_trigger_points,break_even_offset_points,trailing_stop_enabled,trailing_stop_distance_points,has_accepted_risk_warning,block_execution_without_stop_loss)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT(user_id) DO UPDATE SET risk_mode=EXCLUDED.risk_mode,risk_percent=EXCLUDED.risk_percent,max_open_positions=EXCLUDED.max_open_positions,daily_loss_limit=EXCLUDED.daily_loss_limit,auto_trading_enabled=EXCLUDED.auto_trading_enabled,lot_size_mode=EXCLUDED.lot_size_mode,fixed_lot_size=EXCLUDED.fixed_lot_size,max_daily_trades=EXCLUDED.max_daily_trades,execution_account_id=EXCLUDED.execution_account_id,break_even_enabled=EXCLUDED.break_even_enabled,break_even_trigger_points=EXCLUDED.break_even_trigger_points,break_even_offset_points=EXCLUDED.break_even_offset_points,trailing_stop_enabled=EXCLUDED.trailing_stop_enabled,trailing_stop_distance_points=EXCLUDED.trailing_stop_distance_points,has_accepted_risk_warning=EXCLUDED.has_accepted_risk_warning,block_execution_without_stop_loss=EXCLUDED.block_execution_without_stop_loss,updated_at=NOW()
+     RETURNING risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",lot_size_mode AS "lotSizeMode",fixed_lot_size AS "fixedLotSize",max_daily_trades AS "maxDailyTrades",execution_account_id AS "executionAccountId",break_even_enabled AS "breakEvenEnabled",break_even_trigger_points AS "breakEvenTriggerPoints",break_even_offset_points AS "breakEvenOffsetPoints",trailing_stop_enabled AS "trailingStopEnabled",trailing_stop_distance_points AS "trailingStopDistancePoints",has_accepted_risk_warning AS "hasAcceptedRiskWarning",block_execution_without_stop_loss AS "blockExecutionWithoutStopLoss"`,
+    [req.userId, riskMode, riskPercent, maxOpenPositions, dailyLossLimit, autoTradingEnabled, lotSizeMode, fixedLotSize, maxDailyTrades, executionAccountId || null, breakEvenEnabled, breakEvenTriggerPoints, breakEvenOffsetPoints, trailingStopEnabled, trailingStopDistancePoints, hasAcceptedRiskWarning === true, blockExecutionWithoutStopLoss],
   );
   // Saving execution settings counts as activity for the inactivity policy.
   await inactivityService.touchQuietly(req.userId);
@@ -1163,7 +1284,25 @@ app.patch('/api/admin/users/:id', authenticate, requireAdmin, adminRoute('Updati
     update = normalizeUserUpdate(req.body || {});
     assertAllowedSelfUpdate({ actorId: req.userId, targetId, update });
   } catch (error) {
-    return fail(res, error.status || 400, error.message);
+    /* A refused account edit used to leave no trace at all: the panel showed a sentence for a second
+       and then forgot it, and the audit log recorded only successes - so "the Suspend button fails"
+       could not be answered from the server side. The field names that arrived, the status, and the
+       sentence go to the log, and a refusal of a suspension attempt goes to the audit trail too. */
+    const status = Number(error.status) || 400;
+    const fields = Object.keys(req.body || {});
+    log('warn', 'Admin account edit refused', { actorId: req.userId, targetId, status, fields, reason: error.message });
+    if (fields.includes('isSuspended')) {
+      await auditLog.record({
+        actorId: req.userId,
+        actorEmail: req.userEmail,
+        action: 'user.suspend.refused',
+        targetType: 'user',
+        targetId,
+        summary: `Refused a suspension request: ${error.message}`,
+        metadata: { status, fields },
+      }).catch(() => {});
+    }
+    return fail(res, status, error.message);
   }
 
   // The statement and its values are built together, and checked against each other, in one place:
@@ -1195,8 +1334,149 @@ app.patch('/api/admin/users/:id', authenticate, requireAdmin, adminRoute('Updati
     summary: `${updated.name || 'Account'} <${updated.email || 'unknown'}>: ${changes.join(', ') || 'no visible change'}.`,
     metadata: { ...update, revokedSupportSessions: revokedSessions || undefined },
   });
-  log('info', 'Admin updated user', { actorId: req.userId, targetId, role: update.role, isSuspended: update.isSuspended });
+  log('info', 'Admin updated user', { actorId: req.userId, targetId, role: update.role, isSuspended: update.isSuspended, changes: changes.join(', ') });
   res.set('Cache-Control', 'no-store').json({ user: updated, ...(revokedSessions ? { notice: `${revokedSessions} support session(s) on that workspace were closed.` } : {}) });
+}));
+
+/* ------------------------------------------------------------------ data management (admin)
+   *
+   * The same two guarantees as the user-facing deletes - trades are unlinked, never removed - and
+   * every action is audited with the numbers it moved, because "how many signals did the platform
+   * lose on 4 April" has to be answerable from the audit log alone.
+   */
+const adminSignalColumns = `s.id,s.user_id AS "userId",u.name AS "userName",u.email AS "userEmail",
+  s.channel_id AS "channelId",s.channel_title AS "channelTitle",s.source,s.symbol,s.side,
+  s.entry_price AS "entryPrice",s.stop_loss AS "stopLoss",s.take_profit AS "takeProfit",
+  s.direction_inferred AS "directionInferred",s.execution_ready AS "executionReady",
+  s.parse_error AS "parseError",s.execution_note AS "executionNote",s.status,s.created_at AS "createdAt",
+  (SELECT COUNT(*)::int FROM trades t WHERE t.signal_id=s.id) AS "tradeCount",
+  left(s.message,300) AS "message",COUNT(*) OVER()::int AS "totalCount"`;
+const ADMIN_SIGNAL_FILTER = `WHERE ($1::text=''
+     OR position(lower($1) in lower(u.email))>0
+     OR position(lower($1) in lower(u.name))>0
+     OR position(lower($1) in lower(coalesce(s.channel_title,'')))>0
+     OR position(lower($1) in lower(coalesce(s.symbol,'')))>0)
+   AND ($2::uuid IS NULL OR s.user_id=$2)
+   AND ($3::timestamptz IS NULL OR s.created_at>=$3)
+   AND ($4::timestamptz IS NULL OR s.created_at<$4)`;
+
+/**
+ * A date the administrator typed. A bare day is UTC midnight, and for the upper bound that means the
+ * whole day: a range of "4 April to 4 April" has to return 4 April, so the day-only form is pushed to
+ * the next midnight while the filter stays `created_at < $4`. A value with a time in it is taken exactly
+ * as written, because then the reader has said what they meant.
+ */
+function readSignalDateFilter(value, label, { endOfDay = false } = {}) {
+  const text = String(value ?? '').trim();
+  if (!text) return null;
+  const dayOnly = /^\d{4}-\d{2}-\d{2}$/.test(text);
+  const instant = new Date(dayOnly ? `${text}T00:00:00.000Z` : text);
+  if (!Number.isFinite(instant.getTime())) {
+    const error = new Error(`${label} is not a date I can read.`);
+    error.status = 400;
+    throw error;
+  }
+  if (endOfDay && dayOnly) instant.setUTCDate(instant.getUTCDate() + 1);
+  return instant.toISOString();
+}
+
+app.get('/api/admin/signals', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const search = String(req.query.search || '').trim().slice(0, 100);
+  const userId = String(req.query.userId || '').trim();
+  if (userId && !UUID_PATTERN.test(userId)) return fail(res, 400, 'Choose a valid user account.');
+  let from = null;
+  let to = null;
+  try {
+    from = readSignalDateFilter(req.query.from, 'The starting date');
+    to = readSignalDateFilter(req.query.to, 'The ending date', { endOfDay: true });
+  } catch (error) { return fail(res, error.status || 400, error.message); }
+  const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 25));
+  const offset = Math.max(0, Number.parseInt(req.query.offset, 10) || 0);
+  const { rows } = await pool.query(
+    `SELECT ${adminSignalColumns} FROM signals s JOIN users u ON u.id=s.user_id ${ADMIN_SIGNAL_FILTER}
+      ORDER BY s.created_at DESC LIMIT $5 OFFSET $6`,
+    [search, userId || null, from, to, limit, offset],
+  );
+  res.set('Cache-Control', 'no-store').json({ signals: rows, total: rows[0]?.totalCount ?? 0, limit, offset, search, from, to });
+}));
+
+/** What a bulk delete would take, read before anything is asked to confirm it. */
+app.get('/api/admin/signals/purge-preview', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const days = Math.trunc(Number(req.query.olderThanDays) || SIGNAL_PURGE_DEFAULT_DAYS);
+  if (!Number.isInteger(days) || days < 1 || days > 3650) return fail(res, 400, 'Choose an age between 1 and 3650 days.');
+  const { rows } = await pool.query(buildSignalsPurgeCount({ days }).sql, buildSignalsPurgeCount({ days }).params);
+  res.set('Cache-Control', 'no-store').json({
+    olderThanDays: days,
+    signals: rows[0]?.signals ?? 0,
+    unlinkableTrades: rows[0]?.unlinkable_trades ?? 0,
+  });
+}));
+
+app.delete('/api/admin/signals/:id', authenticate, requireAdmin, adminRoute('Deleting that signal', async (req, res) => {
+  const signalId = String(req.params.id || '').trim();
+  if (!UUID_PATTERN.test(signalId)) return fail(res, 400, 'Choose a signal to remove.');
+  const { rows: found } = await pool.query(
+    `SELECT s.id,u.email AS "userEmail",(SELECT COUNT(*)::int FROM trades t WHERE t.signal_id=s.id) AS "tradeCount"
+       FROM signals s JOIN users u ON u.id=s.user_id WHERE s.id=$1 LIMIT 1`,
+    [signalId],
+  );
+  const target = found[0];
+  if (!target) return fail(res, 404, 'That signal is no longer in the history.');
+  const result = await runSignalDelete(buildAdminSignalDelete({ signalId }));
+  if (!result.deleted) return fail(res, 404, 'That signal is no longer in the history.');
+  markApplied(req);
+  await auditLog.record({
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+    action: 'signal.delete',
+    targetType: 'signal',
+    targetId: signalId,
+    summary: `Removed 1 captured signal from ${target.userEmail}. ${Number(target.tradeCount) || 0} trade record(s) kept, unlinked.`,
+    metadata: { user: target.userEmail, trades: Number(target.tradeCount) || 0 },
+  });
+  res.json({ deleted: result.deleted, unlinkedTrades: result.unlinked });
+}));
+
+app.delete('/api/admin/users/:id/signals', authenticate, requireAdmin, adminRoute('Clearing that workspace\'s signal history', async (req, res) => {
+  const targetId = String(req.params.id || '').trim();
+  if (!UUID_PATTERN.test(targetId)) return fail(res, 400, 'Choose a valid user account.');
+  const { rows: userRows } = await pool.query('SELECT id,email FROM users WHERE id=$1 LIMIT 1', [targetId]);
+  const target = userRows[0];
+  if (!target) return fail(res, 404, 'That user could not be found.');
+  const preview = await pool.query(buildSignalsPurgeCount({ userId: targetId }).sql, buildSignalsPurgeCount({ userId: targetId }).params);
+  const scope = Number(preview.rows[0]?.signals) || 0;
+  if (!scope) return fail(res, 409, `${target.email} has no captured signals left to remove. Nothing was changed.`);
+  const result = await runSignalDelete(buildSignalsPurgeForUser({ userId: targetId }));
+  markApplied(req);
+  await auditLog.record({
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+    action: 'signal.clearUser',
+    targetType: 'user',
+    targetId,
+    summary: `Cleared ${result.deleted} captured signal(s) for ${target.email}. ${result.unlinked} trade record(s) kept, unlinked.`,
+    metadata: { user: target.email, deleted: result.deleted, unlinkedTrades: result.unlinked },
+  });
+  log('warn', 'Admin cleared a workspace signal history', { actorId: req.userId, targetId, deleted: result.deleted, unlinkedTrades: result.unlinked });
+  res.json({ deleted: result.deleted, unlinkedTrades: result.unlinked, user: target.email });
+}));
+
+app.post('/api/admin/signals/purge', authenticate, requireAdmin, adminRoute('Purging the oldest signals', async (req, res) => {
+  const days = Math.trunc(Number(req.body?.olderThanDays) || SIGNAL_PURGE_DEFAULT_DAYS);
+  if (!Number.isInteger(days) || days < 1 || days > 3650) return fail(res, 400, `Choose an age between 1 and 3650 days (the confirmation was for ${days > 0 ? days : SIGNAL_PURGE_DEFAULT_DAYS} days).`);
+  const result = await runSignalDelete(buildSignalsPurgeOlderThan({ days }));
+  markApplied(req);
+  await auditLog.record({
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+    action: 'signal.purgeOld',
+    targetType: 'platform',
+    targetId: null,
+    summary: `Purged ${result.deleted} signal(s) older than ${days} days across every workspace. ${result.unlinked} trade record(s) kept, unlinked.`,
+    metadata: { olderThanDays: days, deleted: result.deleted, unlinkedTrades: result.unlinked },
+  });
+  log('warn', 'Platform signal purge completed', { actorId: req.userId, olderThanDays: days, deleted: result.deleted, unlinkedTrades: result.unlinked });
+  res.json({ deleted: result.deleted, unlinkedTrades: result.unlinked, olderThanDays: days });
 }));
 
 app.get('/api/admin/promo-codes', authenticate, requireAdmin, asyncRoute(async (_req, res) => {
@@ -1877,7 +2157,25 @@ app.get('/api/telegram/status', authenticate, asyncRoute(async (req, res) => {
   if (rows[0]?.telegram_connected && !connected && configured) {
     try { connected = Boolean(await restoreTelegramClient(req.userId)); } catch (error) { log('warn', 'Telegram session restore deferred', { userId: req.userId, error: error.message }); }
   }
-  res.json({ configured, connected, message: configured ? null : 'Telegram sign-in is temporarily unavailable. Please try again later.' });
+  const entry = telegramClients.get(req.userId);
+  // A connected client with no event handler is the exact shape of the silent-drop failure this
+  // workspace can hit, so it is reported and repaired here rather than left to the next restart.
+  if (entry?.client?.connected && !entry.handler) await startTelegramListener(req.userId, entry.client).catch(() => {});
+  const { rows: channelRows } = await pool.query('SELECT COUNT(*)::int AS count FROM channels WHERE user_id=$1 AND enabled=TRUE', [req.userId]);
+  const stats = entry?.stats || {};
+  res.json({
+    configured,
+    connected,
+    listening: Boolean(entry?.handler && entry.client?.connected),
+    monitoredChannels: channelRows[0]?.count ?? 0,
+    messagesSeen: Number(stats.seen) || 0,
+    messagesIgnored: Number(stats.ignored) || 0,
+    signalsSaved: Number(stats.saved) || 0,
+    lastMessageAt: stats.lastAt || null,
+    lastChatId: stats.lastChatId || null,
+    lastError: stats.lastError || null,
+    message: configured ? null : 'Telegram sign-in is temporarily unavailable. Please try again later.',
+  });
 }));
 async function persistTelegramLoginAttempt(userId, attempt) {
   const stringSession = attempt.client.session.save();

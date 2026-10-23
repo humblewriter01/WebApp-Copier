@@ -420,6 +420,20 @@ export async function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS support_sessions_user_idx ON support_sessions(user_id,created_at DESC);
     CREATE INDEX IF NOT EXISTS support_sessions_live_idx ON support_sessions(expires_at) WHERE revoked_at IS NULL;
     ALTER TABLE support_sessions ENABLE ROW LEVEL SECURITY;
+    /* A direction that was read off the prices instead of written down is stored as derived, so the
+     * Signals page can badge it and the execution path can keep refusing it. Nothing inferred is ever
+     * traded as though the channel had said it. */
+    ALTER TABLE signals ADD COLUMN IF NOT EXISTS direction_inferred BOOLEAN NOT NULL DEFAULT FALSE;
+    /* Signals are now deletable, by their owner and by an administrator, so both the age sweep and the
+     * unlink of a trade that was placed from a deleted signal need an index to be a cheap statement
+     * rather than a table scan on the largest table in the workspace. */
+    CREATE INDEX IF NOT EXISTS signals_created_at_idx ON signals(created_at);
+    CREATE INDEX IF NOT EXISTS trades_signal_idx ON trades(signal_id) WHERE signal_id IS NOT NULL;
+    /* Advanced Safety: a workspace can require a stop loss on every automatic order, which is the
+     * default and the behaviour the parser has always enforced, or allow an order out without one.
+     * Turning it off changes what is sent to the broker, so it is stored beside the other execution
+     * limits and read on every capture instead of being remembered in memory. */
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS block_execution_without_stop_loss BOOLEAN NOT NULL DEFAULT TRUE;
   `);
   const adminAccess = createAdminAccess();
   if (adminAccess.emails.length) {

@@ -7,18 +7,19 @@ const baseItem = {
   signal_id: 'signal-1', source: 'telegram', signal_created_at: new Date(), symbol: 'EURUSD', side: 'buy',
   entry_price: null, stop_loss: 1.09, take_profit: 1.12, execution_ready: true, parse_error: null,
   auto_trading_enabled: true, lot_size_mode: 'fixed', fixed_lot_size: 0.01, risk_percent: 1,
+  block_execution_without_stop_loss: true,
   max_open_positions: 3, max_daily_trades: 10, daily_loss_limit: 5, execution_account_id: 'account-1',
   metaapi_account_id: 'account-1', managed_by_app: true, account_state: 'DEPLOYED',
   subscription_status: 'active', subscription_plan: 'pro',
 };
 
-function fakePool({ baseline = 1000, localTrades = 0, disableBeforeSubmit = false, subscriptionStatus = 'active' } = {}) {
+function fakePool({ baseline = 1000, localTrades = 0, disableBeforeSubmit = false, subscriptionStatus = 'active', item = {} } = {}) {
   const calls = [];
   return {
     calls,
     async query(sql, params = []) {
       calls.push({ sql, params });
-      if (sql.includes('SELECT ej.id AS job_id')) return { rows: [{ ...baseItem, subscription_status: subscriptionStatus }] };
+      if (sql.includes('SELECT ej.id AS job_id')) return { rows: [{ ...baseItem, subscription_status: subscriptionStatus, ...item }] };
       if (sql.includes('SELECT baseline_equity')) return { rows: [{ baseline_equity: baseline }] };
       if (sql.includes('SELECT COUNT(*)::int AS count FROM trades')) return { rows: [{ count: localTrades }] };
       if (sql.includes('SELECT auto_trading_enabled AS "autoTradingEnabled"')) return { rows: [{ autoTradingEnabled: !disableBeforeSubmit, executionAccountId: 'account-1' }] };
@@ -26,6 +27,11 @@ function fakePool({ baseline = 1000, localTrades = 0, disableBeforeSubmit = fals
       return { rows: [], rowCount: 1 };
     },
   };
+}
+
+/** The account snapshot is not an order: only `createMarketOrder` may be counted as reaching the broker. */
+function orderCalls(trading) {
+  return trading.calls.filter((call) => call?.order);
 }
 
 function fakeTrading() {
@@ -47,6 +53,43 @@ function fakeTrading() {
     },
   };
 }
+
+/* Advanced Safety: whether a signal with no stop loss may be sent at all is the workspace's decision,
+   and each of the three answers has to read differently - "your guard refused it", "it went out with no
+   stop because you allowed that", and "risk-based sizing needs the stop to exist" are not the same
+   sentence, and they used to be one. */
+test('a signal with no stop loss is refused while the workspace guard is on', async () => {
+  const pool = fakePool({ item: { stop_loss: null, block_execution_without_stop_loss: true } });
+  const trading = fakeTrading();
+  const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true });
+  const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.equal(result.status, 'skipped');
+  assert.match(result.message, /requires one before an order is sent/);
+  assert.equal(orderCalls(trading).length, 0, 'nothing reaches the broker while the guard is on');
+});
+
+test('with the guard off a fixed-lot order goes out without a stop, and the row records that', async () => {
+  const pool = fakePool({ item: { stop_loss: null, block_execution_without_stop_loss: false } });
+  const trading = fakeTrading();
+  const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true });
+  const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.equal(result.status, 'executed');
+  const order = trading.calls.find((call) => call?.order)?.order;
+  assert.equal(order.stopLoss, undefined, 'the stop is omitted from the order, not sent as 0 or NaN');
+  const inserted = pool.calls.find(({ sql }) => sql.includes('INSERT INTO trades'));
+  assert.ok(inserted.params.includes(null), 'the stored trade says it has no stop loss');
+  assert.equal(inserted.params.some((value) => Number.isNaN(value)), false, 'NaN never reaches a numeric column');
+});
+
+test('the guard cannot be switched off into risk-based sizing, which is calculated from the stop', async () => {
+  const pool = fakePool({ item: { stop_loss: null, block_execution_without_stop_loss: false, lot_size_mode: 'risk_based' } });
+  const trading = fakeTrading();
+  const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true });
+  const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.equal(result.status, 'skipped');
+  assert.match(result.message, /cannot be sized safely/);
+  assert.equal(orderCalls(trading).length, 0);
+});
 
 test('runtime OFF is a hard gate and cannot call the broker adapter', async () => {
   const pool = fakePool();
