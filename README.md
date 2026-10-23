@@ -242,6 +242,16 @@ This is why the manual subscription adjustment now states its period as
 instead of choosing between two SQL strings: an explicit end date still wins and a number of days is
 still counted from now, but both bindings exist in every branch.
 
+The same scan reads **qualifiers** as well as counts, because a statement can bind perfectly and still
+be illegible to Postgres. `server/services/announcements.js` used to hand its `a.`-qualified column
+list to the `RETURNING` clause of its own inserts and updates, and a write has no `a` to resolve - an
+`INSERT` cannot alias its target at all - so publishing, editing and retiring an announcement all failed
+with `missing FROM-clause entry for table "a"` before anything was stored. `undeclaredQualifiers` now
+lists the relations a statement actually declares (its targets, their aliases, `EXCLUDED`, the trigger
+records) and fails on any `x.column` outside that set, over the same statically resolvable call sites.
+Announcement columns are described once and rendered twice from that single field table - qualified for
+the joined reads, bare for every `RETURNING` - so the two forms cannot drift apart.
+
 ## Admin panel
 
 Administrators see an **Admin Panel** entry in the sidebar and can open it directly at `/admin`. The route is protected twice: the frontend only renders the panel for an `admin` role, and every `/api/admin/*` endpoint re-reads the caller's role from PostgreSQL on each request (a non-admin receives HTTP 403, a signed-out caller HTTP 401).

@@ -173,3 +173,32 @@ test('dismissing is recorded once per user and never fails the request', async (
   const broken = createAnnouncementService({ pool: { async query() { throw new Error('dead'); } }, logger: { warn: () => {} }, now: () => NOW });
   assert.deepEqual(await broken.dismiss({ userId: 'user-1', id: 'ann-1' }), { recorded: false });
 });
+
+/* A write statement has no alias to qualify with - `INSERT` cannot name its target at all - so the
+   read alias belongs to the reads only. Every announcement write used to return `a.id,a.message,…`
+   and Postgres refused the whole action with `missing FROM-clause entry for table "a"`, which reached
+   the panel as an unexplained failure of Publish, Edit, and Retire alike. */
+test('an announcement write reads its row back without borrowing the read alias', async () => {
+  const row = { rows: [{ id: 'ann-1', message: 'Maintenance', level: 'info', active: true }], rowCount: 1 };
+  const pool = fakePool({ publish: row, update: row, retire: row });
+  const service = createAnnouncementService({ pool, logger: { info: () => {}, warn: () => {} }, now: () => NOW });
+
+  await service.publish({ draft: { message: 'Maintenance', level: 'info', active: true, startsAt: null, endsAt: null }, actorId: 'admin-1' });
+  await service.update({ id: 'ann-1', draft: { message: 'Maintenance moved to 3 AM' } });
+  await service.retire({ id: 'ann-1' });
+
+  assert.equal(pool.calls.length, 3);
+  for (const { sql } of pool.calls) {
+    const at = sql.indexOf('RETURNING');
+    assert.notEqual(at, -1, `a write returns the stored row: ${sql}`);
+    const returning = sql.slice(at);
+    assert.equal(/\ba\.\w/.test(returning), false, `RETURNING must not use the read alias: ${returning}`);
+    assert.match(returning, /starts_at AS "startsAt"/, 'the camelCase shape the panel reads is unchanged');
+    assert.match(returning, /updated_at AS "updatedAt"/);
+  }
+
+  // The reads keep their qualifier, because they join the table under it.
+  await service.list({ limit: 25, offset: 0, status: 'live' });
+  assert.match(pool.calls.at(-1).sql, /SELECT a\.id,a\.message/);
+  assert.match(pool.calls.at(-1).sql, /FROM announcements a/);
+});
