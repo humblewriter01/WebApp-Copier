@@ -1,3 +1,5 @@
+import { assertQueryParameters } from './query-params.js';
+
 const PROMO_CODE_PATTERN = /^[A-Z0-9][A-Z0-9_-]{2,49}$/;
 const ROLE_VALUES = new Set(['user', 'admin']);
 const DEFAULT_ADMIN_EMAILS = ['ameenujaafar432@gmail.com'];
@@ -221,7 +223,12 @@ export function assertAllowedImpersonation({ actorId, target }) {
  * anything a validation chose deliberately. Sub-500 errors pass through untouched, because their
  * message was written for the person who just typed it.
  */
-export function adminActionError(action, error) {
+/**
+ * `applied` says whether the mutation had already reached the database when the failure happened.
+ * "Nothing was changed" is worth reading only when it is true; a failure after the write would
+ * otherwise send the administrator to reload a list that already shows their change.
+ */
+export function adminActionError(action, error, { applied = false } = {}) {
   const status = Number(error?.status) || 500;
   if (status < 500) return error;
   const wrapped = new Error(error?.message || `${action} could not be completed.`);
@@ -231,6 +238,106 @@ export function adminActionError(action, error) {
   const detail = [error?.message, error?.detail].filter(Boolean).join(' - ').replace(/\s+/g, ' ').trim().slice(0, 180);
   wrapped.userMessage = typeof error?.userMessage === 'string' && error.userMessage.trim()
     ? error.userMessage
-    : `${action} did not complete${detail ? `: ${detail}` : ''}. Nothing was changed - please try again, and send us this reference if it fails twice.`;
+    : `${action} did not complete${detail ? `: ${detail}` : ''}. ${applied
+      ? 'Part of this may already be saved - reload the list before you try it again.'
+      : 'Nothing was changed - please try again, and send us this reference if it fails twice.'}`;
   return wrapped;
+}
+
+/* ----------------------------------------------------------------------------------------------
+ * Admin statements that are assembled rather than written out.
+ *
+ * A query with a fixed text is safe by inspection; these are not, because the columns they touch
+ * depend on which fields the administrator filled in, and a period can come either from a number of
+ * days or from an explicit end date. Each builder returns the statement *and* its values from the same
+ * expression and checks them against each other before returning, which is the only moment both halves
+ * are known together. `pool.query` repeats the check at the boundary, so a statement built anywhere
+ * else in the app cannot reach Postgres half-bound either.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The account edit: only the fields that were sent are written, and the id binds last. */
+export function buildUserAdminUpdate(update = {}, targetId) {
+  const assignments = [];
+  const values = [];
+  const push = (column, value) => {
+    values.push(value);
+    assignments.push(`${column}=$${values.length}`);
+  };
+  if (update.role !== undefined) push('role', update.role);
+  if (update.isSuspended !== undefined) push('is_suspended', update.isSuspended);
+  if (update.suspensionReason !== undefined) push('suspension_reason', update.suspensionReason || null);
+  if (!assignments.length) throw validationError('Choose at least one change to save.');
+  values.push(targetId);
+  const sql = `UPDATE users SET ${assignments.join(',')} WHERE id=$${values.length}
+     RETURNING id AS "userId"`;
+  assertQueryParameters(sql, values, 'Updating that account');
+  return { sql, params: values };
+}
+
+/** The period an admin granted is counted once, in SQL, so the insert and the conflict update agree. */
+export const SUBSCRIPTION_PERIOD_EXPRESSION = 'COALESCE($5::timestamptz,NOW() + ($4::text)::interval)';
+
+/**
+ * Granting a plan: the mirrored row on `users` (what the product enforces) and the subscription row
+ * (what the expiry is read from). The period is one expression used twice - an explicit end date wins,
+ * otherwise it is counted from now - rather than two different statements, because a variant that
+ * mentions `$5` only sometimes is exactly how a bind ends up with more values than slots.
+ */
+export function buildSubscriptionGrantStatements({ targetId, plan, interval, period, endsAt = null, limits = {} } = {}) {
+  if (!plan?.key) throw validationError('Choose a plan to grant.');
+  const userUpdate = {
+    sql: "UPDATE users SET subscription_status='active',subscription_plan=$2,plan_limits=$3 WHERE id=$1",
+    params: [targetId, plan.key, JSON.stringify(limits || {})],
+  };
+  const subscription = {
+    sql: `INSERT INTO subscriptions(user_id,plan_key,status,interval,current_period_end,cancel_at_period_end,started_at,provider,updated_at)
+     VALUES($1,$2,'active',$3,${SUBSCRIPTION_PERIOD_EXPRESSION},FALSE,NOW(),'manual',NOW())
+     ON CONFLICT(user_id) DO UPDATE SET plan_key=EXCLUDED.plan_key,status='active',interval=EXCLUDED.interval,
+       current_period_end=GREATEST(COALESCE(subscriptions.current_period_end,NOW()),${SUBSCRIPTION_PERIOD_EXPRESSION}),
+       cancel_at_period_end=FALSE,started_at=COALESCE(subscriptions.started_at,NOW()),canceled_at=NULL,updated_at=NOW()
+     RETURNING current_period_end AS "periodEnd"`,
+    params: [targetId, plan.key, interval || 'monthly', period, endsAt ?? null],
+  };
+  assertQueryParameters(userUpdate.sql, userUpdate.params, 'Adjusting that plan (account row)');
+  assertQueryParameters(subscription.sql, subscription.params, 'Adjusting that plan (subscription row)');
+  return { userUpdate, subscription };
+}
+
+/** Moving an existing subscription's expiry without changing the plan. */
+export function buildSubscriptionExtendStatement({ targetId, days = null, endsAt = null } = {}) {
+  const assignment = endsAt
+    ? 'current_period_end=$2::timestamptz'
+    : `current_period_end=GREATEST(COALESCE(current_period_end,NOW()),NOW()) + ($2::int * INTERVAL '1 day')`;
+  const sql = `UPDATE subscriptions SET ${assignment},
+           status=CASE WHEN status IN ('canceled','free') THEN 'non_renewing' ELSE status END,
+           cancel_at_period_end=CASE WHEN status IN ('canceled','free') THEN TRUE ELSE cancel_at_period_end END,
+           updated_at=NOW()
+         WHERE user_id=$1
+         RETURNING current_period_end AS "periodEnd",status,cancel_at_period_end AS "cancelAtPeriodEnd"`;
+  const params = [targetId, endsAt || days];
+  assertQueryParameters(sql, params, 'Adjusting that plan (extension)');
+  return { sql, params };
+}
+
+/** Revoking a paid plan: both rows return to Free, and the limits with them. */
+export function buildSubscriptionReleaseStatements({ targetId, limits = {} } = {}) {
+  const userUpdate = {
+    sql: "UPDATE users SET subscription_status='free',subscription_plan='free',plan_limits=$2 WHERE id=$1",
+    params: [targetId, JSON.stringify(limits || {})],
+  };
+  const subscription = {
+    sql: "UPDATE subscriptions SET plan_key='free',status='free',current_period_end=NULL,cancel_at_period_end=FALSE,updated_at=NOW() WHERE user_id=$1",
+    params: [targetId],
+  };
+  assertQueryParameters(userUpdate.sql, userUpdate.params, 'Adjusting that plan (account row)');
+  assertQueryParameters(subscription.sql, subscription.params, 'Adjusting that plan (subscription row)');
+  return { userUpdate, subscription };
+}
+
+/** Re-deriving the enforced mirror from the subscription row, which is the truth after any change. */
+export function buildSubscriptionMirrorStatement({ targetId, status, planKey, limits = {} } = {}) {
+  const sql = 'UPDATE users SET subscription_status=$2,subscription_plan=$3,plan_limits=$4 WHERE id=$1';
+  const params = [targetId, status, planKey, JSON.stringify(limits || {})];
+  assertQueryParameters(sql, params, 'Adjusting that plan (mirror)');
+  return { sql, params };
 }

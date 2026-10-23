@@ -20,7 +20,7 @@ import { createMetaApiTradingAdapter } from './services/metaapi-trading.js';
 import { createExecutionEngine, PLATFORM_PAUSE_MESSAGE } from './services/execution-engine.js';
 import { createExecutionWorker } from './services/execution-worker.js';
 import { createSupabaseAuthBridge } from './services/supabase-auth.js';
-import { createAdminAccess, normalizePromoCodeInput, normalizePromoCodeUpdate, normalizeUserUpdate, assertAllowedSelfUpdate, normalizeSubscriptionAdjustment, assertAllowedImpersonation, adminActionError } from './services/admin.js';
+import { createAdminAccess, normalizePromoCodeInput, normalizePromoCodeUpdate, normalizeUserUpdate, assertAllowedSelfUpdate, normalizeSubscriptionAdjustment, assertAllowedImpersonation, adminActionError, buildUserAdminUpdate, buildSubscriptionGrantStatements, buildSubscriptionExtendStatement, buildSubscriptionReleaseStatements, buildSubscriptionMirrorStatement } from './services/admin.js';
 import { createAccountCleanup } from './services/account-cleanup.js';
 import { billingConfig, verifyWebhookSignature, normalizeReference, findPlan, FREE_PLAN } from './services/billing.js';
 import { createPaystackClient } from './services/paystack.js';
@@ -80,12 +80,18 @@ const asyncRoute = (handler) => (req, res, next) => Promise.resolve(handler(req,
 const fail = (res, status, error) => res.status(status).json({ error });
 
 const adminRoute = (action, handler) => asyncRoute(async (req, res) => {
+  req.adminMutation = { applied: false };
   try {
     await handler(req, res);
   } catch (error) {
-    throw adminActionError(action, error);
+    throw adminActionError(action, error, { applied: req.adminMutation.applied === true });
   }
 });
+
+/** Called the moment a write has landed, so a later failure in the same request stops denying it. */
+const markApplied = (req) => {
+  if (req.adminMutation) req.adminMutation.applied = true;
+};
 
 app.disable('x-powered-by');
 app.use(helmet());
@@ -1160,20 +1166,14 @@ app.patch('/api/admin/users/:id', authenticate, requireAdmin, adminRoute('Updati
     return fail(res, error.status || 400, error.message);
   }
 
-  const assignments = [];
-  const values = [];
-  const push = (column, value) => { values.push(value); assignments.push(`${column}=$${values.length}`); };
-  if (update.role !== undefined) push('role', update.role);
-  if (update.isSuspended !== undefined) push('is_suspended', update.isSuspended);
-  if (update.suspensionReason !== undefined) push('suspension_reason', update.suspensionReason || null);
-  values.push(targetId);
-
-  const { rows } = await pool.query(
-    `UPDATE users SET ${assignments.join(',')} WHERE id=$${values.length}
-     RETURNING id AS "userId"`,
-    values,
-  );
+  // The statement and its values are built together, and checked against each other, in one place:
+  // which columns exist at all depends on which fields the administrator filled in.
+  let statement;
+  try { statement = buildUserAdminUpdate(update, targetId); }
+  catch (error) { return fail(res, error.status || 400, error.message); }
+  const { rows } = await pool.query(statement.sql, statement.params);
   if (!rows[0]) return fail(res, 404, 'That user could not be found.');
+  markApplied(req);
   const { rows: updatedRows } = await pool.query(`SELECT ${adminUserColumns} FROM users u WHERE u.id=$1`, [targetId]);
   const updated = updatedRows[0] || {};
   // An account that just lost access also loses anyone looking at it through support.
@@ -1564,6 +1564,7 @@ app.post('/api/admin/announcements', authenticate, requireAdmin, adminRoute('Pub
   let announcement;
   try {
     announcement = await announcementService.publish({ draft, actorId: req.userId });
+    markApplied(req);
   } catch (error) {
     if (error.code === '23514') return fail(res, 400, 'Those dates do not fit together, so the announcement was not published.');
     throw error;
@@ -1768,14 +1769,9 @@ app.patch('/api/admin/users/:id/subscription', authenticate, requireAdmin, admin
   try {
     await client.query('BEGIN');
     if (adjustment.planKey === 'free') {
-      await client.query(
-        "UPDATE users SET subscription_status='free',subscription_plan='free',plan_limits=$2 WHERE id=$1",
-        [targetId, JSON.stringify(FREE_PLAN.limits)],
-      );
-      await client.query(
-        "UPDATE subscriptions SET plan_key='free',status='free',current_period_end=NULL,cancel_at_period_end=FALSE,updated_at=NOW() WHERE user_id=$1",
-        [targetId],
-      );
+      const released = buildSubscriptionReleaseStatements({ targetId, limits: FREE_PLAN.limits });
+      await client.query(released.userUpdate.sql, released.userUpdate.params);
+      await client.query(released.subscription.sql, released.subscription.params);
       entries.push({
         action: MANUAL_SUBSCRIPTION_ACTIONS.free,
         summary: `Moved ${target.email} to Free, ending the ${target.subscriptionPlan || 'paid'} plan. Reason: ${adjustment.reason}`,
@@ -1783,21 +1779,19 @@ app.patch('/api/admin/users/:id/subscription', authenticate, requireAdmin, admin
       });
     } else if (plan) {
       // A grant with an explicit period honours that period instead of the plan's own interval,
-      // so "Pro for 14 days" means fourteen days and not a month plus two weeks.
-      const periodSql = adjustment.endsAt ? '$5::timestamptz' : 'NOW() + ($4::text)::interval';
-      await client.query(
-        "UPDATE users SET subscription_status='active',subscription_plan=$2,plan_limits=$3 WHERE id=$1",
-        [targetId, plan.key, JSON.stringify(plan.limits || {})],
-      );
-      const { rows: upserted } = await client.query(
-        `INSERT INTO subscriptions(user_id,plan_key,status,interval,current_period_end,cancel_at_period_end,started_at,provider,updated_at)
-         VALUES($1,$2,'active',$3,${periodSql},FALSE,NOW(),'manual',NOW())
-         ON CONFLICT(user_id) DO UPDATE SET plan_key=EXCLUDED.plan_key,status='active',interval=EXCLUDED.interval,
-           current_period_end=GREATEST(COALESCE(subscriptions.current_period_end,NOW()),${periodSql}),
-           cancel_at_period_end=FALSE,started_at=COALESCE(subscriptions.started_at,NOW()),canceled_at=NULL,updated_at=NOW()
-         RETURNING current_period_end AS "periodEnd"`,
-        [targetId, plan.key, paystackConfig.interval || 'monthly', adjustment.days ? `${adjustment.days} days` : planPeriodInterval(paystackConfig.interval), adjustment.endsAt],
-      );
+      // so "Pro for 14 days" means fourteen days and not a month plus two weeks - and the choice is
+      // one COALESCE that always references both bindings, so no branch can supply a value the
+      // statement has no slot for.
+      const granted = buildSubscriptionGrantStatements({
+        targetId,
+        plan,
+        limits: plan.limits || {},
+        interval: paystackConfig.interval,
+        period: adjustment.days ? `${adjustment.days} days` : planPeriodInterval(paystackConfig.interval),
+        endsAt: adjustment.endsAt,
+      });
+      await client.query(granted.userUpdate.sql, granted.userUpdate.params);
+      const { rows: upserted } = await client.query(granted.subscription.sql, granted.subscription.params);
       periodEnd = upserted[0]?.periodEnd || periodEnd;
       entries.push({
         action: MANUAL_SUBSCRIPTION_ACTIONS.grant,
@@ -1806,18 +1800,8 @@ app.patch('/api/admin/users/:id/subscription', authenticate, requireAdmin, admin
       });
     }
     if (extending && !plan) {
-      const assignment = adjustment.endsAt
-        ? 'current_period_end=$2::timestamptz'
-        : `current_period_end=GREATEST(COALESCE(current_period_end,NOW()),NOW()) + ($2::int * INTERVAL '1 day')`;
-      const { rows: extended } = await client.query(
-        `UPDATE subscriptions SET ${assignment},
-           status=CASE WHEN status IN ('canceled','free') THEN 'non_renewing' ELSE status END,
-           cancel_at_period_end=CASE WHEN status IN ('canceled','free') THEN TRUE ELSE cancel_at_period_end END,
-           updated_at=NOW()
-         WHERE user_id=$1
-         RETURNING current_period_end AS "periodEnd",status,cancel_at_period_end AS "cancelAtPeriodEnd"`,
-        [targetId, adjustment.endsAt || adjustment.days],
-      );
+      const extendedStatement = buildSubscriptionExtendStatement({ targetId, days: adjustment.days, endsAt: adjustment.endsAt });
+      const { rows: extended } = await client.query(extendedStatement.sql, extendedStatement.params);
       periodEnd = extended[0]?.periodEnd || periodEnd;
       entries.push({
         action: MANUAL_SUBSCRIPTION_ACTIONS.extend,
@@ -1834,10 +1818,14 @@ app.patch('/api/admin/users/:id/subscription', authenticate, requireAdmin, admin
     const synced = syncedRows[0] || null;
     if (synced) {
       const limits = findPlan(paystackConfig, synced.planKey)?.limits || FREE_PLAN.limits;
-      await client.query('UPDATE users SET subscription_status=$2,subscription_plan=$3,plan_limits=$4 WHERE id=$1', [targetId, synced.status, synced.planKey, JSON.stringify(limits)]);
+      const mirror = buildSubscriptionMirrorStatement({ targetId, status: synced.status, planKey: synced.planKey, limits });
+      await client.query(mirror.sql, mirror.params);
       periodEnd = synced.periodEnd;
     }
     await client.query('COMMIT');
+    // Everything this route wrote is committed here, so a failure after this point - the read-back,
+    // the audit entries - must not be reported as though the adjustment had been rolled back.
+    markApplied(req);
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
     throw error;
