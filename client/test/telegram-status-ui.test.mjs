@@ -15,7 +15,7 @@ const outfile = path.join(here, '.tmp', 'telegram-status.mjs');
 await build({
   stdin: {
     contents: [
-      "export { TelegramStatusContext, telegramStatusReducer, telegramConnectionView, TelegramStatusPill, WAITING_FOR_MESSAGES_MESSAGE, TELEGRAM_STATUS_ENDPOINT } from './TelegramStatus.jsx';",
+      "export { TelegramStatusContext, telegramStatusReducer, telegramConnectionView, TelegramStatusPill, WAITING_FOR_MESSAGES_MESSAGE, LISTENER_NOT_ATTACHED_MESSAGE, monitoringLabel, TELEGRAM_STATUS_ENDPOINT } from './TelegramStatus.jsx';",
       "export { default as SignalTable, signalEmptyState } from './SignalTable.jsx';",
       "export { telegramSourceNote } from './MetaApiPanel.jsx';",
     ].join('\n'),
@@ -34,8 +34,8 @@ assert.ok(existsSync(outfile), 'the component bundle was produced');
 
 const {
   TelegramStatusContext, telegramStatusReducer, telegramConnectionView, TelegramStatusPill,
-  WAITING_FOR_MESSAGES_MESSAGE, TELEGRAM_STATUS_ENDPOINT,
-  SignalTable, signalEmptyState, telegramSourceNote,
+  WAITING_FOR_MESSAGES_MESSAGE, LISTENER_NOT_ATTACHED_MESSAGE, TELEGRAM_STATUS_ENDPOINT,
+  monitoringLabel, SignalTable, signalEmptyState, telegramSourceNote,
 } = await import(pathToFileURL(outfile).href);
 
 const UNKNOWN = telegramStatusReducer(undefined, { type: '@@initial' });
@@ -205,4 +205,36 @@ test('the telegram page keeps its sign-in form out of the loading window', () =>
   assert.match(source, /Checking your Telegram connection/);
   assert.match(source, /connected === true/, 'chats load only for a confirmed connection');
   assert.equal(source.includes('setStatus'), false, 'the page has no local copy of the status any more');
+});
+
+/* ---------------------------------------------------------------------------------------------
+ * The dashboard's monitoring label is a status claim, so it has to be disprovable by the one field
+ * the server is entitled to set: `listening`. A signed-in session with nothing attached to it used
+ * to read here as "Signal monitoring", which is precisely how a dropped handler stayed invisible for
+ * weeks - the empty list said it, but the pill contradicted it, and the pill is what is always on
+ * screen.
+ * ------------------------------------------------------------------------------------------- */
+
+const connectedView = (listening) => telegramConnectionView(stateFor({ connected: true, configured: true, listening }));
+
+test('the monitoring label is not claimed by a session that is not listening', () => {
+  assert.deepEqual(
+    { key: monitoringLabel({ view: connectedView(true), channelCount: 2 }).key, live: monitoringLabel({ view: connectedView(true), channelCount: 2 }).live },
+    { key: 'monitoring', live: true },
+    'a connected session with a live handler and a channel selected is monitoring',
+  );
+  const idle = monitoringLabel({ view: connectedView(false), channelCount: 2 });
+  assert.equal(idle.key, 'idle');
+  assert.equal(idle.live, false, 'and a label that is not live may not be drawn as live');
+  assert.match(idle.text, /Waiting for Telegram/, 'the sentence says the app is waiting, not that a fault happened');
+  assert.equal(/Render|sleep|asleep|instance/i.test(idle.text), false, 'the mechanism is an administrator diagnostic, never dashboard copy');
+  assert.equal(monitoringLabel({ view: connectedView(false), channelCount: 0 }).key, 'no-channels', 'a workspace with nothing selected is a different fact');
+});
+
+test('the not-listening empty state is one sentence an operator can act on', () => {
+  const empty = signalEmptyState({ view: connectedView(false), channelCount: 2 });
+  assert.equal(empty.message, LISTENER_NOT_ATTACHED_MESSAGE);
+  assert.ok(LISTENER_NOT_ATTACHED_MESSAGE.length < 170, 'the copy stays readable where it is read: a whole paragraph in an empty state is text nobody finishes');
+  assert.match(LISTENER_NOT_ATTACHED_MESSAGE, /not receiving messages yet/);
+  assert.equal(/Render|sleep|asleep|restart/i.test(LISTENER_NOT_ATTACHED_MESSAGE), false, 'no host mechanics in a user-facing empty state');
 });

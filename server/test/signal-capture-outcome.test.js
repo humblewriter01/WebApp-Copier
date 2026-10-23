@@ -10,6 +10,10 @@ import {
 import { createExecutionEngine } from '../services/execution-engine.js';
 
 const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+// The capture loop moved into its own module so that a test can drive an update through it. The
+// invariants this file guards - storage before any execution decision, no plan gate in the listener -
+// are worth keeping, but they now live in the service, not in the routing file.
+const listenerSource = readFileSync(new URL('../services/telegram-listener.js', import.meta.url), 'utf8');
 const engineSource = readFileSync(new URL('../services/execution-engine.js', import.meta.url), 'utf8');
 
 function section(source, startMarker, endMarker) {
@@ -19,8 +23,8 @@ function section(source, startMarker, endMarker) {
   return source.slice(start, end === -1 ? source.length : end);
 }
 
-const saveSignalBody = section(index, 'async function saveSignal(', '\nasync function startTelegramListener');
-const listenerBody = section(index, 'async function startTelegramListener(', '\nasync function restoreTelegramClient');
+const saveSignalBody = section(index, 'async function saveSignal(', '\nconst telegramCapture = createTelegramListener(');
+const listenerBody = section(listenerSource, 'async function ingestMessage(', '  /**\n   * Attach the capture handler');
 const settingsPut = section(index, "app.put('/api/settings'", '\napp.get(\'/api/trades\'');
 
 const eligible = {
@@ -126,9 +130,10 @@ test('a live message is never dropped without saying where it went', () => {
   }
   // and the counters survive into the status route, so "is it even listening?" has an answer
   const statusRoute = section(index, "app.get('/api/telegram/status'", 'async function persistTelegramLoginAttempt');
-  assert.match(statusRoute, /listening: Boolean\(entry\?\.handler && entry\.client\?\.connected\)/);
+  assert.match(index, /void resumeTelegramSessions\(\{ reason: 'boot' \}\)/, 'sessions are re-armed at boot, without waiting for someone to open the dashboard');
+  assert.match(statusRoute, /listening: Boolean\(entry\?\.client\?\.connected && entry\.handler && telegramCapture\.handlerIsLive\(entry\.client, entry\.handler\)\)/, 'listening is read from GramJS\'s handler list, not from a flag of ours');
   assert.match(statusRoute, /messagesSeen|signalsSaved/, 'the panel can tell a silent listener from a quiet channel');
-  assert.match(statusRoute, /if \(entry\?\.client\?\.connected && !entry\.handler\) await startTelegramListener/, 'a connected client with no handler is attached on the spot');
+  assert.match(statusRoute, /await startTelegramListener\(req\.userId, entry\.client\)/, 'a connected client with no live handler is attached on the spot');
 });
 
 test('the safety nets are read before the row is written, and the decision is not made twice', () => {

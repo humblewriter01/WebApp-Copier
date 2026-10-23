@@ -303,7 +303,13 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     setError('');
     setNotice('');
     try {
-      await request(`/api/admin/users/${userId}`, token, { method: 'PATCH', body });
+      /*
+       * `retryWhenUnanswered` is what makes the Suspend button honest about a sleeping host: the
+       * first write after a quiet period can reach a gateway that has not finished starting, and that
+       * is a reason to wait a few seconds and send it once more, not a reason to tell the
+       * administrator the change failed. A refusal from the service itself is never repeated.
+       */
+      await request(`/api/admin/users/${userId}`, token, { method: 'PATCH', body, retryWhenUnanswered: true });
       setNotice(successMessage);
       setSuspension({ userId: '', name: '', reason: '' });
       await loadOverview();
@@ -1119,6 +1125,30 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
               <div><strong>{check.label}</strong><span className="health-check-headline">{check.headline}</span><p>{check.detail}</p></div>
             </li>)}
           </ul>
+          {health.capture ? <div className="health-capture" role="note">
+            <div className="health-capture-head">
+              <strong>Message capture</strong>
+              <span className={`count-badge ${healthCheckTone(health.capture.state)}`}>{health.capture.headline}</span>
+            </div>
+            <p>{health.capture.detail}</p>
+            {health.capture.sleepSuspected ? <p className="health-capture-sleep">A Telegram session only exists while this process is running, and Render's free tier stops it between visitors. If channels are monitored but "messages seen" is 0, the instance was asleep when the channel posted - not a fault in the listener.</p> : null}
+            <div className="health-queue">
+              <div><span>Sessions held</span><strong>{health.capture.sessionsInMemory}</strong></div>
+              <div><span>Listening</span><strong>{health.capture.listening}</strong></div>
+              <div><span>Messages seen</span><strong>{health.capture.messagesSeen}</strong></div>
+              <div><span>Signals stored</span><strong>{health.capture.signalsSaved}</strong></div>
+              <div><span>Monitored channels</span><strong>{health.capture.monitoredChannels}</strong></div>
+              <div><span>Workspaces connected</span><strong>{health.capture.connectedUsers}</strong></div>
+              <div><span>Last message through</span><strong>{health.capture.lastMessageAt ? formatDateTime(health.capture.lastMessageAt) : 'Never'}</strong></div>
+              <div><span>Last stored signal</span><strong>{health.capture.lastSignalAt ? formatDateTime(health.capture.lastSignalAt) : 'Never'}</strong></div>
+            </div>
+            <p className="health-capture-foot">
+              Instance up {health.capture.instanceUptimeSeconds === null ? '—' : `${health.capture.instanceUptimeSeconds}s`}
+              {health.capture.instanceStartedAt ? ` · started ${formatDateTime(health.capture.instanceStartedAt)}` : ''}
+              {health.capture.gitCommit ? ` · build ${health.capture.gitCommit.slice(0, 7)}` : ''}
+              {health.capture.lastError ? ` · handler error: ${health.capture.lastError}` : ''}
+            </p>
+          </div> : null}
           <div className="health-queue">
             <div><span>Queued jobs</span><strong>{health.queue ? health.queue.queuedJobs : '—'}</strong></div>
             <div><span>In flight</span><strong>{health.queue ? health.queue.processingJobs : '—'}</strong></div>

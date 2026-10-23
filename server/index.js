@@ -11,13 +11,12 @@ import rateLimit from 'express-rate-limit';
 import { Server } from 'socket.io';
 import { Api, TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
-import { NewMessage } from 'telegram/events/index.js';
 import { pool, initializeDatabase } from './db.js';
 import { createMetaApiConfigurationLink, metaApiRequest, toSafeMetaApiAccount } from './services/metaapi.js';
 import { getTelegramErrorCode, isTelegramPasswordNeeded, shouldDiscardTelegramLogin, telegramAuthErrorPayload } from './services/telegram-auth.js';
 import { parseSignal } from './services/signal-parser.js';
 import { captureSafety, readFallbackPoints } from './services/signal-safety.js';
-import { isTelegramServiceMessage, resolveTelegramChatId, telegramMessageText, telegramPeerIdVariants } from './services/telegram-peer.js';
+import { createTelegramListener } from './services/telegram-listener.js';
 import { createMetaApiTradingAdapter } from './services/metaapi-trading.js';
 import { createExecutionEngine, PLATFORM_PAUSE_MESSAGE } from './services/execution-engine.js';
 import { createExecutionWorker } from './services/execution-worker.js';
@@ -221,7 +220,7 @@ async function resolveExecutionToken(userId, accountId, managedByApp) {
  */
 const platformControls = createPlatformControls({ pool, logger: console });
 const auditLog = createAuditLogger({ pool, logger: console });
-const systemHealth = createSystemHealthService({ pool, controls: platformControls, runtimeEnabled: autoTradingRuntimeEnabled, logger: console });
+const systemHealth = createSystemHealthService({ pool, controls: platformControls, runtimeEnabled: autoTradingRuntimeEnabled, logger: console, capture: () => ({ ...telegramCapture.telegramFleetSummary(), gitCommit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || null }) });
 const announcementService = createAnnouncementService({ pool, logger: console });
 const supportSessions = createSupportSessionService({ pool, logger: console });
 
@@ -359,71 +358,32 @@ async function saveSignal(userId, message, channel = {}) {
   return signal;
 }
 
-/**
+/*
  * The live capture path, and the reason it used to be invisible.
  *
- * This function used to read `message.chatId` and compare it with one exact string. Both halves were
- * wrong in the same direction: that property is not on every update shape GramJS delivers, and a
- * channel id has two spellings (`-1001234567890` and `1234567890`) depending on which accessor produced
- * it - so a message either had no id to read or an id that did not equal the stored one, and the
- * handler returned. No error, no row, no line in the log: a workspace could monitor a channel for weeks
- * and see only "Waiting for signals".
+ * This block used to be a function in this file reading `message.chatId` and comparing it with one
+ * exact string. Both halves were wrong in the same direction: that property is not on every update
+ * shape GramJS delivers, and a channel id has two spellings (`-1001234567890` and `1234567890`)
+ * depending on which accessor produced it - so a message either had no id to read or an id that did
+ * not equal the stored one, and the handler returned. No error, no row, no line in the log: a
+ * workspace could monitor a channel for weeks and see only "Waiting for signals".
  *
- * It now reads the id from every place GramJS puts it, matches the monitored channel by any spelling of
- * that id, and writes down what it saw - including the messages it decided to ignore, which is the only
- * way a silent drop can be told apart from a quiet channel.
+ * It now lives in `services/telegram-listener.js` with its dependencies injected, for two reasons.
+ * The first is that the fix can only be believed when a test can drive a real GramJS update through
+ * the real dispatcher into the real storage call, which a closure over module state cannot be. The
+ * second is that three separate things had to be guaranteed and were not: that a handler is attached
+ * to the client that is actually connected (verified against GramJS's own handler list, not against
+ * a flag of ours), that channel ids are matched in every spelling on both sides, and that the
+ * messages which arrived while this instance was not running are pulled back out of Telegram -
+ * `catchUp()` in this version of the library is an empty stub, so nothing else ever will.
  */
-async function startTelegramListener(userId, client) {
-  const current = telegramClients.get(userId);
-  if (!current) return;
-  if (current.handler) return;
-  const stats = current.stats || { seen: 0, saved: 0, ignored: 0, lastAt: null, lastChatId: null, lastError: null };
-  current.stats = stats;
-  const handler = async (event) => {
-    const message = event?.message;
-    try {
-      stats.seen += 1;
-      const chatId = resolveTelegramChatId(message, event);
-      stats.lastAt = new Date().toISOString();
-      stats.lastChatId = chatId || null;
-      const text = telegramMessageText(message);
-      if (!chatId) {
-        stats.ignored += 1;
-        log('warn', 'Telegram message had no chat id to match on', { userId, messageId: message?.id ?? null, peer: message?.peerId?.className ?? null });
-        return;
-      }
-      if (!text) {
-        // A photo, a poll, a pin, a join notice: nothing to parse, and saying so is what makes
-        // "no new signals" an answer rather than a mystery.
-        stats.ignored += 1;
-        log('info', 'Telegram message carried no text to read', { userId, chatId, service: isTelegramServiceMessage(message) });
-        return;
-      }
-      const variants = telegramPeerIdVariants(chatId);
-      const { rows } = await pool.query(
-        `SELECT channel_id AS "channelId",title FROM channels
-          WHERE user_id=$1 AND enabled=TRUE AND channel_id = ANY($2::text[])
-          ORDER BY created_at DESC LIMIT 1`,
-        [userId, variants],
-      );
-      if (!rows.length) {
-        stats.ignored += 1;
-        log('info', 'Telegram message ignored: that chat is not monitored', { userId, chatId, variants: variants.join('|'), chars: text.length });
-        return;
-      }
-      log('info', 'Telegram message captured', { userId, chatId, channel: rows[0].title, chars: text.length, messageId: message?.id ?? null });
-      // The signal is stored whatever the parser makes of it - a message from a monitored channel that
-      // reads as prose is still a captured message, and it is shown as such instead of vanishing.
-      await saveSignal(userId, text, { source: 'telegram', channelId: rows[0].channelId, title: rows[0].title, telegramMessageId: message?.id ?? null });
-      stats.saved += 1;
-    } catch (error) {
-      stats.lastError = `${error.message}`.slice(0, 200);
-      log('error', 'Telegram update processing failed', { userId, error: error.message });
-    }
-  };
-  client.addEventHandler(handler, new NewMessage({}));
-  current.handler = handler;
-}
+const telegramCapture = createTelegramListener({
+  clients: telegramClients,
+  pool,
+  log: (level, message, meta) => log(level, message, meta),
+  saveSignal: (userId, message, channel) => saveSignal(userId, message, channel),
+});
+const startTelegramListener = (userId, client) => telegramCapture.startTelegramListener(userId, client);
 
 /** How far back the platform purge goes unless the administrator says otherwise. */
 const SIGNAL_PURGE_DEFAULT_DAYS = 30;
@@ -453,23 +413,89 @@ async function runSignalDelete(pair) {
   }
 }
 
-async function restoreTelegramClient(userId) {
+/**
+ * Bring one workspace's Telegram session up, and make sure something is listening on it.
+ *
+ * An entry whose client is present but not connected used to be left exactly as it was found: the
+ * handler stayed attached to a socket that had already closed, `users.telegram_connected` still said
+ * true, and the workspace was told it was connected forever. Reconnecting the same client and
+ * re-attaching the handler is what a sleeping host needs, because a wake is a new process while the
+ * flag in the database is inherited from the old one.
+ */
+async function restoreTelegramClient(userId, { reason = 'restore' } = {}) {
   const current = telegramClients.get(userId);
-  if (current?.client?.connected) return current.client;
+  if (current?.client?.connected === true && current.handler && telegramCapture.handlerIsLive(current.client, current.handler)) return current.client;
+  if (current?.client && current.client.connected !== true) {
+    try { await current.client.connect(); } catch (error) { log('warn', 'Telegram reconnect deferred', { userId, error: error.message }); }
+    if (current.client.connected === true) {
+      await startTelegramListener(userId, current.client);
+      void telegramCapture.runCatchUp(userId).catch(() => {});
+      return current.client;
+    }
+  }
+  // Whatever half-connected object was here is dropped before a new one replaces it, so a wake does
+  // not leave a second authorized session polling with the same StringSession.
+  if (current?.client && current.client.connected !== true) await current.client.disconnect().catch(() => {});
   const { rows } = await pool.query('SELECT telegram_session FROM users WHERE id=$1', [userId]);
-  if (!rows[0]?.telegram_session) return null;
-  if (!process.env.API_ID || !process.env.API_HASH) throw new Error('Telegram API credentials are not configured');
-  const client = new TelegramClient(new StringSession(decryptSecret(rows[0].telegram_session)), Number(process.env.API_ID), process.env.API_HASH, { connectionRetries: 3 });
-  await client.connect();
-  if (!(await client.checkAuthorization())) {
-    await client.disconnect();
-    await pool.query('UPDATE users SET telegram_connected=FALSE,telegram_session=NULL WHERE id=$1', [userId]);
+  if (!rows[0]?.telegram_session) {
+    if (current) telegramClients.delete(userId);
     return null;
   }
-  telegramClients.set(userId, { client, handler: null, stats: { seen: 0, saved: 0, ignored: 0, lastAt: null, lastChatId: null, lastError: null } });
+  if (!process.env.API_ID || !process.env.API_HASH) throw new Error('Telegram API credentials are not configured');
+  const client = new TelegramClient(new StringSession(decryptSecret(rows[0].telegram_session)), Number(process.env.API_ID), process.env.API_HASH, { connectionRetries: 3, autoReconnect: true });
+  await client.connect();
+  if (!(await client.checkAuthorization())) {
+    await client.disconnect().catch(() => {});
+    await pool.query('UPDATE users SET telegram_connected=FALSE,telegram_session=NULL WHERE id=$1', [userId]);
+    telegramClients.delete(userId);
+    log('warn', 'Telegram session is no longer authorized', { userId, reason });
+    return null;
+  }
+  telegramClients.set(userId, { client, handler: null, stats: telegramCapture.EMPTY_STATS() });
   await startTelegramListener(userId, client);
   await pool.query('UPDATE users SET telegram_connected=TRUE WHERE id=$1', [userId]);
+  telegramCapture.markSessionResumed();
+  log('info', 'Telegram session restored for capture', { userId, reason });
+  // The messages this session missed while nothing was running are pulled back in the background,
+  // so a workspace that was asleep during a channel's signal does not have to wait for the next one.
+  void telegramCapture.runCatchUp(userId).catch((error) => log('warn', 'Telegram catch-up failed', { userId, error: error.message }));
   return client;
+}
+
+/**
+ * Every workspace with a stored session gets a live listener, whether or not anyone opens the app.
+ *
+ * The first pass happens at boot; the sweep that repeats it is what covers the other case - a
+ * process that survives while its socket dies, which is what a paused host looks like from inside.
+ * Each pass is cheap: an entry already connected with a verified handler costs one boolean check.
+ */
+async function resumeTelegramSessions({ reason = 'restore' } = {}) {
+  const { rows } = await pool.query('SELECT id FROM users WHERE telegram_connected=TRUE AND telegram_session IS NOT NULL ORDER BY last_active_at DESC NULLS LAST LIMIT 200');
+  let restored = 0;
+  for (const row of rows) {
+    try {
+      if (await restoreTelegramClient(row.id, { reason })) restored += 1;
+    } catch (error) {
+      log('warn', 'Telegram listener restore failed', { userId: row.id, error: error.message });
+    }
+  }
+  if (rows.length) log('info', 'Telegram sessions swept for capture', { reason, wanted: rows.length, restored });
+  return { wanted: rows.length, restored };
+}
+
+/** Re-attach anything in memory that has lost its handler, and run the catch-up it flagged. */
+async function rearmTelegramListeners() {
+  let rearmed = 0;
+  for (const [userId, entry] of telegramClients.entries()) {
+    if (entry.client?.connected === true && (!entry.handler || !telegramCapture.handlerIsLive(entry.client, entry.handler))) {
+      await startTelegramListener(userId, entry.client);
+      rearmed += 1;
+    }
+    if (entry.needsCatchUp && entry.client?.connected === true) {
+      await telegramCapture.runCatchUp(userId).catch((error) => log('warn', 'Telegram catch-up failed', { userId, error: error.message }));
+    }
+  }
+  return rearmed;
 }
 
 io.use((socket, next) => {
@@ -484,8 +510,22 @@ io.on('connection', (socket) => {
   socket.emit('connected', { ok: true });
 });
 
-app.get('/health', asyncRoute(async (_req, res) => { await pool.query('SELECT 1'); res.json({ status: 'ok', timestamp: new Date().toISOString() }); }));
-app.get('/api/health', asyncRoute(async (_req, res) => { await pool.query('SELECT 1'); res.json({ status: 'ok', timestamp: new Date().toISOString() }); }));
+/*
+ * The answer to a question this workspace has had to guess at repeatedly: is the code I just merged
+ * the code that is running? A boot stamp costs nothing to expose, and without it "the fix is not
+ * working" and "the fix was never deployed" are the same observation. `RENDER_GIT_COMMIT` is set by
+ * Render for a Git-connected service; when it is absent the stamp says so rather than inventing one.
+ */
+const BOOTED_AT = new Date();
+const healthPayload = () => ({
+  status: 'ok',
+  timestamp: new Date().toISOString(),
+  bootedAt: BOOTED_AT.toISOString(),
+  uptimeSeconds: Math.round((Date.now() - BOOTED_AT.getTime()) / 1000),
+  gitCommit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || null,
+});
+app.get('/health', asyncRoute(async (_req, res) => { await pool.query('SELECT 1'); res.set('Cache-Control', 'no-store').json(healthPayload()); }));
+app.get('/api/health', asyncRoute(async (_req, res) => { await pool.query('SELECT 1'); res.set('Cache-Control', 'no-store').json(healthPayload()); }));
 
 // Public browser configuration. These two values are safe to ship to a browser
 // (they are already bundled into every frontend build); exposing them at runtime
@@ -738,8 +778,15 @@ app.post('/api/channels', authenticate, asyncRoute(async (req, res) => {
      RETURNING id,channel_id AS "channelId",title,username,enabled,created_at AS "createdAt"`,
     [req.userId, channelId, title, username],
   );
-  const client = telegramClients.get(req.userId)?.client;
-  if (client) await startTelegramListener(req.userId, client);
+  /*
+   * Choosing a channel to monitor is the moment a workspace expects capture to begin, so it is also
+   * the moment a session that is not in memory is brought back - waiting for the next status poll was
+   * how "I switched Monitor on and nothing ever arrived" stayed true.
+   */
+  const held = telegramClients.get(req.userId)?.client;
+  if (held?.connected === true) await startTelegramListener(req.userId, held);
+  else await restoreTelegramClient(req.userId, { reason: 'channel-monitored' })
+    .catch((error) => log('warn', 'Telegram session restore deferred after a channel was added', { userId: req.userId, error: error.message }));
   res.status(201).json({ channel: rows[0] });
 }));
 app.delete('/api/channels/:id', authenticate, asyncRoute(async (req, res) => {
@@ -1283,7 +1330,31 @@ app.get('/api/admin/users', authenticate, requireAdmin, asyncRoute(async (req, r
 
 app.patch('/api/admin/users/:id', authenticate, requireAdmin, adminRoute('Updating that account', async (req, res) => {
   const targetId = String(req.params.id || '').trim();
-  if (!UUID_PATTERN.test(targetId)) return fail(res, 400, 'Choose a valid user account.');
+  /*
+   * A target that is not an account id used to return a 400 from outside the route's logging and
+   * outside the audit trail, which is why "the Suspend button fails" could never be answered from the
+   * server side: the request that arrived with a garbled id left no trace at all, and neither did a
+   * refusal. Every way this endpoint can say no now says it in the log and in the audit trail, so
+   * "the audit table has no user rows" means something precise: the request never reached this
+   * handler, which is a deployment or a network fact, not a business rule.
+   */
+  const refuse = async (status, message, fields) => {
+    log('warn', 'Admin account edit refused', { actorId: req.userId, targetId, status, fields, reason: message });
+    if (fields.includes('isSuspended')) {
+      await auditLog.record({
+        actorId: req.userId,
+        actorEmail: req.userEmail,
+        action: 'user.suspend.refused',
+        targetType: 'user',
+        targetId,
+        summary: `Refused a suspension request: ${message}`,
+        metadata: { status, fields },
+      }).catch(() => {});
+    }
+    return fail(res, status, message);
+  };
+  const sentFields = Object.keys(req.body || {});
+  if (!UUID_PATTERN.test(targetId)) return refuse(400, 'Choose a valid user account.', sentFields);
   let update;
   try {
     update = normalizeUserUpdate(req.body || {});
@@ -1293,33 +1364,37 @@ app.patch('/api/admin/users/:id', authenticate, requireAdmin, adminRoute('Updati
        and then forgot it, and the audit log recorded only successes - so "the Suspend button fails"
        could not be answered from the server side. The field names that arrived, the status, and the
        sentence go to the log, and a refusal of a suspension attempt goes to the audit trail too. */
-    const status = Number(error.status) || 400;
-    const fields = Object.keys(req.body || {});
-    log('warn', 'Admin account edit refused', { actorId: req.userId, targetId, status, fields, reason: error.message });
-    if (fields.includes('isSuspended')) {
-      await auditLog.record({
-        actorId: req.userId,
-        actorEmail: req.userEmail,
-        action: 'user.suspend.refused',
-        targetType: 'user',
-        targetId,
-        summary: `Refused a suspension request: ${error.message}`,
-        metadata: { status, fields },
-      }).catch(() => {});
-    }
-    return fail(res, status, error.message);
+    return refuse(Number(error.status) || 400, error.message, sentFields);
   }
 
   // The statement and its values are built together, and checked against each other, in one place:
   // which columns exist at all depends on which fields the administrator filled in.
   let statement;
   try { statement = buildUserAdminUpdate(update, targetId); }
-  catch (error) { return fail(res, error.status || 400, error.message); }
-  const { rows } = await pool.query(statement.sql, statement.params);
-  if (!rows[0]) return fail(res, 404, 'That user could not be found.');
+  catch (error) { return refuse(Number(error.status) || 400, error.message, sentFields); }
+
+  let applied;
+  try {
+    const { rows } = await pool.query(statement.sql, statement.params);
+    if (!rows[0]) return refuse(404, 'That user could not be found.', sentFields);
+    applied = rows[0];
+  } catch (error) {
+    /* The database itself refused. This is the only case where the change is genuinely unknown, so
+       the sentence has to say that rather than blame the form. */
+    log('error', 'Admin account edit failed in the database', { actorId: req.userId, targetId, code: error.code || null, error: error.message });
+    return fail(res, 500, 'The change could not be written to the database, so this account has not been updated. Try again in a moment.');
+  }
+  // Everything below happens after the account really has changed. None of it may turn a completed
+  // suspension into a failure: the applied values are already in hand, so a follow-up that throws is
+  // reported and the request still answers with what was written.
   markApplied(req);
-  const { rows: updatedRows } = await pool.query(`SELECT ${adminUserColumns} FROM users u WHERE u.id=$1`, [targetId]);
-  const updated = updatedRows[0] || {};
+  let updated = { id: targetId, role: applied.role, isSuspended: applied.isSuspended, suspensionReason: applied.suspensionReason };
+  try {
+    const { rows: updatedRows } = await pool.query(`SELECT ${adminUserColumns} FROM users u WHERE u.id=$1`, [targetId]);
+    if (updatedRows[0]) updated = updatedRows[0];
+  } catch (error) {
+    log('warn', 'Admin user details could not be re-read after an applied change', { actorId: req.userId, targetId, error: error.message });
+  }
   // An account that just lost access also loses anyone looking at it through support.
   let revokedSessions = 0;
   if (update.isSuspended === true) {
@@ -2163,15 +2238,17 @@ app.get('/api/telegram/status', authenticate, asyncRoute(async (req, res) => {
     try { connected = Boolean(await restoreTelegramClient(req.userId)); } catch (error) { log('warn', 'Telegram session restore deferred', { userId: req.userId, error: error.message }); }
   }
   const entry = telegramClients.get(req.userId);
-  // A connected client with no event handler is the exact shape of the silent-drop failure this
-  // workspace can hit, so it is reported and repaired here rather than left to the next restart.
-  if (entry?.client?.connected && !entry.handler) await startTelegramListener(req.userId, entry.client).catch(() => {});
+  // A connected client whose handler is not in GramJS's own list is the exact shape of the
+  // silent-drop failure this workspace keeps hitting, so it is repaired here, before the answer is
+  // composed, rather than being reported as a healthy session that receives nothing.
+  if (entry?.client?.connected && (!entry.handler || !telegramCapture.handlerIsLive(entry.client, entry.handler))) await startTelegramListener(req.userId, entry.client).catch(() => {});
   const { rows: channelRows } = await pool.query('SELECT COUNT(*)::int AS count FROM channels WHERE user_id=$1 AND enabled=TRUE', [req.userId]);
   const stats = entry?.stats || {};
   res.json({
     configured,
     connected,
-    listening: Boolean(entry?.handler && entry.client?.connected),
+    listening: Boolean(entry?.client?.connected && entry.handler && telegramCapture.handlerIsLive(entry.client, entry.handler)),
+    catchUpQueued: entry?.needsCatchUp === true,
     monitoredChannels: channelRows[0]?.count ?? 0,
     messagesSeen: Number(stats.seen) || 0,
     messagesIgnored: Number(stats.ignored) || 0,
@@ -2455,10 +2532,16 @@ async function start() {
     log('warn', 'Idle MetaAPI account cleanup is disabled by configuration; provisioned accounts will accumulate', {});
   }
   httpServer.listen(PORT, '0.0.0.0', () => log('info', 'Server listening', { port: PORT }));
-  const { rows: telegramUsers } = await pool.query('SELECT id FROM users WHERE telegram_connected=TRUE AND telegram_session IS NOT NULL');
-  for (const row of telegramUsers) {
-    void restoreTelegramClient(row.id).catch((error) => log('warn', 'Telegram listener restore failed', { userId: row.id, errorType: error?.constructor?.name || 'Error' }));
-  }
+  // The listener is re-armed in the background, after the port is open: a workspace with a stored
+  // session must be listening whether or not anyone opens the dashboard, and a Telegram handshake
+  // must never be able to hold up the first request the host is woken for.
+  void resumeTelegramSessions({ reason: 'boot' }).catch((error) => log('warn', 'Telegram session sweep failed', { error: error.message }));
+  const telegramSweep = setInterval(() => {
+    void resumeTelegramSessions({ reason: 'sweep' })
+      .then(() => rearmTelegramListeners())
+      .catch((error) => log('warn', 'Telegram listener sweep failed', { error: error.message }));
+  }, 60 * 1000);
+  telegramSweep.unref?.();
 }
 start().catch((error) => { log('error', 'Startup failed', { error: error.message }); process.exit(1); });
 

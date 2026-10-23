@@ -281,7 +281,6 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
     <section className="panel" aria-labelledby="monitored-sources-title">
       <div className="panel-heading"><div><p className="eyebrow">MONITORED SOURCES</p><h2 id="monitored-sources-title">Monitored groups &amp; channels</h2></div><span className="count-badge">{channels.length}</span></div>
       {!channels.length ? <div className="empty-state"><span className="empty-icon" aria-hidden="true">⌁</span><strong>No chats selected</strong><span>{connected ? 'Choose the groups and channels to monitor above, and Signal Desk will read only those.' : 'Connect Telegram to choose which groups or channels to monitor.'}</span></div> : <div className="chat-list">{channels.map((channel) => <div className="chat-row" key={channel.id}><div><strong>{channel.title}</strong><small>{channel.enabled ? 'Monitoring enabled' : 'Paused'}</small></div><button className="button button-small button-secondary" type="button" aria-label={`Stop monitoring ${channel.title}`} disabled={busy} onClick={() => removeChannel(channel.id)}>Stop monitoring</button></div>)}</div>}
-      <div className="note-box">Monitoring may pause if the service goes to sleep.</div>
     </section>
   </div>;
 }

@@ -4,7 +4,16 @@ const apiUrl = import.meta.env.PROD && configuredApiUrl.includes('telegram-copie
   : configuredApiUrl || (import.meta.env.PROD ? 'https://telegram-copier-api-l1mj.onrender.com' : 'http://localhost:5000');
 export const API_URL = apiUrl.replace(/\/$/, '');
 
+import { WAKE_RETRY_DELAY_MS, isUnansweredRequestFailure, withWakeRetry } from './wake-retry.js';
+
 export async function request(path, token, options = {}) {
+  const { retryWhenUnanswered = false, retryDelayMs = WAKE_RETRY_DELAY_MS, sleep, ...send } = options;
+  if (!retryWhenUnanswered) return sendRequest(path, token, send);
+  // The rule itself lives in `lib/wake-retry.js`, where it can be tested without an API origin.
+  return withWakeRetry(() => sendRequest(path, token, send), { retryDelayMs, sleep });
+}
+
+async function sendRequest(path, token, options = {}) {
   const response = await fetch(`${API_URL}${path}`, {
     ...options,
     headers: {
@@ -36,11 +45,14 @@ export async function request(path, token, options = {}) {
     const said = (value) => (typeof value === 'string' && value.trim() ? value.trim() : '');
     const described = said(payload.userMessage) || said(payload.error) || said(payload.message);
     let message = described;
+    const answered = { answered: true };
     if (!message && response.status >= 500) {
       // An empty JSON body is still an answer from Signal Desk; an HTML error page is not.
       message = answeredAsJson
         ? 'We could not complete that request. Please try again in a moment.'
         : `Signal Desk did not answer that request (HTTP ${response.status}), so it may never have been applied. Nothing you can see here is a lie, but this section may be stale - reload it, and try again after a few seconds.`;
+      // Recorded on the error so a caller can tell "the service said no" from "nobody was home".
+      if (!answeredAsJson) answered.answered = false;
     }
     // A reference the user can read out beats any sentence this file could invent about the cause.
     if (response.status >= 500 && typeof payload.requestId === 'string' && payload.requestId) {
@@ -48,6 +60,7 @@ export async function request(path, token, options = {}) {
     }
     if (!message) message = 'Please check your details and try again.';
     const error = new Error(message);
+    Object.assign(error, answered);
     error.status = response.status;
     if (!described && response.status >= 500) error.retryable = true;
     if (typeof payload.requestId === 'string' && payload.requestId) error.requestId = payload.requestId;

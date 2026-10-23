@@ -21,7 +21,7 @@ export const WAITING_FOR_MESSAGES_MESSAGE = 'Telegram is connected. Waiting for 
  * not keeping, and this state is exactly the one that hid a dropped-message defect for so long: the
  * panel re-attaches the handler when the status is read, so the message names the moment, not a fault.
  */
-export const LISTENER_NOT_ATTACHED_MESSAGE = 'Telegram is signed in, but the live message stream is not attached to this session yet. Reading this page re-attaches it; messages that arrive from now on will be captured.';
+export const LISTENER_NOT_ATTACHED_MESSAGE = 'Telegram is signed in, but this session is not receiving messages yet. Open this page again and the next message will be captured.';
 
 const UNKNOWN_STATE = Object.freeze({
   loading: true,
@@ -152,6 +152,13 @@ export function monitoringLabel({ view, channelCount = 0 } = {}) {
   if (view.key === 'unavailable') return { key: 'unavailable', text: 'Telegram unavailable', live: false };
   if (view.key === 'unreachable') return { key: 'unreachable', text: 'Status unavailable', live: false };
   if (!Number(channelCount)) return { key: 'no-channels', text: 'No channels selected', live: false };
+  /*
+   * `listening === false` is the one state the server can prove and the pill could previously
+   * ignore: a signed-in session with nothing attached to it looks exactly like a quiet channel from
+   * the dashboard, which is how a dropped handler stayed invisible. The wording stays plain - the
+   * reason (an instance that stopped) is an administrator's diagnostic, not this user's problem.
+   */
+  if (view.listening === false) return { key: 'idle', text: 'Waiting for Telegram…', live: false };
   return { key: 'monitoring', text: 'Signal monitoring', live: true };
 }
 
