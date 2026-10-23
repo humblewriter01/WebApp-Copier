@@ -162,10 +162,12 @@ export async function initializeDatabase() {
     CREATE UNIQUE INDEX IF NOT EXISTS signals_telegram_event_unique_idx
       ON signals(user_id,channel_id,telegram_message_id)
       WHERE source='telegram' AND channel_id IS NOT NULL AND telegram_message_id IS NOT NULL;
-    /* A transient broker failure is retried, and the wait is the point: `next_attempt_at` is when the
-     * queue may look at the job again, and the worker's claim refuses anything whose time has not come.
-     * It is a column on the job rather than a timer in the process because a worker that restarts must not
-     * lose the backoff - or, worse, resume without it and hammer a broker that had just asked it to stop. */
+    /* A transient broker failure is retried, and the wait is the point: next_attempt_at is when the queue
+     * may look at the job again, and the worker's claim refuses anything whose time has not come. It is a
+     * column on the job rather than a timer in the process because a worker that restarts must not lose the
+     * backoff - or, worse, resume without it and hammer a broker that had just asked it to stop.
+     * No backticks in this comment, on purpose: it sits inside the template literal that holds the whole
+     * schema, so a backtick here ends that string and the service dies at boot on a SyntaxError. */
     ALTER TABLE execution_jobs ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ;
     CREATE INDEX IF NOT EXISTS execution_jobs_ready_idx ON execution_jobs(status,created_at) WHERE status='queued';
     CREATE INDEX IF NOT EXISTS execution_jobs_backoff_idx ON execution_jobs(next_attempt_at) WHERE status='queued' AND next_attempt_at IS NOT NULL;
