@@ -91,6 +91,28 @@ test('the endpoints the confirmation calls are the routes the server mounted', (
   }
 });
 
+test('each clear is declared before any sibling :param route that could swallow it', () => {
+  // The history clear shipped *after* `app.delete('/api/admin/announcements/:id')`, Express matched the
+  // earlier pattern, `history` became an id, and the button was answered with `Choose a valid announcement.`
+  // - a sentence about a banner nobody was touching, from the endpoint that retires one. Checking that a
+  // route exists is not checking that it runs, so order is what is asserted here, against the sibling that
+  // can steal it rather than against a copy of Express's matcher.
+  const deletes = [...serverRoutes.matchAll(/app\.delete\('(\/[^']+)'/g)].map((match) => ({ path: match[1], at: match.index }));
+  for (const endpoint of Object.values(CLEAR_ENDPOINTS)) {
+    const mine = deletes.find((route) => route.path === endpoint);
+    assert.ok(mine, `${endpoint} is mounted as a DELETE`);
+    const parent = endpoint.slice(0, endpoint.lastIndexOf('/'));
+    const rivals = deletes.filter((route) => route.path !== endpoint
+      && route.path.startsWith(`${parent}/:`)
+      && route.path.split('/').length === endpoint.split('/').length);
+    for (const rival of rivals) {
+      assert.ok(mine.at < rival.at, `${endpoint} has to be declared before ${rival.path}, or the last segment is read as its :param`);
+    }
+  }
+  const sibling = deletes.find((route) => route.path === '/api/admin/announcements/:id');
+  assert.ok(sibling, 'the retire route is still there, so the ordering check above had something to order against');
+});
+
 test('the notice after a clear is the server answer, and the list is read again', () => {
   const handler = panel.slice(panel.indexOf('const runClearHistory'), panel.indexOf('const changePage'));
   assert.match(handler, /setNotice\(data\?\.notice \|\| 'History cleared\.'\)/, 'the count of deleted rows comes from the response');
