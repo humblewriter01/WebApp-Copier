@@ -224,7 +224,7 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
         {sourceNote.action === 'choose' && onOpenTelegram ? <button type="button" className="text-button" onClick={onOpenTelegram}>Choose channels</button> : null}
         {sourceNote.action === 'connect' && onOpenTelegram && view.showConnectCallToAction ? <button type="button" className="text-button" onClick={onOpenTelegram}>Connect Telegram</button> : null}
       </div> : null}
-      <div className="note-box">Adding an account does not place a trade by itself. Auto-Trading is ON by default for new workspaces; after you select a deployed account, new eligible Telegram signals may place orders. Turn it off in Risk Settings to stop new orders. MetaAPI usage limits or charges may apply when a trading account is connected.</div>
+      <div className="note-box">Adding an account does not place a trade by itself. Auto-Trading is ON by default for new workspaces; after you select a deployed account, new eligible Telegram signals may place orders. Turn it off in Advanced Settings to stop new orders. MetaAPI usage limits or charges may apply when a trading account is connected.</div>
     </section>
 
     <section className="panel" aria-labelledby="metaapi-accounts-title">

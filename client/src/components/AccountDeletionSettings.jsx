@@ -34,7 +34,7 @@ export default function AccountDeletionSettings({ token, onDeleted }) {
   };
 
   return <section className="panel account-danger-zone" aria-labelledby="delete-account-heading">
-    <div className="panel-heading"><div><p className="eyebrow">ACCOUNT</p><h2 id="delete-account-heading">Delete My Account</h2></div></div>
+    <div className="panel-heading"><div><p className="eyebrow">DANGER ZONE</p><h2 id="delete-account-heading">Delete My Account</h2></div></div>
     <p className="muted">Permanently delete your Signal Desk profile and stored workspace data, including Telegram sessions, channels, signals, notes, connected-account records, settings, and execution history. Auto-Trading will be turned off first. Trading accounts this workspace created through MetaAPI are removed from MetaAPI as well, so they stop accruing provider charges. This does not close your broker account, close open broker positions, cancel orders already sent, or delete a MetaAPI account you added with your own MetaAPI token.</p>
     {!confirming ? <button type="button" className="button button-danger" onClick={() => setConfirming(true)}>Delete My Account</button> : <form className="form-stack deletion-confirm-form" onSubmit={submit}>
       <div className="alert alert-error deletion-warning" role="alert">This action cannot be undone. Confirm your current password and type DELETE to proceed.</div>

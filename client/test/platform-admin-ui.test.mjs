@@ -30,7 +30,7 @@ const bundlePath = (name) => path.join(here, '.tmp', `${name}.mjs`);
 // `import.meta.env`; the bundle gives that a value so the module can load in Node.
 await build({
   entryPoints: [
-    path.join(here, '..', 'src', 'components', 'ExecutionSettings.jsx'),
+    path.join(here, '..', 'src', 'components', 'AdvancedSettings.jsx'),
     path.join(here, '..', 'src', 'components', 'AnnouncementBanner.jsx'),
     path.join(here, '..', 'src', 'components', 'SupportSessionBar.jsx'),
   ],
@@ -46,11 +46,11 @@ await build({
   outExtension: { '.js': '.mjs' },
   logLevel: 'silent',
 });
-for (const name of ['ExecutionSettings', 'AnnouncementBanner', 'SupportSessionBar']) {
+for (const name of ['AdvancedSettings', 'AnnouncementBanner', 'SupportSessionBar']) {
   assert.ok(existsSync(bundlePath(name)), `the ${name} bundle was produced`);
 }
 
-const { default: ExecutionSettings, platformPauseNotice } = await import(pathToFileURL(bundlePath('ExecutionSettings')).href);
+const { default: AdvancedSettings, platformPauseNotice } = await import(pathToFileURL(bundlePath('AdvancedSettings')).href);
 const { default: AnnouncementBanner } = await import(pathToFileURL(bundlePath('AnnouncementBanner')).href);
 const { default: SupportSessionBar } = await import(pathToFileURL(bundlePath('SupportSessionBar')).href);
 
@@ -212,7 +212,7 @@ test('a platform pause explains itself next to a toggle that is already on', () 
   assert.match(platformPauseNotice({ paused: true, state: 'unavailable' }), /could not confirm its platform execution switch/);
   assert.doesNotMatch(platformPauseNotice({ paused: true, state: 'unavailable' }), /paused by Signal Desk for every workspace/, 'an unknown switch is not announced as a deliberate pause');
 
-  const markup = renderToStaticMarkup(React.createElement(ExecutionSettings, {
+  const markup = renderToStaticMarkup(React.createElement(AdvancedSettings, {
     settings: { autoTradingEnabled: true, riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 3, dailyLossLimit: 5, lotSizeMode: 'fixed', fixedLotSize: 0.01, maxDailyTrades: 10, executionAccountId: '', breakEvenEnabled: false, breakEvenTriggerPoints: 20, breakEvenOffsetPoints: 0, trailingStopEnabled: false, trailingStopDistancePoints: 10 },
     accounts: [],
     trades: [],
@@ -238,7 +238,7 @@ test('only the shared view decides what a platform state looks like', () => {
   assert.equal(/live:\s*'Live'/.test(panel), false, 'a local label map is how an unknown read ends up looking green');
   assert.equal(panel.includes("killSwitch?.state || 'live'"), false, 'the fallback has to be the blocked state, never the trading one');
 
-  const settings = readSource('components', 'ExecutionSettings.jsx');
+  const settings = readSource('components', 'AdvancedSettings.jsx');
   assert.match(settings, /export function platformPauseNotice/, 'the sentence a user sees about a platform pause lives with the component that shows it');
   assert.equal(settings.includes("request('/api/settings'"), false, 'the panel is told the pause state with its own settings instead of polling separately');
 

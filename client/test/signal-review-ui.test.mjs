@@ -36,7 +36,7 @@ const bundleFor = async (name, ...parts) => {
 
 const signalTableModule = await bundleFor('signal-table', 'components', 'SignalTable.jsx');
 const ConfirmModal = (await bundleFor('confirm-modal', 'components', 'ConfirmModal.jsx')).default;
-const ExecutionSettings = (await bundleFor('execution-settings', 'components', 'ExecutionSettings.jsx')).default;
+const AdvancedSettings = (await bundleFor('advanced-settings', 'components', 'AdvancedSettings.jsx')).default;
 const SignalTable = signalTableModule.default;
 const { signalEmptyState } = signalTableModule;
 // The two sentences belong to the status module, not the table, so they are read from there: a test that
@@ -129,7 +129,7 @@ const settingsBase = {
   breakEvenEnabled: false, breakEvenTriggerPoints: 20, breakEvenOffsetPoints: 0,
   trailingStopEnabled: false, trailingStopDistancePoints: 10, hasAcceptedRiskWarning: true,
 };
-const renderSettings = (settings) => render(ExecutionSettings, {
+const renderSettings = (settings) => render(AdvancedSettings, {
   settings,
   accounts: [{ metaApiAccountId: 'account-1', name: 'Demo MT5', platform: 'mt5', server: 'Broker-Demo', state: 'DEPLOYED' }],
   trades: [],
@@ -140,18 +140,23 @@ const renderSettings = (settings) => render(ExecutionSettings, {
   saving: false,
 });
 
-test('the risk panel is three groups, and the strict one is folded away', () => {
+test('the advanced page is grouped by what a value decides, and the strict group is folded away', () => {
   const markup = renderSettings(settingsBase);
-  assert.match(markup, /<h3>Core Risk<\/h3>/);
+  assert.match(markup, /<h3>Auto-Trading<\/h3>/);
   assert.match(markup, /<h3>Trade Management<\/h3>/);
   assert.match(markup, /Advanced Safety/);
   // The grouping has to be real, not three headings over one undifferentiated stack.
-  assert.ok(markup.indexOf('Core Risk') < markup.indexOf('Trade Management'), 'Core Risk comes first');
+  assert.ok(markup.indexOf('Auto-Trading') < markup.indexOf('Trade Management'), 'the switch that decides whether anything is sent leads the page');
   assert.ok(markup.indexOf('Trade Management') < markup.indexOf('Advanced Safety'), 'the strictest rules come last');
-  assert.ok(markup.indexOf('id="risk-percent"') < markup.indexOf('Trade Management'), 'risk limits sit under Core Risk');
   assert.ok(markup.indexOf('id="execution-account"') > markup.indexOf('Trade Management'), 'the account and lot sizing sit under Trade Management');
   assert.match(markup, /<details class="execution-advanced">/, 'Advanced Safety is a closed disclosure, not open by default');
   assert.equal(markup.includes('<details class="execution-advanced" open'), false, 'nothing about this group is switched on for the reader');
+  // What moved out stays out: the panel used to carry these between the risk percent and the safety
+  // blocks, which is exactly the mixing this split exists to end.
+  for (const absent of ['id="risk-percent"', 'id="max-open-trades"', 'id="max-daily-trades"', 'id="daily-loss-limit"', 'Delete My Account', 'account-danger-zone']) {
+    assert.equal(markup.includes(absent), false, `${absent} belongs to another page now`);
+  }
+  assert.match(markup, /Risk Settings/, 'and the page says where those numbers went');
 });
 
 test('the stop-loss guard is on unless the workspace has explicitly switched it off', () => {

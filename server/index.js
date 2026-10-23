@@ -718,7 +718,7 @@ app.get('/api/dashboard', authenticate, asyncRoute(async (req, res) => {
     stats: { totalSignals: signalsCount.rows[0].count, activeChannels: channelsCount.rows[0].count, accounts: accountsCount.rows[0].count },
     signals: recentSignals.rows,
     settings: settings.rows[0] || { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 5, dailyLossLimit: 5, autoTradingEnabled: false },
-    trading: { liveExecutionEnabled: autoTradingRuntimeEnabled, autoTradingEnabled: settings.rows[0]?.autoTradingEnabled === true, message: autoTradingRuntimeEnabled ? 'Auto-Trading starts on for new workspaces; review the live-trading warning and turn it off in Risk Settings whenever you want.' : 'Automatic execution is unavailable right now. Signals can still be reviewed.' },
+    trading: { liveExecutionEnabled: autoTradingRuntimeEnabled, autoTradingEnabled: settings.rows[0]?.autoTradingEnabled === true, message: autoTradingRuntimeEnabled ? 'Auto-Trading starts on for new workspaces; review the live-trading warning and turn it off in Advanced Settings whenever you want.' : 'Automatic execution is unavailable right now. Signals can still be reviewed.' },
   });
 }));
 

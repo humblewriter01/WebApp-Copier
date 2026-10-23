@@ -1,1 +1,1 @@
-{"routes":[{"path":"/","title":"Signal Desk"},{"path":"/admin","title":"Admin Panel"},{"path":"/billing","title":"Billing"},{"path":"/billing/callback","title":"Payment status"},{"path":"/update-password","title":"Update password"}]}
+{"routes":[{"path":"/","title":"Signal Desk"},{"path":"/advanced","title":"Advanced settings"},{"path":"/profile","title":"Profile"},{"path":"/admin","title":"Admin Panel"},{"path":"/billing","title":"Billing"},{"path":"/billing/callback","title":"Payment status"},{"path":"/update-password","title":"Update password"}]}

@@ -13,7 +13,7 @@ const outfile = path.join(here, '.tmp', 'components.mjs');
 // The component is written in JSX, so it is transpiled once per test run into a
 // throwaway bundle. React stays external so the bundle shares this process' copy.
 await build({
-  entryPoints: [path.join(here, '..', 'src', 'components', 'ExecutionSettings.jsx')],
+  entryPoints: [path.join(here, '..', 'src', 'components', 'AdvancedSettings.jsx')],
   outfile,
   bundle: true,
   format: 'esm',
@@ -25,7 +25,7 @@ await build({
 assert.ok(existsSync(outfile), 'the component bundle was produced');
 
 const {
-  default: ExecutionSettings,
+  default: AdvancedSettings,
   EXECUTION_WARNING,
   breakEvenSummary,
   RiskWarningModal,
@@ -45,7 +45,7 @@ const accounts = [{ metaApiAccountId: 'account-1', name: 'Demo MT5', platform: '
 function render(props = {}) {
   const settings = { ...baseSettings, ...(props.settings || {}) };
   return renderToStaticMarkup(
-    React.createElement(ExecutionSettings, {
+    React.createElement(AdvancedSettings, {
       settings,
       accounts,
       trades: [],

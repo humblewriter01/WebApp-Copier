@@ -50,7 +50,7 @@ export function platformPauseNotice(platformPause) {
     : `Automatic execution is paused by Signal Desk for every workspace. Your own settings are untouched, and new signals are saved for review until the pause is lifted.${reason}`;
 }
 
-export default function ExecutionSettings({ settings, accounts = [], trades = [], runtimeAvailable = false, platformPause = null, onChange, onSubmit, onToggle, saving = false }) {
+export default function AdvancedSettings({ settings, accounts = [], trades = [], runtimeAvailable = false, platformPause = null, onChange, onSubmit, onToggle, onOpenRiskSettings = () => {}, saving = false }) {
   const [riskWarningOpen, setRiskWarningOpen] = React.useState(false);
   const pauseNotice = platformPauseNotice(platformPause);
   // Turning the switch on is the only action here that spends money, so it is the only one that
@@ -81,7 +81,7 @@ export default function ExecutionSettings({ settings, accounts = [], trades = []
   return (
     <section className="panel settings-panel execution-settings-panel">
       <div className="panel-heading">
-        <div><p className="eyebrow">RISK &amp; EXECUTION</p><h2>Risk settings</h2></div>
+        <div><p className="eyebrow">EXECUTION &amp; AUTOMATION</p><h2>Advanced Settings</h2></div>
         <span className={`status-pill ${settings.autoTradingEnabled ? 'online' : ''}`}>
           {settings.autoTradingEnabled ? 'Auto-Trading ON' : 'Auto-Trading OFF'}
         </span>
@@ -92,27 +92,32 @@ export default function ExecutionSettings({ settings, accounts = [], trades = []
       {runtimeAvailable && <p className="field-help execution-runtime-note">The worker runs while Signal Desk is online. If the service is offline, new signals may be missed; stale signals are never executed after it returns.</p>}
 
       <form className="form-stack execution-settings-form" onSubmit={onSubmit} aria-busy={saving}>
-        {/* Three groups, because the panel used to mix what to risk with where to send it with what to
-            refuse outright. Only the last of those can change what reaches a broker without a stop. */}
-        <section className="execution-group">
+        {/* What an order does, in three groups: the switch and what guards it, how the trade is looked after
+            afterwards, and the rules that decide whether a captured signal may become an order at all. What a
+            trade may cost is deliberately not here - that is Risk Settings, and it is not power-user material. */}
+        <section className="execution-group execution-group-automation">
         <div className="execution-section-heading">
-          <h3>Core Risk</h3>
-          <p>How much a trade may cost you. Limits are checked against the selected connected account before every order.</p>
+          <h3>Auto-Trading</h3>
+          <p>The switch that decides whether a signal may become an order, and everything that guards it. The size of the risk a trade carries is set on the Risk Settings page.</p>
         </div>
-        <label htmlFor="risk-percent">Risk percent per position
-          <input id="risk-percent" type="number" min="0.1" max="5" step="0.1" value={settings.riskPercent} onChange={(event) => set('riskPercent', event.target.value)} required />
+        <label className="execution-toggle-row" htmlFor="auto-trading-enabled">
+          <input id="auto-trading-enabled" type="checkbox" checked={Boolean(settings.autoTradingEnabled)} disabled={saving || (!settings.autoTradingEnabled && !runtimeAvailable)} onChange={(event) => requestAutoTrading(event.target.checked)} />
+          <span><strong>Auto-Trading {settings.autoTradingEnabled ? 'ON' : 'OFF'}</strong><small>This toggle saves immediately. Switch it off whenever you want no new orders to be submitted.</small></span>
         </label>
-        <div className="form-row">
-          <label htmlFor="max-open-trades">Maximum Open Trades
-            <input id="max-open-trades" type="number" min="1" max="50" step="1" value={settings.maxOpenPositions} onChange={(event) => set('maxOpenPositions', event.target.value)} required />
-          </label>
-          <label htmlFor="max-daily-trades">Maximum Daily Trades
-            <input id="max-daily-trades" type="number" min="1" max="100" step="1" value={settings.maxDailyTrades} onChange={(event) => set('maxDailyTrades', event.target.value)} required />
-          </label>
-        </div>
-        <label htmlFor="daily-loss-limit">Daily loss limit (%)
-          <input id="daily-loss-limit" type="number" min="1" max="25" step="0.5" value={settings.dailyLossLimit} onChange={(event) => set('dailyLossLimit', event.target.value)} required />
-        </label>
+        <p className="risk-reminder">
+          <span>{RISK_REMINDER}</span>
+          <details className="risk-reminder-details">
+            <summary>What else applies to this switch</summary>
+            <ul>
+              {settings.breakEvenEnabled || settings.trailingStopEnabled
+                ? <li>Break-even and trailing-stop moves send further modify requests for trades Signal Desk opened, so protection follows the trade without you.</li>
+                : <li>Break-even and trailing-stop moves are off, so nothing protects an open trade automatically.</li>}
+              <li>An order that has already reached the broker cannot be recalled here; close it in your trading terminal.</li>
+              <li>Signals without a clear symbol, direction, or stop loss are saved for review and never traded, whatever this switch says.</li>
+              {settings.hasAcceptedRiskWarning === true ? <li>You confirmed the live-trading warning for this workspace, so it is not asked for again.</li> : <li>You have not confirmed the live-trading warning yet; you will be asked the first time you switch this on.</li>}
+            </ul>
+          </details>
+        </p>
         </section>
 
         <section className="execution-group">
@@ -229,25 +234,8 @@ export default function ExecutionSettings({ settings, accounts = [], trades = []
           </details>
         </section>
 
-        <label className="execution-toggle-row" htmlFor="auto-trading-enabled">
-          <input id="auto-trading-enabled" type="checkbox" checked={Boolean(settings.autoTradingEnabled)} disabled={saving || (!settings.autoTradingEnabled && !runtimeAvailable)} onChange={(event) => requestAutoTrading(event.target.checked)} />
-          <span><strong>Auto-Trading {settings.autoTradingEnabled ? 'ON' : 'OFF'}</strong><small>This toggle saves immediately. Switch it off whenever you want no new orders to be submitted.</small></span>
-        </label>
-        <p className="risk-reminder">
-          <span>{RISK_REMINDER}</span>
-          <details className="risk-reminder-details">
-            <summary>What else applies to this switch</summary>
-            <ul>
-              {settings.breakEvenEnabled || settings.trailingStopEnabled
-                ? <li>Break-even and trailing-stop moves send further modify requests for trades Signal Desk opened, so protection follows the trade without you.</li>
-                : <li>Break-even and trailing-stop moves are off, so nothing protects an open trade automatically.</li>}
-              <li>An order that has already reached the broker cannot be recalled here; close it in your trading terminal.</li>
-              <li>Signals without a clear symbol, direction, or stop loss are saved for review and never traded, whatever this switch says.</li>
-              {settings.hasAcceptedRiskWarning === true ? <li>You confirmed the live-trading warning for this workspace, so it is not asked for again.</li> : <li>You have not confirmed the live-trading warning yet; you will be asked the first time you switch this on.</li>}
-            </ul>
-          </details>
-        </p>
-        <p className="field-help">Break-even moves apply to positions Signal Desk opened; trades you placed yourself in the terminal keep their own stops. The open-trade limit counts open positions and pending orders. The daily trade limit counts new broker positions opened during the current UTC day. Signals without a clear direction, symbol, or stop loss are saved for review but are not traded.</p>
+        <p className="field-help">Break-even moves apply to positions Signal Desk opened; trades you placed yourself in the terminal keep their own stops. Signals without a clear direction, symbol, or stop loss are saved for review but are not traded.</p>
+        <p className="field-help advanced-settings-crosslink">Risk percent per position, the maximum number of open trades, and the daily loss limit are on the <button type="button" className="text-button" onClick={onOpenRiskSettings}>Risk Settings</button> page; a save here writes them as they were last loaded, never as blanks.</p>
         <button className="button button-primary" type="submit" disabled={saving}>{saving ? 'Saving settings…' : 'Save settings'}</button>
       </form>
       <RiskWarningModal

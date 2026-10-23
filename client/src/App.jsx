@@ -8,8 +8,10 @@ import TelegramConnect from './components/TelegramConnect.jsx';
 import { TelegramStatusProvider, TelegramStatusPill, useTelegramStatus, monitoringLabel } from './components/TelegramStatus.jsx';
 import { MetaApiStatusProvider } from './components/MetaApiStatus.jsx';
 import MetaApiPanel from './components/MetaApiPanel.jsx';
-import ExecutionSettings from './components/ExecutionSettings.jsx';
-import AccountDeletionSettings from './components/AccountDeletionSettings.jsx';
+import RiskSettings from './components/RiskSettings.jsx';
+import AdvancedSettings from './components/AdvancedSettings.jsx';
+import ProfileSettings from './components/ProfileSettings.jsx';
+import { PASSWORD_RESET_SENT, sendPasswordResetEmail } from './lib/password-reset.js';
 import AdminPanel from './components/AdminPanel.jsx';
 import AnnouncementBanner from './components/AnnouncementBanner.jsx';
 import SupportSessionBar from './components/SupportSessionBar.jsx';
@@ -32,25 +34,7 @@ function AuthScreen({ onAuthenticated, installPrompt, onInstall }) {
     event.preventDefault(); setBusy(true); setError('');
     try {
       if (mode === 'forgot') {
-        const email = form.email.trim().toLowerCase();
-        const client = await supabaseReady();
-        if (!client) {
-          console.error('[password-reset] Supabase browser configuration is missing, so no reset email can be sent.', {
-            hint: 'Set VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY in the static-site build environment, and SUPABASE_URL / SUPABASE_PUBLISHABLE_KEY on the API service, then redeploy. GET /api/config must return both values.',
-          });
-          throw new Error('Password recovery is temporarily unavailable. Please try again shortly or contact support.');
-        }
-        await request('/api/auth/prepare-password-reset', null, { method: 'POST', body: { email } });
-        const { error: resetError } = await client.auth.resetPasswordForEmail(email, { redirectTo: `${window.location.origin}/update-password` });
-        if (resetError) {
-          console.error('[password-reset] Supabase resetPasswordForEmail failed', {
-            message: resetError.message,
-            status: resetError.status,
-            code: resetError.code,
-            name: resetError.name,
-          });
-          throw new Error('We could not process that reset request right now. Please try again later.');
-        }
+        await sendPasswordResetEmail(form.email);
         setResetSent(true);
         return;
       }
@@ -66,7 +50,7 @@ function AuthScreen({ onAuthenticated, installPrompt, onInstall }) {
       <h1>{mode === 'login' ? 'Welcome back' : mode === 'register' ? 'Create your workspace' : resetSent ? 'Check your email' : 'Reset your password'}</h1>
       <p className="muted">{mode === 'forgot' ? 'Enter the email address for your Signal Desk account. If it exists, we will send a secure reset link.' : 'Automate your trading by executing Telegram signals directly to your broker.'}</p>
       {mode === 'forgot' && resetSent ? <>
-        <div className="alert alert-success" role="status">If an account exists for that address, a password reset link has been sent. Check your inbox and spam folder.</div>
+        <div className="alert alert-success" role="status">{PASSWORD_RESET_SENT}</div>
         <button type="button" className="button button-secondary button-wide auth-mode-button" onClick={() => changeMode('login')}>Back to sign in</button>
       </> : <form onSubmit={submit} className="form-stack">
         {mode === 'register' && <label>Your name<input autoComplete="name" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} required maxLength={100} /></label>}
@@ -79,7 +63,7 @@ function AuthScreen({ onAuthenticated, installPrompt, onInstall }) {
         {mode === 'forgot' && <button type="button" className="button button-secondary button-wide auth-mode-button" onClick={() => changeMode('login')}>Back to sign in</button>}
       </form>}
       {mode !== 'forgot' && <p className="auth-switch">{mode === 'login' ? 'New to Signal Desk?' : 'Already have an account?'} <button type="button" className="text-button" onClick={() => changeMode(mode === 'login' ? 'register' : 'login')}>{mode === 'login' ? 'Create account' : 'Sign in'}</button></p>}
-      <p className="fine-print">Auto-Trading is ON by default for new workspaces. New eligible Telegram signals may place live orders after you select a deployed trading account. Review the risk settings and turn it off whenever you want to stop new orders.</p>
+      <p className="fine-print">Auto-Trading is ON by default for new workspaces. New eligible Telegram signals may place live orders after you select a deployed trading account. Review your Risk Settings and Advanced Settings, and turn Auto-Trading off whenever you want to stop new orders.</p>
       {installPrompt && <button type="button" className="button button-primary button-wide install-button" onClick={onInstall}>Install Signal Desk</button>}
     </section>
   </main>;
@@ -95,6 +79,13 @@ function Metric({ label, value, note }) {
   return <div className="metric-card"><span className="metric-label">{label}</span><strong>{value ?? '—'}</strong><span className="metric-note">{note}</span></div>;
 }
 
+/* Pages that own a URL, so a refresh or a pasted link lands on the page and not on Overview. Anything
+   else is the workspace shell at `/`. The table is read in both directions: `App` writes the path when a
+   page is opened, and reads it back on a refresh and on the browser's own back and forward. `/billing/callback`
+   and `/update-password` are deliberately absent - they are full-screen flows handled before this. */
+const PATH_FOR_TAB = { admin: '/admin', billing: '/billing', advanced: '/advanced', profile: '/profile' };
+const TAB_FOR_PATH = Object.fromEntries(Object.entries(PATH_FOR_TAB).map(([tab, path]) => [path, tab]));
+
 function App() {
   const [token, setToken] = useState(() => {
     try { return localStorage.getItem('signal-token') || sessionStorage.getItem('signal-token') || ''; }
@@ -107,12 +98,7 @@ function App() {
    * every write the server refuses is refused by the server, not by a client-side guess. */
   const [support, setSupport] = useState(() => readSupportSession());
   const authToken = support?.token || token;
-  const initialTabFromPath = (pathname) => {
-    const path = String(pathname || '').replace(/\/+$/, '');
-    if (path === '/admin') return 'admin';
-    if (path === '/billing') return 'billing';
-    return 'overview';
-  };
+  const initialTabFromPath = (pathname) => TAB_FOR_PATH[String(pathname || '').replace(/\/+$/, '')] || 'overview';
   const [tab, setTab] = useState(() => initialTabFromPath(window.location.pathname));
   const [dashboard, setDashboard] = useState(null);
   const [channels, setChannels] = useState([]);
@@ -170,7 +156,7 @@ function App() {
     setTab(nextTab);
     closeMobileSidebar();
     try {
-      const path = nextTab === 'admin' ? '/admin' : nextTab === 'billing' ? '/billing' : '/';
+      const path = PATH_FOR_TAB[nextTab] || '/';
       if (window.location.pathname !== path) window.history.pushState({ tab: nextTab }, '', path);
     } catch {}
   };
@@ -194,8 +180,7 @@ function App() {
 
   useEffect(() => {
     const syncTabFromPath = () => {
-      const path = window.location.pathname.replace(/\/+$/, '');
-      setTab(path === '/admin' ? 'admin' : path === '/billing' ? 'billing' : 'overview');
+      setTab(TAB_FOR_PATH[window.location.pathname.replace(/\/+$/, '')] || 'overview');
     };
     window.addEventListener('popstate', syncTabFromPath);
     return () => window.removeEventListener('popstate', syncTabFromPath);
@@ -290,7 +275,7 @@ function App() {
     event.preventDefault(); setError(''); setNotice('');
     if (readOnlySupport) { setError('Support view is read-only, so risk and execution settings cannot be changed.'); return; }
     setSettingsSaving(true);
-    try { const result = await request('/api/settings', authToken, { method: 'PUT', body: settings }); setSettings(result.settings); setExecutionRuntimeEnabled(Boolean(result.runtimeEnabled)); setExecutionPaused(result.executionPaused || null); setNotice('Execution settings saved.'); }
+    try { const result = await request('/api/settings', authToken, { method: 'PUT', body: settings }); setSettings(result.settings); setExecutionRuntimeEnabled(Boolean(result.runtimeEnabled)); setExecutionPaused(result.executionPaused || null); setNotice('Settings saved.'); }
     catch (e) { setError(e.message); }
     finally { setSettingsSaving(false); }
   };
@@ -333,8 +318,8 @@ function App() {
         {tab === 'overview' && <>
           <section className="welcome-row"><div><h2>Good to see you, {user?.name?.split(' ')[0] || 'trader'}.</h2><p>Monitor Telegram signals and keep your setup organized.</p></div><LiveLabel channelCount={channels.length} /></section>
           <div className="metrics-grid"><Metric label="Signals captured" value={dashboard?.stats?.totalSignals ?? 0} note="Across your workspace" /><Metric label="Active sources" value={dashboard?.stats?.activeChannels ?? 0} note="Telegram channels" /><Metric label="Account Notes" value={dashboard?.stats?.accounts ?? 0} note="Labels and references" /><Metric label="Auto-Trading" value={settings.autoTradingEnabled ? 'On' : 'Off'} note={settings.autoTradingEnabled ? 'Eligible signals may place orders' : 'Off until you enable it'} /></div>
-          {settings.autoTradingEnabled && <p className="risk-reminder risk-reminder-compact"><span>{RISK_REMINDER} Use a demo account while you are testing, and turn this off in Risk settings whenever you want no new orders.</span></p>}
-          <div className="notice-banner"><strong>{settings.autoTradingEnabled ? 'Auto-Trading is on' : 'Auto-Trading is off'}</strong><span>{settings.autoTradingEnabled ? 'New eligible Telegram signals may place live orders on your selected account. You can turn this off in Risk Settings.' : 'Signals are saved for review only. Turn Auto-Trading on in Risk Settings to submit new eligible signals to your broker.'}</span></div>
+          {settings.autoTradingEnabled && <p className="risk-reminder risk-reminder-compact"><span>{RISK_REMINDER} Use a demo account while you are testing, and turn this off in Advanced Settings whenever you want no new orders.</span></p>}
+          <div className="notice-banner"><strong>{settings.autoTradingEnabled ? 'Auto-Trading is on' : 'Auto-Trading is off'}</strong><span>{settings.autoTradingEnabled ? 'New eligible Telegram signals may place live orders on your selected account. You can turn this off in Advanced Settings.' : 'Signals are saved for review only. Turn Auto-Trading on in Advanced Settings to submit new eligible signals to your broker.'}</span></div>
           <section className="panel"><div className="panel-heading"><div><p className="eyebrow">LATEST ACTIVITY</p><h2>Recent signals</h2></div><button className="text-button" onClick={() => setTab('signals')}>View all</button></div><SignalTable signals={dashboard?.signals || []} channelCount={channels.length} onOpenTelegram={() => navigateToTab('telegram')} onUpgrade={() => navigateToTab('billing')} /></section>
         </>}
         {tab === 'telegram' && <TelegramConnect token={authToken} channels={channels} onRefresh={refresh} />}
@@ -361,7 +346,12 @@ function App() {
             <p className="muted">This area is only available to workspace administrators. If you believe you should have access, contact the workspace owner.</p>
             <button type="button" className="button button-secondary" onClick={() => navigateToTab('overview')}>Return to overview</button>
           </section>)}
-        {tab === 'settings' && <><ExecutionSettings settings={settings} accounts={linkedAccounts} trades={trades} runtimeAvailable={executionRuntimeEnabled} platformPause={executionPaused} onChange={setSettings} onSubmit={saveSettings} onToggle={toggleAutoTrading} saving={settingsSaving} /><AccountDeletionSettings token={authToken} onDeleted={logout} /></>}
+        {/* One settings row, two pages, one `settings` object in state: whichever page saves, it writes
+            the whole row as the server last returned it, so a save on Risk Settings can never blank what
+            is set on Advanced Settings. `PUT /api/settings` is unchanged by the split. */}
+        {tab === 'settings' && <RiskSettings settings={settings} onChange={setSettings} onSubmit={saveSettings} onOpenAdvanced={() => navigateToTab('advanced')} saving={settingsSaving} />}
+        {tab === 'advanced' && <AdvancedSettings settings={settings} accounts={linkedAccounts} trades={trades} runtimeAvailable={executionRuntimeEnabled} platformPause={executionPaused} onChange={setSettings} onSubmit={saveSettings} onToggle={toggleAutoTrading} onOpenRiskSettings={() => navigateToTab('settings')} saving={settingsSaving} />}
+        {tab === 'profile' && <ProfileSettings user={user} token={authToken} onDeleted={logout} readOnly={readOnlySupport} />}
       </div>
       <footer className="footer">Not financial advice. Use at your own risk.</footer>
     </main>
