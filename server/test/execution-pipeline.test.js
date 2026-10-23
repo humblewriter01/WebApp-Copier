@@ -36,7 +36,7 @@ function orderCalls(trading) {
 }
 
 /** `stopsLevel` is only ever set by the tests that need a broker with a minimum stop distance. */
-function fakeTrading({ stopsLevel } = {}) {
+function fakeTrading({ stopsLevel, quote, specification, symbol = 'EURUSD', tickSize = 0.0001, lossTickValue = 1 } = {}) {
   const calls = [];
   return {
     calls,
@@ -45,8 +45,8 @@ function fakeTrading({ stopsLevel } = {}) {
       return {
         account: { state: 'DEPLOYED' }, accountInformation: { balance: 1000, equity: 1000 },
         positions: [], orders: [], deals: [],
-        specification: { symbol: 'EURUSD', minVolume: 0.01, maxVolume: 20, volumeStep: 0.01, tickSize: 0.0001, ...(stopsLevel ? { stopsLevel } : {}) },
-        price: { bid: 1.1, ask: 1.1002, lossTickValue: 1, time: new Date().toISOString() },
+        specification: { symbol, minVolume: 0.01, maxVolume: 20, volumeStep: tickSize === 0.0001 ? 0.01 : 0.01, tickSize, ...(stopsLevel ? { stopsLevel } : {}), ...(specification || {}) },
+        price: quote || { bid: 1.1, ask: 1.1002, lossTickValue, time: new Date().toISOString() },
       };
     },
     async createMarketOrder(order) {
@@ -309,4 +309,71 @@ test('an engine built without the switch still trades, and the flag is never tru
   const trading = fakeTrading();
   const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true });
   assert.equal((await engine.processJob({ id: 'job-1', user_id: 'user-1', tradingPaused: true })).status, 'executed');
+});
+
+/* ---------------------------------------------------------------------------------------------
+ * One real message, end to end. The text below is a post exactly as a channel writes it - the metal
+ * named in words, the entry as a zone, three numbered targets with the last one left open, and a
+ * disclaimer underneath - because that is the shape the reader has to survive, and every one of those
+ * four features used to cost a signal somewhere: the metal was no symbol, the zone was no entry, and
+ * each "TP n" line contributed its index as a price.
+ * ------------------------------------------------------------------------------------------- */
+
+const GOLD_TEXT = `GOLD SELL NOW IN ZONE  4031.50-4138.60
+
+(SCALPING)
+
+TP 1 : 4029.50
+
+TP 2 : 4027.50
+
+TP 3 : OPEN
+
+SL :  4041.50
+
+Use Proper Money Management. Past Profits do not predict future earnings. Consistency is`;
+
+const goldItem = {
+  symbol: 'XAUUSD', side: 'sell', entry_price: 4031.5, stop_loss: 4041.5, take_profit: 4029.5,
+  execution_ready: true, parse_error: null,
+};
+const goldQuote = { bid: 4032.1, ask: 4032.6, lossTickValue: 100, time: new Date().toISOString() };
+const goldSpec = { symbol: 'XAUUSD', tickSize: 0.01, minVolume: 0.01, maxVolume: 100, volumeStep: 0.01 };
+
+test('the gold zone message is executed as a market sell with the channel’s own stop and first target', async () => {
+  const { parseSignal } = await import('../services/signal-parser.js');
+  const parsed = parseSignal(GOLD_TEXT);
+  // The row the listener would write, straight from the text: no invented price, no dropped one.
+  assert.deepEqual(
+    { symbol: parsed.symbol, side: parsed.side, entry: parsed.entryPrice, stop: parsed.stopLoss, target: parsed.takeProfit },
+    { symbol: 'XAUUSD', side: 'sell', entry: 4031.5, stop: 4041.5, target: 4029.5 },
+  );
+
+  const pool = fakePool({ item: goldItem });
+  const trading = fakeTrading({ quote: goldQuote, specification: goldSpec, symbol: 'XAUUSD', tickSize: 0.01 });
+  const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true });
+  const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.equal(result.status, 'executed', JSON.stringify(result));
+  const order = trading.calls.find((call) => call?.order)?.order;
+  assert.equal(order.side, 'sell');
+  assert.equal(order.symbol, 'XAUUSD', 'the canonical symbol is what the account’s own list confirmed');
+  assert.equal(order.stopLoss, 4041.5, 'the channel’s stop, not a fallback distance');
+  assert.equal(order.takeProfit, 4029.5, 'TP1 is the exit, and the order is not held open for TP3');
+  assert.equal(order.volume, 0.01, 'fixed-lot sizing needs nothing from the signal');
+  assert.equal('entryPrice' in order, false, 'the zone never becomes a limit price: this is a market order');
+  const inserted = pool.calls.find(({ sql }) => sql.includes('INSERT INTO trades'));
+  assert.equal(inserted.params[7], 4032.1, 'recorded at the price a sell is really sent at - the bid - not at the zone');
+  assert.equal(inserted.params[9], 4029.5);
+});
+
+test('a market that has already run past the zone is refused, and the sentence says which bound failed', async () => {
+  // A sell below the bottom of its entry zone is a worse trade than the channel described, and the
+  // conservative bound is what makes that visible: 4030.00 is inside the zone's text but under its low.
+  const pool = fakePool({ item: goldItem });
+  const trading = fakeTrading({ quote: { ...goldQuote, bid: 4030.0, ask: 4030.5 }, specification: goldSpec, symbol: 'XAUUSD', tickSize: 0.01 });
+  const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true });
+  const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.equal(result.status, 'skipped');
+  assert.match(result.message, /worse than the signal entry price/);
+  assert.equal(orderCalls(trading).length, 0, 'nothing reaches the broker on the wrong side of the zone');
 });

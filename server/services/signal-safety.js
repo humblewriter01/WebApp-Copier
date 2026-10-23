@@ -125,7 +125,9 @@ export function captureSafety({ parsed, source = 'telegram', settings = {} } = {
   }
   // A missing target is not a parser failure at all - it is a fact about the row - so it is only ever a
   // problem when the workspace has asked for it to be one.
-  if (governed && parsed?.missing?.takeProfit === true && !codes.has('take-profit-multiple') && !codes.has('take-profit-range') && !codes.has('take-profit-invalid')) {
+  // A message that named several exits has a target (`missing.takeProfit` is false), so this branch is
+  // only ever reached when the channel stated no price at all - which is what the switch is about.
+  if (governed && parsed?.missing?.takeProfit === true && !codes.has('take-profit-range') && !codes.has('take-profit-invalid')) {
     if (targetNet !== null) resolved.add('take-profit-missing');
     else if (!blockTarget) resolved.add('take-profit-missing');
     else problems.push({ code: 'take-profit-required', message: TARGET_REQUIRED_MESSAGE });

@@ -9,6 +9,8 @@ test('parses a strict BUY signal with an entry, stop loss, and one target', () =
     executionReady: true, parseError: null,
     directionInferred: false,
     hasTradingData: true,
+    entryRange: null,
+    takeProfitLevels: [1.095],
     missing: { entryPrice: false, stopLoss: false, takeProfit: false },
     blockers: [],
   });
@@ -30,11 +32,61 @@ test('does not interpret TAKE PROFIT or other instructions as a symbol', () => {
   assert.match(parsed.parseError, /symbol/i);
 });
 
-test('rejects ambiguous directions, symbols, entry ranges, and multiple targets', () => {
+test('rejects ambiguous directions and symbols, and a range with no direction to read it against', () => {
   assert.match(parseSignal('BUY SELL EURUSD SL 1.0').parseError, /direction/i);
   assert.match(parseSignal('BUY EURUSD GBPUSD SL 1.0').parseError, /symbol/i);
-  assert.match(parseSignal('BUY EURUSD Entry 1.10-1.12 SL 1.08').parseError, /range/i);
-  assert.match(parseSignal('BUY EURUSD SL 1.08 TP1 1.12 TP2 1.15').parseError, /multiple take-profit/i);
+  // A stop or target given as a range is genuinely one price the channel did not commit to, so the
+  // refusal stays: an entry range can be bounded by the direction, a stop range cannot.
+  assert.match(parseSignal('BUY EURUSD SL 1.08-1.06').parseError, /stop-loss range/i);
+  assert.match(parseSignal('BUY EURUSD SL 1.08 TP 1.11-1.12').parseError, /take-profit range/i);
+  // Two stops is not a signal with a spare stop; it is a message that does not say which one to use.
+  // Only an unambiguous stop is read, so a target can be indexed and a stop never both.
+  assert.match(parseSignal('BUY EURUSD SL 1.08 SL 1.07 TP 1.12').parseError, /more than one stop loss/i);
+});
+
+test('a price the message restates is still one price', () => {
+  // Channels repeat themselves in prose and in short-hand; only two different numbers is a conflict.
+  const restated = parseSignal('SELL GBPUSD Entry 1.2750 SL 1.28 TP 1.26 (SL 1.28 is above entry)');
+  assert.equal(restated.stopLoss, 1.28);
+  assert.deepEqual(restated.blockers, []);
+  assert.equal(restated.executionReady, true);
+  const repeatedTarget = parseSignal('BUY EURUSD Entry 1.08 SL 1.07 TP 1.12 TP 1.12');
+  assert.equal(repeatedTarget.takeProfit, 1.12);
+  assert.deepEqual(repeatedTarget.takeProfitLevels, [1.12]);
+  // Two different stops stay a contradiction, whatever the spelling.
+  assert.match(parseSignal('BUY EURUSD SL 1.08 SL 1.07 TP 1.12').parseError, /more than one stop loss/i);
+});
+
+test('an entry zone is read as an entry, at the least favourable price in it for the side', () => {
+  // The bound is what keeps the engine's price guard honest, so a buy takes the top of its zone and a
+  // sell the bottom, and neither can look better-filled than the channel described.
+  assert.equal(parseSignal('BUY EURUSD Entry 1.10-1.12 SL 1.08').entryPrice, 1.12);
+  assert.equal(parseSignal('SELL EURUSD Entry 1.10-1.12 SL 1.14').entryPrice, 1.1);
+  const zone = parseSignal('GOLD SELL NOW IN ZONE  4031.50-4138.60 SL : 4041.50');
+  assert.equal(zone.entryPrice, 4031.5, 'the word ZONE is an entry label, not an unknown word');
+  assert.deepEqual(zone.entryRange, { low: 4031.5, high: 4138.6 });
+  assert.equal(zone.missing.entryPrice, false);
+  // Without a direction there is no bound to pick, so the range still reads as a range.
+  const directionless = parseSignal('EURUSD IN ZONE 1.10-1.12 SL 1.08');
+  assert.equal(directionless.entryPrice, null);
+  assert.ok(directionless.blockers.some((blocker) => blocker.code === 'entry-range'), 'saved for review, with the reason named');
+});
+
+/* Scale-out targets used to be a refusal, while the Advanced Safety panel told users that "missing or
+   multiple targets are shown as they are; the block above is what decides, not the parser". Reading
+   TP1 and leaving the rest on the row makes that sentence true, and closing at the first target is
+   earlier than the channel's plan, never riskier: the stop still governs the risk. */
+test('numbered targets are read, with the first one as the exit and the rest recorded', () => {
+  const two = parseSignal('BUY EURUSD SL 1.08 TP1 1.12 TP2 1.15');
+  assert.equal(two.takeProfit, 1.12, 'TP1 is the primary target');
+  assert.deepEqual(two.takeProfitLevels, [1.12, 1.15]);
+  assert.deepEqual(two.blockers, [], 'a plan with several exits is not a contradiction');
+  assert.equal(two.executionReady, true);
+  assert.equal(two.missing.takeProfit, false);
+  // A target that names no price at all is not a target, and must not read as one worth 1 point.
+  const openEnd = parseSignal('BUY EURUSD Entry 1.08 SL 1.07 TP 1 : 1.10 TP 2 : OPEN');
+  assert.equal(openEnd.takeProfit, 1.1, 'the index is consumed as a label, not as the price');
+  assert.deepEqual(openEnd.takeProfitLevels, [1.1]);
 });
 
 test('requires a valid stop loss before a signal can be queued for execution', () => {
@@ -92,10 +144,11 @@ test('what a message lacks is reported as facts, not as one generic failure', ()
   assert.equal(prose.hasTradingData, false, 'only a message with no trading data at all reads as unclear');
   assert.deepEqual(prose.blockers.map((blocker) => blocker.code), ['direction-missing', 'symbol', 'stop-loss-missing'], 'a greeting is refused for what it actually lacks');
 
-  // Multiple targets leave the value null, which is a fact about the row and not a missing field.
+  // Several exits are a plan, not a gap: the first is used and the rest are kept as levels.
   const twoTargets = parseSignal('BUY EURUSD SL 1.08 TP1 1.12 TP2 1.15');
-  assert.equal(twoTargets.takeProfit, null);
-  assert.deepEqual(twoTargets.blockers.map((blocker) => blocker.code), ['take-profit-multiple']);
+  assert.equal(twoTargets.takeProfit, 1.12);
+  assert.deepEqual(twoTargets.missing, { entryPrice: true, stopLoss: false, takeProfit: false });
+  assert.deepEqual(twoTargets.blockers, []);
 });
 
 test('resolves a unique broker suffix but refuses ambiguous symbol aliases', () => {
