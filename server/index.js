@@ -16,7 +16,7 @@ import { pool, initializeDatabase } from './db.js';
 import { createMetaApiConfigurationLink, metaApiRequest, toSafeMetaApiAccount } from './services/metaapi.js';
 import { getTelegramErrorCode, isTelegramPasswordNeeded, shouldDiscardTelegramLogin, telegramAuthErrorPayload } from './services/telegram-auth.js';
 import { parseSignal } from './services/signal-parser.js';
-import { isBlockedOnlyByStopLoss } from './services/signal-parser.js';
+import { captureSafety, readFallbackPoints } from './services/signal-safety.js';
 import { isTelegramServiceMessage, resolveTelegramChatId, telegramMessageText, telegramPeerIdVariants } from './services/telegram-peer.js';
 import { createMetaApiTradingAdapter } from './services/metaapi-trading.js';
 import { createExecutionEngine, PLATFORM_PAUSE_MESSAGE } from './services/execution-engine.js';
@@ -281,20 +281,19 @@ async function saveSignal(userId, message, channel = {}) {
      capture to be. Nothing about the plan, the trading account, or the runtime belongs here: the
      message is stored whatever those say, and they decide only what happens afterwards. */
   const { rows: guardRows } = await pool.query(
-    'SELECT lot_size_mode AS lotSizeMode,block_execution_without_stop_loss AS blockWithoutStopLoss FROM settings WHERE user_id=$1 LIMIT 1',
+    'SELECT lot_size_mode AS lotSizeMode,block_execution_without_stop_loss AS blockExecutionWithoutStopLoss,block_execution_without_take_profit AS blockExecutionWithoutTakeProfit,fallback_stop_loss_points AS fallbackStopLossPoints,fallback_take_profit_points AS fallbackTakeProfitPoints FROM settings WHERE user_id=$1 LIMIT 1',
     [userId],
   );
   const guard = guardRows[0] || {};
-  /* A signal with no stop loss stops here unless the workspace has deliberately switched that guard
-     off - and even then only a fixed lot can be sent, because risk-based sizing is arithmetic on the
-     distance to a stop that does not exist. A direction that was inferred from the prices never becomes
-     eligible at all: reading a channel is not the same as being told to trade. */
-  const allowMissingStopLoss = source === 'telegram'
-    && isBlockedOnlyByStopLoss(parsed)
-    && guard.blockWithoutStopLoss === false
-    && String(guard.lotSizeMode || 'fixed') === 'fixed';
-  const executionReady = allowMissingStopLoss ? true : parsed.executionReady === true;
-  const parseError = allowMissingStopLoss ? null : parsed.parseError || null;
+  /* Which refusals this workspace's own safety rules can answer: a fallback distance may complete a leg
+     the channel forgot, an override may send the order without it, and neither is true when the block is
+     up and no net is set. A direction inferred from the prices never becomes eligible at all - reading a
+     channel is not the same as being told to trade. The prices themselves are computed later, against a
+     live quote and the broker's own symbol rules, so the row never claims to be executable for a leg the
+     broker would refuse, and never claims to be unusable for a leg the workspace has a net for. */
+  const safety = captureSafety({ parsed, source, settings: guard });
+  const executionReady = safety.executionReady === true;
+  const parseError = safety.parseError || null;
   const { rows } = await pool.query(
     `INSERT INTO signals(user_id,channel_id,channel_title,telegram_message_id,source,message,symbol,side,entry_price,stop_loss,take_profit,execution_ready,parse_error,status,direction_inferred)
      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
@@ -1009,9 +1008,9 @@ app.delete('/api/metaapi/accounts/:accountId', authenticate, asyncRoute(async (r
 }));
 
 app.get('/api/settings', authenticate, asyncRoute(async (req, res) => {
-  const { rows } = await pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",lot_size_mode AS "lotSizeMode",fixed_lot_size AS "fixedLotSize",max_daily_trades AS "maxDailyTrades",execution_account_id AS "executionAccountId",break_even_enabled AS "breakEvenEnabled",break_even_trigger_points AS "breakEvenTriggerPoints",break_even_offset_points AS "breakEvenOffsetPoints",trailing_stop_enabled AS "trailingStopEnabled",trailing_stop_distance_points AS "trailingStopDistancePoints",has_accepted_risk_warning AS "hasAcceptedRiskWarning",block_execution_without_stop_loss AS "blockExecutionWithoutStopLoss" FROM settings WHERE user_id=$1', [req.userId]);
+  const { rows } = await pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",lot_size_mode AS "lotSizeMode",fixed_lot_size AS "fixedLotSize",max_daily_trades AS "maxDailyTrades",execution_account_id AS "executionAccountId",break_even_enabled AS "breakEvenEnabled",break_even_trigger_points AS "breakEvenTriggerPoints",break_even_offset_points AS "breakEvenOffsetPoints",trailing_stop_enabled AS "trailingStopEnabled",trailing_stop_distance_points AS "trailingStopDistancePoints",has_accepted_risk_warning AS "hasAcceptedRiskWarning",block_execution_without_stop_loss AS "blockExecutionWithoutStopLoss",block_execution_without_take_profit AS "blockExecutionWithoutTakeProfit",fallback_stop_loss_points AS "fallbackStopLossPoints",fallback_take_profit_points AS "fallbackTakeProfitPoints" FROM settings WHERE user_id=$1', [req.userId]);
   res.set('Cache-Control', 'no-store').json({
-    settings: { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 3, dailyLossLimit: 5, autoTradingEnabled: false, lotSizeMode: 'fixed', fixedLotSize: 0.01, maxDailyTrades: 10, executionAccountId: '', breakEvenEnabled: false, breakEvenTriggerPoints: 20, breakEvenOffsetPoints: 0, trailingStopEnabled: false, trailingStopDistancePoints: 10, hasAcceptedRiskWarning: false, blockExecutionWithoutStopLoss: true, ...(rows[0] || {}) },
+    settings: { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 3, dailyLossLimit: 5, autoTradingEnabled: false, lotSizeMode: 'fixed', fixedLotSize: 0.01, maxDailyTrades: 10, executionAccountId: '', breakEvenEnabled: false, breakEvenTriggerPoints: 20, breakEvenOffsetPoints: 0, trailingStopEnabled: false, trailingStopDistancePoints: 10, hasAcceptedRiskWarning: false, blockExecutionWithoutStopLoss: true, blockExecutionWithoutTakeProfit: true, fallbackStopLossPoints: null, fallbackTakeProfitPoints: null, ...(rows[0] || {}) },
     runtimeEnabled: autoTradingRuntimeEnabled,
     // The user's own toggle being on is not the same as orders being possible: if the platform
     // switch is engaged, say so here instead of letting the panel imply their setting is at fault.
@@ -1038,6 +1037,12 @@ app.put('/api/settings', authenticate, asyncRoute(async (req, res) => {
   // Absent means ON: a client that does not know about the switch cannot silently widen what the
   // workspace is willing to send to a broker without a stop.
   const blockExecutionWithoutStopLoss = req.body.blockExecutionWithoutStopLoss !== false;
+  const blockExecutionWithoutTakeProfit = req.body.blockExecutionWithoutTakeProfit !== false;
+  /* A fallback is either a usable whole number of points or no net at all. It is never clamped: the
+     difference between 0, 5 and 500000 points is the difference between no stop and a wrong one. */
+  const fallbackStopLoss = readFallbackPoints(req.body.fallbackStopLossPoints, 'The fallback stop-loss distance');
+  const fallbackTakeProfit = readFallbackPoints(req.body.fallbackTakeProfitPoints, 'The fallback take-profit distance');
+  if (fallbackStopLoss.error || fallbackTakeProfit.error) return fail(res, 400, fallbackStopLoss.error || fallbackTakeProfit.error);
   if (!lotSizeMode) return fail(res, 400, 'Choose a valid lot size mode.');
   if (!Number.isFinite(riskPercent) || riskPercent < 0.1 || riskPercent > 5) return fail(res, 400, 'Risk percent must be between 0.1 and 5.');
   if (!Number.isInteger(maxOpenPositions) || maxOpenPositions < 1 || maxOpenPositions > 50) return fail(res, 400, 'Maximum open trades must be between 1 and 50.');
@@ -1083,10 +1088,10 @@ app.put('/api/settings', authenticate, asyncRoute(async (req, res) => {
     catch { return fail(res, 409, 'A safe daily loss baseline could not be captured. Confirm the account is deployed and connected, then try again. Auto-Trading remains off.'); }
   }
   const { rows } = await pool.query(
-    `INSERT INTO settings(user_id,risk_mode,risk_percent,max_open_positions,daily_loss_limit,auto_trading_enabled,lot_size_mode,fixed_lot_size,max_daily_trades,execution_account_id,break_even_enabled,break_even_trigger_points,break_even_offset_points,trailing_stop_enabled,trailing_stop_distance_points,has_accepted_risk_warning,block_execution_without_stop_loss)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT(user_id) DO UPDATE SET risk_mode=EXCLUDED.risk_mode,risk_percent=EXCLUDED.risk_percent,max_open_positions=EXCLUDED.max_open_positions,daily_loss_limit=EXCLUDED.daily_loss_limit,auto_trading_enabled=EXCLUDED.auto_trading_enabled,lot_size_mode=EXCLUDED.lot_size_mode,fixed_lot_size=EXCLUDED.fixed_lot_size,max_daily_trades=EXCLUDED.max_daily_trades,execution_account_id=EXCLUDED.execution_account_id,break_even_enabled=EXCLUDED.break_even_enabled,break_even_trigger_points=EXCLUDED.break_even_trigger_points,break_even_offset_points=EXCLUDED.break_even_offset_points,trailing_stop_enabled=EXCLUDED.trailing_stop_enabled,trailing_stop_distance_points=EXCLUDED.trailing_stop_distance_points,has_accepted_risk_warning=EXCLUDED.has_accepted_risk_warning,block_execution_without_stop_loss=EXCLUDED.block_execution_without_stop_loss,updated_at=NOW()
-     RETURNING risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",lot_size_mode AS "lotSizeMode",fixed_lot_size AS "fixedLotSize",max_daily_trades AS "maxDailyTrades",execution_account_id AS "executionAccountId",break_even_enabled AS "breakEvenEnabled",break_even_trigger_points AS "breakEvenTriggerPoints",break_even_offset_points AS "breakEvenOffsetPoints",trailing_stop_enabled AS "trailingStopEnabled",trailing_stop_distance_points AS "trailingStopDistancePoints",has_accepted_risk_warning AS "hasAcceptedRiskWarning",block_execution_without_stop_loss AS "blockExecutionWithoutStopLoss"`,
-    [req.userId, riskMode, riskPercent, maxOpenPositions, dailyLossLimit, autoTradingEnabled, lotSizeMode, fixedLotSize, maxDailyTrades, executionAccountId || null, breakEvenEnabled, breakEvenTriggerPoints, breakEvenOffsetPoints, trailingStopEnabled, trailingStopDistancePoints, hasAcceptedRiskWarning === true, blockExecutionWithoutStopLoss],
+    `INSERT INTO settings(user_id,risk_mode,risk_percent,max_open_positions,daily_loss_limit,auto_trading_enabled,lot_size_mode,fixed_lot_size,max_daily_trades,execution_account_id,break_even_enabled,break_even_trigger_points,break_even_offset_points,trailing_stop_enabled,trailing_stop_distance_points,has_accepted_risk_warning,block_execution_without_stop_loss,block_execution_without_take_profit,fallback_stop_loss_points,fallback_take_profit_points)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) ON CONFLICT(user_id) DO UPDATE SET risk_mode=EXCLUDED.risk_mode,risk_percent=EXCLUDED.risk_percent,max_open_positions=EXCLUDED.max_open_positions,daily_loss_limit=EXCLUDED.daily_loss_limit,auto_trading_enabled=EXCLUDED.auto_trading_enabled,lot_size_mode=EXCLUDED.lot_size_mode,fixed_lot_size=EXCLUDED.fixed_lot_size,max_daily_trades=EXCLUDED.max_daily_trades,execution_account_id=EXCLUDED.execution_account_id,break_even_enabled=EXCLUDED.break_even_enabled,break_even_trigger_points=EXCLUDED.break_even_trigger_points,break_even_offset_points=EXCLUDED.break_even_offset_points,trailing_stop_enabled=EXCLUDED.trailing_stop_enabled,trailing_stop_distance_points=EXCLUDED.trailing_stop_distance_points,has_accepted_risk_warning=EXCLUDED.has_accepted_risk_warning,block_execution_without_stop_loss=EXCLUDED.block_execution_without_stop_loss,block_execution_without_take_profit=EXCLUDED.block_execution_without_take_profit,fallback_stop_loss_points=EXCLUDED.fallback_stop_loss_points,fallback_take_profit_points=EXCLUDED.fallback_take_profit_points,updated_at=NOW()
+     RETURNING risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",lot_size_mode AS "lotSizeMode",fixed_lot_size AS "fixedLotSize",max_daily_trades AS "maxDailyTrades",execution_account_id AS "executionAccountId",break_even_enabled AS "breakEvenEnabled",break_even_trigger_points AS "breakEvenTriggerPoints",break_even_offset_points AS "breakEvenOffsetPoints",trailing_stop_enabled AS "trailingStopEnabled",trailing_stop_distance_points AS "trailingStopDistancePoints",has_accepted_risk_warning AS "hasAcceptedRiskWarning",block_execution_without_stop_loss AS "blockExecutionWithoutStopLoss",block_execution_without_take_profit AS "blockExecutionWithoutTakeProfit",fallback_stop_loss_points AS "fallbackStopLossPoints",fallback_take_profit_points AS "fallbackTakeProfitPoints"`,
+    [req.userId, riskMode, riskPercent, maxOpenPositions, dailyLossLimit, autoTradingEnabled, lotSizeMode, fixedLotSize, maxDailyTrades, executionAccountId || null, breakEvenEnabled, breakEvenTriggerPoints, breakEvenOffsetPoints, trailingStopEnabled, trailingStopDistancePoints, hasAcceptedRiskWarning === true, blockExecutionWithoutStopLoss, blockExecutionWithoutTakeProfit, fallbackStopLoss.value, fallbackTakeProfit.value],
   );
   // Saving execution settings counts as activity for the inactivity policy.
   await inactivityService.touchQuietly(req.userId);

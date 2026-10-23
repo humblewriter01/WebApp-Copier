@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { countSignalEntryDeals as countDailySignalEntryDeals, resolveBrokerSymbol } from './signal-parser.js';
+import { applySafetyNets, safetyNote } from './signal-safety.js';
 import { isPaidSubscriber, PAID_STATUSES } from './plan-limits.js';
 import { signalStatusForJobStatus } from './signal-outcome.js';
 
@@ -425,7 +426,7 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
     return { day, equity };
   }
 
-  async function updateJob(jobId, userId, status, errorMessage) {
+  async function updateJob(jobId, userId, status, errorMessage, note = null) {
     await pool.query(
       `UPDATE execution_jobs SET status=$1,error_message=$2,locked_at=NULL,updated_at=NOW() WHERE id=$3 AND user_id=$4`,
       [status, errorMessage || null, jobId, userId],
@@ -435,7 +436,7 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
     // has to guess why nothing reached the broker.
     await pool.query(
       `UPDATE signals SET status=$1,execution_note=$2 WHERE id=(SELECT signal_id FROM execution_jobs WHERE id=$3 AND user_id=$4)`,
-      [signalStatusForJobStatus(status), ['skipped', 'expired', 'unknown'].includes(status) ? safeText(errorMessage) || null : null, jobId, userId],
+      [signalStatusForJobStatus(status), note ? safeText(note) : (['skipped', 'expired', 'unknown'].includes(status) ? safeText(errorMessage) || null : null), jobId, userId],
     );
   }
 
@@ -457,6 +458,7 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
                 s.execution_ready,s.parse_error,
                 st.auto_trading_enabled,st.lot_size_mode,st.fixed_lot_size,st.risk_percent,st.max_open_positions,
                 st.max_daily_trades,st.daily_loss_limit,st.execution_account_id,st.block_execution_without_stop_loss,
+                st.block_execution_without_take_profit,st.fallback_stop_loss_points,st.fallback_take_profit_points,
                 ma.metaapi_account_id,ma.managed_by_app,ma.state AS account_state,
                 u.subscription_status,u.subscription_plan
          FROM execution_jobs ej
@@ -533,24 +535,55 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
         if (!Number.isFinite(desired) || (item.side === 'buy' && ask > desired) || (item.side === 'sell' && bid < desired)) return stop(job, 'skipped', 'The current market price is worse than the signal entry price.');
       }
       /* A signal with no stop arrives here as SQL NULL, and `Number(null)` is 0 - a number that is on
-         the correct side of any price, so the old check read it as a stop at zero and sent 0 to both
-         the trade row and the broker. Null and 0 are now told apart before anything is decided. */
-      const stopLoss = item.stop_loss == null ? null : Number(item.stop_loss);
-      const hasStopLoss = stopLoss !== null && Number.isFinite(stopLoss);
-      const takeProfit = item.take_profit == null ? null : Number(item.take_profit);
-      /* A signal without a stop is refused here unless the workspace switched its own Advanced Safety
-         guard off, and even then only where a size can be computed without one: risk-based sizing is
-         arithmetic on the distance to a stop that does not exist. Each refusal names which rule applied,
-         because after the fact "no stop loss" and "you allowed no stop loss" are different sentences. */
-      if (!hasStopLoss && item.block_execution_without_stop_loss !== false) {
-        return stop(job, 'skipped', 'The signal has no stop loss, and your workspace requires one before an order is sent.');
+         the correct side of any price, so the old check read it as a stop at zero and sent 0 to both the
+         trade row and the broker. Null and 0 are told apart before anything is decided. */
+      const signalStopLoss = item.stop_loss == null ? null : Number(item.stop_loss);
+      const signalTakeProfit = item.take_profit == null ? null : Number(item.take_profit);
+      /* The safety nets, in one place: the signal's own legs always win; a leg the channel did not state
+         is completed from the workspace's fallback distance, measured from the price this order goes out
+         at and aligned onto the broker's tick grid; and only when there is no net to apply does the
+         block-or-override decision run. Doing the arithmetic here, against a live quote and the symbol's
+         own rules, is what turns a distance into a price - and what lets a net that cannot be honoured
+         (no tick size, a stop inside `stopsLevel`, a leg on the wrong side of the spread) be refused out
+         loud rather than quietly ignored. */
+      const safety = applySafetyNets({
+        side: item.side,
+        marketPrice,
+        bid,
+        ask,
+        tickSize: state.specification?.tickSize,
+        stopsLevelPoints: state.specification?.stopsLevel,
+        stopLoss: Number.isFinite(signalStopLoss) ? signalStopLoss : null,
+        takeProfit: Number.isFinite(signalTakeProfit) ? signalTakeProfit : null,
+        fallbackStopLossPoints: item.fallback_stop_loss_points,
+        fallbackTakeProfitPoints: item.fallback_take_profit_points,
+        blockExecutionWithoutStopLoss: item.block_execution_without_stop_loss,
+        blockExecutionWithoutTakeProfit: item.block_execution_without_take_profit,
+        lotSizeMode: item.lot_size_mode,
+      });
+      if (safety.blocking) return stop(job, 'skipped', safety.reason);
+      for (const warning of safety.warnings) {
+        // An override has to stay findable afterwards, on the account it happened to.
+        logger?.warn?.(JSON.stringify({
+          level: 'warn',
+          message: warning.message,
+          userId: job.user_id,
+          jobId: job.id,
+          signalId: item.signal_id,
+          symbol: resolved.symbol,
+          account: item.metaapi_account_id,
+        }));
       }
-      if (hasStopLoss && (item.side === 'buy' ? stopLoss >= bid : stopLoss <= ask)) {
+      const stopLoss = safety.stopLoss;
+      const hasStopLoss = stopLoss !== null && Number.isFinite(stopLoss);
+      const takeProfit = safety.takeProfit;
+      if (hasStopLoss && Number.isFinite(signalStopLoss) && (item.side === 'buy' ? stopLoss >= bid : stopLoss <= ask)) {
         return stop(job, 'skipped', 'The signal stop loss is on the wrong side of the market.');
       }
-      if (!hasStopLoss && String(item.lot_size_mode) !== 'fixed') {
-        return stop(job, 'skipped', 'Risk-based sizing is calculated from the stop loss, so a signal without one cannot be sized safely.');
-      }
+      const safetyNoteText = safetyNote(safety.sources, {
+        stopLoss: item.fallback_stop_loss_points,
+        takeProfit: item.fallback_take_profit_points,
+      }, item.side);
       if (takeProfit != null && (!Number.isFinite(takeProfit) || (item.side === 'buy' ? takeProfit <= ask : takeProfit >= bid))) return stop(job, 'skipped', 'The signal take profit is on the wrong side of the market.');
 
       const volume = calculateOrderVolume({
@@ -599,7 +632,9 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
         `UPDATE trades SET status='executed',provider_response=$1,broker_order_id=$2,broker_position_id=$3,executed_at=NOW() WHERE id=$4 AND user_id=$5`,
         [providerResponse, result?.orderId ? String(result.orderId) : null, result?.positionId ? String(result.positionId) : null, tradeId, job.user_id],
       );
-      await updateJob(job.id, job.user_id, 'executed', null);
+      // A completed order normally clears the row's note; when a leg came from the workspace rather than
+      // from the channel, that is the one thing worth leaving on the signal for the reader to find later.
+      await updateJob(job.id, job.user_id, 'executed', null, safetyNoteText);
       // Executing for a user counts as activity, so an account that is trading is never
       // swept up by the inactivity policy.
       await pool.query('UPDATE users SET last_active_at=NOW() WHERE id=$1', [job.user_id]).catch(() => {});

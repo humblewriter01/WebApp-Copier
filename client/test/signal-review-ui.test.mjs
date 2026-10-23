@@ -160,7 +160,12 @@ test('the stop-loss guard is on unless the workspace has explicitly switched it 
   assert.match(defaultMarkup, /id="block-missing-stop" type="checkbox" checked/, 'a settings object that predates the switch reads as the safe one');
   assert.match(defaultMarkup, /Blocking/, 'the summary states the effect before it is opened');
 
-  const relaxed = renderSettings({ ...settingsBase, blockExecutionWithoutStopLoss: false });
+  // One block off while the other is still on is still a blocking workspace: the header says what the
+  // group does overall, not what the one switch the reader just touched does.
+  const halfRelaxed = renderSettings({ ...settingsBase, blockExecutionWithoutStopLoss: false });
+  assert.match(halfRelaxed, /Blocking/, 'the take-profit block is still up, so nothing has been allowed overall');
+
+  const relaxed = renderSettings({ ...settingsBase, blockExecutionWithoutStopLoss: false, blockExecutionWithoutTakeProfit: false });
   assert.match(relaxed, /id="block-missing-stop" type="checkbox"/);
   assert.equal(/id="block-missing-stop" type="checkbox" checked/.test(relaxed), false, 'the checkbox reflects the saved value');
   assert.match(relaxed, /Allowed/, 'and the summary says what that means');
@@ -168,6 +173,66 @@ test('the stop-loss guard is on unless the workspace has explicitly switched it 
   assert.match(relaxed, /only in Fixed Lot mode/);
   assert.match(relaxed, /Nothing else is relaxed/i);
   assert.match(relaxed, /inferred[^.]*never executed|never executed/i);
+});
+
+test('the take-profit block and the two fallback distances are part of the same folded decision', () => {
+  const markup = renderSettings(settingsBase);
+  assert.match(markup, /Block execution if Take Profit is missing ON/, 'a workspace that predates the switch is not silently permitted to trade with no exit');
+  assert.match(markup, /id="block-missing-target" type="checkbox" checked/);
+  assert.match(markup, /id="fallback-stop-loss" type="number" min="1" max="1000000" step="1" placeholder="None"/);
+  assert.match(markup, /id="fallback-take-profit" type="number" min="1" max="1000000" step="1" placeholder="None"/);
+  // Points, like every other distance in this panel, and blank is a legal answer.
+  assert.match(markup, /Fallback Stop Loss \(points\)/);
+  assert.match(markup, /Fallback Take Profit \(points\)/);
+  assert.match(markup, /Blank means no fallback\./);
+  assert.match(markup, /On most FX pairs 10 points is one pip/);
+  assert.match(markup, /value=""/, 'no fallback is an empty field, not a 0 somebody has to notice');
+  // Where the fields sit is the policy in visual form: the two refusals, then the two rescues, all of it
+  // inside the same disclosure that decides execution.
+  assert.ok(markup.indexOf('id="block-missing-stop"') < markup.indexOf('id="block-missing-target"'), 'the two blocks are read together');
+  assert.ok(markup.indexOf('id="block-missing-target"') < markup.indexOf('id="fallback-stop-loss"'), 'the nets follow the rules they answer');
+  assert.ok(markup.indexOf('id="fallback-take-profit"') < markup.indexOf('execution-advanced-facts'), 'nothing about execution eligibility lives outside this group');
+  assert.ok(markup.indexOf('Fallback Stop Loss') > markup.indexOf('Trade Management'), 'a fallback is not filed with the lot settings');
+  // The copy that makes the rescue honest.
+  assert.match(markup, /used only when a signal states no stop loss of its own/);
+  assert.match(markup, /what the channel wrote always wins/);
+  assert.match(markup, /reported as unusable rather than ignored/);
+  assert.match(markup, /Block execution if Stop Loss is missing ON/, 'the wording the workspace already reads is untouched');
+  assert.match(markup, /Nothing else is relaxed/i);
+});
+
+test('saved fallback distances come back into the fields, and an empty one is not turned into a number', () => {
+  const saved = renderSettings({ ...settingsBase, fallbackStopLossPoints: 3000, fallbackTakeProfitPoints: '4000', blockExecutionWithoutTakeProfit: false });
+  assert.match(saved, /id="fallback-stop-loss"[^>]*value="3000"/);
+  assert.match(saved, /id="fallback-take-profit"[^>]*value="4000"/);
+  assert.match(saved, /Block execution if Take Profit is missing OFF/);
+  assert.equal(/id="block-missing-target" type="checkbox" checked/.test(saved), false, 'the checkbox reflects the saved value');
+  assert.match(saved, /Blocking/, 'while the stop block is on the group still refuses, and says so');
+
+  const cleared = renderSettings({ ...settingsBase, fallbackStopLossPoints: null, fallbackTakeProfitPoints: undefined });
+  // Scoped to these two inputs on purpose: `value="0"` is a legitimate break-even offset, and a distance
+  // of zero here is not - it would mean a stop sitting exactly on the order price.
+  const emptyStop = cleared.match(/id="fallback-stop-loss"[^>]*/)[0];
+  const emptyTarget = cleared.match(/id="fallback-take-profit"[^>]*/)[0];
+  assert.equal(/value="0"/.test(emptyStop) || /value="0"/.test(emptyTarget), false, 'a blank net never renders as 0 points, which would be a distance');
+  assert.match(emptyStop, /value=""/);
+  assert.match(emptyTarget, /value=""/);
+
+  const both = renderSettings({ ...settingsBase, blockExecutionWithoutStopLoss: false, blockExecutionWithoutTakeProfit: false });
+  assert.match(both, /Allowed/, 'only with neither block left standing does the header say what is permitted');
+});
+
+test('a missing leg is described as the choice it now is', () => {
+  const signal = { id: 'signal-1', source: 'telegram', status: 'skipped', stopLoss: null, takeProfit: null };
+  const badges = signalBadges(signal);
+  assert.deepEqual(badges.map((badge) => badge.key), ['missing-stop', 'missing-target']);
+  assert.match(badges[0].title, /fallback distance in your Safety settings can supply one/i);
+  assert.match(badges[0].title, /while the stop-loss block is on/);
+  // The target badge used to promise that no target never stopped an order; the block made that false,
+  // and a badge that contradicts the refusal sentence under it is worse than no badge.
+  assert.match(badges[1].title, /Your Safety settings decide whether that stops an order/);
+  assert.equal(badges[1].title.includes('never stopped an order'), false);
+  assert.deepEqual(signalBadges({ ...signal, source: 'manual' }), [], 'a note the user typed is not judged by the rules for a live channel');
 });
 
 /* ---------------------------------------------------------------- the callers */

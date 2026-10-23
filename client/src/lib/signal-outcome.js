@@ -67,10 +67,10 @@ export function signalBadges(signal) {
     badges.push({ key: 'inferred', label: 'Inferred', tone: 'warn', title: 'The message did not say BUY or SELL; the direction was read from the entry and target prices. It is saved for review and never traded on that basis.' });
   }
   if (signal?.stopLoss == null && signal?.source === 'telegram') {
-    badges.push({ key: 'missing-stop', label: 'Missing SL', tone: 'warn', title: 'No stop loss in the message. Nothing is sent unless your Risk settings allow a trade without one.' });
+    badges.push({ key: 'missing-stop', label: 'Missing SL', tone: 'warn', title: 'No stop loss in the message. A fallback distance in your Safety settings can supply one; otherwise nothing is sent while the stop-loss block is on, and with that block off the trade goes out unprotected, which is recorded as an override.' });
   }
   if (signal?.takeProfit == null && signal?.source === 'telegram') {
-    badges.push({ key: 'missing-target', label: 'Missing TP', tone: 'muted', title: 'No target in the message. A target is shown for reading only, so this alone never stopped an order.' });
+    badges.push({ key: 'missing-target', label: 'Missing TP', tone: 'muted', title: 'No target in the message. Your Safety settings decide whether that stops an order: a fallback distance can supply a target, and with the take-profit block off the position is opened with nothing planned to close it.' });
   }
   return badges;
 }

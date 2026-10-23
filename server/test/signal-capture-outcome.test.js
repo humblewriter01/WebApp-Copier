@@ -131,13 +131,22 @@ test('a live message is never dropped without saying where it went', () => {
   assert.match(statusRoute, /if \(entry\?\.client\?\.connected && !entry\.handler\) await startTelegramListener/, 'a connected client with no handler is attached on the spot');
 });
 
-test('the stop-loss guard is read before the row is written, and nothing else is', () => {
-  assert.match(saveSignalBody, /isBlockedOnlyByStopLoss\(parsed\)/, 'a message blocked only by its missing stop is the case the setting governs');
-  assert.match(saveSignalBody, /guard\.blockWithoutStopLoss === false/, 'the workspace has to have switched the guard off');
-  assert.match(saveSignalBody, /String\(guard\.lotSizeMode \|\| 'fixed'\) === 'fixed'/, 'risk-based sizing cannot be computed without a stop to size from');
+test('the safety nets are read before the row is written, and the decision is not made twice', () => {
+  /* Capture decides eligibility by asking the same policy the engine will consult at send time. Two
+     copies of that rule is how a signal ended up queued as executable and then refused, or blocked at
+     the row while a perfectly usable fallback sat in settings. */
+  assert.match(saveSignalBody, /captureSafety\(\{ parsed, source, settings: guard \}\)/, 'the shared policy is the only one allowed to decide');
+  assert.match(saveSignalBody, /const executionReady = safety\.executionReady === true/);
+  assert.match(saveSignalBody, /const parseError = safety\.parseError \|\| null/);
+  for (const dropped of ['isBlockedOnlyByStopLoss', 'allowMissingStopLoss']) {
+    assert.equal(saveSignalBody.includes(dropped), false, `${dropped} is the old inline copy of the rule`);
+  }
   const beforeInsert = saveSignalBody.slice(0, saveSignalBody.indexOf('INSERT INTO signals'));
-  assert.match(beforeInsert, /block_execution_without_stop_loss/, 'the eligibility decision needs the workspace setting');
+  for (const read of ['lot_size_mode', 'block_execution_without_stop_loss', 'block_execution_without_take_profit', 'fallback_stop_loss_points', 'fallback_take_profit_points']) {
+    assert.match(beforeInsert, new RegExp(read), `the policy needs ${read} from the settings row`);
+  }
   assert.equal(beforeInsert.includes('auto_trading_enabled'), false, 'the capture decision never reads the trading switch');
+  assert.equal(/pool\.query\(\s*'UPDATE settings/.test(beforeInsert), false, 'reading the guard never writes to settings');
   // The inferred direction is stored with the signal, so the badge survives a reload.
   assert.match(saveSignalBody, /direction_inferred AS "directionInferred"/);
   assert.match(saveSignalBody, /parsed\.directionInferred === true/);

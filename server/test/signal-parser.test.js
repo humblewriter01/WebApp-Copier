@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { countSignalEntryDeals, isBlockedOnlyByStopLoss, parseSignal, resolveBrokerSymbol } from '../services/signal-parser.js';
+import { countSignalEntryDeals, parseSignal, resolveBrokerSymbol } from '../services/signal-parser.js';
 
 test('parses a strict BUY signal with an entry, stop loss, and one target', () => {
   const parsed = parseSignal('BUY EURUSD\nEntry: 1.0850\nSL: 1.0800\nTP1: 1.0950');
@@ -79,8 +79,9 @@ test('a direction is inferred from the prices, marked as inferred, and never tra
 test('what a message lacks is reported as facts, not as one generic failure', () => {
   const noStop = parseSignal('BUY EURUSD Entry 1.08 TP 1.10');
   assert.deepEqual(noStop.missing, { entryPrice: false, stopLoss: true, takeProfit: false });
+  // The parser only states facts. Whether a missing stop is survivable is one workspace setting away, so
+  // that judgement lives in `captureSafety` and is tested there against this same shape.
   assert.deepEqual(noStop.blockers.map((blocker) => blocker.code), ['stop-loss-missing']);
-  assert.equal(isBlockedOnlyByStopLoss(noStop), true);
   assert.equal(noStop.hasTradingData, true, 'a usable note is not "no clear signal"');
 
   const noTarget = parseSignal('BUY EURUSD Entry 1.08 SL 1.06');
@@ -89,7 +90,7 @@ test('what a message lacks is reported as facts, not as one generic failure', ()
 
   const prose = parseSignal('good morning everyone, another great week ahead');
   assert.equal(prose.hasTradingData, false, 'only a message with no trading data at all reads as unclear');
-  assert.equal(isBlockedOnlyByStopLoss(prose), false);
+  assert.deepEqual(prose.blockers.map((blocker) => blocker.code), ['direction-missing', 'symbol', 'stop-loss-missing'], 'a greeting is refused for what it actually lacks');
 
   // Multiple targets leave the value null, which is a fact about the row and not a missing field.
   const twoTargets = parseSignal('BUY EURUSD SL 1.08 TP1 1.12 TP2 1.15');
