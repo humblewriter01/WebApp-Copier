@@ -98,29 +98,79 @@ export function normalizePromoCodeUpdate(input = {}) {
   return Object.freeze(update);
 }
 
+/* ----------------------------------------------------------------------------------------------
+ * Reading the account edit the panel sends.
+ *
+ * Every rejection here is a sentence an administrator reads instead of a red badge, so each one names
+ * what the endpoint actually received rather than what it wanted. That distinction is the whole point:
+ * a payload whose key is spelled differently, or whose boolean arrived as text, used to fail with
+ * "Choose at least one change to save." - which is true, useless, and indistinguishable from having
+ * pressed the button without changing anything.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The shape a value arrived in, never its contents - enough to spot a string where a boolean belongs. */
+function describeValue(value) {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'a list';
+  if (typeof value === 'string') return `the text "${value.slice(0, 24)}"`;
+  if (typeof value === 'object') return 'an object';
+  return `a ${typeof value}`;
+}
+
+/**
+ * A suspension flag, read tolerantly. `true`/`false` are what the panel sends; the same words as text
+ * mean the same thing and cost nothing to accept, because the value only ever selects between two
+ * statements the endpoint already validates. Anything else - a list, an object, a number - is refused
+ * rather than guessed at.
+ */
+function readSuspensionFlag(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const text = value.trim().toLowerCase();
+    if (text === 'true') return true;
+    if (text === 'false') return false;
+  }
+  return undefined;
+}
+
+/** Field names only, sanitised: enough to reveal a key the endpoint does not write, never a value. */
+function sentFieldNames(input) {
+  const names = Object.keys(input || {})
+    .filter((key) => /^[A-Za-z][A-Za-z0-9_]{0,31}$/.test(key))
+    .slice(0, 5)
+    .map((key) => `"${key}"`);
+  if (!names.length) return 'the request arrived with no recognised field';
+  return `it sent ${names.join(', ')}`;
+}
+
 /** Validates a partial admin edit of a user record. */
 export function normalizeUserUpdate(input = {}) {
   const update = {};
 
   if (Object.hasOwn(input, 'role')) {
     const role = String(input.role || '').trim().toLowerCase();
-    if (!ROLE_VALUES.has(role)) throw validationError('Choose either the user or admin role.');
+    if (!ROLE_VALUES.has(role)) throw validationError(`Choose either the user or admin role (received ${describeValue(input.role)}).`);
     update.role = role;
   }
 
   if (Object.hasOwn(input, 'isSuspended')) {
-    if (typeof input.isSuspended !== 'boolean') throw validationError('Suspension must be true or false.');
-    update.isSuspended = input.isSuspended;
+    const flag = readSuspensionFlag(input.isSuspended);
+    if (flag === undefined) {
+      throw validationError(`Suspension must be true or false (received ${describeValue(input.isSuspended)}).`);
+    }
+    update.isSuspended = flag;
   }
 
   if (Object.hasOwn(input, 'suspensionReason')) {
     update.suspensionReason = input.suspensionReason == null ? '' : String(input.suspensionReason).trim().slice(0, 200);
   }
 
-  if (!Object.keys(update).length) throw validationError('Choose at least one change to save.');
+  if (!Object.keys(update).length) {
+    throw validationError(`Choose at least one change to save - this endpoint writes "role", "isSuspended" and "suspensionReason", and ${sentFieldNames(input)}.`);
+  }
 
   if (update.isSuspended === true && !update.suspensionReason) {
-    throw validationError('Add a short reason so the user understands the suspension.');
+    throw validationError(`Add a short reason so the user understands the suspension (suspensionReason ${Object.hasOwn(input, 'suspensionReason') ? 'arrived blank' : 'was not sent'}).`);
   }
   if (update.isSuspended === false) update.suspensionReason = '';
 

@@ -270,6 +270,18 @@ The panel provides:
 
 Suspension blocks new sign-ins with the stored reason. Existing JWT sessions on other devices remain valid until they expire (12 hours, or 30 days with "keep me signed in"), so revoke a role or suspend an account knowing that short window. Suspending an account also closes any open support session on it.
 
+That edit is a three-field contract between two packages - `client/src/components/AdminPanel.jsx` sends
+`{ role }`, or `{ isSuspended, suspensionReason }`, and `normalizeUserUpdate` in
+`server/services/admin.js` reads exactly those names - so `client/test/platform-admin-ui.test.mjs`
+extracts the field names from the server's reader and requires the panel to send each one. The endpoint
+also accepts a suspension flag that arrived as the text `"true"`/`"false"` (a boolean is what the panel
+sends; the words mean the same and only ever select between two statements that are validated anyway),
+and every rejection names what arrived - `it sent "suspended", "reason"`, `suspensionReason arrived
+blank`, `received a number` - because "Choose at least one change to save." on a filled-in form reads as
+a broken button rather than a naming problem. Field *names* are echoed after an identifier check; values
+never are. The form carries the account it was opened for, so paging or searching with it open closes
+it instead of submitting against a row that is no longer on screen.
+
 ### Global auto-trading kill switch
 
 `AUTO_TRADING_RUNTIME_ENABLED` is read once when the process boots, so it can stop execution but it cannot be flipped while the service is running. The kill switch is the runtime half of that decision: it lives in `admin_settings` under `auto_trading_kill_switch`, and `processJob()` reads it from the database before it touches the broker and again immediately before it records a trade and sends the order. Turning it off therefore stops new trades for every workspace on the next job - no deploy, no restart - and the trade is never half-submitted.

@@ -75,7 +75,10 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const [priceNote, setPriceNote] = useState('');
   const [syncResults, setSyncResults] = useState([]);
   const [promoForm, setPromoForm] = useState({ code: '', discountType: 'percentage', discountValue: '', maxUses: '', expiresAt: '' });
-  const [suspension, setSuspension] = useState({ userId: '', reason: '' });
+  // The account is carried inside the form, not looked up from the list at submit time: a re-`find`
+  // would quietly do nothing once paging or a search had replaced that page, and 'nothing happened'
+  // is the worst failure an admin panel can have - no request, no error, no audit row.
+  const [suspension, setSuspension] = useState({ userId: '', name: '', reason: '' });
   const [loading, setLoading] = useState(true);
   const [savingPromo, setSavingPromo] = useState(false);
   const [savingPricing, setSavingPricing] = useState(false);
@@ -188,6 +191,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const applySearch = async (event) => {
     event.preventDefault();
     const nextSearch = searchInput.trim();
+    closeSuspensionForm();
     setSearch(nextSearch);
     setOffset(0);
     setLoading(true);
@@ -197,6 +201,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const changePage = async (direction) => {
     const nextOffset = Math.max(0, offset + direction * PAGE_SIZE);
     if (nextOffset === offset) return;
+    closeSuspensionForm();
     setOffset(nextOffset);
     setLoading(true);
     await loadEverything(search, nextOffset);
@@ -209,7 +214,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     try {
       await request(`/api/admin/users/${userId}`, token, { method: 'PATCH', body });
       setNotice(successMessage);
-      setSuspension({ userId: '', reason: '' });
+      setSuspension({ userId: '', name: '', reason: '' });
       await loadOverview();
       await loadUsers();
     } catch (updateError) {
@@ -224,12 +229,19 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     void updateUser(user.id, { role }, role === 'admin' ? `${user.name} is now an administrator.` : `${user.name} is now a standard user.`);
   };
 
-  const startSuspension = (user) => setSuspension({ userId: user.id, reason: '' });
-  const cancelSuspension = () => setSuspension({ userId: '', reason: '' });
-  const confirmSuspension = async (user) => {
+  const startSuspension = (user) => setSuspension({ userId: user.id, name: user.name || user.email, reason: '' });
+  const cancelSuspension = () => setSuspension({ userId: '', name: '', reason: '' });
+  const closeSuspensionForm = () => setSuspension({ userId: '', name: '', reason: '' });
+  /**
+   * Sends exactly the two fields the endpoint writes: a real boolean and the trimmed reason. The
+   * reason is required here as well as on the server, because a blank one is the difference between
+   * "suspended for chargeback" and an account whose owner has to ask what happened.
+   */
+  const confirmSuspension = async () => {
+    if (!suspension.userId) { setError('Open the suspension form again for that account.'); return; }
     const reason = suspension.reason.trim();
     if (!reason) { setError('Add a short reason before suspending this user.'); return; }
-    await updateUser(user.id, { isSuspended: true, suspensionReason: reason }, `${user.name} has been suspended.`);
+    await updateUser(suspension.userId, { isSuspended: true, suspensionReason: reason }, `${suspension.name || 'That account'} has been suspended.`);
   };
   const liftSuspension = (user) => updateUser(user.id, { isSuspended: false }, `${user.name} can sign in again.`);
 
@@ -750,8 +762,8 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
             </table>
           </div>
 
-          {suspension.userId && <form className="admin-suspend" onSubmit={(event) => { event.preventDefault(); const user = users.find((item) => item.id === suspension.userId); if (user) confirmSuspension(user); }}>
-            <strong>Suspend this account</strong>
+          {suspension.userId && <form className="admin-suspend" onSubmit={(event) => { event.preventDefault(); void confirmSuspension(); }}>
+            <strong>Suspend {suspension.name || 'this account'}</strong>
             <label>Reason shown to the user<input value={suspension.reason} onChange={(event) => setSuspension({ ...suspension, reason: event.target.value })} maxLength={200} required placeholder="For example: chargeback on subscription" /></label>
             <div className="button-row">
               <button type="submit" className="button button-danger" disabled={busyUser === suspension.userId}>Suspend user</button>
