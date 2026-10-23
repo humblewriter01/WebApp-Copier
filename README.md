@@ -209,8 +209,38 @@ Then add the webhook URL in the Paystack dashboard (Settings → API Keys & Webh
 Any request can fail for a reason the frontend has no way to invent, so the rule in `client/src/lib/api.js` is that the server's own sentence is what the user reads. Three cases are told apart, because they need different advice:
 
 - **A refusal with a status** (`400`, `402`, `409`, `429`) keeps its message, since that sentence was written for the person who just pressed the button.
-- **A server error with a body** returns `userMessage` when the route set one — administrative mutations do, through `adminActionError(action, error)` in `server/services/admin.js`, which names the action that failed (`Adjusting that plan did not complete: …`) — plus a `code` (`UNEXPECTED` when nothing chose one) and a short `requestId`. The same reference is on the `Request failed` log line, together with the method and path, so "the admin panel said no" becomes a searchable line instead of a screenshot. The raw internal message is never the headline for a status-less failure, because it can name a table or a column.
+- **A server error with a body** returns `userMessage` when the route set one — administrative mutations do, through `adminActionError(action, error)` in `server/services/admin.js`, which names the action that failed (`Adjusting that plan did not complete: …`) — plus a `code` (`UNEXPECTED` when nothing chose one) and a short `requestId`. The sentence ends with what the administrator can still do about it: `Nothing was changed - please try again…` while the write had not happened, and `Part of this may already be saved - reload the list before you try it again.` once `markApplied(req)` has recorded that it did. The same reference is on the `Request failed` log line, together with the method and path, so "the admin panel said no" becomes a searchable line instead of a screenshot. The raw internal message is never the headline for a status-less failure, because it can name a table or a column.
 - **A response that never came from the app** — an empty body or an HTML error page from the proxy, typical of a service that is waking up — is described as that, and says plainly that the change may not have been applied. `error.retryable` is set so a panel can offer a retry instead of implying the user's data is wrong.
+
+## A statement and its values are checked together
+
+`pg` sends a statement and its bind values as a pair, and Postgres refuses the pair when the two
+halves disagree: `bind message supplies 5 parameters, but prepared statement "" requires 4`. That
+message arrives from the driver, far from the code that assembled the SQL, and it says nothing about
+which query or which value was wrong. So the pair is checked where it is built:
+
+- `server/services/query-params.js` counts placeholders (the highest `$n`, because `$1` used twice is
+  still one slot) and compares that with the length of the value array. `assertQueryParameters` throws
+  `QUERY_PARAMETER_MISMATCH` naming the statement's label and the missing or surplus numbers.
+- `withParameterChecks` wraps the one pool the app owns **and** the clients it hands out, so a
+  statement inside `BEGIN … COMMIT` is checked like any other. A rejected call never reaches the
+  socket, which is why a mismatch can no longer half-apply anything.
+- The admin statements whose columns or period depend on what the administrator filled in are built by
+  `buildUserAdminUpdate`, `buildSubscriptionGrantStatements`, `buildSubscriptionExtendStatement`,
+  `buildSubscriptionReleaseStatements`, and `buildSubscriptionMirrorStatement` in
+  `server/services/admin.js`. Each returns `{ sql, params }` from one expression and asserts them
+  against each other, so a variant that mentions `$5` only sometimes cannot be written again.
+- `server/test/query-parameter-contract.test.js` reads every `pool.query` / `client.query` call site in
+  the server (212 sites, 200 of them statically resolvable, the rest being statements assembled at
+  runtime) and fails if any of them binds a different number of values than its statement asks for -
+  **per branch**, by expanding `condition ? 'sql A' : 'sql B'`. One of its tests feeds the scan the
+  exact statement shape that reached production and requires it to be flagged, so the net is tested and
+  not merely asserted.
+
+This is why the manual subscription adjustment now states its period as
+`COALESCE($5::timestamptz, NOW() + ($4::text)::interval)` in both the insert and the conflict update,
+instead of choosing between two SQL strings: an explicit end date still wins and a number of days is
+still counted from now, but both bindings exist in every branch.
 
 ## Admin panel
 

@@ -1,9 +1,14 @@
 import pg from 'pg';
 import { createAdminAccess } from './services/admin.js';
+import { withParameterChecks } from './services/query-params.js';
 
 const { Pool } = pg;
 
-export const pool = new Pool({
+/* The one pool this app owns, wrapped so every statement it carries is checked against its own
+   placeholders before it is sent. A hand-assembled statement whose values and placeholders disagree
+   otherwise fails deep in the driver with `bind message supplies N parameters, but prepared statement
+   requires M`, which no route, log line, or test names. */
+export const pool = withParameterChecks(new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL?.includes('render.com')
     ? { rejectUnauthorized: false }
@@ -11,7 +16,7 @@ export const pool = new Pool({
   max: Number(process.env.PG_POOL_MAX || 5),
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 10_000,
-});
+}), 'pool');
 
 export async function initializeDatabase() {
   await pool.query(`

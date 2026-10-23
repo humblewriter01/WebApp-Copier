@@ -47,6 +47,36 @@ test('a long internal message is shortened rather than dumped', () => {
   assert.match(quoted, /^column "nope" does not exist - context /, 'the part that names the column is the part that is kept');
 });
 
+test('a failure after the write stops promising that nothing was changed', () => {
+  const cause = new Error('connection terminated');
+  const before = adminActionError('Suspend that account', cause);
+  assert.match(before.userMessage, /Nothing was changed - please try again/);
+  const after = adminActionError('Suspend that account', cause, { applied: true });
+  assert.match(after.userMessage, /Part of this may already be saved - reload the list before you try it again\./);
+  assert.equal(after.userMessage.includes('Nothing was changed'), false, 'a claim that contradicts the row the admin can already see is worse than no claim');
+  assert.match(after.userMessage, /^Suspend that account did not complete: connection terminated\. /, 'the action and the cause are still named');
+});
+
+test('each of the three routes marks the moment its write landed, and not before', () => {
+  const routes = [
+    ["app.patch('/api/admin/users/:id', authenticate", 'markApplied(req)', 'const { rows } = await pool.query(statement.sql, statement.params);'],
+    ["app.post('/api/admin/announcements', authenticate", 'markApplied(req)', 'announcement = await announcementService.publish({ draft, actorId: req.userId });'],
+    ["app.patch('/api/admin/users/:id/subscription', authenticate", 'markApplied(req)', "await client.query('COMMIT');"],
+  ];
+  for (const [start, marker, write] of routes) {
+    const from = index.indexOf(start);
+    assert.notEqual(from, -1, start);
+    const body = index.slice(from, index.indexOf('\n}));', from));
+    const markerAt = body.indexOf(marker);
+    const writeAt = body.indexOf(write);
+    assert.notEqual(markerAt, -1, `${start} marks its write`);
+    assert.notEqual(writeAt, -1, `${start} contains the statement it marks`);
+    assert.ok(markerAt > writeAt, `${start} reports a mutation as applied only after ${write.slice(0, 28)}…`);
+  }
+  assert.match(index, /req\.adminMutation = \{ applied: false \};/);
+  assert.match(index, /adminActionError\(action, error, \{ applied: req\.adminMutation\.applied === true \}\)/);
+});
+
 test('every admin mutation the panel exposes runs through the naming wrapper', () => {
   for (const route of [
     "app.patch('/api/admin/users/:id', authenticate, requireAdmin, adminRoute('Updating that account'",
