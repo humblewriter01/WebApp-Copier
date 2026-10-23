@@ -118,13 +118,70 @@ A provisioned MetaAPI account keeps billing this workspace for as long as it exi
 - **Three rules outrank the schedule.** A user whose subscription is `active` or `non_renewing` is exempt, because they are paying for the account. An account whose synchronized state still shows an open position or pending order is *deferred* rather than deleted, so a trade is never stranded with nobody able to close it; the reason is shown to the user and retried on a later sweep. And a user with the `admin` role is never swept at all — an operator running the product must not watch their own test accounts disappear, and warning about a deletion that will never happen is noise. The exemptions are applied twice: the candidate query filters them out so they cannot occupy a sweep slot, and the decision function re-checks them, so an exempt account is not even read from MetaAPI.
 - **Nothing is destroyed on a guess.** If the position state cannot be read the sweep fails closed and waits. If MetaAPI refuses the deletion the local row is kept so a later sweep can retry, and after ten failed attempts the account is marked `failed` with a notice telling the user to remove it manually rather than looping forever. Each account is handled in its own `try`, so one provider outage cannot take the job down and the workspace is never left with a still-billed account no retry path can reach.
 
-Notices live in `account_activity_notices` (RLS-enabled, user-scoped) and are surfaced in-app as a banner on **Trading Accounts**, under the policy note beside the add-account form. This project has no email transport, so the in-app banner is the delivery channel and `warningText()` is the single seam a later email sender would reuse. The sweep runs at startup and every six hours, `INACTIVITY_SWEEP_LIMIT` accounts per pass, oldest first, and `INACTIVITY_WARNING_DAYS` / `INACTIVITY_DELETION_DAYS` move the thresholds (`INACTIVITY_CLEANUP_ENABLED=false` turns the job off); warnings and deletions are logged with user and account ids and never with tokens.
+Notices live in `account_activity_notices` (RLS-enabled, user-scoped) and are surfaced in-app as a banner on **Trading Accounts**, under the policy note beside the add-account form. A separate, quieter row belongs to the account itself: when the execution engine decides an account cannot trade at all it writes `metaapi_accounts.execution_note`, the panel renders it under that account, and the next executed order clears it. This project has no email transport, so the in-app banner is the delivery channel and `warningText()` is the single seam a later email sender would reuse. The sweep runs at startup and every six hours, `INACTIVITY_SWEEP_LIMIT` accounts per pass, oldest first, and `INACTIVITY_WARNING_DAYS` / `INACTIVITY_DELETION_DAYS` move the thresholds (`INACTIVITY_CLEANUP_ENABLED=false` turns the job off); warnings and deletions are logged with user and account ids and never with tokens.
 
 ## Auto-Trading and break even
 
 Automatic execution is opt-in per workspace and lives in **Advanced Settings** (`/advanced`). The red warning above the toggle is required copy; the toggle saves on click so switching it off never waits for a form submit.
 
 Before an order is submitted the engine re-reads its inputs and fails closed on anything missing: the user's current Auto-Trading setting, the server-side `AUTO_TRADING_RUNTIME_ENABLED` switch, ownership and `DEPLOYED` state of the selected account, signal age (two minutes), synchronized positions/pending orders, the open-trade and daily-trade caps, the UTC-day equity baseline for the daily loss limit, a fresh valid quote, a stop loss on the correct side of that quote, and the broker's own minimum, maximum, and volume step. A signal with an entry price is only executed when the current quote is not worse than that entry for the signal's direction. The record is written to `trades` *before* the SDK call with a stable `clientId`, so a replay cannot duplicate an order.
+
+### Three layers between a signal and an order
+
+Real-world failures are the ones that cost money, so the order path carries three guards, decided in
+`server/services/execution-defense.js` and each of which stops the order *before* MetaAPI is asked for
+anything. Nothing in that module touches the database or the network: every layer is a pure decision over
+values the engine already holds, so each one can be tested against a mocked adapter.
+
+- **Stale quote (slippage).** An order is only sent against a quote no older than `MAX_QUOTE_AGE_MS`
+  (2 seconds, measured from the timestamp MetaAPI stamped on the price against this service's own clock)
+  and only while the account reports itself connected and synchronized. A price dated in the *future* past
+  the same window is refused too, because clock skew must not be able to look like permanent freshness, and
+  a price with no timestamp is refused, because a number that cannot be dated cannot be bounded. The check
+  runs twice - when the snapshot arrives, and again at the last gate before the trade row is opened - since
+  the sizing, the safety nets and the settings re-read in between are fast but not instant. Skipping is the
+  only safe remedy: slippage is prevented by not trading, never by hoping the market holds still. The
+  adapter keeps a deliberately looser 15-second tolerance for the *protection* sweeps, because moving a
+  stop on a slightly aged price still beats leaving a position naked.
+- **Exposure caps.** `guardExposure` compares the live terminal state against the workspace's own numbers,
+  never against this app's idea of what is open: `max_open_positions` counts open positions *and* resting
+  orders, the day's drawdown is measured against the UTC-day equity baseline and `daily_loss_limit`, and
+  `max_daily_trades` is compared with the greater of the broker's own deal count and the local trade rows.
+  A missing baseline blocks instead of counting as "no loss yet", and all three bounds are inclusive.
+- **What a broker failure proves.** Every refusal - returned or thrown, since MetaAPI's SDK documents its
+  order methods with `@throws {TradeError}`, so a thrown refusal is the common case - is classified against
+  the return codes MetaAPI publishes, and the classification answers one question: can this request be
+  *shown* not to have reached the trading server? Only then is a retry allowed.
+  - Transient and provably never delivered (`TRADE_RETCODE_DISCONNECTED_BEFORE_TRADE`,
+    `ERR_NOT_SYNCHRONIZED`, `ERR_NO_QUOTES`, a requote, `MARKET_CLOSED`, `TOO_MANY_REQUESTS`) puts the job
+    back on the queue with an exponential wait (`1.5s`, `3s`, `6s`, capped, at most three attempts in
+    total). `execution_jobs.next_attempt_at` is the wait, so a worker restart cannot lose it or resume
+    early, and the signal's own two-minute window still bounds everything: a signal that outlives it
+    expires rather than being traded late.
+  - Anything whose delivery is *unknown* - `TRADE_RETCODE_TIMEOUT`, `DISCONNECTED_DURING_TRADE`, a socket
+    that hung up mid-request - is recorded as `unknown` on the trade and the job and is never retried
+    automatically. An accidental second market order on top of a filled first one is the one failure this
+    service cannot take back, so it is the one thing no backoff makes safe. A human reconciles it, and the
+    row says so.
+  - Permanent and account-level (`E_AUTH`, an HTTP 401/403, an investor password, a broker server MetaAPI
+    cannot serve, auto-trading disabled on the account) fails the job once, does not retry, and leaves a
+    sentence on `metaapi_accounts.execution_note` - *"Broker connection failed. Please check your
+    credentials."* - which **Trading Accounts** shows on that account's row. It lives on the account rather
+    than on every signal because the account is what is broken, and the engine clears it the moment an order
+    goes through, so a fixed problem stops being announced. A refusal of *this order* (invalid volume, a
+    symbol rule, a broker cap) stays a rejection on the signal and leaves no note to alarm anybody with.
+
+The client id is the piece that makes the middle bullet survivable. `buildClientId` produces
+`SD_<SYMBOL>_<hash of the job id>` - the shape MetaAPI documents (`${strategyId}_${positionId}_${orderId}`),
+inside the length it documents too: MetaAPI stores the id in the order comment, so `comment` + `clientId`
+share a budget of 26 characters, and the app uses 25 and never truncates (`createMarketOrder` and
+`closePositionPartially` refuse an order with no id or one too long before the terminal is touched). It is
+stable for the life of a job rather than per attempt, on purpose, and it is *not* a promise the broker keeps:
+MetaAPI publishes no unique constraint over `clientId`, so a duplicate is not refused for us. What the id
+buys is discovery - before a retry sends a job's order a second time, the engine asks the account for a
+position, pending order or deal carrying that id (`findOrderByClientId`) and reconciles the trade row
+instead of re-sending. An adapter that cannot answer that question is treated as an answer of "unknown",
+and nothing is sent on an unknown.
 
 **Break even** extends the same loop instead of adding a second one. For each executed trade whose broker position is still open, once the market has travelled `breakEvenTriggerPoints` in favour of the trade, the stop is moved to the entry price plus `breakEvenOffsetPoints` — an offset is how you cover spread and commission instead of parking the stop exactly where the quote touches it.
 
@@ -498,7 +555,7 @@ The static site is served over HTTPS and includes a linked web app manifest, 192
 - `POST /api/billing/webhook` – Paystack callback, authenticated by signature only
 - `GET /api/dashboard`
 - `GET/POST /api/channels`, `DELETE /api/channels/:id`
-- `GET/POST /api/signals`, `DELETE /api/signals/:id`, `DELETE /api/signals` — every stored message with its outcome: `status` (`received`, `queued`, `unexecuted`, `expired`, `unparsed`, `executed`), `executionNote` (the sentence explaining an outcome that was not a trade), `directionInferred`, and the parsed prices; `DELETE` removes captured messages only and unlinks any trade they produced
+- `GET/POST /api/signals`, `DELETE /api/signals/:id`, `DELETE /api/signals` — every stored message with its outcome: `status` (`received`, `queued`, `unexecuted`, `expired`, `unparsed`, `executed`, `rejected`, `unknown`, `failed` — the last one meaning the account was blocked, not the signal), `executionNote` (the sentence explaining an outcome that was not a trade), `directionInferred`, and the parsed prices; `DELETE` removes captured messages only and unlinks any trade they produced
 - `GET/POST /api/accounts`, `DELETE /api/accounts/:id`
 - `GET/PUT /api/settings` – risk limits, lot sizing, selected execution account, break-even trigger/offset, trailing distance, and Advanced Safety: `blockExecutionWithoutStopLoss`, `blockExecutionWithoutTakeProfit` (both default `true`) and `fallbackStopLossPoints` / `fallbackTakeProfitPoints` (points, `null` for no fallback); `GET` also reports the platform's own execution switch so the panel can explain a pause instead of leaving a user to hunt for a toggle that is already on
 - `GET /api/trades` – execution activity, including the break-even outcome for each position

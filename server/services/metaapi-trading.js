@@ -2,9 +2,17 @@ import crypto from 'node:crypto';
 import MetaApi from 'metaapi.cloud-sdk/esm-node';
 import { normalizeMetaApiToken } from './metaapi.js';
 import { resolveBrokerSymbol } from './signal-parser.js';
+import { CLIENT_ID_COMMENT, clientIdFits } from './execution-defense.js';
 
 const CONNECTION_TIMEOUT_MS = 45_000;
 const DEFAULT_QUOTE_TIMEOUT_MS = 7_000;
+/* Deliberately looser than the execution engine's 2-second bound (`MAX_QUOTE_AGE_MS` in
+ * `execution-defense.js`), and not a mistake: this tolerance governs every read of the account, including
+ * the protection sweeps, where acting on a slightly aged price beats leaving an open position with no
+ * stop at all. Opening a NEW position is the case where an aged price costs money, so that judgement is
+ * made in the engine against a tighter clock - this file supplies the quote and says how old it is, and
+ * never decides whether old means "don't trade".
+ */
 const MAX_QUOTE_AGE_MS = 15_000;
 
 function withTimeout(promise, milliseconds, label) {
@@ -112,14 +120,38 @@ export function createMetaApiTradingAdapter({ MetaApiClass = MetaApi, now = () =
     const deals = history.dealsByTimeRange(new Date(fromTime), new Date(now()));
     const price = resolvedSymbol ? await waitForFreshPrice(connection, resolvedSymbol, requestQuoteTimeoutMs) : null;
 
-    return { account, connection, accountInformation, positions, orders, deals, history, price, specification, symbol: resolvedSymbol };
+    /* `link` is what the connection itself says at the moment the snapshot was taken. The two flags come
+     * straight off the SDK: `connectedToBroker` on the terminal state, and the connection's own
+     * `synchronized` getter. They are reported, not enforced here, because "the link is down" has two very
+     * different remedies depending on whether it blocks an order or only warns against moving a stop - and
+     * deciding that is the engine's job, not this file's.
+     */
+    return {
+      account, connection, accountInformation, positions, orders, deals, history, price, specification,
+      symbol: resolvedSymbol,
+      link: { connectedToBroker: terminal?.connectedToBroker === true, synchronized: connection.synchronized !== false },
+    };
+  }
+
+  /**
+   * MetaAPI has no unique constraint over `clientId`: it stores the value inside the order comment, which
+   * is also why the two share a length budget (the schemas in this SDK version say 30 characters with a
+   * comment and 31 without, the older JSDoc says 26; the app obeys the strictest reading, with slack).
+   * So a repeated id is *not* refused by the broker, and an order without an id cannot be recognised as a
+   * repeat at all. That is why this boundary refuses to submit without one: the alternative is a silent
+   * second trade on an account that is not ours to guess about.
+   */
+  function assertClientId(clientId) {
+    const fit = clientIdFits({ clientId, comment: CLIENT_ID_COMMENT });
+    if (!fit.ok) throw new Error(fit.reason);
+    return String(clientId);
   }
 
   async function createMarketOrder({ token, accountId, side, symbol, volume, stopLoss, takeProfit, clientId }) {
+    const order = { comment: CLIENT_ID_COMMENT, clientId: assertClientId(clientId) };
     const { connection } = await getConnection(token, accountId);
-    const options = { comment: 'SD', clientId };
-    if (side === 'buy') return connection.createMarketBuyOrder(symbol, volume, stopLoss, takeProfit ?? undefined, options);
-    if (side === 'sell') return connection.createMarketSellOrder(symbol, volume, stopLoss, takeProfit ?? undefined, options);
+    if (side === 'buy') return connection.createMarketBuyOrder(symbol, volume, stopLoss, takeProfit ?? undefined, order);
+    if (side === 'sell') return connection.createMarketSellOrder(symbol, volume, stopLoss, takeProfit ?? undefined, order);
     throw new Error('Unsupported order direction.');
   }
 
@@ -149,7 +181,44 @@ export function createMetaApiTradingAdapter({ MetaApiClass = MetaApi, now = () =
     const lots = Number(volume);
     if (!Number.isFinite(lots) || lots <= 0) throw new Error('A positive volume is required to close part of a position.');
     const { connection } = await getConnection(token, accountId);
-    return connection.closePositionPartially(id, lots, { comment: 'SD', ...(clientId ? { clientId } : {}) });
+    // A partial close is retried by the plan sweep just like an entry is, so it earns the same rule.
+    return connection.closePositionPartially(id, lots, { comment: CLIENT_ID_COMMENT, clientId: assertClientId(clientId) });
+  }
+
+  /**
+   * "Is an order with this client id already on the account?" - the question a retry may not skip. MetaAPI
+   * puts the id in the order comment and keeps it on the resulting position, pending order and deal, so a
+   * second submission of the same intent can be *found* even though it cannot be refused for us. Live
+   * positions and pending orders answer first, because that is where an order accepted a moment ago is;
+   * the day's deals are searched as well so a position opened and closed inside the retry window is still
+   * found. A missing history store is not an error here: it narrows the search, it does not clear it.
+   */
+  async function findOrderByClientId({ token, accountId, clientId, fromTime } = {}) {
+    const id = assertClientId(clientId);
+    const { connection } = await getConnection(token, accountId);
+    const terminal = connection.terminalState;
+    if (!Array.isArray(terminal?.positions) || !Array.isArray(terminal?.orders)) {
+      throw new Error('MetaAPI account positions or pending orders are not synchronized.');
+    }
+    const matches = (candidate) => String(candidate?.clientId || '') === id;
+    const position = terminal.positions.find(matches);
+    if (position) {
+      return { where: 'position', symbol: position.symbol || null, positionId: position.positionId ?? position.id ?? null, orderId: position.orderId ?? null, position };
+    }
+    const pending = terminal.orders.find(matches);
+    if (pending) {
+      return { where: 'order', symbol: pending.symbol || null, positionId: pending.positionId ?? null, orderId: pending.id ?? pending.orderId ?? null, position: pending };
+    }
+    const history = connection.historyStorage;
+    if (history && history.dealSynchronizationFinished === true && typeof history.dealsByTimeRange === 'function') {
+      const start = fromTime || new Date(new Date(now()).setUTCHours(0, 0, 0, 0));
+      const deals = history.dealsByTimeRange(new Date(start), new Date(now()));
+      const deal = (Array.isArray(deals) ? deals : []).find(matches);
+      if (deal) {
+        return { where: 'deal', symbol: deal.symbol || null, positionId: deal.positionId ?? null, orderId: deal.orderId ?? null, position: deal };
+      }
+    }
+    return null;
   }
 
   async function close() {
@@ -162,5 +231,5 @@ export function createMetaApiTradingAdapter({ MetaApiClass = MetaApi, now = () =
     clients.clear();
   }
 
-  return { getAccountState, createMarketOrder, modifyPosition, closePositionPartially, close };
+  return { getAccountState, createMarketOrder, modifyPosition, closePositionPartially, findOrderByClientId, close };
 }

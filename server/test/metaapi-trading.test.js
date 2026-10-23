@@ -105,3 +105,84 @@ test('a partial close is forwarded as a volume, with the comment and client id t
   await assert.rejects(() => adapter.closePositionPartially({ token: 'ASCII_TEST_TOKEN_0123456789', accountId: 'account-1', positionId: '  ', volume: 0.05 }), /broker position id is required/);
   assert.equal(calls.filter(([name]) => name === 'closePartial').length, 1, 'a refused request never reached the connection');
 });
+
+/* ---------------- the boundary every order passes: an id the broker can store and we can find again ----------------
+ * MetaAPI keeps `clientId` inside the order comment, so the two share one length budget, and it publishes
+ * no unique constraint over the id. Both facts show up as rules here: an order without an id, or with one
+ * too long for the field, never leaves this process, and the lookup a retry depends on is this file's job.
+ */
+
+const TOKEN = 'ASCII_TEST_TOKEN_0123456789';
+const GOOD_ID = 'SD_EURUSD_deadbeef1';
+
+test('an order without a client id is refused before the broker is touched', async () => {
+  const { FakeMetaApi, calls } = mockMetaApi();
+  const adapter = createMetaApiTradingAdapter({ MetaApiClass: FakeMetaApi });
+  await assert.rejects(() => adapter.createMarketOrder({ token: TOKEN, accountId: 'account-1', side: 'buy', symbol: 'EURUSD', volume: 0.02, stopLoss: 1.09, takeProfit: 1.12 }), /client id is required/i);
+  await assert.rejects(() => adapter.closePositionPartially({ token: TOKEN, accountId: 'account-1', positionId: 'position-1', volume: 0.01 }), /client id is required/i);
+  assert.deepEqual(calls.filter(([name]) => name === 'buy' || name === 'closePartial'), [], 'no request reaches the terminal on either path');
+  await adapter.close();
+});
+
+test('an id too long for the comment field is refused rather than truncated by the broker', async () => {
+  const { FakeMetaApi, calls } = mockMetaApi();
+  const adapter = createMetaApiTradingAdapter({ MetaApiClass: FakeMetaApi });
+  // The old shape: `SD` + 24 hex is 26 characters of its own and 28 beside a two-character comment, over
+  // the strictest budget MetaAPI documents. It has to fail here instead of on the user's account.
+  await assert.rejects(() => adapter.createMarketOrder({ token: TOKEN, accountId: 'account-1', side: 'buy', symbol: 'EURUSD', volume: 0.02, stopLoss: 1.09, takeProfit: 1.12, clientId: `SD${'a'.repeat(24)}` }), /within 26 characters/i);
+  assert.equal(calls.filter(([name]) => name === 'buy').length, 0);
+  await adapter.close();
+});
+
+test('the account is searched for an earlier attempt by position, then pending order, then deal', async () => {
+  const withPosition = mockMetaApi();
+  withPosition.connection.terminalState.positions = [{ id: 'broker-position-9', symbol: 'EURUSD', clientId: GOOD_ID }];
+  const adapterA = createMetaApiTradingAdapter({ MetaApiClass: withPosition.FakeMetaApi });
+  const foundPosition = await adapterA.findOrderByClientId({ token: TOKEN, accountId: 'account-1', clientId: GOOD_ID });
+  assert.equal(foundPosition.where, 'position');
+  assert.equal(foundPosition.positionId, 'broker-position-9');
+  await adapterA.close();
+
+  const withOrder = mockMetaApi();
+  withOrder.connection.terminalState.orders = [{ id: 'broker-order-4', symbol: 'EURUSD', clientId: GOOD_ID }];
+  const adapterB = createMetaApiTradingAdapter({ MetaApiClass: withOrder.FakeMetaApi });
+  assert.equal((await adapterB.findOrderByClientId({ token: TOKEN, accountId: 'account-1', clientId: GOOD_ID })).where, 'order');
+  await adapterB.close();
+
+  const withDeal = mockMetaApi();
+  withDeal.connection.historyStorage = { dealSynchronizationFinished: true, dealsByTimeRange: () => [{ id: 'deal-1', orderId: 'broker-order-7', positionId: 'broker-position-7', symbol: 'EURUSD', clientId: GOOD_ID }] };
+  const adapterC = createMetaApiTradingAdapter({ MetaApiClass: withDeal.FakeMetaApi });
+  const deal = await adapterC.findOrderByClientId({ token: TOKEN, accountId: 'account-1', clientId: GOOD_ID });
+  assert.deepEqual({ where: deal.where, positionId: deal.positionId, orderId: deal.orderId }, { where: 'deal', positionId: 'broker-position-7', orderId: 'broker-order-7' }, 'a position opened and closed inside the retry window is still evidence');
+  await adapterC.close();
+
+  const empty = mockMetaApi();
+  const adapterD = createMetaApiTradingAdapter({ MetaApiClass: empty.FakeMetaApi });
+  assert.equal(await adapterD.findOrderByClientId({ token: TOKEN, accountId: 'account-1', clientId: GOOD_ID }), null, 'and nothing found is a genuine answer, not an error');
+  await adapterD.close();
+});
+
+test('an unsynchronized account refuses to answer the duplicate question', async () => {
+  const { FakeMetaApi, connection } = mockMetaApi();
+  connection.terminalState.positions = null;
+  const adapter = createMetaApiTradingAdapter({ MetaApiClass: FakeMetaApi });
+  await assert.rejects(() => adapter.findOrderByClientId({ token: TOKEN, accountId: 'account-1', clientId: GOOD_ID }), /not synchronized/i);
+  await adapter.close();
+});
+
+test('the snapshot reports what the link itself says, including after it drops', async () => {
+  const { FakeMetaApi, connection } = mockMetaApi();
+  const adapter = createMetaApiTradingAdapter({ MetaApiClass: FakeMetaApi });
+  const before = await adapter.getAccountState({ token: TOKEN, accountId: 'account-1', symbol: 'EURUSD' });
+  assert.deepEqual(before.link, { connectedToBroker: true, synchronized: true });
+  // The connection is cached, so this is the real shape of the failure: the link went away after the
+  // snapshot machinery had already approved it, and only the flags say so.
+  connection.terminalState.connectedToBroker = false;
+  const after = await adapter.getAccountState({ token: TOKEN, accountId: 'account-1', symbol: 'EURUSD' });
+  assert.equal(after.link.connectedToBroker, false);
+  connection.terminalState.connectedToBroker = true;
+  connection.synchronized = false;
+  const unsynced = await adapter.getAccountState({ token: TOKEN, accountId: 'account-1', symbol: 'EURUSD' });
+  assert.equal(unsynced.link.synchronized, false);
+  await adapter.close();
+});

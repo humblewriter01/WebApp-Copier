@@ -14,6 +14,9 @@ const OUTCOMES = {
   expired: { label: 'Too old to execute', tone: 'warn' },
   unknown: { label: 'Unconfirmed', tone: 'bad' },
   rejected: { label: 'Rejected by broker', tone: 'bad' },
+  // Not "rejected": the account itself was refused, so the next signal will not fare better until the
+  // workspace fixes what the note on this row says to fix.
+  failed: { label: 'Blocked by a broker error', tone: 'bad' },
   executed: { label: 'Executed', tone: 'good' },
   filled: { label: 'Filled', tone: 'good' },
 };

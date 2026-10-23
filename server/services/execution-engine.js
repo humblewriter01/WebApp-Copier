@@ -1,4 +1,12 @@
-import crypto from 'node:crypto';
+/* The three layers that sit between "a signal was captured" and "an order reaches the broker": quote
+ * freshness, the workspace's own exposure caps, and what a broker failure actually proves. All of it is
+ * decided in `execution-defense.js` rather than inline here, so each guard is a function a test can call
+ * with the numbers a real MetaAPI account produces and read the answer off.
+ */
+import {
+  MAX_ORDER_ATTEMPTS, MAX_QUOTE_AGE_MS, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS, STALE_QUOTE_MESSAGE,
+  buildClientId, canRetry, classifyBrokerFailure, guardExposure, guardQuote, quoteAgeMs, retryDelayMs,
+} from './execution-defense.js';
 import { countSignalEntryDeals as countDailySignalEntryDeals, resolveBrokerSymbol } from './signal-parser.js';
 import { applySafetyNets, safetyNote } from './signal-safety.js';
 import { planScaleOutLevels, resolveCloseVolume, selectTarget, targetReached } from './scale-out.js';
@@ -367,7 +375,7 @@ export function classifyBreakEvenFailure(error) {
   return { status: 'failed', retry: true, message: message || 'The broker rejected the stop-loss change.' };
 }
 
-export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnabled = false, isTradingPaused = async () => false, now = () => Date.now(), breakEvenIntervalMs = 5_000, takeProfitSweepIntervalMs = 5_000, breakEvenMaxAttempts = BREAK_EVEN_MAX_ATTEMPTS, logger = console } = {}) {
+export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnabled = false, isTradingPaused = async () => false, now = () => Date.now(), breakEvenIntervalMs = 5_000, takeProfitSweepIntervalMs = 5_000, breakEvenMaxAttempts = BREAK_EVEN_MAX_ATTEMPTS, quoteMaxAgeMs = MAX_QUOTE_AGE_MS, maxOrderAttempts = MAX_ORDER_ATTEMPTS, retryBaseMs = RETRY_BASE_DELAY_MS, retryMaxMs = RETRY_MAX_DELAY_MS, logger = console } = {}) {
   if (!pool?.query || !trading?.getAccountState || !trading?.createMarketOrder || typeof resolveToken !== 'function') {
     throw new TypeError('Execution engine dependencies are incomplete.');
   }
@@ -427,18 +435,86 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
     return { day, equity };
   }
 
+  /* A job that has been decided has no scheduled retry waiting behind it, so `next_attempt_at` is cleared
+     on every terminal write rather than left to be noticed later: a finished signal that comes back to
+     life because a timestamp outlived its status is the worst kind of bug to discover on a live account. */
+  const JOB_SETTLE_SQL = `UPDATE execution_jobs SET status=$1,error_message=$2,locked_at=NULL,next_attempt_at=NULL,updated_at=NOW() WHERE id=$3 AND user_id=$4`;
+  const JOB_DEFER_SQL = `UPDATE execution_jobs SET status='queued',error_message=$2,locked_at=NULL,next_attempt_at=NOW()+($3::text || ' milliseconds')::interval,updated_at=NOW() WHERE id=$1 AND user_id=$4`;
+  const SIGNAL_MIRROR_SQL = `UPDATE signals SET status=$1,execution_note=$2 WHERE id=(SELECT signal_id FROM execution_jobs WHERE id=$3 AND user_id=$4)`;
+  /* The note an account carries when it cannot trade at all. It lives on the account and not on the
+     signal because the fault is not the signal's: every workspace row would otherwise repeat the same
+     sentence, and the one place a user goes to look at a trading account is where the answer belongs. */
+  const ACCOUNT_NOTE_SQL = `UPDATE metaapi_accounts SET execution_note=$3,execution_note_at=NOW() WHERE user_id=$1 AND metaapi_account_id=$2`;
+  const ACCOUNT_NOTE_CLEAR_SQL = `UPDATE metaapi_accounts SET execution_note=NULL,execution_note_at=NULL WHERE user_id=$1 AND metaapi_account_id=$2 AND execution_note IS NOT NULL`;
+
   async function updateJob(jobId, userId, status, errorMessage, note = null) {
-    await pool.query(
-      `UPDATE execution_jobs SET status=$1,error_message=$2,locked_at=NULL,updated_at=NOW() WHERE id=$3 AND user_id=$4`,
-      [status, errorMessage || null, jobId, userId],
-    );
+    await pool.query(JOB_SETTLE_SQL, [status, errorMessage || null, jobId, userId]);
     // The job table and the signal table describe one event in different words: a skipped job is a
     // signal the workspace reads as unexecuted, and the reason travels with it so the panel never
     // has to guess why nothing reached the broker.
     await pool.query(
-      `UPDATE signals SET status=$1,execution_note=$2 WHERE id=(SELECT signal_id FROM execution_jobs WHERE id=$3 AND user_id=$4)`,
-      [signalStatusForJobStatus(status), note ? safeText(note) : (['skipped', 'expired', 'unknown'].includes(status) ? safeText(errorMessage) || null : null), jobId, userId],
+      SIGNAL_MIRROR_SQL,
+      [signalStatusForJobStatus(status), note ? safeText(note) : (['skipped', 'expired', 'unknown', 'failed'].includes(status) ? safeText(errorMessage) || null : null), jobId, userId],
     );
+  }
+
+  /**
+   * Hand the job back to the queue with a wait on it. The signal row deliberately goes back to `queued`
+   * with no note: a job waiting its turn is in flight, not blocked, and the difference is one the user
+   * can act on. The reason for the wait stays on the job, where the admin panel reads it.
+   */
+  async function deferJob(job, { delayMs, message }) {
+    const delay = String(Math.max(0, Math.round(Number(delayMs) || 0)));
+    await pool.query(JOB_DEFER_SQL, [job.id, safeText(message), delay, job.user_id]);
+    await pool.query(SIGNAL_MIRROR_SQL, [signalStatusForJobStatus('queued'), null, job.id, job.user_id]);
+  }
+
+  /**
+   * What a retry has to clear before it sends anything: whether the earlier attempt is already at the
+   * broker. MetaAPI publishes no unique constraint on `clientId`, so a duplicate is not refused for us -
+   * it is *found* here, by position, pending order or deal carrying the id this job invented, and
+   * reconciled instead of re-sent. An adapter that cannot answer is an answer of "unknown", and nothing is
+   * sent on an unknown: the safe response to a question nobody can answer is not to ask it with money.
+   */
+  async function reconcilePriorAttempt({ job, token, accountId, clientId, tradeId }) {
+    const userId = job.user_id;
+    const blockAsUnknown = async (reason) => {
+      const message = safeText(reason);
+      await pool.query('UPDATE trades SET status=$1,error_message=$2 WHERE id=$3 AND user_id=$4', ['unknown', message, tradeId, userId]).catch(() => {});
+      await updateJob(job.id, userId, 'unknown', message).catch(() => {});
+      return { handled: true, status: 'unknown', message };
+    };
+    if (typeof trading.findOrderByClientId !== 'function') {
+      return blockAsUnknown('A retry needs the account to be searched for the earlier attempt, and this service cannot do that. The order was not sent again; reconcile the broker account before retrying.');
+    }
+    let found = null;
+    try {
+      found = await trading.findOrderByClientId({ token, accountId, clientId });
+    } catch (error) {
+      return blockAsUnknown(`The account could not be searched for the earlier attempt (${safeText(error?.message || error)}). The order was not sent again; reconcile the broker account before retrying.`);
+    }
+    if (!found) return { handled: false };
+    /* The first attempt did reach the broker. Recording what it produced is the whole job from here: the
+       position exists, the trade row gets its ids, and the signal is executed - by another route than the
+       order that was never sent, to the same end state, with no second trade in it. */
+    await pool.query(
+      `UPDATE trades SET status='executed',provider_response=$1,broker_order_id=$2,broker_position_id=$3,executed_at=NOW() WHERE id=$4 AND user_id=$5`,
+      [safeProviderResponse(found, token), found.orderId ? String(found.orderId) : null, found.positionId ? String(found.positionId) : null, tradeId, userId],
+    );
+    const message = 'An earlier attempt already reached your broker; the order was matched by its client id and was not sent again.';
+    await updateJob(job.id, userId, 'executed', null, message);
+    return { handled: true, status: 'executed', message };
+  }
+
+  /** Best-effort by design: a note is a courtesy, and losing one must never fail an order. */
+  async function noteAccount(userId, accountId, note) {
+    if (!accountId || !note) return;
+    await pool.query(ACCOUNT_NOTE_SQL, [userId, accountId, safeText(note)]).catch(() => {});
+  }
+
+  async function clearAccountNote(userId, accountId) {
+    if (!accountId) return;
+    await pool.query(ACCOUNT_NOTE_CLEAR_SQL, [userId, accountId]).catch(() => {});
   }
 
   /**
@@ -479,9 +555,19 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
     let tradeId = null;
     let orderSubmitted = false;
     let token = null;
+    // Hoisted because the failure paths need them and the success path is not where they are written:
+    // `attempt` decides whether a retry is still available, and `accountId` is where an account-level
+    // fault has to be recorded - both of which are decided in the catch block below.
+    let accountId = null;
+    let attempt = 1;
+    let expiresAt = Number.NaN;
+    /* A retry is only worth scheduling if the signal still has time to be traded. The window is the
+       engine's own freshness bound, and it is the reason a stale signal expires instead of being executed
+       half a minute late on a price nobody quoted. */
+    const retryWindowOpen = (delayMs) => !(Number.isFinite(expiresAt) && expiresAt - now() <= Number(delayMs || 0));
     try {
       const { rows } = await pool.query(
-        `SELECT ej.id AS job_id,ej.user_id,ej.status AS job_status,ej.expires_at,
+        `SELECT ej.id AS job_id,ej.user_id,ej.status AS job_status,ej.attempt_count AS "attemptCount",ej.expires_at,
                 s.id AS signal_id,s.source,s.created_at AS signal_created_at,s.symbol,s.side,s.entry_price,s.stop_loss,s.take_profit,
                 s.execution_ready,s.parse_error,
                 st.auto_trading_enabled,st.lot_size_mode,st.fixed_lot_size,st.risk_percent,st.max_open_positions,
@@ -500,6 +586,9 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
       );
       const item = rows[0];
       if (!item) return stop(job, 'skipped', 'Execution settings, signal, or selected account are unavailable.');
+      accountId = item.metaapi_account_id || null;
+      attempt = Number(item.attemptCount || 1);
+      expiresAt = Date.parse(String(item.expires_at || ''));
       if (!runtimeEnabled) return stop(job, 'skipped', 'Automatic execution is unavailable on this service.');
       // Checked before any work on the order: while the platform switch is engaged no workspace
       // can trade, and the signal is skipped rather than executed or lost in the queue.
@@ -526,8 +615,20 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
       const equity = Number(account?.equity);
       if (![balance, equity].every((value) => Number.isFinite(value) && value > 0)) return stop(job, 'skipped', 'MetaAPI did not provide valid current account balance and equity.');
 
-      const openTrades = countPositionsAndOrders(state.positions, state.orders);
-      if (openTrades >= Number(item.max_open_positions)) return stop(job, 'skipped', 'Maximum open trades has been reached.');
+      /* Layer 1, before anything is decided from the snapshot: the quote has to be *current*, not merely
+         present. A broker link that stopped delivering keeps positions and equity frozen along with the
+         price, so every number below would be measured against yesterday. The adapter's own freshness rule
+         is deliberately looser (15s) because a protection move on a slightly aged price still beats leaving
+         a position naked; opening a NEW position is the case where acting late costs money, so the tight
+         bound is applied here rather than inside the connection. */
+      const quote = state.price;
+      const freshness = guardQuote({ price: quote, link: state.link, now: now(), maxAgeMs: quoteMaxAgeMs });
+      if (!freshness.ok) return stop(job, 'skipped', freshness.message);
+
+      /* Layer 2: the caps the workspace set for itself, read off the live terminal state rather than this
+         app's own bookkeeping, because a position the user opened on their phone is a position this engine
+         has to see. `guardExposure` holds the arithmetic and the sentences; the history and baseline reads
+         stay here because they are database work, not judgement. */
       if (!Array.isArray(state.deals)) return stop(job, 'skipped', 'MetaAPI daily trade history is unavailable.');
       const providerDailyTrades = countSignalEntryDeals(state.deals);
       const utcDay = utcDate(now());
@@ -540,8 +641,6 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
       }
       const baseline = Number(baselineRows[0].baseline_equity);
       if (!Number.isFinite(baseline) || baseline <= 0) return stop(job, 'skipped', 'The daily account-equity baseline is invalid.');
-      const lossPercent = Math.max(0, ((baseline - equity) / baseline) * 100);
-      if (lossPercent >= Number(item.daily_loss_limit)) return stop(job, 'skipped', 'The daily loss limit has been reached.');
 
       const { rows: localTrades } = await pool.query(
         `SELECT COUNT(*)::int AS count FROM trades
@@ -550,11 +649,19 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
         [job.user_id, item.metaapi_account_id],
       );
       const dailyTrades = Math.max(providerDailyTrades, Number(localTrades[0]?.count || 0));
-      if (dailyTrades >= Number(item.max_daily_trades)) return stop(job, 'skipped', 'Maximum daily trades has been reached.');
+      const exposure = guardExposure({
+        openTrades: countPositionsAndOrders(state.positions, state.orders),
+        maxOpenPositions: item.max_open_positions,
+        dailyTrades,
+        maxDailyTrades: item.max_daily_trades,
+        equity,
+        baselineEquity: baseline,
+        dailyLossLimit: item.daily_loss_limit,
+      });
+      if (!exposure.ok) return stop(job, 'skipped', exposure.message);
 
       const resolved = resolveBrokerSymbol(item.symbol, state.specification ? [state.specification] : []);
       if (!resolved.symbol) return stop(job, 'skipped', resolved.error);
-      const quote = state.price;
       const bid = Number(quote?.bid);
       const ask = Number(quote?.ask);
       const marketPrice = item.side === 'buy' ? ask : item.side === 'sell' ? bid : NaN;
@@ -664,7 +771,15 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
       // above this point reads broker state and can take seconds, which is long enough for an
       // administrator to engage the switch mid-job.
       if (await tradingPaused()) return stop(job, 'skipped', `${PLATFORM_PAUSE_MESSAGE} The order was stopped before it reached the broker.`);
-      const clientId = `SD${String(job.id).replaceAll('-', '').slice(0, 24)}`;
+      /* The quote has aged while everything above ran - the safety nets, the sizing and several database
+         reads are fast but not instant - and this is the last point at which a stale price can still be
+         refused without touching the broker. Same question, same sentence, one more time. */
+      const ageAtSubmit = quoteAgeMs(quote, now());
+      if (ageAtSubmit === null || Math.abs(ageAtSubmit) > quoteMaxAgeMs) return stop(job, 'skipped', STALE_QUOTE_MESSAGE);
+
+      /* One client id for the whole life of the job, deliberately not one per attempt: it is what makes a
+         second send of the same order recognisable as the same order. */
+      const clientId = buildClientId({ jobId: job.id, symbol: resolved.symbol });
       const { rows: tradeRows } = await pool.query(
         `INSERT INTO trades(user_id,signal_id,execution_job_id,metaapi_account_id,symbol,side,quantity,entry_price,stop_loss,take_profit,status,client_id)
          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'submitting',$11)
@@ -672,22 +787,90 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
          RETURNING id`,
         [job.user_id, item.signal_id, job.id, item.metaapi_account_id, resolved.symbol, item.side, volume, marketPrice, hasStopLoss ? stopLoss : null, sendTakeProfit, clientId],
       );
-      if (!tradeRows[0]) return stop(job, 'unknown', 'A trade record already exists for this job; automatic retry was blocked for safety.');
-      tradeId = tradeRows[0].id;
+      if (tradeRows[0]) {
+        tradeId = tradeRows[0].id;
+      } else {
+        /* A row already exists for this job, which since retries exist has two very different meanings:
+           the previous attempt provably never reached the trading server (its row is still 'submitting',
+           and that is only possible because anything less certain is recorded as 'unknown' instead), or
+           nobody can say what the previous attempt did. Only the first may continue, and it continues on
+           the same row with the same client id. */
+        // The claim and the re-stamp are one statement: only a row still at 'submitting' is taken over, and
+        // it is updated to the size and legs *this* attempt will send, because a market that moved in the
+        // meantime would otherwise leave the trade describing a trade nobody is placing.
+        const { rows: prior } = await pool.query(
+          `UPDATE trades SET symbol=$3,side=$4,quantity=$5,entry_price=$6,stop_loss=$7,take_profit=$8,client_id=$9
+           WHERE execution_job_id=$1 AND user_id=$2 AND status='submitting'
+           RETURNING id`,
+          [job.id, job.user_id, resolved.symbol, item.side, volume, marketPrice, hasStopLoss ? stopLoss : null, sendTakeProfit, clientId],
+        );
+        if (!prior[0]) return stop(job, 'unknown', 'A trade record already exists for this job; automatic retry was blocked for safety.');
+        tradeId = prior[0].id;
+      }
+      if (attempt > 1) {
+        const reconciled = await reconcilePriorAttempt({ job, token, accountId: item.metaapi_account_id, clientId, tradeId });
+        if (reconciled.handled) return { status: reconciled.status, message: reconciled.message, tradeId };
+      }
 
       orderSubmitted = true;
-      const result = await trading.createMarketOrder({ token, accountId: item.metaapi_account_id, side: item.side, symbol: resolved.symbol, volume, stopLoss: hasStopLoss ? stopLoss : undefined, takeProfit: sendTakeProfit, clientId });
-      const providerResponse = safeProviderResponse(result, token);
-      if (!successfulTradeResponse(result)) {
-        const message = safeText(result?.message || result?.description || `MetaAPI rejected the order (${result?.stringCode || result?.numericCode || 'unknown provider code'}).`, [token]);
+      /* A broker refusal arrives here as a *thrown* `TradeError` far more often than as a returned object -
+         that is how the SDK documents every order method - so both shapes are collected and read together.
+         Nothing about the submission is re-thrown past this point: from here on the outcome is recorded,
+         whatever it is, because a job that dies with an exception in flight is a job whose broker state
+         nobody can reconstruct. */
+      let result = null;
+      let rejection = null;
+      try {
+        result = await trading.createMarketOrder({ token, accountId: item.metaapi_account_id, side: item.side, symbol: resolved.symbol, volume, stopLoss: hasStopLoss ? stopLoss : undefined, takeProfit: sendTakeProfit, clientId });
+      } catch (error) {
+        rejection = error;
+      }
+      const providerResponse = safeProviderResponse(result || rejection, token);
+      if (rejection || !successfulTradeResponse(result)) {
+        const failure = classifyBrokerFailure({ result: rejection ? null : result, error: rejection, submitted: true });
+        const detail = safeText(failure.message || `MetaAPI rejected the order (${failure.code || 'unknown provider code'}).`, [token]);
+        const message = failure.code ? `${detail} (${failure.code})` : detail;
+
+        if (failure.kind === 'ambiguous') {
+          /* The request may have become an order. Nothing downstream may be assumed about a position that
+             might exist, so this stays the one outcome with no automatic action at all - not a retry, not a
+             rejection, and not an account note blaming the user for a broker that merely stopped talking. */
+          const note = `${message} The order may already have been applied; reconcile the broker account before retrying.`;
+          await pool.query('UPDATE trades SET status=$1,provider_response=$2,error_message=$3 WHERE id=$4 AND user_id=$5', ['unknown', providerResponse, note, tradeId, job.user_id]);
+          await updateJob(job.id, job.user_id, 'unknown', note);
+          return { status: 'unknown', message: note, failure: failure.kind };
+        }
+        if (failure.accountFault && failure.note) await noteAccount(job.user_id, item.metaapi_account_id, failure.note);
+        if (canRetry({ attempt, maxAttempts: maxOrderAttempts, retriable: failure.retriable })) {
+          const delayMs = retryDelayMs({ attempt, baseMs: retryBaseMs, maxMs: retryMaxMs }) ?? 0;
+          if (!retryWindowOpen(delayMs)) return stop(job, 'expired', `${message} There was no time left in the signal's window to try again.`);
+          logger?.info?.(JSON.stringify({
+            level: 'info',
+            message: 'Execution deferred: the order never reached the trading server, so it will be attempted again.',
+            userId: job.user_id,
+            jobId: job.id,
+            attempt,
+            code: failure.code,
+            retryInMs: delayMs,
+          }));
+          // The trade row stays 'submitting' on purpose: the retry continues on this row, and a row that
+          // was rewritten for every attempt is a row whose history nobody can trust.
+          await deferJob(job, { delayMs, message: `${message} Retrying: the request never reached the trading server.` });
+          return { status: 'queued', message, retryInMs: delayMs, failure: failure.kind };
+        }
+        const status = failure.accountFault ? 'failed' : 'rejected';
         await pool.query('UPDATE trades SET status=$1,provider_response=$2,error_message=$3 WHERE id=$4 AND user_id=$5', ['rejected', providerResponse, message, tradeId, job.user_id]);
-        await updateJob(job.id, job.user_id, 'rejected', message);
-        return { status: 'rejected', message };
+        await updateJob(job.id, job.user_id, status, message);
+        return { status, message, failure: failure.kind };
       }
       await pool.query(
         `UPDATE trades SET status='executed',provider_response=$1,broker_order_id=$2,broker_position_id=$3,executed_at=NOW() WHERE id=$4 AND user_id=$5`,
         [providerResponse, result?.orderId ? String(result.orderId) : null, result?.positionId ? String(result.positionId) : null, tradeId, job.user_id],
       );
+      /* A filled order is the proof that whatever was wrong with this account is not wrong now, so the
+         sentence saying so has to leave with it - a stale "check your credentials" under a trading account
+         that is trading is a false alarm the user cannot un-see. */
+      await clearAccountNote(job.user_id, item.metaapi_account_id);
       /* Only now is the ladder written down: a trade that was never opened owns no plan, and a rejected
          order must not leave pending closes for a position that does not exist. A rejected plan write
          cannot undo the order either, so it is logged and the sweep simply has nothing to act on. */
@@ -711,11 +894,26 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
       return { status: 'executed', tradeId, providerResponse };
     } catch (error) {
       const message = safeText(error?.message || error, [token]);
+      const failure = classifyBrokerFailure({ error, submitted: orderSubmitted });
       if (tradeId) {
         const status = orderSubmitted ? 'unknown' : 'rejected';
         await pool.query('UPDATE trades SET status=$1,error_message=$2 WHERE id=$3 AND user_id=$4', [status, message, tradeId, job.user_id]).catch(() => {});
         await updateJob(job.id, job.user_id, status, message).catch(() => {});
         return { status, message };
+      }
+      /* Nothing was written and nothing reached the broker, which makes this the half of a failure where
+         acting is free: an account that cannot be reached at all is worth saying so about once, on the
+         account itself, and a request that provably never left here may be sent again shortly. */
+      if (failure.accountFault) {
+        if (failure.note) await noteAccount(job.user_id, accountId, failure.note);
+        await updateJob(job.id, job.user_id, 'failed', message).catch(() => {});
+        return { status: 'failed', message, failure: failure.kind };
+      }
+      if (canRetry({ attempt, maxAttempts: maxOrderAttempts, retriable: failure.retriable })) {
+        const delayMs = retryDelayMs({ attempt, baseMs: retryBaseMs, maxMs: retryMaxMs }) ?? 0;
+        if (!retryWindowOpen(delayMs)) return stop(job, 'expired', `${message} There was no time left in the signal's window to try again.`);
+        await deferJob(job, { delayMs, message: `${message} Retrying: the request never reached the broker.` });
+        return { status: 'queued', message, retryInMs: delayMs, failure: failure.kind };
       }
       await updateJob(job.id, job.user_id, 'skipped', message).catch(() => {});
       return { status: 'skipped', message };
@@ -1255,7 +1453,7 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
             }
             const result = await trading.closePositionPartially({
               token, accountId, positionId: String(candidate.broker_position_id), volume: sizing.volume,
-              clientId: stableClientId(`${candidate.id}:${candidate.level_index}`),
+              clientId: stableClientId(`${candidate.id}:${candidate.level_index}`, candidate.symbol),
             });
             const providerResponse = safeProviderResponse(result, token);
             if (!successfulTradeResponse(result)) {
@@ -1314,6 +1512,11 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
   return { processJob, captureDailyBaseline, captureUtcDayBaselines, sweepBreakEven, sweepTakeProfitLevels, runtimeEnabled: Boolean(runtimeEnabled) };
 }
 
-export function stableClientId(jobId) {
-  return `SD${crypto.createHash('sha256').update(String(jobId)).digest('hex').slice(0, 24)}`;
+export function stableClientId(seed, symbol = null) {
+  /* One id per *intent*, derived from the durable row rather than a random value, so that a retry of a
+     close the broker may already have applied is findable instead of becoming a second close. The builder
+     is shared with the entry order for a reason: MetaAPI stores this id inside the order comment, so both
+     have to fit the same budget, and a hand-rolled 26-character id next to a 2-character comment is over
+     the limit the broker documents. */
+  return buildClientId({ jobId: seed, symbol });
 }

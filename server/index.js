@@ -907,6 +907,7 @@ app.get('/api/metaapi/linked-accounts', authenticate, asyncRoute(async (req, res
     `SELECT ma.id,ma.metaapi_account_id AS "metaApiAccountId",ma.login,ma.name,ma.platform,ma.state,ma.server,
        ma.managed_by_app AS "managedByApp",ma.created_at AS "createdAt",
        ma.inactivity_status AS "inactivityStatus",ma.inactivity_reason AS "inactivityReason",
+       ma.execution_note AS "executionNote",ma.execution_note_at AS "executionNoteAt",
        COALESCE(u.last_active_at,u.last_login,u.created_at) AS "lastActiveAt"
      FROM metaapi_accounts ma JOIN users u ON u.id=ma.user_id
      WHERE ma.user_id=$1 ORDER BY ma.created_at DESC`,

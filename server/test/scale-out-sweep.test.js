@@ -72,9 +72,13 @@ function fakePool({ item = {}, levels = [], claimFails = false, armed = true } =
  */
 function fakeBroker({ price, positions = [], closeResult, closeError, modifyResult, modifyError, quote = price } = {}) {
   const calls = [];
+  /* MetaAPI stamps every price it delivers with a `time`, and the engine now refuses to open a NEW position
+     against a quote it cannot date. The fixture supplies the field the way a real account does, in the one
+     place all four order-path tests share; a test that cares about quote age passes its own `time`. */
+  const priced = quote && !quote.time ? { ...quote, time: new Date().toISOString() } : quote;
   const state = {
     account: { state: 'DEPLOYED' }, accountInformation: { balance: 1000, equity: 1000 },
-    positions, orders: [], deals: [], specification: SPEC, price: quote,
+    positions, orders: [], deals: [], specification: SPEC, price: priced,
   };
   return {
     calls,

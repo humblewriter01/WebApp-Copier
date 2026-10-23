@@ -162,7 +162,19 @@ export async function initializeDatabase() {
     CREATE UNIQUE INDEX IF NOT EXISTS signals_telegram_event_unique_idx
       ON signals(user_id,channel_id,telegram_message_id)
       WHERE source='telegram' AND channel_id IS NOT NULL AND telegram_message_id IS NOT NULL;
+    /* A transient broker failure is retried, and the wait is the point: `next_attempt_at` is when the
+     * queue may look at the job again, and the worker's claim refuses anything whose time has not come.
+     * It is a column on the job rather than a timer in the process because a worker that restarts must not
+     * lose the backoff - or, worse, resume without it and hammer a broker that had just asked it to stop. */
+    ALTER TABLE execution_jobs ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ;
     CREATE INDEX IF NOT EXISTS execution_jobs_ready_idx ON execution_jobs(status,created_at) WHERE status='queued';
+    CREATE INDEX IF NOT EXISTS execution_jobs_backoff_idx ON execution_jobs(next_attempt_at) WHERE status='queued' AND next_attempt_at IS NOT NULL;
+    /* The one sentence a user needs when their trading account cannot trade at all, kept on the account
+     * rather than on each signal: it is the account that is broken, and every signal would otherwise
+     * repeat the same explanation. Cleared by the engine the moment an order goes through, so a resolved
+     * problem stops being announced. */
+    ALTER TABLE metaapi_accounts ADD COLUMN IF NOT EXISTS execution_note TEXT;
+    ALTER TABLE metaapi_accounts ADD COLUMN IF NOT EXISTS execution_note_at TIMESTAMPTZ;
     CREATE INDEX IF NOT EXISTS execution_jobs_stale_idx ON execution_jobs(status,locked_at) WHERE status='processing';
     CREATE INDEX IF NOT EXISTS trades_user_created_idx ON trades(user_id,created_at DESC);
     /* Break-even stop management for positions Signal Desk opened. One row per
