@@ -100,6 +100,33 @@ test('an ambiguous number is named, not coin-flipped', () => {
   assert.equal(tied.executionReady, false);
 });
 
+test('what a real channel sent on a Saturday, read exactly as it arrived', () => {
+  /* Quoted from the screenshots a user reported, punctuation and emoji included, because each of these three
+     rows was wrong in a different direction: a dashed stop read as no stop, a section heading read as a
+     trading symbol, and a win-post read as a signal with a hole in it. */
+  const manage = parseSignal('GOLD BUY MORE NOW !\n\nPrice : 4026.00 - 4016.00\n\nSL - 4011.00\nTP - 50Pips / 100Pips\n\nManage Layering And Money Management !');
+  assert.equal(manage.symbol, 'XAUUSD', 'the metal, not the word MANAGE from the next line');
+  assert.equal(manage.entryPrice, 4026, 'a zone is read, at the bound that is least favourable to a buy');
+  assert.equal(manage.stopLoss, 4011, 'a dash is a separator, not a minus sign in front of nothing');
+  assert.equal(manage.takeProfitPips, 50, 'two pip targets are a scale-out plan, so the first is the row\'s');
+  assert.equal(manage.takeProfit, null, 'and neither number is dressed up as a price');
+  assert.equal(manage.executionReady, true);
+  assert.equal(manage.parseError, null, 'nothing about this message is missing');
+
+  const winpost = parseSignal('✅ R1 GOLD BUY : 50PIPS\n✅ R2 GOLD BUY : 50PIPS\n✅ R3 GOLD BUY : 70PIPS\n\nWinning streak as usual when you trade with Sir Adrielle right ? So guys, enjoy your profit ! ⚡');
+  assert.equal(winpost.side, 'buy', 'the direction is genuine - it is the price that is absent');
+  assert.equal(winpost.hasPriceLevel, false, '50PIPS after a role number is a report of a closed trade, not a level to enter at');
+  const held = captureSafety({ parsed: winpost, source: 'telegram', settings: { fallbackStopLossPoints: 500, fallbackTakeProfitPoints: 1000, blockExecutionWithoutStopLoss: true, blockExecutionWithoutTakeProfit: true } });
+  assert.equal(held.executionReady, false, 'and no fallback turns a win-post into an order');
+  assert.match(held.parseError, /states a direction but no price/);
+
+  const chatter = parseSignal('Should I release more setups, guys ? Because I see the tap-tap reactions are so damn slow ! 😔');
+  assert.equal(chatter.symbol, null, 'no word in a sentence is a trading symbol');
+  assert.equal(chatter.side, null);
+  assert.equal(chatter.hasPriceLevel, false);
+  assert.equal(needsLayer2(chatter), false, 'and asking a model about it would cost a request to learn nothing');
+});
+
 /* --------------------------------------------------------------------- Layer 2: the fallback --------------------------------------------------------------------- */
 
 test('Layer 2 fills a gap Layer 1 could not read, and says that it did', async () => {
