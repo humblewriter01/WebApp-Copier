@@ -164,8 +164,14 @@ test('the header of a card cannot be squeezed out of the screen by its own badge
   // The truncation moved the only long text in a card, which left the header as the thing that runs out of
   // room on a phone: a channel title on the left, four badges on the right, and no rule saying which one
   // gives way. It should be the title, never the state of the signal.
-  assert.match(styles, /\.signal-top\{[^}]*gap:10px/, 'the two halves get room to breathe before either is squeezed');
-  assert.match(styles, /\.signal-top>div\{min-width:0\}/, 'and the text side is allowed to shrink below its content, which is what makes an ellipsis possible at all');
-  assert.match(styles, /\.signal-flags\{[^}]*flex:0 0 auto/, 'while the badges keep their width');
+  /* The first answer to this was wrong in a way worth writing down: it made the badges rigid
+     (`flex:0 0 auto`) so they would not be squeezed - and a container that cannot shrink is laid out at its
+     content's full width, so its own `flex-wrap` had nothing narrower to wrap into, the row overflowed the
+     card, and the one item that could give way was the title underneath it. Give way in two steps instead:
+     the row may break, and the badge container may shrink. `signal-card-badge-row-ui.test.mjs` owns the
+     detail; this is here so the rigid version cannot quietly return to this card. */
+  assert.match(styles, /\.signal-top\{[^}]*flex-wrap:wrap/, 'the badges may drop onto a line of their own under the title');
+  assert.match(styles, /\.signal-flags\{[^}]*flex:0 1 auto/, 'and the row may shrink to what the card can actually offer');
+  assert.match(styles, /\.signal-top>div\{min-width:0\}/, 'the text side may shrink below its content, which is what makes an ellipsis possible at all');
   assert.match(styles, /\.signal-top strong,\.signal-source\{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap\}/, 'so a long channel name clips instead of pushing the outcome off the edge');
 });

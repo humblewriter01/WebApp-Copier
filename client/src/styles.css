@@ -13,13 +13,49 @@
 .signal-item-compact .signal-outcome-note{margin-top:7px}
 
 
-/* A signal card's header is where a phone runs out of room first: the symbol and its source on the left,
-   a row of badges on the right, and no room for either. The text lines clip with an ellipsis and the badges
-   keep their width, so the state of the signal is never the thing that gets squeezed off the edge. */
-.signal-top{gap:10px}
+/* A signal card's header is where a phone runs out of room first: the symbol and its source on the left, up
+   to four badges on the right (side, outcome, and a flag per missing leg), and no room for either.
+
+   The row has to be able to give way in two steps, and the first attempt here got the order wrong: with
+   `flex:0 0 auto` on the badge container it could not shrink at all, so its width stayed at *max-content* -
+   every badge on one line, whatever the card had - and `flex-wrap` inside it never had a narrower box to wrap
+   into. The title div then absorbed the whole squeeze (that is what `min-width:0` buys it), the overflowing
+   badges ran over the top of it, and the last one hung off the right edge of the screen. A badge with no
+   `white-space` of its own took the remaining pressure by breaking its own label, so "MISSING TP" arrived
+   split over two lines inside a pill half as wide as its word: squished, not wrapped.
+
+   So: the header row wraps as a whole, which is what puts the badges on a line of their own underneath the
+   title when they genuinely do not fit; the badge container may shrink (`flex:0 1 auto`) so its own
+   `flex-wrap` can engage when they almost fit; a badge keeps its label on one line and its width, and the
+   pressure lands on the text instead, which is secondary and is repeated in full on the card below.
+
+   It is worth stating why no arrangement of one line could ever have worked: side + outcome + a flag for each
+   missing leg measures roughly 366px with its gaps at these font sizes, and the narrowest viewport the app
+   supports is 320px (`body{min-width:320px}`). Four pills do not fit next to a title on a phone, so they
+   have to be allowed to stop being one row. */
+.signal-top{gap:8px 10px;flex-wrap:wrap}
 .signal-top>div{min-width:0}
-.signal-flags{flex:0 0 auto}
+.signal-flags{flex:0 1 auto;margin-left:auto}
 .signal-top strong,.signal-source{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.signal-flags .badge{white-space:nowrap;flex:0 0 auto}
+
+/* Every other card header that sets a title beside status pills gets the same two concessions - the row may
+   break, and a child may shrink below its content. A panel heading is never ellipsized the way a signal
+   card's is, because nothing else on the page restates it: the badges drop instead. */
+.panel-heading{flex-wrap:wrap;gap:8px 14px}
+.panel-heading>*{min-width:0}
+.panel-heading .badge,.panel-heading .count-badge{flex:0 0 auto;white-space:nowrap}
+
+/* The admin's signal cards and the plan cards are the same construction, so they get the same give: a rigid
+   right-hand column is what turns a narrow screen into a title of zero width. `.admin-signal-actions` is a
+   column of buttons, so it is allowed to shrink and to move under the row - never *wrapped*, which in a column
+   would set its buttons side by side - and that relaxation is written in its own rule further down this file,
+   where a duplicate up here would simply be outranked. The plan card's pill is a phrase ("Deployed default"),
+   and a pill that breaks mid-phrase is the second symptom of the original bug, so it keeps its label whole. */
+.admin-signal-row{flex-wrap:wrap}
+.pricing-plan-head{flex-wrap:wrap}
+.pricing-plan-head>div{min-width:0}
+.pricing-plan-head .badge{flex:0 0 auto;white-space:nowrap}
 
 /* Production UX: visible keyboard focus, touch-sized controls, and readable secondary text. */
 :root{--sidebar-width:244px;--focus-ring:#087f8c}
@@ -469,7 +505,7 @@ button,input,textarea,select{touch-action:manipulation}
   .health-queue strong { font-size: 12.5px; overflow-wrap: anywhere; }
 }
 /* Live-trading warning: asked once in a dialog, then kept as one quiet line under the switch. */
-.modal-backdrop{position:fixed;inset:0;z-index:60;background:rgba(16,26,38,.5);display:grid;place-items:center;padding:20px;backdrop-filter:blur(2px)}.modal{max-width:480px;width:100%;box-shadow:0 24px 60px rgba(13,25,38,.28)}.risk-warning-modal h3{margin:0 0 10px;font:700 16px Manrope,sans-serif;color:#22344b}.risk-warning-body{border-left:4px solid #c7352b;background:#fff6f5;color:#7c2e29;border-radius:8px;padding:12px 14px;margin:0 0 12px;font-size:13px;font-weight:700;line-height:1.55}.risk-warning-points{margin:0 0 16px;padding-left:18px;display:flex;flex-direction:column;gap:6px}.risk-warning-points li{font-size:12px;color:#59697e;line-height:1.5}.modal-actions{display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}.risk-reminder{display:flex;flex-direction:column;gap:6px;margin:10px 0 0;padding:10px 12px;border:1px solid #e6ebf0;background:#f8fafb;border-radius:9px;font-size:12px;color:#4f5f74;line-height:1.5}.risk-reminder>span{font-weight:600;color:#5a4a24}.risk-reminder-details summary{cursor:pointer;font-size:11px;color:#657286}.risk-reminder-details ul{margin:7px 0 0;padding-left:16px;display:flex;flex-direction:column;gap:5px}.risk-reminder-details li{font-size:11px;color:#657286;line-height:1.5}.risk-reminder-compact{margin:0 0 14px}.signal-flags{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}.signal-outcome{font-size:9px;text-transform:uppercase;letter-spacing:.04em;background:#f1f4f7;color:#5d6a7d}.signal-outcome.tone-good{background:#e6f7ef;color:#207554}.signal-outcome.tone-busy{background:#eaf2fb;color:#2c5c86}.signal-outcome.tone-bad{background:#fff0ed;color:#a43f35}.signal-outcome-note{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin:6px 0 0;font-size:11px;color:#7a6a3f;background:#fdf8ec;border-left:3px solid #d9b45c;border-radius:0 7px 7px 0;padding:7px 10px;line-height:1.5}.signal-item.outcome-bad .signal-outcome-note{color:#8d362f;background:#fdf1ef;border-left-color:#c7352b}.signal-capture-note{margin:0 0 12px}
+.modal-backdrop{position:fixed;inset:0;z-index:60;background:rgba(16,26,38,.5);display:grid;place-items:center;padding:20px;backdrop-filter:blur(2px)}.modal{max-width:480px;width:100%;box-shadow:0 24px 60px rgba(13,25,38,.28)}.risk-warning-modal h3{margin:0 0 10px;font:700 16px Manrope,sans-serif;color:#22344b}.risk-warning-body{border-left:4px solid #c7352b;background:#fff6f5;color:#7c2e29;border-radius:8px;padding:12px 14px;margin:0 0 12px;font-size:13px;font-weight:700;line-height:1.55}.risk-warning-points{margin:0 0 16px;padding-left:18px;display:flex;flex-direction:column;gap:6px}.risk-warning-points li{font-size:12px;color:#59697e;line-height:1.5}.modal-actions{display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}.risk-reminder{display:flex;flex-direction:column;gap:6px;margin:10px 0 0;padding:10px 12px;border:1px solid #e6ebf0;background:#f8fafb;border-radius:9px;font-size:12px;color:#4f5f74;line-height:1.5}.risk-reminder>span{font-weight:600;color:#5a4a24}.risk-reminder-details summary{cursor:pointer;font-size:11px;color:#657286}.risk-reminder-details ul{margin:7px 0 0;padding-left:16px;display:flex;flex-direction:column;gap:5px}.risk-reminder-details li{font-size:11px;color:#657286;line-height:1.5}.risk-reminder-compact{margin:0 0 14px}.signal-flags{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}.signal-outcome{font-size:9px;text-transform:uppercase;letter-spacing:.04em;background:#f1f4f7;color:#5d6a7d}.signal-outcome.tone-good{background:#e6f7ef;color:#207554}.signal-outcome.tone-busy{background:#eaf2fb;color:#2c5c86}.signal-outcome.tone-bad{background:#fff0ed;color:#a43f35}.signal-outcome-note{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin:6px 0 0;font-size:11px;color:#7a6a3f;background:#fdf8ec;border-left:3px solid #d9b45c;border-radius:0 7px 7px 0;padding:7px 10px;line-height:1.5}.signal-item.outcome-bad .signal-outcome-note{color:#8d362f;background:#fdf1ef;border-left-color:#c7352b}.signal-capture-note{margin:0 0 12px}
 @media(max-width:700px){.modal-actions .button{flex:1 1 40%}.signal-outcome-note{flex-direction:column;align-items:flex-start;gap:4px}}
 /* ---- captured signals: what a message lacked, and how far it got ---- */
 .panel-heading-actions{display:flex;align-items:center;gap:14px}.signal-flag-badge{font-size:9px;letter-spacing:.04em;text-transform:uppercase;background:#f1f4f7;color:#5d6a7d}.signal-flag-badge.tone-warn{background:#fdf6e6;color:#8a6a1f}.signal-flag-badge.tone-good{background:#e6f7ef;color:#207554}.signal-item{position:relative}.signal-delete-button{border:1px solid #e8ebf0;background:#fff;color:#a85049;border-radius:8px;width:26px;height:26px;line-height:1;font-size:13px;flex:0 0 auto;margin-left:10px;transition:.15s}.signal-delete-button:hover:not(:disabled){background:#fff0ed;border-color:#f0c8c2;color:#8d362f}.signal-delete-button:disabled{opacity:.55}
@@ -500,7 +536,7 @@ button,input,textarea,select{touch-action:manipulation}
 @media(max-width:700px){.profile-fact{flex-direction:column;align-items:flex-start;gap:3px}.profile-fact dd{text-align:left}}
 
 /* ---- admin data management ---- */
-.admin-signal-filters{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;align-items:end;margin-bottom:14px}.admin-signal-filters label{font-size:11px;font-weight:700;color:#344258;display:flex;flex-direction:column;gap:6px}.admin-signal-filters input{border:1px solid #dce2ea;border-radius:9px;padding:9px 10px;font:inherit;font-size:12px;color:#172338;background:#fff}.admin-signal-filters .button{padding:9px 14px}.admin-signal-row{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;padding:12px 0;border-top:1px solid #eff1f4}.admin-signal-row>div{min-width:0}.admin-signal-row strong{display:block;font-size:12px;color:#26364d}.admin-signal-row .admin-signal-sub{display:block;color:#8792a3;font-size:10px;margin-top:4px;overflow-wrap:anywhere}.admin-signal-row p{margin:6px 0 0;font-size:11px;color:#526074;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}.admin-signal-actions{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex:0 0 auto}.admin-signal-actions .button{padding:7px 11px;font-size:11px}.admin-purge-card{border-color:#efd2cf}.admin-purge-card h3{color:#8c332c}.admin-purge-preview{margin:0;font-size:12px;color:#5c6a80;line-height:1.55}.admin-signal-linked{font-size:10px;color:#8a6a1f;background:#fdf6e6;border-radius:100px;padding:4px 8px;font-weight:700}@media(max-width:900px){.admin-signal-filters{grid-template-columns:1fr 1fr}}
+.admin-signal-filters{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;align-items:end;margin-bottom:14px}.admin-signal-filters label{font-size:11px;font-weight:700;color:#344258;display:flex;flex-direction:column;gap:6px}.admin-signal-filters input{border:1px solid #dce2ea;border-radius:9px;padding:9px 10px;font:inherit;font-size:12px;color:#172338;background:#fff}.admin-signal-filters .button{padding:9px 14px}.admin-signal-row{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;padding:12px 0;border-top:1px solid #eff1f4}.admin-signal-row>div{min-width:0}.admin-signal-row strong{display:block;font-size:12px;color:#26364d}.admin-signal-row .admin-signal-sub{display:block;color:#8792a3;font-size:10px;margin-top:4px;overflow-wrap:anywhere}.admin-signal-row p{margin:6px 0 0;font-size:11px;color:#526074;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}.admin-signal-actions{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex:0 1 auto;margin-left:auto}.admin-signal-actions .button{padding:7px 11px;font-size:11px}.admin-purge-card{border-color:#efd2cf}.admin-purge-card h3{color:#8c332c}.admin-purge-preview{margin:0;font-size:12px;color:#5c6a80;line-height:1.55}.admin-signal-linked{font-size:10px;color:#8a6a1f;background:#fdf6e6;border-radius:100px;padding:4px 8px;font-weight:700}@media(max-width:900px){.admin-signal-filters{grid-template-columns:1fr 1fr}}
 /* Accordion sections on the advanced page: a light bar with the section's state on the right, a chevron
    that turns when it opens, and the controls folded away underneath. The bar is the only thing a reader
    scanning the page has to parse, so the heading carries a one-line summary and nothing longer. */
