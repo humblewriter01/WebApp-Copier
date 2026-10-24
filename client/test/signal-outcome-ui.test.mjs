@@ -123,9 +123,12 @@ test('an unstated entry is described as a market order, never as an unclear mess
 test('the badge is only earned by a message that actually stated a level', () => {
   // A row that produced a word and nothing else is a bulletin, and it already says so.
   const hype = { id: 'h', symbol: 'SHOULD', side: 'buy', source: 'telegram', status: 'unparsed', entryPrice: null, stopLoss: null, takeProfit: null };
-  assert.deepEqual(signalBadges(hype).map((badge) => badge.key), ['missing-stop', 'missing-target']);
+  /* A row that produced a word and nothing else is a bulletin, and it already says so - so it now wears no
+     missing-leg pills either. "Missing SL" is advice about a signal, and a message that never stated a price
+     is not a signal with a hole in it: the pair used to appear on a captured "Should I release more setups?"
+     and told the user to go fix a trade that did not exist. */
+  assert.deepEqual(signalBadges(hype), [], 'nothing is missing from a message that asked for nothing');
   assert.equal(signalHasTradingData(hype), true, 'the loose test stays as it is - it answers a different question');
-  assert.equal(signalBadges(hype).some((badge) => badge.key === 'market'), false, 'a message with no price in it is not a market order');
 
   // An entry that is present has no story to tell about its absence.
   const limited = { ...MARKET_ROW, entryPrice: 4050 };

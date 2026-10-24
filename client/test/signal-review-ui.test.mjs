@@ -248,7 +248,9 @@ test('saved fallback distances come back into the fields, and an empty one is no
 });
 
 test('a missing leg is described as the choice it now is', () => {
-  const signal = { id: 'signal-1', source: 'telegram', status: 'skipped', stopLoss: null, takeProfit: null };
+  // An entry is stated here on purpose: the missing-leg pills are only earned by a message that named a level,
+  // and this test is about what those pills say once they are.
+  const signal = { id: 'signal-1', source: 'telegram', status: 'skipped', entryPrice: 1.085, stopLoss: null, takeProfit: null };
   const badges = signalBadges(signal);
   assert.deepEqual(badges.map((badge) => badge.key), ['missing-stop', 'missing-target']);
   assert.match(badges[0].title, /fallback distance in your Safety settings can supply one/i);

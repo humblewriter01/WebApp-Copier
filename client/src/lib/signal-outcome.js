@@ -34,6 +34,22 @@ export function signalHasTradingData(signal) {
 }
 
 /**
+ * Whether the row carries a number that could be a price - as a level or as a distance.
+ *
+ * This is the client's copy of the server's `hasPriceLevel`, and it is the line between "the channel asked
+ * for a trade and forgot a leg" and "this message is not about a trade". It is recomputed from the stored
+ * legs rather than shipped as a flag, because it is a question with one honest answer: a row has a price if
+ * its price columns are not all null.
+ */
+export function signalStatesAPrice(signal) {
+  return signal?.entryPrice != null
+    || signal?.stopLoss != null
+    || signal?.takeProfit != null
+    || signal?.stopLossPips != null
+    || signal?.takeProfitPips != null;
+}
+
+/**
  * A free or unlinked workspace still captures every message; what it sees is an outcome that names
  * the missing piece. Upgrade wording is recognised so the panel can offer the way forward instead of
  * leaving the user to conclude that Signal Desk ignored them.
@@ -83,17 +99,21 @@ export function signalBadges(signal) {
      one look identical. Deliberately keyed off a *stated* price rather than `signalHasTradingData`, which
      also answers true for a row that only yielded a word for a symbol - that one has nothing to be a market
      order about, and it already wears a "Missing SL" badge. */
-  const statesDistance = signal?.stopLossPips != null || signal?.takeProfitPips != null;
-  if (signal?.entryPrice == null && signal?.source === 'telegram' && (signal?.stopLoss != null || signal?.takeProfit != null || statesDistance)) {
+  if (signal?.entryPrice == null && signal?.source === 'telegram' && signalStatesAPrice(signal)) {
     badges.push({ key: 'market', label: 'Market', tone: 'muted', title: 'The message did not name an entry price, so it is not waiting for one: it goes to the broker as a market order, filled at the current ask for a buy or the current bid for a sell.' });
   }
   /* A stop given as `SL 30 pips` is not a missing stop, and saying it is would point the reader at a Safety
      setting they do not need to touch - the distance is there, it is only in the unit only the broker can
      turn into a price. So every "missing" badge is checked against both forms of the leg. */
-  if (signal?.stopLoss == null && signal?.stopLossPips == null && signal?.source === 'telegram') {
+  /* The missing-leg pills are advice, and advice has to be earned: "your signal has no stop" is true of a
+     message that named an entry and a target, and noise on a message that was never about a trade. The card
+     in the screenshot wearing `Missing SL` and `Missing TP` over "Should I release more setups, guys?" was
+     the second case - two pills telling a user to fix a signal that did not exist. */
+  const missingLegs = signal?.source === 'telegram' && signalStatesAPrice(signal);
+  if (signal?.stopLoss == null && signal?.stopLossPips == null && missingLegs) {
     badges.push({ key: 'missing-stop', label: 'Missing SL', tone: 'warn', title: 'No stop loss in the message. A fallback distance in your Safety settings can supply one; otherwise nothing is sent while the stop-loss block is on, and with that block off the trade goes out unprotected, which is recorded as an override.' });
   }
-  if (signal?.takeProfit == null && signal?.takeProfitPips == null && signal?.source === 'telegram') {
+  if (signal?.takeProfit == null && signal?.takeProfitPips == null && missingLegs) {
     badges.push({ key: 'missing-target', label: 'Missing TP', tone: 'muted', title: 'No target in the message. Your Safety settings decide whether that stops an order: a fallback distance can supply a target, and with the take-profit block off the position is opened with nothing planned to close it.' });
   }
   /* Provenance, on the face of the row. Two of these legs came from a model, and a number a model reported

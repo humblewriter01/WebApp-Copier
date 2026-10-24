@@ -143,7 +143,9 @@ test('the Signals page and the Overview render the identical header, so the fix 
   const thin = {
     id: 'thin', symbol: 'XAUUSD', side: 'buy', source: 'telegram', channelTitle: 'Gold Signals',
     message: 'Gold Buy now\n\nSL: 4041.50', status: 'unparsed',
-    entryPrice: null, stopLoss: null, takeProfit: null, createdAt: '2026-10-24T00:16:00.000Z',
+    // One level stated, so the row still earns its missing-leg pills: the crowded header this test exists for
+    // is now the *signal* case, since a message with no price in it is left with one quiet outcome pill.
+    entryPrice: 4041.5, stopLoss: null, takeProfit: null, createdAt: '2026-10-24T00:16:00.000Z',
   };
   const render = (compact) => renderToStaticMarkup(React.createElement(SignalTable, {
     signals: [thin], channelCount: 1, compact, onOpenTelegram() {}, onUpgrade() {},
@@ -161,4 +163,101 @@ test('the Signals page and the Overview render the identical header, so the fix 
   assert.equal(badgesInMarkup(full), 4, 'and not one badge lives outside it, which is what would put it over the title');
   assert.equal(badgesInMarkup(compact), 4, 'same on the Overview card');
   assert.match(full, /<div class="signal-top">/, 'and the header is still a single flex row - the one that is now allowed to break');
+});
+
+/* ------------------------- the header a real channel produces -------------------------
+ *
+ * Three captured messages, quoted exactly as they arrived, run through the real server parser and the real
+ * safety decision, then rendered. This is the whole point of the header: it is not decoration under a title,
+ * it is the user's only view of what the platform understood - so the pair of them has to be tested together.
+ * A UI test that builds its own rows by hand can pass while every one of those rows is wrong.
+ */
+const { parseSignal } = await import('../../server/services/signal-parser.js');
+const { captureSafety } = await import('../../server/services/signal-safety.js');
+
+const SETTINGS_WITH_NETS = {
+  fallbackStopLossPoints: 500,
+  fallbackTakeProfitPoints: 1000,
+  blockExecutionWithoutStopLoss: true,
+  blockExecutionWithoutTakeProfit: true,
+};
+
+/** The row `saveSignal` writes, as the API hands it back. */
+function storedRow(message, { id = 'row', channelTitle = 'ADRIELLE TRADERS CIRCLE' } = {}) {
+  const parsed = parseSignal(message);
+  const safety = captureSafety({ parsed, source: 'telegram', settings: SETTINGS_WITH_NETS });
+  return {
+    id, source: 'telegram', channelTitle, message,
+    symbol: parsed.symbol, side: parsed.side,
+    entryPrice: parsed.entryPrice, stopLoss: parsed.stopLoss, takeProfit: parsed.takeProfit,
+    stopLossPips: parsed.stopLossPips, takeProfitPips: parsed.takeProfitPips,
+    executionReady: safety.executionReady, status: safety.executionReady ? 'received' : 'unparsed',
+    executionNote: safety.parseError, createdAt: '2026-10-23T16:01:30.000Z',
+  };
+}
+
+const CHATTER = 'Should I release more setups, guys ? Because I see the tap-tap reactions are so damn slow ! 😔';
+const MANAGE = 'GOLD BUY MORE NOW !\n\nPrice : 4026.00 - 4016.00\n\nSL - 4011.00\nTP - 50Pips / 100Pips\n\nManage Layering And Money Management !';
+const WINPOST = '✅ R1 GOLD BUY : 50PIPS\n✅ R2 GOLD BUY : 50PIPS\n✅ R3 GOLD BUY : 70PIPS\n\nWinning streak as usual when you trade with Sir Adrielle right ? So guys, enjoy your profit ! ⚡';
+
+test('a chat message wears one honest pill and nothing else', async () => {
+  const { default: SignalTable } = await bundle('SignalTable.jsx');
+  const markup = renderToStaticMarkup(React.createElement(SignalTable, {
+    signals: [storedRow(CHATTER)], channelCount: 1, onOpenTelegram() {}, onUpgrade() {},
+  }));
+  assert.equal(markup.includes('Missing SL'), false, 'no stop is missing from a message that never asked for a trade');
+  assert.equal(markup.includes('Missing TP'), false, 'and neither is a target');
+  assert.equal(/>received</.test(markup), false, 'and the pill that read "received" because no direction was found is gone: a card saying RECEIVED / NO CLEAR SIGNAL said the same nothing twice');
+  assert.equal((markup.match(/class="badge/g) || []).length, 1, 'one pill, the outcome');
+  assert.match(markup, /No clear signal/, 'which is the truth of it');
+  assert.match(markup, /<strong>Signal message<\/strong>/, 'titled by what it is, not by a word the parser mistook for a symbol');
+});
+
+test('an entry zone with a dashed stop and a pip target is read, and says so on the header', async () => {
+  const { default: SignalTable } = await bundle('SignalTable.jsx');
+  const row = storedRow(MANAGE);
+  assert.equal(row.symbol, 'XAUUSD', 'the metal is named by the word GOLD; "Manage Layering" is not a symbol');
+  assert.equal(row.entryPrice, 4026, 'the zone 4026.00 - 4016.00 is credited at its least favourable bound for a buy');
+  assert.equal(row.stopLoss, 4011, 'SL - 4011.00 is a stop loss, dash and all - the pill that used to sit here said it was missing');
+  assert.equal(row.takeProfitPips, 50, 'TP - 50Pips / 100Pips is a scale-out plan, so the first target is the row\'s and the rest stay in the message');
+  assert.equal(row.executionReady, true, 'and nothing about it is blocked');
+
+  const markup = renderToStaticMarkup(React.createElement(SignalTable, {
+    signals: [row], channelCount: 1, onOpenTelegram() {}, onUpgrade() {},
+  }));
+  assert.match(markup, /<strong>XAUUSD<\/strong>/);
+  assert.equal(markup.includes('Missing SL'), false, 'the missing-stop pill is gone, which was the complaint');
+  assert.match(markup, /<span>SL 4011<\/span>/, 'the stop is shown as a price');
+  assert.match(markup, /<span>TP 50 pips<\/span>/, 'the target is shown as a distance, never as "TP 50"');
+  assert.equal((markup.match(/class="badge/g) || []).length, 3, 'side, outcome, and one flag that is information rather than a complaint');
+  assert.match(markup, /class="badge signal-flag-badge tone-muted"[^>]*>Pips TP 50</, 'which is the badge saying the target is a distance, so the row is not read as having no plan');
+});
+
+test('a win-post is refused for the reason a user can act on, without inventing a missing leg', async () => {
+  const { default: SignalTable } = await bundle('SignalTable.jsx');
+  const row = storedRow(WINPOST);
+  assert.equal(row.symbol, 'XAUUSD');
+  assert.equal(row.side, 'buy', 'the direction is real - R1/R2/R3 GOLD BUY says buy gold');
+  assert.equal(row.entryPrice, null, 'and there is no price in it, because it is a report of trades already closed');
+  assert.equal(row.executionReady, false);
+
+  const markup = renderToStaticMarkup(React.createElement(SignalTable, {
+    signals: [row], channelCount: 1, onOpenTelegram() {}, onUpgrade() {},
+  }));
+  assert.equal(markup.includes('Missing SL'), false, 'no missing-leg pill, because nothing was omitted from a trade this message never proposed');
+  assert.match(markup, /Needs [Rr]eview/);
+  assert.match(markup, /states a direction but no price/, 'the sentence under it names the actual reason - and it says the fallbacks were deliberately not used');
+});
+
+test('the delete control travels with the pills it sits beside, so it is never stranded on a line of its own', async () => {
+  const { default: SignalTable } = await bundle('SignalTable.jsx');
+  const markup = renderToStaticMarkup(React.createElement(SignalTable, {
+    signals: [storedRow(MANAGE)], channelCount: 1, onOpenTelegram() {}, onUpgrade() {}, onDeleteSignal() {},
+  }));
+  /* The button used to be the third child of `.signal-top`, after the pill row: with the row wrapping on a
+     phone, it dropped onto a line of its own, alone on the left, under the badges it belongs to. It is now the
+     last item inside the wrapping group, so it wraps with the pills and stays at their end. */
+  assert.match(markup, /<\/span><button class="signal-delete-button"[^>]*>✕<\/button><\/div><\/div>/, 'the control closes the flags row, inside it');
+  assert.equal(declared('.signal-flags')['flex-wrap'], 'wrap', 'and that row is still the one allowed to break');
+  assert.equal(/\.signal-flags\s*\{[^}]*flex:0 0 auto/.test(css), false, 'still not rigid');
 });
