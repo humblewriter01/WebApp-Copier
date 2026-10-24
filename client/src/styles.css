@@ -4,6 +4,23 @@
 .brand-mark{overflow:hidden;padding:0;background:transparent;flex:none}.brand-mark img{display:block;width:100%;height:100%;object-fit:cover;border-radius:inherit}.install-button{margin-top:12px}.telegram-setup ol{margin:8px 0 0;padding-left:19px}.telegram-setup li{margin-top:5px}.telegram-setup a{color:inherit;font-weight:700}
 
 
+/* Overview: a bounded list with a bounded amount of text per row. The truncation itself happens in
+   `signal-summary.js` so that it is testable and identical on every viewport; these rules only keep the
+   shortened card visually shorter than the full one on the Signals page. */
+.dashboard-signals-note{margin:0 0 13px;font-size:11px;line-height:1.5;color:#8793a4}
+.signal-item-compact{padding:13px 0}
+.signal-item-compact .signal-message{font-size:11px;line-height:1.45;margin:8px 0 7px}
+.signal-item-compact .signal-outcome-note{margin-top:7px}
+
+
+/* A signal card's header is where a phone runs out of room first: the symbol and its source on the left,
+   a row of badges on the right, and no room for either. The text lines clip with an ellipsis and the badges
+   keep their width, so the state of the signal is never the thing that gets squeezed off the edge. */
+.signal-top{gap:10px}
+.signal-top>div{min-width:0}
+.signal-flags{flex:0 0 auto}
+.signal-top strong,.signal-source{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
 /* Production UX: visible keyboard focus, touch-sized controls, and readable secondary text. */
 :root{--sidebar-width:244px;--focus-ring:#087f8c}
 html,body,#root{min-height:100%;min-height:100dvh}

@@ -1,6 +1,7 @@
 import React from 'react';
 import { LISTENER_NOT_ATTACHED_MESSAGE, useTelegramStatus, WAITING_FOR_MESSAGES_MESSAGE } from './TelegramStatus.jsx';
 import { signalBadges, signalOutcomeView } from '../lib/signal-outcome.js';
+import { DASHBOARD_SIGNAL_LIMIT, summarizeSignalMessage } from '../lib/signal-summary.js';
 
 /**
  * What the signal list says when it is empty — decided entirely by the confirmed Telegram
@@ -59,16 +60,21 @@ function SignalEmpty({ channelCount, onOpenTelegram, view }) {
  * account connected, is exactly the case where silence reads as failure: the signal is there, and
  * the reason it was not traded has to be as visible as the signal itself.
  */
-export default function SignalTable({ signals, channelCount = 0, onOpenTelegram, onUpgrade, onDeleteSignal, deletingId = null }) {
+export default function SignalTable({ signals, channelCount = 0, onOpenTelegram, onUpgrade, onDeleteSignal, deletingId = null, compact = false }) {
   const { view } = useTelegramStatus();
   if (!signals?.length) return <SignalEmpty channelCount={channelCount} onOpenTelegram={onOpenTelegram} view={view} />;
-  return <div className="signal-list">{signals.map((signal) => {
+  /* The Overview is a glance, so it shows a bounded list with a bounded amount of text per row, and the
+     `View all` beside its heading is what carries the reader to the rest. The Signals page passes no `compact`
+     and still shows everything, in full, because that is where a captured message is actually read. */
+  const shown = compact ? signals.slice(0, DASHBOARD_SIGNAL_LIMIT) : signals;
+  return <div className="signal-list">{shown.map((signal) => {
     const outcome = signalOutcomeView(signal);
     const badges = signalBadges(signal);
-    return <article className={`signal-item outcome-${outcome.tone}`} key={signal.id}>
+    const summary = compact ? summarizeSignalMessage(signal.message) : null;
+    return <article className={`signal-item outcome-${outcome.tone}${compact ? ' signal-item-compact' : ''}`} key={signal.id}>
     <div className="signal-top"><div><strong>{signal.symbol || 'Signal message'}</strong><span className="signal-source">{signal.channelTitle || 'Telegram chat'}</span></div><div className="signal-flags"><span className={`badge ${signal.side === 'buy' ? 'badge-buy' : signal.side === 'sell' ? 'badge-sell' : ''}`}>{signal.side || 'received'}</span><span className={`badge signal-outcome tone-${outcome.tone}`}>{outcome.label}</span>{badges.map((badge) => <span key={badge.key} className={`badge signal-flag-badge tone-${badge.tone}`} title={badge.title}>{badge.label}</span>)}</div>
       {onDeleteSignal ? <button className="signal-delete-button" type="button" title="Remove this signal from your history" aria-label={`Remove ${signal.symbol || 'this signal'} from your history`} disabled={deletingId === signal.id} onClick={() => onDeleteSignal(signal)}>{deletingId === signal.id ? '…' : '✕'}</button> : null}</div>
-    <p className="signal-message">{signal.message}</p>
+    <p className="signal-message"{...(summary?.truncated ? { title: signal.message } : {})}>{summary ? summary.text : signal.message}</p>
     <div className="signal-meta">{signal.entryPrice != null && <span>Entry {signal.entryPrice}</span>}{signal.stopLoss != null && <span>SL {signal.stopLoss}</span>}{signal.takeProfit != null && <span>TP {signal.takeProfit}</span>}<time>{signal.createdAt ? new Date(signal.createdAt).toLocaleString() : ''}</time></div>
     {outcome.showNote ? <p className="signal-outcome-note"><span>{outcome.note}</span>{outcome.upgradeRequired && onUpgrade ? <button className="text-button" type="button" onClick={onUpgrade}>See plans</button> : null}</p> : null}
   </article>;
