@@ -7,7 +7,7 @@ import { build } from 'esbuild';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
-import { signalOutcomeView, signalsAwaitingUpgrade } from '../src/lib/signal-outcome.js';
+import { signalBadges, signalHasTradingData, signalOutcomeView, signalsAwaitingUpgrade } from '../src/lib/signal-outcome.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -94,6 +94,63 @@ test('a free workspace sees its captured signals with the reason attached, not a
   assert.match(markup, /Sent for execution/);
   assert.match(markup, /outcome-warn/);
   assert.equal(markup.includes('Connect Telegram'), false, 'a workspace that is already capturing is never told to connect');
+});
+
+/* --------------------- a market order: a level stated, no entry --------------------- */
+
+/** The row `Gold Buy now` / `SL: 4041.50` produces: symbol, side and stop, with the entry left absent. */
+const MARKET_ROW = {
+  id: 'gold-market', symbol: 'XAUUSD', side: 'buy', source: 'telegram', channelTitle: 'Gold Signals',
+  message: 'Gold Buy now\n\nSL: 4041.50', status: 'unparsed', executionReady: true,
+  entryPrice: null, stopLoss: 4041.5, takeProfit: null, createdAt: '2026-10-24T00:16:00.000Z',
+};
+
+test('an unstated entry is described as a market order, never as an unclear message', () => {
+  const view = signalOutcomeView(MARKET_ROW);
+  assert.equal(view.label, 'Needs review', 'the status is still unparsed, but the message said something tradeable, so it is not written off');
+  assert.equal(view.label === 'No clear signal', false);
+
+  const badges = signalBadges(MARKET_ROW);
+  // The missing target earns its own badge, correctly: the Safety settings really do have a say about it,
+  // while nothing has a say about the entry.
+  assert.deepEqual(badges.map((badge) => badge.key), ['market', 'missing-target']);
+  assert.equal(badges[0].label, 'Market');
+  assert.equal(badges[0].tone, 'muted', 'nothing is wrong with the signal, so nothing is coloured as a warning');
+  assert.match(badges[0].title, /market order/i, 'the tooltip explains what the badge means in terms of what the broker will be sent');
+  assert.match(badges[0].title, /ask|bid/, 'and names the price it fills at');
+});
+
+test('the badge is only earned by a message that actually stated a level', () => {
+  // A row that produced a word and nothing else is a bulletin, and it already says so.
+  const hype = { id: 'h', symbol: 'SHOULD', side: 'buy', source: 'telegram', status: 'unparsed', entryPrice: null, stopLoss: null, takeProfit: null };
+  assert.deepEqual(signalBadges(hype).map((badge) => badge.key), ['missing-stop', 'missing-target']);
+  assert.equal(signalHasTradingData(hype), true, 'the loose test stays as it is - it answers a different question');
+  assert.equal(signalBadges(hype).some((badge) => badge.key === 'market'), false, 'a message with no price in it is not a market order');
+
+  // An entry that is present has no story to tell about its absence.
+  const limited = { ...MARKET_ROW, entryPrice: 4050 };
+  assert.deepEqual(signalBadges(limited).map((badge) => badge.key), ['missing-target'], 'a complete entry leaves nothing to explain about the entry');
+
+  // A target and no entry is still "at market": the level the channel gave need not be a stop.
+  const targetOnly = { ...MARKET_ROW, stopLoss: null, takeProfit: 4075 };
+  assert.deepEqual(signalBadges(targetOnly).map((badge) => badge.key), ['market', 'missing-stop']);
+
+  // A message typed into the review panel is not a channel asking for a market fill.
+  const manual = { ...MARKET_ROW, source: 'manual' };
+  assert.deepEqual(signalBadges(manual).map((badge) => badge.key), []);
+});
+
+test('the card shows the stop, says Market where the entry would have been, and keeps the number off the screen', async () => {
+  const { default: SignalTable } = await bundle('SignalTable.jsx');
+  const markup = renderToStaticMarkup(React.createElement(SignalTable, {
+    signals: [MARKET_ROW], channelCount: 1, onOpenTelegram() {}, onUpgrade() {},
+  }));
+  assert.match(markup, /XAUUSD/);
+  assert.match(markup, /SL 4041\.5/, 'the level the channel did state is on the row');
+  assert.equal(markup.includes('Entry '), false, 'and the entry line is not printed with an empty value');
+  assert.match(markup, /class="badge signal-flag-badge tone-muted"[^>]*>Market<|>Market<\/span>/, 'the absence is labelled, not left to look like a gap');
+  assert.match(markup, /filled at the current ask/);
+  assert.equal(markup.includes('No clear signal'), false);
 });
 
 /* ----------------------------- what a failed request says back ----------------------------- */

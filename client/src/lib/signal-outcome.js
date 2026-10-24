@@ -69,6 +69,14 @@ export function signalBadges(signal) {
   if (signal?.directionInferred === true) {
     badges.push({ key: 'inferred', label: 'Inferred', tone: 'warn', title: 'The message did not say BUY or SELL; the direction was read from the entry and target prices. It is saved for review and never traded on that basis.' });
   }
+  /* A message that names a level but not the entry is not missing the entry: it asked to be filled at the
+     market. Without this the row's meta line simply has no "Entry" in it, and an absent leg and an unstated
+     one look identical. Deliberately keyed off a *stated* price rather than `signalHasTradingData`, which
+     also answers true for a row that only yielded a word for a symbol - that one has nothing to be a market
+     order about, and it already wears a "Missing SL" badge. */
+  if (signal?.entryPrice == null && signal?.source === 'telegram' && (signal?.stopLoss != null || signal?.takeProfit != null)) {
+    badges.push({ key: 'market', label: 'Market', tone: 'muted', title: 'The message did not name an entry price, so it is not waiting for one: it goes to the broker as a market order, filled at the current ask for a buy or the current bid for a sell.' });
+  }
   if (signal?.stopLoss == null && signal?.source === 'telegram') {
     badges.push({ key: 'missing-stop', label: 'Missing SL', tone: 'warn', title: 'No stop loss in the message. A fallback distance in your Safety settings can supply one; otherwise nothing is sent while the stop-loss block is on, and with that block off the trade goes out unprotected, which is recorded as an override.' });
   }
