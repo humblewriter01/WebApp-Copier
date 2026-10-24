@@ -1,6 +1,7 @@
 import pg from 'pg';
 import { createAdminAccess } from './services/admin.js';
 import { withParameterChecks } from './services/query-params.js';
+import { splitSchemaStatements, sqlPreview, withDeadline, timeoutSetting } from './services/schema-sql.js';
 
 const { Pool } = pg;
 
@@ -8,18 +9,45 @@ const { Pool } = pg;
    placeholders before it is sent. A hand-assembled statement whose values and placeholders disagree
    otherwise fails deep in the driver with `bind message supplies N parameters, but prepared statement
    requires M`, which no route, log line, or test names. */
+/**
+ * Whether the pool must wrap its socket in TLS, inferred from the connection string it was given.
+ *
+ * The rule used to be `if the host is render.com`, which was true of the database this app was written
+ * against and stopped being true the day the schema moved to Supabase. Encryption is not optional at most
+ * managed hosts, and a server that requires it does not always say so: some answer the startup packet with
+ * nothing at all, which is indistinguishable from a machine that is merely slow - no error, no log line,
+ * and a process that waits forever before it ever binds a port. So TLS is on for any non-local host unless
+ * the URL itself already chose, in which case the choice is the operator's and is left alone.
+ */
+export function resolvePoolSsl(connectionString, env = process.env) {
+  const url = String(connectionString ?? '');
+  if (!url) return undefined;
+  // Whatever the operator put in the connection string wins, including `sslmode=disable` for a local
+  // database and `sslmode=verify-full` for anyone who wants the certificate checked.
+  if (/sslmode=|[?&]ssl=/.test(url)) return undefined;
+  if (/@(localhost|127\.0\.0\.1|::1|\[::1\])(?::\d+)?[/?]/i.test(url)) return undefined;
+  // Encryption without verification is what `sslmode=require` means, and it is what every documented
+  // connection string for these hosts uses, so it is the setting this app can adopt without changing what
+  // already works. Verification is one variable away for a deployment that wants it.
+  const rejectUnauthorized = String(env?.PGSSL_VERIFY ?? '').toLowerCase() === 'true';
+  return { rejectUnauthorized };
+}
+
 export const pool = withParameterChecks(new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes('render.com')
-    ? { rejectUnauthorized: false }
-    : undefined,
+  ssl: resolvePoolSsl(process.env.DATABASE_URL, process.env),
   max: Number(process.env.PG_POOL_MAX || 5),
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 10_000,
 }), 'pool');
 
-export async function initializeDatabase() {
-  await pool.query(`
+/* Everything below is one string, and Postgres receives it statement by statement, not as one query.
+   Sending it as a single query would hold every lock it takes until the last statement commits, which is
+   how a routine deploy turns into a stalled database that no request can get past.
+   The text is also a template literal, so a backtick or a dollar-brace anywhere inside it - including in a
+   comment - would end the string or interpolate into it. Quote identifiers in the comments below with
+   nothing at all. */
+const SCHEMA_SQL = `
     CREATE TABLE IF NOT EXISTS users (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       name TEXT NOT NULL,
@@ -513,7 +541,87 @@ export async function initializeDatabase() {
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS fallback_stop_loss_points NUMERIC;
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS fallback_take_profit_points NUMERIC;
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS block_execution_without_take_profit BOOLEAN NOT NULL DEFAULT TRUE;
-  `);
+`;
+
+/** The schema exactly as it will be sent: one entry per statement, in the order it is written above. */
+export function schemaStatements() {
+  return splitSchemaStatements(SCHEMA_SQL);
+}
+
+/* How long one statement may queue for a lock, how many times it tries, and how long the whole connection
+   may take to establish itself. The numbers are small on purpose: an application that waits briefly and
+   then says what it was waiting for is diagnosable, and one that waits indefinitely is only a mystery with
+   a longer timeout. A `lock_timeout` also ends the pile-up rather than adding to it - a migration that
+   cannot get its lock walks away, so the reads that were queued behind it get their turn. */
+const LOCK_TIMEOUT_MS = Number(process.env.PG_MIGRATION_LOCK_TIMEOUT_MS || 5_000);
+const STATEMENT_TIMEOUT_MS = Number(process.env.PG_MIGRATION_STATEMENT_TIMEOUT_MS || 120_000);
+const LOCK_ATTEMPTS = Math.max(1, Number(process.env.PG_MIGRATION_LOCK_ATTEMPTS || 3));
+const CONNECT_TIMEOUT_MS = Number(process.env.PG_BOOT_CONNECT_TIMEOUT_MS || 10_000);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Postgres saying "the lock did not arrive in time", which is a reason to try again, not to give up. */
+function isLockWaitFailure(error) {
+  return error?.code === '55P03' || error?.code === '40P01' || /lock timeout|deadlock detected/i.test(String(error?.message ?? ''));
+}
+
+/** An error that names its own statement, because "the schema failed" is not an answer anyone can act on. */
+function nameSchemaError(error, { statement, position, total, attempts }) {
+  const reason = attempts > 1 ? `never got the lock it needed after ${attempts} attempts` : 'failed';
+  error.message = `Schema statement ${position + 1} of ${total} ${reason}: ${sqlPreview(statement)} - ${error.message}`;
+  error.schemaStatement = sqlPreview(statement);
+  error.schemaStatementIndex = position;
+  error.code = error.code || 'SCHEMA_STATEMENT_FAILED';
+  return error;
+}
+
+async function runStatement(client, statement, position, total, onStep) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= LOCK_ATTEMPTS; attempt += 1) {
+    try {
+      await client.query(statement);
+      return;
+    } catch (error) {
+      if (!isLockWaitFailure(error)) throw nameSchemaError(error, { statement, position, total, attempt });
+      lastError = error;
+      if (attempt === LOCK_ATTEMPTS) break;
+      onStep({ step: 'waiting-for-lock', position, total, attempt, statement: sqlPreview(statement) });
+      await sleep(Math.min(1_000 * 2 ** (attempt - 1), 8_000));
+    }
+  }
+  throw nameSchemaError(lastError, { statement, position, total, attempts: LOCK_ATTEMPTS });
+}
+
+/**
+ * Bring the schema up to date, and report where the boot is while doing it.
+ *
+ * `onStep` exists because a deploy that fails between two `console` calls leaves nothing to read: the
+ * caller gets told when the connection is being opened, when a statement is queueing behind a lock, and
+ * when the work is done, so the service log says which of those is the one that never finished.
+ */
+export async function initializeDatabase({ onStep = () => {} } = {}) {
+  const startedAt = Date.now();
+  onStep({ step: 'connecting', total: 0 });
+  // A connection that never completes is the failure mode this whole function is built around, so even
+  // the checkout is raced against a deadline. If it lands afterwards it is released rather than kept.
+  const client = await withDeadline(
+    pool.connect(),
+    CONNECT_TIMEOUT_MS,
+    'a database connection for the schema',
+    { onLate: (late) => { try { late?.release?.(); } catch { /* the pool has already given the slot back */ } } },
+  );
+  const statements = schemaStatements();
+  try {
+    await client.query(`SET lock_timeout = '${timeoutSetting(LOCK_TIMEOUT_MS, 5_000)}'`);
+    await client.query(`SET statement_timeout = '${timeoutSetting(STATEMENT_TIMEOUT_MS, 120_000)}'`);
+    let position = 0;
+    for (const statement of statements) {
+      await runStatement(client, statement, position, statements.length, onStep);
+      position += 1;
+    }
+  } finally {
+    client.release();
+  }
   const adminAccess = createAdminAccess();
   if (adminAccess.emails.length) {
     await pool.query(
@@ -522,4 +630,7 @@ export async function initializeDatabase() {
     );
   }
   await pool.query('SELECT 1');
+  const elapsedMs = Date.now() - startedAt;
+  onStep({ step: 'ready', total: statements.length, elapsedMs });
+  return { statements: statements.length, elapsedMs };
 }

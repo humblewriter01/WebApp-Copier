@@ -12,6 +12,7 @@ import { Server } from 'socket.io';
 import { Api, TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { pool, initializeDatabase } from './db.js';
+import { withDeadline } from './services/schema-sql.js';
 import { createMetaApiConfigurationLink, metaApiRequest, toSafeMetaApiAccount } from './services/metaapi.js';
 import { getTelegramErrorCode, isTelegramPasswordNeeded, shouldDiscardTelegramLogin, telegramAuthErrorPayload } from './services/telegram-auth.js';
 import { parseSignal } from './services/signal-parser.js';
@@ -47,6 +48,36 @@ const httpServer = createServer(app);
 const allowedOrigins = (process.env.CLIENT_URL || '').split(',').map((item) => item.trim()).filter(Boolean);
 const io = new Server(httpServer, { cors: { origin: allowedOrigins.length ? allowedOrigins : true, credentials: true } });
 const PORT = Number(process.env.PORT || 5000);
+
+/* Startup order, and why it is the opposite of the obvious one.
+ *
+ * The port used to be bound at the very end of `start()`, after the schema migration and after a
+ * housekeeping query. That shape is fine until the database is slow - held by another session's lock, or
+ * simply not answering - and then the process is alive, silent, and bound to nothing. The platform waits
+ * fifteen minutes, reports only "Port scan timeout reached, no open ports detected", and a stalled
+ * migration is indistinguishable from a broken build, a bad credential, or a dead host.
+ *
+ * So: listen first, bring the database up behind the open port. Until the schema is ready, everything that
+ * would touch a table is answered with one short sentence and a 503, so no route can half-work against a
+ * schema that has not been applied yet; `/health` keeps answering, and answers *without* waiting on the
+ * database, because a health check that depends on the thing it is checking is how a restart storm starts.
+ * The migration retries on its own, so a lock that clears in two minutes costs two minutes, not a human.
+ */
+const boot = {
+  ready: false,
+  step: 'listening',
+  database: 'unknown',
+  statements: 0,
+  attempts: 0,
+  lastError: null,
+  runtimeStarted: false,
+};
+const BOOT_RETRY_BASE_MS = 5_000;
+const BOOT_RETRY_MAX_MS = 60_000;
+// A probe longer than this would make the health check slower than Render's own patience with it.
+const HEALTH_PROBE_TIMEOUT_MS = 1_500;
+const STARTUP_GATE_EXEMPT = new Set(['/health', '/api/health']);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const telegramClients = new Map();
 const telegramLogins = new Map();
 const autoTradingRuntimeEnabled = String(process.env.AUTO_TRADING_RUNTIME_ENABLED || '').toLowerCase() === 'true';
@@ -221,7 +252,7 @@ async function resolveExecutionToken(userId, accountId, managedByApp) {
  */
 const platformControls = createPlatformControls({ pool, logger: console });
 const auditLog = createAuditLogger({ pool, logger: console });
-const systemHealth = createSystemHealthService({ pool, controls: platformControls, runtimeEnabled: autoTradingRuntimeEnabled, logger: console, capture: () => ({ ...telegramCapture.telegramFleetSummary(), gitCommit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || null }) });
+const systemHealth = createSystemHealthService({ pool, controls: platformControls, runtimeEnabled: autoTradingRuntimeEnabled, logger: console, capture: () => ({ ...telegramCapture.telegramFleetSummary(), gitCommit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || null, startup: { ...boot } }) });
 const announcementService = createAnnouncementService({ pool, logger: console });
 const supportSessions = createSupportSessionService({ pool, logger: console });
 
@@ -540,8 +571,37 @@ const healthPayload = () => ({
   uptimeSeconds: Math.round((Date.now() - BOOTED_AT.getTime()) / 1000),
   gitCommit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || null,
 });
-app.get('/health', asyncRoute(async (_req, res) => { await pool.query('SELECT 1'); res.set('Cache-Control', 'no-store').json(healthPayload()); }));
-app.get('/api/health', asyncRoute(async (_req, res) => { await pool.query('SELECT 1'); res.set('Cache-Control', 'no-store').json(healthPayload()); }));
+/**
+ * Whether the database answers, decided on a short deadline. A health route that awaits the database with
+ * no limit hangs exactly as long as the database is hung, which turns one stalled dependency into an
+ * unresponsive service and, on Render, into a killed instance and a lost log.
+ */
+const databaseProbe = async () => {
+  try {
+    await withDeadline(pool.query('SELECT 1'), HEALTH_PROBE_TIMEOUT_MS, 'the health probe');
+    return 'ok';
+  } catch {
+    return boot.database === 'ok' ? 'unreachable' : boot.database;
+  }
+};
+/* The public shape of the startup state, deliberately without `lastError`: a migration failure message can
+   name a table, a column, or a host, and `/health` is not authenticated. The administrator sees the full
+   object through the System Health snapshot below. */
+const publicStartup = () => ({ ready: boot.ready, step: boot.step, database: boot.database, statements: boot.statements, attempts: boot.attempts });
+const startupStatus = async () => ({ database: await databaseProbe(), startup: publicStartup() });
+app.get('/health', asyncRoute(async (_req, res) => { res.set('Cache-Control', 'no-store').json({ ...healthPayload(), ...(await startupStatus()) }); }));
+app.get('/api/health', asyncRoute(async (_req, res) => { res.set('Cache-Control', 'no-store').json({ ...healthPayload(), ...(await startupStatus()) }); }));
+
+/* Declared after the health routes so a starting service can still be asked how it is doing; the exempt set
+   is the same promise in code, so moving these routes cannot accidentally gate the endpoint the platform
+   and the status page depend on. */
+app.use((req, res, next) => {
+  if (boot.ready || STARTUP_GATE_EXEMPT.has(req.path)) return next();
+  res.set('Cache-Control', 'no-store').status(503).json({
+    error: 'Signal Desk is still starting up. Please try again in a moment.',
+    code: 'STARTING',
+  });
+});
 
 // Public browser configuration. These two values are safe to ship to a browser
 // (they are already bundled into every frontend build); exposing them at runtime
@@ -2634,12 +2694,31 @@ app.use((error, req, res, _next) => {
   res.status(error.status || 500).json(payload);
 });
 
-async function start() {
-  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
-  if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) throw new Error('JWT_SECRET must contain at least 32 characters');
-  await initializeDatabase();
-  await pool.query('DELETE FROM telegram_login_attempts WHERE expires_at <= NOW()');
+/** Opens the port and resolves once it is listening, so a bind failure is reported instead of thrown. */
+const listen = () => new Promise((resolve, reject) => {
+  const onError = (error) => reject(error);
+  httpServer.once('error', onError);
+  httpServer.listen(PORT, '0.0.0.0', () => {
+    httpServer.removeListener('error', onError);
+    log('info', 'Server listening', { port: PORT });
+    resolve();
+  });
+});
+
+/**
+ * Everything that needs the schema. Started once, after the migration has been applied.
+ *
+ * Each step is guarded on its own because they are not equally important: the worker is the part that
+ * trades, so a housekeeping query that fails must not be able to leave it stopped, and the sweeps below are
+ * already fire-and-forget. The `runtimeStarted` latch is what keeps a later retry of the migration from
+ * arming a second interval or a second worker.
+ */
+async function beginRuntime() {
+  if (boot.runtimeStarted) return;
+  boot.runtimeStarted = true;
   executionWorker.start();
+  await pool.query('DELETE FROM telegram_login_attempts WHERE expires_at <= NOW()')
+    .catch((error) => log('warn', 'Could not clear expired login attempts', { error: error.message }));
   void billingService.expireDueSubscriptions().catch((error) => log('warn', 'Subscription expiry sweep failed', { code: error.code || 'SUBSCRIPTION_SWEEP_FAILED' }));
   const billingSweep = setInterval(() => {
     void billingService.expireDueSubscriptions().catch((error) => log('warn', 'Subscription expiry sweep failed', { code: error.code || 'SUBSCRIPTION_SWEEP_FAILED' }));
@@ -2658,7 +2737,6 @@ async function start() {
   } else {
     log('warn', 'Idle MetaAPI account cleanup is disabled by configuration; provisioned accounts will accumulate', {});
   }
-  httpServer.listen(PORT, '0.0.0.0', () => log('info', 'Server listening', { port: PORT }));
   // The listener is re-armed in the background, after the port is open: a workspace with a stored
   // session must be listening whether or not anyone opens the dashboard, and a Telegram handshake
   // must never be able to hold up the first request the host is woken for.
@@ -2669,6 +2747,60 @@ async function start() {
       .catch((error) => log('warn', 'Telegram listener sweep failed', { error: error.message }));
   }, 60 * 1000);
   telegramSweep.unref?.();
+}
+
+/**
+ * The migration, retried until it lands.
+ *
+ * Failing here must not kill the process: the port is already open, the service is already answering
+ * `/health`, and every data route is saying that it is starting. Exiting instead would trade a readable
+ * degraded state for a crash loop whose only trace is a platform log about ports - which is the outage this
+ * file is now written to prevent. Backoff is capped, because the common cause is a lock held by the
+ * instance that is still serving traffic while a deploy waits to become healthy.
+ */
+async function bringUpDatabase() {
+  for (let attempt = 1; ; attempt += 1) {
+    boot.attempts = attempt;
+    boot.step = `applying the schema (attempt ${attempt})`;
+    try {
+      const summary = await initializeDatabase({
+        onStep: (step) => {
+          boot.step = step.step === 'ready' ? 'ready' : step.step;
+          if (step.total) boot.statements = step.total;
+          if (step.step === 'waiting-for-lock') log('warn', 'A schema statement is waiting for a lock held by another session', step);
+        },
+      });
+      boot.ready = true;
+      boot.database = 'ok';
+      boot.step = 'ready';
+      boot.lastError = null;
+      log('info', 'Schema ready', { statements: summary.statements, elapsedMs: summary.elapsedMs, attempts: attempt });
+      boot.step = 'starting runtime';
+      await beginRuntime().catch((error) => log('error', 'The schema is ready but a runtime step failed to start', { error: error.message }));
+      return;
+    } catch (error) {
+      boot.database = 'unreachable';
+      boot.step = 'schema failed';
+      boot.lastError = error.message;
+      const retryInMs = Math.min(BOOT_RETRY_BASE_MS * 2 ** (attempt - 1), BOOT_RETRY_MAX_MS);
+      log('error', 'Startup could not prepare the database; the service is listening and will keep trying', {
+        attempt,
+        retryInMs,
+        error: error.message,
+        code: error.code,
+      });
+      await sleep(retryInMs);
+    }
+  }
+}
+
+async function start() {
+  /* A missing URL or secret is a misconfiguration, not a slow dependency: there is nothing to retry and
+     nothing to serve, so it fails fast and says which of the two it is. */
+  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
+  if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) throw new Error('JWT_SECRET must contain at least 32 characters');
+  await listen();
+  void bringUpDatabase();
 }
 start().catch((error) => { log('error', 'Startup failed', { error: error.message }); process.exit(1); });
 
