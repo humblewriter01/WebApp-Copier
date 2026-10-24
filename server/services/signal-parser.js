@@ -70,10 +70,20 @@ function isAssetPair(candidate) {
 /** Alias keys are matched as whole words, longest first, so "BRENT CRUDE" wins over "BRENT". */
 const ALIAS_PHRASES = Object.keys(SYMBOL_ALIASES).sort((left, right) => right.length - left.length);
 
+/**
+ * Whether a name in the message is the asset's name or part of a longer word.
+ *
+ * The boundary used to be "a space, a bracket, or an asterisk" on each side, which reads a name on its own
+ * line perfectly and a name in a sentence not at all: `BUY NOW Gold, SL 4041.50` produced *no symbol* and
+ * the message was refused as "No supported trading symbol was found" - a complete instruction, killed by a
+ * comma. Channels punctuate constantly (`GOLD:`, `**SELL GOLD:**`, `#Gold`), so what is required instead is
+ * simply that the name not be glued to another letter or digit. That still refuses "DOW" inside "DOWN" and
+ * "ETH" inside "ETHICAL", which is the only thing the strict boundary was ever doing for us.
+ */
 function findAliasSymbol(text) {
   const upper = text.toUpperCase();
   for (const phrase of ALIAS_PHRASES) {
-    const pattern = new RegExp(`(?:^|[\\s(\\[]|\\*)${phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[\\s)\\]]|\\*)`, 'i');
+    const pattern = new RegExp(`(?<![A-Z0-9])${phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Z0-9])`, 'i');
     if (pattern.test(upper)) return SYMBOL_ALIASES[phrase];
   }
   return null;

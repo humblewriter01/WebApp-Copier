@@ -53,8 +53,12 @@ const render = (component, props = {}, ...children) => renderToStaticMarkup(Reac
 
 /* ---------------------------------------------------------------- the badges */
 test('a badge is only ever printed for something the signal row actually says', () => {
-  const inferred = { source: 'telegram', directionInferred: true, stopLoss: 1.08, takeProfit: 1.09 };
+  // A direction is only ever inferred *from* an entry and a target, so the fixture carries both.
+  const inferred = { source: 'telegram', directionInferred: true, entryPrice: 1.08, stopLoss: 1.08, takeProfit: 1.09 };
   assert.deepEqual(signalBadges(inferred).map((badge) => badge.label), ['Inferred']);
+  // Take the entry away and that is not a third hole in the message - it is the channel asking to be filled
+  // now, which is a fact worth printing next to the inference it was judged from.
+  assert.deepEqual(signalBadges({ ...inferred, entryPrice: null }).map((badge) => badge.label), ['Inferred', 'Market']);
 
   const thin = { source: 'telegram', directionInferred: false, entryPrice: 1.08, stopLoss: null, takeProfit: null };
   assert.deepEqual(signalBadges(thin).map((badge) => badge.label), ['Missing SL', 'Missing TP']);
