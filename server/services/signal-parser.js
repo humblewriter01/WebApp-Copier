@@ -253,7 +253,12 @@ const ENTRY_SEPARATORS = '[:=@–—-]';
  * states a size, and a stop 2.0 away from 1.08 is exactly the readable-but-wrong number this file exists
  * to refuse. A price that matches a leg the labels already found is that leg restated, not an entry.
  */
-const BARE_ENTRY_GUARD = '(?!\\s*(?:lots?|units?|deals?|%|pips?|pts?|points?|USD|EUR|digits?|minutes?|hours?|days?|traders?))';
+/* The first lookahead is not decoration: `NUMBER` is `\d+`, so without it the engine is free to give a digit
+   back when the guard rejects the match. `GOLD BUY : 50PIPS` then matched as an entry of **5** - the guard
+   happily looking at `0PIPS`, which is not a unit word. `50 lots`, `300PIPS`, `2%` are the same shape: a
+   number the message attached to a measure, read as a price by shrinking it until the measure stopped
+   looking like a measure. A number that has a digit after it was never the whole number. */
+const BARE_ENTRY_GUARD = '(?!\\d)(?!\\s*(?:lots?|units?|deals?|%|pips?|pts?|points?|USD|EUR|digits?|minutes?|hours?|days?|traders?))';
 
 function parseBareEntry(text, names, taken) {
   const pattern = (names || []).filter(Boolean).map((name) => String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));

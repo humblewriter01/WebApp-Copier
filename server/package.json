@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
-    "test": "node --test"
+    "test": "node --test",
+    "backfill:signals": "node scripts/backfill-signal-parse.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "2.118.0",
