@@ -499,6 +499,11 @@ Fixing the catalogue exposed one latent schema bug: `subscriptions.plan_key` sti
 | `INACTIVITY_WARNING_DAYS` / `INACTIVITY_DELETION_DAYS` | No | Idle-account thresholds in days; default to `25` and `30`, and a pair where deletion does not come after the warning falls back to both defaults |
 | `INACTIVITY_SWEEP_LIMIT` | No | Accounts examined per sweep pass, oldest first; defaults to `25` |
 | `PORT` | No | Render supplies this automatically |
+| `PG_MIGRATION_LOCK_TIMEOUT_MS` | No | How long one schema statement may queue for a lock before it gives up and retries; defaults to `5000` |
+| `PG_MIGRATION_STATEMENT_TIMEOUT_MS` | No | Ceiling on a single schema statement, so a migration cannot run past the deploy; defaults to `120000` |
+| `PG_MIGRATION_LOCK_ATTEMPTS` | No | Tries per schema statement before the boot reports it; defaults to `3` |
+| `PG_BOOT_CONNECT_TIMEOUT_MS` | No | How long the startup waits for a connection that never answers; defaults to `10000` |
+| `PGSSL_VERIFY` | No | `true` also verifies the database certificate. Off by default because `sslmode=require` - what these hosts document - encrypts without verifying, and a deployment should not lose its database over a CA bundle |
 
 The UI/API can be used without Telegram credentials; Telegram is shown as unavailable until `API_ID` and `API_HASH` are configured. Never commit real credentials to Git.
 
@@ -520,6 +525,53 @@ Three things about that rule are easy to get wrong. The action has to be **Rewri
 The client is the last line rather than the first: `TAB_FOR_PATH` in `App.jsx` falls back to Overview for a path it does not recognise, so a served-but-unknown address — `/risk settings`, typed with a space in it — renders a workspace instead of a blank shell.
 
 Required API variables: `DATABASE_URL`, `JWT_SECRET`, `SESSION_ENCRYPTION_KEY`, and `CLIENT_URL`. Add `API_ID` and `API_HASH` for Telegram sign-in. Add `METAAPI_PROVISIONING_TOKEN` to the API service's Environment settings to enable MT4/MT5 account setup. Keep it out of the static-site environment.
+
+### The port opens before the database, on purpose
+
+`node index.js` used to bind its port at the end of startup, after the schema migration. It is now the first
+thing that happens, and the migration runs behind it. That order is the whole difference between a degraded
+app and an unreachable one. A deploy that binds nothing for fifteen minutes is reported by Render as
+`Port scan timeout reached, no open ports detected` - no error, no cause, no application - and that is what a
+held lock looks like from the outside.
+
+Three properties of the old boot made it fail that way rather than noisily:
+
+1. **The schema was one query.** `server/db.js` holds the entire schema as a single block of text, and a
+   multi-statement string is one implicit transaction in Postgres: every `ALTER TABLE` in it takes its lock at
+   the start and keeps it until the last statement commits. Any other session reading one of those tables -
+   the worker, a dashboard query, the previous instance that is still serving traffic while a deploy waits to
+   be marked healthy - parks the whole migration, and everything after it parks behind the migration.
+   `splitSchemaStatements` in `server/services/schema-sql.js` cuts the text at the semicolons that really end
+   statements (a `DO $$ ... $$` body, a string literal, and a comment all contain semicolons that do not), and
+   each statement now runs alone, so a lock is held for the length of one `ALTER` instead of one file. The
+   string in `db.js` is unchanged: it is still one template literal, so the rule about backticks inside it
+   still applies.
+2. **Nothing had a timeout.** A statement now runs under `lock_timeout`, gives up, tries again a couple of
+   times, and if it still cannot proceed the boot *names the statement* instead of waiting indefinitely. The
+   connection itself is raced against a deadline too, because a host that accepts a TCP connection and then
+   never replies is the one failure a TCP timeout does not cover.
+3. **A failed migration killed the process.** It no longer does: the service stays up, retries with a capped
+   backoff, and heals itself as soon as the lock clears. Missing configuration (`DATABASE_URL`,
+   `JWT_SECRET`) still exits immediately, because there is nothing to retry and nothing to serve.
+
+While the schema is not ready, every route that would touch a table answers one short sentence with a `503`
+(`Signal Desk is still starting up. Please try again in a moment.`) rather than half-working against a table
+that has not been created yet. `/health` and `/api/health` stay answering throughout, and no longer wait on
+the database: a health check whose answer depends on the thing it is checking turns one stalled dependency
+into a restarted instance and a lost log. They report what the boot is actually doing -
+`{"database":"unknown","startup":{"ready":false,"step":"connecting","attempts":1}}` - and the same `startup`
+snapshot appears in Admin Panel -> System Health.
+
+Two environment consequences are worth knowing. `DATABASE_URL` is now connected to with TLS for any non-local
+host unless the URL itself already says otherwise, since a managed database that requires encryption does not
+always say so - some simply stop answering, and "stalled" is what that looks like from a deploy log. And
+`PG_MIGRATION_LOCK_TIMEOUT_MS` is the knob to raise if a migration legitimately needs to wait behind a long
+write on a big table.
+
+`server/test/boot-readiness.test.js` spawns the real server against a database that accepts the connection and
+then says nothing, and asserts the port is open anyway, that `/health` answers, that a data route replies with
+the 503 rather than hanging, and that the process is still alive retrying. `server/test/schema-migration.test.js`
+holds the splitting and timeout rules. Both were confirmed to fail against the boot sequence they replaced.
 
 ### Add Telegram API credentials in Render
 
