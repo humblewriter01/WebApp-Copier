@@ -11,7 +11,7 @@
  *   node scripts/backfill-signal-parse.js --apply                # the same, writing it
  *   node scripts/backfill-signal-parse.js --user <uuid>         # one workspace only
  *   node scripts/backfill-signal-parse.js --dump-json rows.json # take the rows out, change nothing
- *   node scripts/backfill-signal-parse.js --from-json rows.json --emit-sql out.sql
+ *   node scripts/backfill-signal-parse.js --from-json rows.json --emit-sql out.sql --guard-b64
  *                                                               # plan and SQL from a dump, no connection at all
  *
  * The last form exists because a host where the only way in is a query box is a normal situation, and it is
@@ -35,7 +35,7 @@ function usage(message) {
   if (message) console.error(`${message}\n`);
   console.error('Usage: node scripts/backfill-signal-parse.js [--apply] [--user <uuid>] [--limit <n>]');
   console.error('       node scripts/backfill-signal-parse.js --dump-json <path>');
-  console.error('       node scripts/backfill-signal-parse.js --from-json <path> [--emit-sql <path>] [--apply]');
+  console.error('       node scripts/backfill-signal-parse.js --from-json <path> [--emit-sql <path>] [--guard-b64] [--apply]');
   process.exit(message ? 1 : 0);
 }
 
@@ -48,6 +48,8 @@ async function main() {
   const sqlPath = option('emit-sql');
   const limit = Math.max(1, Number(option('limit') || 100_000) || 100_000);
   const userId = option('user');
+  // With --emit-sql: match the message by base64 instead of by text, so no statement carries a newline.
+  const guardB64 = flag('guard-b64');
 
   let rows = null;
   let pool = null;
@@ -71,7 +73,8 @@ async function main() {
 
   const capped = rows.slice(0, limit);
   const plan = planBackfill(capped, { userId });
-  console.log(`${capped.length} candidate rows · ${plan.changes.length} would change · ${plan.untouched} already current · ${plan.skipped} skipped (no message${userId ? ', other workspace' : ''})`);
+  const refusedLegs = plan.changes.reduce((total, change) => total + (change.refused?.length ?? 0), 0);
+  console.log(`${capped.length} candidate rows · ${plan.changes.length} would change · ${plan.untouched} already current · ${plan.skipped} skipped (no message${userId ? ', other workspace' : ''})${refusedLegs ? ` · ${refusedLegs} price leg${refusedLegs === 1 ? '' : 's'} refused as unread` : ''}`);
   if (!plan.changes.length) {
     console.log('Nothing to do: every stored reading already matches what the current parser produces.');
     return;
@@ -79,7 +82,7 @@ async function main() {
   for (const change of plan.changes) console.log(`\n${describeChange(change)}`);
 
   if (sqlPath) {
-    const statements = backfillStatements(plan.changes);
+    const statements = backfillStatements(plan.changes, { guard: guardB64 ? 'base64' : 'message' });
     writeFileSync(resolve(sqlPath), `${statements.join(';\n')};\n`);
     // The undo script is generated from the values that were there before, with the same write-time guards,
     // so a rollback cannot land on a row that has since acquired a trade.
@@ -91,7 +94,7 @@ async function main() {
       id: change.id,
       message: change.message,
       sets: change.columns.map((column) => ({ column, value: change.before[column] })),
-    })));
+    })), { guard: guardB64 ? 'base64' : 'message' });
     const rollbackPath = `${resolve(sqlPath).replace(/\.sql$/, '')}.rollback.sql`;
     writeFileSync(rollbackPath, `${rollback.join(';\n')};\n`);
     console.log(`\n${statements.length} statements written to ${resolve(sqlPath)} (undo: ${rollbackPath}).`);

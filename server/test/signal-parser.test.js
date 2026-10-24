@@ -177,3 +177,20 @@ test('counts unique new positions from entry and reversal deals, not exits', () 
   assert.throws(() => countSignalEntryDeals([{ type: 'DEAL_TYPE_BUY', orderId: '5' }]), /classification/i);
   assert.throws(() => countSignalEntryDeals([{ type: 'DEAL_TYPE_SELL', entryType: 'DEAL_ENTRY_IN' }]), /identifier/i);
 });
+
+test('a number glued to a unit word is a distance even when the unit is written without a space', () => {
+  /* `50PIPS` with no space was read as an entry of 5: `\d+` matched 50, the unit guard rejected it, and the
+     engine gave a digit back until the guard was happy. Every "N lots", "N pips", "2%" glued to its word is
+     the same shape, and each one was a price the channel never stated. */
+  const shout = '\u{1F4C8} GOLD BUY : 50PIPS \n\nUS Session setups buy, traders ! Like i said, Always trust your market mover here ! \u{1F64F}\n\n\u{1F4F9}@OnlyLunaBecht';
+  const parsed = parseSignal(shout);
+  assert.equal(parsed.symbol, 'XAUUSD', 'the metal is still a fact about the message');
+  assert.equal(parsed.side, 'buy');
+  assert.equal(parsed.entryPrice, null, 'while the number is a distance with no leg to belong to');
+  assert.equal(parsed.executionReady, false);
+  assert.equal(parseSignal('BUY GOLD 50 lots').entryPrice, null, 'and a size is not an entry either');
+  assert.equal(parseSignal('SELL : 300PIPS').entryPrice, null);
+  assert.equal(parseSignal('BUY GOLD 4011').entryPrice, 4011, 'a whole number that is a price is still read as one');
+  assert.equal(parseSignal('BUY GOLD @ 4011.50').entryPrice, 4011.5, 'and so is a decimal');
+});
+

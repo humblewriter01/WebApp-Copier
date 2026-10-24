@@ -82,8 +82,13 @@ const levels = (value) => {
 };
 
 /** What the current parser says about a row's own message, in the shape the table stores. */
-export function reparseMessage(message) {
+/** The parse and the reading, kept apart so a caller can refuse a leg without re-parsing the message. */
+export function readMessage(message) {
   const parsed = parseSignal(message);
+  return { parsed, values: valuesFromParse(parsed) };
+}
+
+function valuesFromParse(parsed) {
   return {
     symbol: text(parsed.symbol),
     side: text(parsed.side),
@@ -96,6 +101,42 @@ export function reparseMessage(message) {
     direction_inferred: parsed.directionInferred === true,
     parse_error: text(parsed.parseError),
   };
+}
+
+export function reparseMessage(message) {
+  return readMessage(message).values;
+}
+
+/** The columns that hold a price, as opposed to a distance or a name. */
+const PRICE_LEGS = Object.freeze(['entry_price', 'stop_loss', 'take_profit', 'take_profit_levels']);
+
+/**
+ * Which price legs this reading earned the right to write.
+ *
+ * Layer 1 is allowed to be opportunistic about *live* signals: a channel that writes `BUY GOLD 4011` with no
+ * labels at all is a trade the subscriber means to take, and the number next to the metal is the best
+ * evidence of the level. The same instinct applied by a script to six weeks of a broadcaster's chatter is a
+ * different matter, because a headline about Bitcoin at 79,000 has no entry price in it - it has a *number*,
+ * which is not the same thing, and the old parser was right to leave the column null.
+ *
+ * So a leg is only rewritten when the message is directed (a BUY or a SELL, which is what makes a price an
+ * order rather than a quote), when no number in it is readable two ways, and - for the entry, which is the
+ * leg most often supplied by inference - when the price was labelled or a zone rather than picked up beside
+ * the symbol name. Everything refused here keeps whatever the row already had, so the operation is still a
+ * no-op on a row nobody has changed: refusing to write is not the same as writing a null.
+ *
+ * Which is also why the run never *clears* a price. A re-read that finds no stop loss in a message says
+ * something about the message; it does not establish that the stored level is wrong, and the two ways a level
+ * can be there anyway - the channel edited its own post, or a person fixed the row - are indistinguishable
+ * from a parser regression at this altitude. Filling and refining are allowed, deletion is not.
+ */
+export function writableLegs(parsed) {
+  const reasons = {};
+  const ambiguous = Array.isArray(parsed.ambiguousLevels) && parsed.ambiguousLevels.length > 0;
+  if (!parsed.side) for (const column of PRICE_LEGS) reasons[column] = 'no BUY or SELL in the message, so a number in it is a quote, not a level';
+  if (ambiguous) for (const column of PRICE_LEGS) reasons[column] ??= 'a number in the message reads two ways, and a backfill must not choose';
+  if (parsed.entryWasBare === true) reasons.entry_price ??= 'the entry is a bare number beside the symbol name, not a stated price';
+  return { allow: PRICE_LEGS.filter((column) => !reasons[column]), reasons };
 }
 
 /** Values as the table holds them, so a comparison is between like things and not `4011` against `'4011.00'`. */
@@ -140,12 +181,36 @@ export function planBackfill(rows = [], { userId = null } = {}) {
       : (typeof row.message === 'string' ? row.message : '');
     if (!message.trim()) { skipped += 1; continue; }
     const before = storedValues(row);
-    const after = reparseMessage(message);
+    const { parsed, values: read } = readMessage(message);
+    const legs = writableLegs(parsed);
+    // A refused leg is not written *and* not cleared: the row keeps what it had, because "the current parser
+    // would not put a price here" is a statement about this reading, not evidence that the stored number is wrong.
+    const after = { ...read };
+    const refusedColumns = [];
+    for (const column of PRICE_LEGS) {
+      if (same(before[column], read[column])) continue;
+      /* Two different refusals, in this order, and the second one is the rule that matters most.
+         - The reading is not confident: do not overwrite.
+         - The row holds a price and this message yields none: never delete it. Signals are re-sent, quoted,
+           truncated and edited, and a level can also have been corrected by hand - none of which a bulk re-read
+           can tell apart from a parser regression. A backfill may *add* and may *refine*; removing a number a
+           trade might have been guarded by is not what anybody asked it to do. */
+      if (before[column] !== null && (read[column] === null || read[column] === undefined)) {
+        after[column] = before[column];
+        refusedColumns.push({ column, reason: 'the row already holds a price and this message yields none, so it is left alone' });
+        continue;
+      }
+      if (!legs.allow.includes(column)) {
+        after[column] = before[column];
+        refusedColumns.push({ column, reason: legs.reasons[column] ?? null });
+      }
+    }
     const differing = BACKFILL_COLUMNS.filter((column) => !same(before[column], after[column]));
     if (!differing.length) continue;
     changes.push({
       id: row.id, createdAt: row.created_at ?? null, message, before, after,
       columns: differing,
+      refused: refusedColumns,
       sets: differing.map((column) => ({ column, value: after[column] })),
     });
   }
@@ -169,13 +234,26 @@ const literal = (value, column) => {
  * sentences from the parser, and a JSON array of numbers. No message text is interpolated anywhere, which is
  * what makes escaping a footnote here rather than the interesting part.
  */
-export function backfillStatements(changes, { table = 'signals' } = {}) {
+/**
+ * The statements, one per row.
+ *
+ * `guard: 'base64'` compares the stored message with its own base64 instead of its text. Same property, one
+ * line per statement, and no newline or emoji in the SQL at all - which is what the form is for: a script
+ * whose output has to be pasted into someone else's web console cannot afford a literal that a clipboard,
+ * a textarea, or a proxy is free to re-wrap, because a re-wrapped message literal does not fail loudly, it
+ * simply stops matching and the row is silently skipped. The encoded text is compared exactly as
+ * `replace(encode(...), E'\n', '')` produces it, which is how a dump is taken.
+ */
+export function backfillStatements(changes, { table = 'signals', guard = 'message' } = {}) {
   return (changes ?? []).map((change) => {
     const sets = change.sets.map((item) => `${item.column} = ${literal(item.value, item.column)}`).join(',\n           ');
+    const check = guard === 'base64'
+      ? `replace(encode(convert_to(s.message, 'UTF8'), 'base64'), E'\\n', '') = ${literal(change.message === null ? null : Buffer.from(String(change.message), 'utf8').toString('base64'), null)}`
+      : `s.message ${change.message === null ? 'IS NULL' : `= ${literal(change.message, null)}`}`;
     return `UPDATE ${table} AS s
         SET ${sets}
       WHERE s.id = ${literal(change.id, null)}::uuid
-       AND s.message ${change.message === null ? 'IS NULL' : `= ${literal(change.message, null)}`}
+       AND ${check}
 ${BACKFILL_WRITE_GUARDS.trimEnd()}`;
   });
 }
@@ -204,5 +282,8 @@ export function backfillParameterized(changes, { table = 'signals' } = {}) {
 /** A one-line summary of one row, for the report. Prices only - the message itself is not reprinted. */
 export function describeChange(change) {
   const shape = (side) => `${side.symbol ?? '-'} ${side.side ?? '-'} E${side.entry_price ?? '-'} SL${side.stop_loss ?? '-'}${side.stop_loss_pips ? `(${side.stop_loss_pips}p)` : ''} TP${side.take_profit ?? '-'}${side.take_profit_pips ? `(${side.take_profit_pips}p)` : ''}`;
-  return `${String(change.id).slice(0, 8)}  ${change.columns.join(', ')}\n    was: ${shape(change.before)}\n    now: ${shape(change.after)}`;
+  const refused = (change.refused ?? []).map((leg) => `\n    not written: ${leg.column}${leg.reason ? ` - ${leg.reason}` : ''}`).join('');
+  /* The refusals are the part an operator has to be able to see. A row that could have had an entry written and
+     did not is the whole difference between a conservative script and a silently incomplete one. */
+  return `${String(change.id).slice(0, 8)}  ${change.columns.join(', ')}\n    was: ${shape(change.before)}\n    now: ${shape(change.after)}${refused}`;
 }

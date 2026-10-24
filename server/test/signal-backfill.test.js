@@ -109,6 +109,18 @@ test('the write re-checks the exclusions, and refuses a row whose message is not
   assert.equal(manage.includes('trap'), false, 'while the row that had nothing to do with it does not carry it');
 });
 
+test('the console form of the guard is one line per row and still cannot be fooled by an edited message', () => {
+  const plan = planBackfill([staleManageRow]);
+  const [statement] = backfillStatements(plan.changes, { guard: 'base64' });
+  assert.equal(statement.includes('\n       AND s.message ='), false, 'no message text is inlined');
+  assert.match(statement, /AND replace\(encode\(convert_to\(s\.message, 'UTF8'\), 'base64'\), E'\\n', ''\) = '[A-Za-z0-9+/=]+'/, 'the check is a base64 literal on one line');
+  assert.equal([...statement.matchAll(/'/g)].length % 2, 0, 'and the quotes still balance');
+  // A single changed character of the message - one space, one re-wrapped newline - must stop the write.
+  const edited = backfillStatements([{ ...plan.changes[0], message: `${plan.changes[0].message} ` }], { guard: 'base64' })[0];
+  assert.notEqual(edited, statement, 'so a row that does not match the text that was parsed cannot be updated by it');
+  assert.equal(plan.changes[0].refused.length, 0, 'while the confident reading still stands, refused or not');
+});
+
 test('the candidates exclude anything with a trade or a job, and a workspace filter lands in the WHERE', () => {
   const all = backfillSelect();
   assert.deepEqual(all.params, []);
@@ -161,6 +173,54 @@ test('a row the parser already reads correctly is left out of the plan entirely'
   const plan = planBackfill([stored]);
   assert.equal(plan.changes.length, 0);
   assert.equal(plan.untouched, 1, 'which is what a re-run on a table that has been backfilled should say');
+});
+
+test('a price the parser had to infer is not written over a row that never had one', () => {
+  /* `#Bitcoin 79,000$` is a headline. Layer 1's opportunistic pass finds a number next to the symbol name and
+     calls it an entry, which is the right call for `BUY GOLD 4011` on a live channel and the wrong call for a
+     broadcast the subscriber never intended as an order. A script must not turn that reading into stored
+     history: the symbol is corrected, the price is refused, and the refusal is reported. */
+  const headline = { ...staleManageRow, id: 'row-news', message: '#Bitcoin 79,000$', symbol: null, side: null, parse_error: 'A BUY or SELL direction was not found.' };
+  const [change] = planBackfill([headline]).changes;
+  assert.equal(change.after.symbol, 'BTCUSD', 'the metal the post is about, which the old parser missed');
+  assert.equal(change.after.entry_price, null, 'and no entry');
+  assert.equal(change.columns.includes('entry_price'), false, 'the column is not even in the write');
+  // Only the leg that *would* have changed is reported as refused: a column that was null and stays null had
+  // nothing to refuse, and a report that listed four would be a report about nothing.
+  assert.deepEqual(change.refused.map((leg) => leg.column), ['entry_price']);
+  assert.match(change.refused[0].reason, /no BUY or SELL/, 'with the reason stated in the report');
+});
+
+test('a leg the row already had is kept when the current reading would not have written it', () => {
+  /* The gate is about *writing*, not about clearing. A headline that mentions 3999 is no evidence that the
+     4011 stored on this row is wrong, so the row keeps its number - and a backfill that "corrected" it to a
+     null, or to the headline's number, would be destroying data it was never given permission to judge. */
+  const plan = planBackfill([{
+    ...staleManageRow, symbol: 'XAUUSD', side: null, entry_price: 4011, stop_loss: null, take_profit: null, parse_error: null,
+    message: 'Bitcoin drifted to 3999 today, nothing else to say',
+  }]);
+  const [change] = plan.changes;
+  assert.equal(change.after.entry_price, 4011, 'the stored entry survives the run');
+  assert.equal(change.columns.includes('entry_price'), false, 'the column is not in the write at all');
+  assert.deepEqual(change.refused.map((leg) => leg.column), ['entry_price'], 'and the run says it declined to touch it');
+  assert.match(change.refused[0].reason, /no BUY or SELL/, 'naming the reason, which is the missing direction here');
+
+  // The other shape of refusal, with a direction present: the price is real-looking but unlabeled, so it is
+  // still not something a script should overwrite a stored level with.
+  const [bare] = planBackfill([{
+    ...staleManageRow, symbol: 'XAUUSD', side: 'buy', entry_price: 4011, stop_loss: 4000, take_profit: null, parse_error: null,
+    message: 'BUY GOLD 3999',
+  }]).changes;
+  assert.equal(bare.after.entry_price, 4011, 'the labelled-at-capture entry the row already carries is not replaced by an inference');
+  assert.match(bare.refused.find((leg) => leg.column === 'entry_price').reason, /bare number/);
+  assert.equal(bare.columns.includes('stop_loss'), false, 'and a leg the message does not mention is left alone');
+  assert.match(bare.refused.find((leg) => leg.column === 'stop_loss').reason, /already holds a price/, 'because a re-read may not delete a level, only add or refine one');
+});
+
+test('a stated signal is not refused by the gate, only an inferred one', () => {
+  const [change] = planBackfill([staleManageRow]).changes;
+  assert.deepEqual(change.refused, [], 'the zone and the dashed SL are labelled in the message, so they are written');
+  assert.equal(change.after.stop_loss, 4011);
 });
 
 test('rows with no message, and other workspaces when one is named, are skipped rather than emptied', () => {
