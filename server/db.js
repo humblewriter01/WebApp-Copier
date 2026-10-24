@@ -541,6 +541,26 @@ const SCHEMA_SQL = `
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS fallback_stop_loss_points NUMERIC;
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS fallback_take_profit_points NUMERIC;
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS block_execution_without_take_profit BOOLEAN NOT NULL DEFAULT TRUE;
+    /* Where a number on the row came from. needs_review is the gate the execution path reads: a row can be
+     * complete, well-formed and still untrustworthy, and the flag is what keeps a signal the platform could
+     * only guess at away from a live account even when the workspace has fallback distances set.
+     * parsed_by, parse_confidence and llm_used are the provenance beside it, so a reader can tell a price the
+     * channel wrote from a price a model reported. The two pip columns store a distance the message stated
+     * (TP 50 pips), never a price, because the broker's tick size is the only honest converter and it is not
+     * known until the order is built.
+     * Every column is nullable with no default, on purpose: a table default would backfill every existing
+     * workspace with a fallback distance, and a workspace that never asked for a safety net must not be given
+     * one by an upgrade. */
+    ALTER TABLE signals ADD COLUMN IF NOT EXISTS needs_review BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE signals ADD COLUMN IF NOT EXISTS parsed_by TEXT NOT NULL DEFAULT 'regex';
+    ALTER TABLE signals ADD COLUMN IF NOT EXISTS parse_confidence NUMERIC;
+    ALTER TABLE signals ADD COLUMN IF NOT EXISTS llm_used BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE signals ADD COLUMN IF NOT EXISTS stop_loss_pips NUMERIC;
+    ALTER TABLE signals ADD COLUMN IF NOT EXISTS take_profit_pips NUMERIC;
+    /* New workspaces start with a net, existing ones do not: DEFAULT on the column is what makes that
+     * distinction without touching a single stored row, because the signup insert omits both columns. */
+    ALTER TABLE settings ALTER COLUMN fallback_stop_loss_points SET DEFAULT 500;
+    ALTER TABLE settings ALTER COLUMN fallback_take_profit_points SET DEFAULT 1000;
 `;
 
 /** The schema exactly as it will be sent: one entry per statement, in the order it is written above. */

@@ -140,7 +140,11 @@ test('the safety nets are read before the row is written, and the decision is no
   /* Capture decides eligibility by asking the same policy the engine will consult at send time. Two
      copies of that rule is how a signal ended up queued as executable and then refused, or blocked at
      the row while a perfectly usable fallback sat in settings. */
-  assert.match(saveSignalBody, /captureSafety\(\{ parsed, source, settings: guard \}\)/, 'the shared policy is the only one allowed to decide');
+  assert.match(saveSignalBody, /captureSafety\(\{ parsed, source, settings: guard, review \}\)/, 'the shared policy is the only one allowed to decide, and the review flag is an input to it rather than a second opinion afterwards');
+  /* Both layers run in exactly one place, and the capture path is it. A second `parseSignal` call would be
+     the same mistake in a new costume: two readings of one message, one of which the row does not have. */
+  assert.match(saveSignalBody, /parseSignalTwoLayer\(savedText, \{ source, config: parserConfig/, 'the row is written from the merged reading, not from Layer 1 alone');
+  assert.equal(/(?:^|[^.\w])parseSignal\(/.test(saveSignalBody), false, 'capture never calls the deterministic layer directly');
   assert.match(saveSignalBody, /const executionReady = safety\.executionReady === true/);
   assert.match(saveSignalBody, /const parseError = safety\.parseError \|\| null/);
   for (const dropped of ['isBlockedOnlyByStopLoss', 'allowMissingStopLoss']) {

@@ -15,7 +15,8 @@ import { pool, initializeDatabase } from './db.js';
 import { withDeadline } from './services/schema-sql.js';
 import { createMetaApiConfigurationLink, metaApiRequest, toSafeMetaApiAccount } from './services/metaapi.js';
 import { getTelegramErrorCode, isTelegramPasswordNeeded, shouldDiscardTelegramLogin, telegramAuthErrorPayload } from './services/telegram-auth.js';
-import { parseSignal } from './services/signal-parser.js';
+import { parseSignalTwoLayer } from './services/signal-parse-pipeline.js';
+import { llmConfig } from './services/signal-llm.js';
 import { TARGET_MODES } from './services/scale-out.js';
 import { captureSafety, readFallbackPoints } from './services/signal-safety.js';
 import { buildDashboardActionableSignalsQuery, buildDashboardRecentSignalsQuery, chooseDashboardSignals } from './services/dashboard-signals.js';
@@ -85,6 +86,12 @@ const autoTradingRuntimeEnabled = String(process.env.AUTO_TRADING_RUNTIME_ENABLE
 const tradingAdapter = createMetaApiTradingAdapter();
 const supabaseAuthBridge = createSupabaseAuthBridge();
 const adminAccess = createAdminAccess();
+/* Layer 2 is configured entirely from the environment, once, at boot: a key rotated by a deployment is a
+   key the process should pick up by restarting, not one it re-reads between two messages of the same
+   capture. `disabledReason` is what the startup log below quotes, and it is the only place an operator finds
+   out that the AI reading assistant is switched off. */
+const parserConfig = llmConfig(process.env);
+
 const accountCleanup = createAccountCleanup({ logger: { warn: (message, extra = {}) => log('warn', message, extra) } });
 const paystackConfig = billingConfig();
 const paystackClient = createPaystackClient({ config: paystackConfig });
@@ -319,7 +326,6 @@ function scaleOutLadder(parsed) {
 }
 
 async function saveSignal(userId, message, channel = {}) {
-  const parsed = parseSignal(message);
   const source = channel.source === 'manual' ? 'manual' : 'telegram';
   const telegramMessageId = source === 'telegram' && channel.telegramMessageId != null ? String(channel.telegramMessageId) : null;
   const savedText = String(message || '').slice(0, 5000);
@@ -331,30 +337,40 @@ async function saveSignal(userId, message, channel = {}) {
     [userId],
   );
   const guard = guardRows[0] || {};
+  /* Both layers, in order, and the review decision with them. This is the only place the model is asked
+     anything, and it is deliberately before the insert: the row a reader sees later is the row that was
+     written, provenance and all, rather than a row that got upgraded after the fact by whatever the fallback
+     layer managed to read while the dashboard was already showing it. */
+  const { parsed, review, provenance } = await parseSignalTwoLayer(savedText, { source, config: parserConfig, logger: serviceLogger });
   /* Which refusals this workspace's own safety rules can answer: a fallback distance may complete a leg
      the channel forgot, an override may send the order without it, and neither is true when the block is
      up and no net is set. A direction inferred from the prices never becomes eligible at all - reading a
      channel is not the same as being told to trade. The prices themselves are computed later, against a
      live quote and the broker's own symbol rules, so the row never claims to be executable for a leg the
      broker would refuse, and never claims to be unusable for a leg the workspace has a net for. */
-  const safety = captureSafety({ parsed, source, settings: guard });
+  /* `needs_review` is the pipeline's answer, kept separate from `execution_ready` on purpose: a row can be
+     complete and still need a human, and a reviewer cannot tell a blocked signal from a broken one if both
+     collapse into the same flag. */
+  const safety = captureSafety({ parsed, source, settings: guard, review });
   const executionReady = safety.executionReady === true;
   const parseError = safety.parseError || null;
   const { rows } = await pool.query(
-    `INSERT INTO signals(user_id,channel_id,channel_title,telegram_message_id,source,message,symbol,side,entry_price,stop_loss,take_profit,execution_ready,parse_error,status,direction_inferred,take_profit_levels)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb)
+    `INSERT INTO signals(user_id,channel_id,channel_title,telegram_message_id,source,message,symbol,side,entry_price,stop_loss,take_profit,execution_ready,parse_error,status,direction_inferred,take_profit_levels,
+       needs_review,parsed_by,parse_confidence,llm_used,stop_loss_pips,take_profit_pips)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18,$19,$20,$21,$22)
      ON CONFLICT DO NOTHING
      RETURNING id,channel_id AS "channelId",channel_title AS "channelTitle",telegram_message_id AS "telegramMessageId",source,message,symbol,side,
        entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt",
-       direction_inferred AS "directionInferred",take_profit_levels AS "takeProfitLevels"`,
-    [userId, channel.channelId || null, channel.title || null, telegramMessageId, source, savedText, parsed.symbol, parsed.side, parsed.entryPrice, parsed.stopLoss, parsed.takeProfit, executionReady, parseError, executionReady ? 'received' : 'unparsed', parsed.directionInferred === true, scaleOutLadder(parsed)],
+       direction_inferred AS "directionInferred",take_profit_levels AS "takeProfitLevels",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",needs_review AS "needsReview"`,
+    [userId, channel.channelId || null, channel.title || null, telegramMessageId, source, savedText, parsed.symbol, parsed.side, parsed.entryPrice, parsed.stopLoss, parsed.takeProfit, executionReady, parseError, executionReady ? 'received' : 'unparsed', parsed.directionInferred === true, scaleOutLadder(parsed),
+      review.required === true, provenance.parsedBy, provenance.confidence, provenance.llmUsed === true, parsed.stopLossPips, parsed.takeProfitPips],
   );
   let signal = rows[0];
   if (!signal && telegramMessageId) {
     const existing = await pool.query(
       `SELECT id,channel_id AS "channelId",channel_title AS "channelTitle",telegram_message_id AS "telegramMessageId",source,message,symbol,side,
          entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",direction_inferred AS "directionInferred",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt",
-         take_profit_levels AS "takeProfitLevels"
+         take_profit_levels AS "takeProfitLevels",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",needs_review AS "needsReview"
        FROM signals WHERE user_id=$1 AND channel_id=$2 AND telegram_message_id=$3 AND source='telegram' LIMIT 1`,
       [userId, channel.channelId, telegramMessageId],
     );
@@ -883,7 +899,7 @@ app.delete('/api/channels/:id', authenticate, asyncRoute(async (req, res) => {
 
 app.get('/api/signals', authenticate, asyncRoute(async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
-  const { rows } = await pool.query(`SELECT id,channel_title AS "channelTitle",source,message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",direction_inferred AS "directionInferred",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",take_profit_levels AS "takeProfitLevels",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2`, [req.userId, limit]);
+  const { rows } = await pool.query(`SELECT id,channel_title AS "channelTitle",source,message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",direction_inferred AS "directionInferred",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",take_profit_levels AS "takeProfitLevels",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",needs_review AS "needsReview",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2`, [req.userId, limit]);
   res.json({ signals: rows });
 }));
 app.post('/api/signals', authenticate, asyncRoute(async (req, res) => {
@@ -1535,6 +1551,7 @@ const adminSignalColumns = `s.id,s.user_id AS "userId",u.name AS "userName",u.em
   s.entry_price AS "entryPrice",s.stop_loss AS "stopLoss",s.take_profit AS "takeProfit",
   s.direction_inferred AS "directionInferred",s.execution_ready AS "executionReady",
   s.parse_error AS "parseError",s.execution_note AS "executionNote",s.status,s.created_at AS "createdAt",
+  parsed_bys. AS "parsedBy",parse_confidences. AS "parseConfidence",llm_useds. AS "llmUsed",stop_loss_pipss. AS "stopLossPips",take_profit_pipss. AS "takeProfitPips",needs_reviews. AS "needsReview",
   (SELECT COUNT(*)::int FROM trades t WHERE t.signal_id=s.id) AS "tradeCount",
   left(s.message,300) AS "message",COUNT(*) OVER()::int AS "totalCount"`;
 const ADMIN_SIGNAL_FILTER = `WHERE ($1::text=''
@@ -2711,6 +2728,12 @@ const listen = () => new Promise((resolve, reject) => {
   httpServer.listen(PORT, '0.0.0.0', () => {
     httpServer.removeListener('error', onError);
     log('info', 'Server listening', { port: PORT });
+    /* Said out loud once, at boot, because a fallback layer that is silently absent is indistinguishable from
+       a fallback layer that is not needed: a channel's malformed signal would be refused with no hint that a
+       second reader exists to be turned on. */
+    log(parserConfig.enabled ? 'info' : 'warn', parserConfig.enabled
+      ? `[Parser] LLM fallback enabled (${parserConfig.model}).`
+      : `[Parser] LLM Fallback disabled (${parserConfig.disabledReason}).`, { parsedBy: parserConfig.enabled ? 'regex+llm' : 'regex' });
     resolve();
   });
 });

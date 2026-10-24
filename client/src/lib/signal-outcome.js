@@ -27,7 +27,10 @@ export function signalHasTradingData(signal) {
     || signal?.side
     || signal?.entryPrice != null
     || signal?.stopLoss != null
-    || signal?.takeProfit != null);
+    || signal?.takeProfit != null
+    // A distance is a price the channel stated, just not in price units, so it counts here too.
+    || signal?.stopLossPips != null
+    || signal?.takeProfitPips != null);
 }
 
 /**
@@ -45,12 +48,18 @@ export function signalOutcomeView(signal) {
   // when nothing usable came out of it. A readable note that is missing a piece says "Needs review"
   // and quotes the server's own sentence underneath.
   const unclear = status === 'unparsed' && !signalHasTradingData(signal);
+  /* The review flag is stated separately from the status because it answers a different question. "unparsed"
+     means nothing usable came out of the message; needs-review means something *did*, and the platform will
+     not act on it without a person. A row can be complete, well-formed, and still be one a human has to
+     look at - which is precisely the case an automated trade must not be made from. */
+  const needsReview = signal?.needsReview === true;
   const upgradeRequired = /upgrade to|paid plan/i.test(note);
   return {
     status,
-    label: unclear ? 'No clear signal'
-      : (status === 'unparsed' ? 'Needs review' : (known?.label || status.replace(/_/g, ' '))),
-    tone: known?.tone || 'muted',
+    label: needsReview ? 'Needs Review'
+      : (unclear ? 'No clear signal'
+        : (status === 'unparsed' ? 'Needs review' : (known?.label || status.replace(/_/g, ' ')))),
+    tone: needsReview ? 'warn' : (known?.tone || 'muted'),
     note,
     upgradeRequired,
     showNote: Boolean(note),
@@ -74,14 +83,37 @@ export function signalBadges(signal) {
      one look identical. Deliberately keyed off a *stated* price rather than `signalHasTradingData`, which
      also answers true for a row that only yielded a word for a symbol - that one has nothing to be a market
      order about, and it already wears a "Missing SL" badge. */
-  if (signal?.entryPrice == null && signal?.source === 'telegram' && (signal?.stopLoss != null || signal?.takeProfit != null)) {
+  const statesDistance = signal?.stopLossPips != null || signal?.takeProfitPips != null;
+  if (signal?.entryPrice == null && signal?.source === 'telegram' && (signal?.stopLoss != null || signal?.takeProfit != null || statesDistance)) {
     badges.push({ key: 'market', label: 'Market', tone: 'muted', title: 'The message did not name an entry price, so it is not waiting for one: it goes to the broker as a market order, filled at the current ask for a buy or the current bid for a sell.' });
   }
-  if (signal?.stopLoss == null && signal?.source === 'telegram') {
+  /* A stop given as `SL 30 pips` is not a missing stop, and saying it is would point the reader at a Safety
+     setting they do not need to touch - the distance is there, it is only in the unit only the broker can
+     turn into a price. So every "missing" badge is checked against both forms of the leg. */
+  if (signal?.stopLoss == null && signal?.stopLossPips == null && signal?.source === 'telegram') {
     badges.push({ key: 'missing-stop', label: 'Missing SL', tone: 'warn', title: 'No stop loss in the message. A fallback distance in your Safety settings can supply one; otherwise nothing is sent while the stop-loss block is on, and with that block off the trade goes out unprotected, which is recorded as an override.' });
   }
-  if (signal?.takeProfit == null && signal?.source === 'telegram') {
+  if (signal?.takeProfit == null && signal?.takeProfitPips == null && signal?.source === 'telegram') {
     badges.push({ key: 'missing-target', label: 'Missing TP', tone: 'muted', title: 'No target in the message. Your Safety settings decide whether that stops an order: a fallback distance can supply a target, and with the take-profit block off the position is opened with nothing planned to close it.' });
+  }
+  /* Provenance, on the face of the row. Two of these legs came from a model, and a number a model reported
+     deserves to look different from a number a channel wrote, even when both are correct: it is the one
+     difference a reader cannot reconstruct afterwards from the price itself. */
+  if (signal?.llmUsed === true && signal?.parsedBy === 'llm') {
+    const confidence = Number(signal?.parseConfidence);
+    badges.push({
+      key: 'ai',
+      label: 'AI Parsed',
+      tone: 'ai',
+      title: `Part of this signal was too garbled for the built-in reader, so an AI reading assistant finished it${Number.isFinite(confidence) ? ` (it reported ${Math.round(confidence * 100)}% confidence)` : ''}. Every price it supplied was checked against the digits in the message; what it had to interpret is what the badge is for.`,
+    });
+  }
+  for (const [key, label, leg, title] of [
+    ['pips-stop', 'Pips SL', signal?.stopLossPips, 'The stop loss was written as a distance in pips rather than a price, so it is measured from the market price at the moment the order goes out, using the broker\'s own price step.'],
+    ['pips-target', 'Pips TP', signal?.takeProfitPips, 'The target was written as a distance in pips rather than a price, so it is measured from the market price at the moment the order goes out, using the broker\'s own price step.'],
+  ]) {
+    if (leg == null) continue;
+    badges.push({ key, label: `${label} ${leg}`, tone: 'muted', title });
   }
   return badges;
 }

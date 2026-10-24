@@ -569,7 +569,7 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
       const { rows } = await pool.query(
         `SELECT ej.id AS job_id,ej.user_id,ej.status AS job_status,ej.attempt_count AS "attemptCount",ej.expires_at,
                 s.id AS signal_id,s.source,s.created_at AS signal_created_at,s.symbol,s.side,s.entry_price,s.stop_loss,s.take_profit,
-                s.execution_ready,s.parse_error,
+                s.execution_ready,s.parse_error,s.needs_review,s.stop_loss_pips,s.take_profit_pips,
                 st.auto_trading_enabled,st.lot_size_mode,st.fixed_lot_size,st.risk_percent,st.max_open_positions,
                 st.max_daily_trades,st.daily_loss_limit,st.execution_account_id,st.block_execution_without_stop_loss,
                 st.block_execution_without_take_profit,st.fallback_stop_loss_points,st.fallback_take_profit_points,
@@ -586,6 +586,12 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
       );
       const item = rows[0];
       if (!item) return stop(job, 'skipped', 'Execution settings, signal, or selected account are unavailable.');
+      /* A row flagged for review is not traded, whatever else is true about it. The job should not exist for
+         a signal like this, and the queue is gated upstream - but a workspace that changed its Safety
+         settings between capture and execution, or a row written by an older version of the parser, must not
+         be able to reach the broker on the strength of a queue entry alone. This is the one place the flag is
+         enforced against a live order, so it is checked before a quote is fetched or a lot is sized. */
+      if (item.needs_review === true) return stop(job, 'skipped', 'This signal was saved for review, so it was not traded.');
       accountId = item.metaapi_account_id || null;
       attempt = Number(item.attemptCount || 1);
       expiresAt = Date.parse(String(item.expires_at || ''));
@@ -691,6 +697,11 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
         stopsLevelPoints: state.specification?.stopsLevel,
         stopLoss: Number.isFinite(signalStopLoss) ? signalStopLoss : null,
         takeProfit: Number.isFinite(signalTakeProfit) ? signalTakeProfit : null,
+        // A distance the channel stated in pips, handed over as a distance: this is the moment the broker's
+        // own tick size exists in the same scope as the number, which is the only honest place to convert.
+        stopLossPips: item.stop_loss_pips == null ? null : Number(item.stop_loss_pips),
+        takeProfitPips: item.take_profit_pips == null ? null : Number(item.take_profit_pips),
+        symbol: resolved.symbol,
         fallbackStopLossPoints: item.fallback_stop_loss_points,
         fallbackTakeProfitPoints: item.fallback_take_profit_points,
         blockExecutionWithoutStopLoss: item.block_execution_without_stop_loss,
