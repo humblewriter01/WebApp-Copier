@@ -18,6 +18,7 @@ import { getTelegramErrorCode, isTelegramPasswordNeeded, shouldDiscardTelegramLo
 import { parseSignal } from './services/signal-parser.js';
 import { TARGET_MODES } from './services/scale-out.js';
 import { captureSafety, readFallbackPoints } from './services/signal-safety.js';
+import { buildDashboardActionableSignalsQuery, buildDashboardRecentSignalsQuery, chooseDashboardSignals } from './services/dashboard-signals.js';
 import { createTelegramListener } from './services/telegram-listener.js';
 import { createMetaApiTradingAdapter } from './services/metaapi-trading.js';
 import { createExecutionEngine, PLATFORM_PAUSE_MESSAGE } from './services/execution-engine.js';
@@ -823,16 +824,25 @@ app.get('/api/auth/me', authenticate, asyncRoute(async (req, res) => {
 }));
 
 app.get('/api/dashboard', authenticate, asyncRoute(async (req, res) => {
-  const [signalsCount, channelsCount, accountsCount, recentSignals, settings] = await Promise.all([
+  /*
+   * Two lists rather than one filtered query, because the Overview either shows setups or says it could not:
+   * both statements are bounded and complete, they are read in the same round-trip fan-out as the counts
+   * beside them, and `chooseDashboardSignals` makes the call. The full history belongs to the Signals tab,
+   * which is why this route is allowed to be short.
+   */
+  const [signalsCount, channelsCount, accountsCount, actionableSignals, recentSignals, settings] = await Promise.all([
     pool.query('SELECT COUNT(*)::int AS count FROM signals WHERE user_id=$1', [req.userId]),
     pool.query('SELECT COUNT(*)::int AS count FROM channels WHERE user_id=$1 AND enabled=TRUE', [req.userId]),
     pool.query('SELECT COUNT(*)::int AS count FROM accounts WHERE user_id=$1', [req.userId]),
-    pool.query(`SELECT id,channel_title AS "channelTitle",source,message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",direction_inferred AS "directionInferred",execution_note AS "executionNote",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT 10`, [req.userId]),
+    pool.query(buildDashboardActionableSignalsQuery().sql, [req.userId]),
+    pool.query(buildDashboardRecentSignalsQuery().sql, [req.userId]),
     pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled" FROM settings WHERE user_id=$1', [req.userId]),
   ]);
+  const dashboardSignals = chooseDashboardSignals({ actionable: actionableSignals.rows, recent: recentSignals.rows });
   res.json({
     stats: { totalSignals: signalsCount.rows[0].count, activeChannels: channelsCount.rows[0].count, accounts: accountsCount.rows[0].count },
-    signals: recentSignals.rows,
+    signals: dashboardSignals.rows,
+    signalsScope: dashboardSignals.scope,
     settings: settings.rows[0] || { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 5, dailyLossLimit: 5, autoTradingEnabled: false },
     trading: { liveExecutionEnabled: autoTradingRuntimeEnabled, autoTradingEnabled: settings.rows[0]?.autoTradingEnabled === true, message: autoTradingRuntimeEnabled ? 'Auto-Trading starts on for new workspaces; review the live-trading warning and turn it off in Advanced Settings whenever you want.' : 'Automatic execution is unavailable right now. Signals can still be reviewed.' },
   });

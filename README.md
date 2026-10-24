@@ -605,7 +605,7 @@ The static site is served over HTTPS and includes a linked web app manifest, 192
 - `GET /api/billing/plans` – public plan catalogue
 - `GET /api/billing/subscription`, `GET /api/billing/quote`, `POST /api/billing/checkout`, `GET /api/billing/verify`, `POST /api/billing/cancel`, `POST /api/billing/resume`
 - `POST /api/billing/webhook` – Paystack callback, authenticated by signature only
-- `GET /api/dashboard`
+- `GET /api/dashboard` – the Overview's counts, settings and `signals`: at most **three** rows, and only ones that state a price (`execution_ready`, a status that has outlived `unparsed`, or a non-null entry/stop/target). A workspace with nothing actionable gets its three most recent messages instead and `signalsScope: "recent"`, which is the one case in which the panel says so in a line of its own. The full history is `GET /api/signals`, which the Overview's **View all** opens
 - `GET/POST /api/channels`, `DELETE /api/channels/:id`
 - `GET/POST /api/signals`, `DELETE /api/signals/:id`, `DELETE /api/signals` — every stored message with its outcome: `status` (`received`, `queued`, `unexecuted`, `expired`, `unparsed`, `executed`, `rejected`, `unknown`, `failed` — the last one meaning the account was blocked, not the signal), `executionNote` (the sentence explaining an outcome that was not a trade), `directionInferred`, and the parsed prices; `DELETE` removes captured messages only and unlinks any trade they produced
 - `GET/POST /api/accounts`, `DELETE /api/accounts/:id`
