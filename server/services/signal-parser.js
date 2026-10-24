@@ -1,5 +1,23 @@
-const NUMBER = '(\\d+(?:\\.\\d+)?|\\.\\d+)';
-const DIRECTION_WORDS = /\b(BUY|SELL|LONG|SHORT)\b/gi;
+import { normalizeSignalNumbers, isPipDistance } from './signal-numbers.js';
+
+/* After `normalizeSignalNumbers`, every price in the scanned text is a canonical dot-decimal, so the only
+   shape a number can take here is one the label scanners were written for. */
+/* NUMBER captures, and the group is not decoration: every scanner below reads `match[1]`, so a
+   non-capturing NUMBER would leave every leg undefined and read as an invalid price. */
+const NUMBER = '(\\d+(?:\\.\\d+)?)';
+
+/**
+ * Direction words, and the two that need a neighbour to mean anything.
+ *
+ * BUY/SELL/LONG/SHORT are unambiguous in a trading message. CALL and PUT are English words first ("do not
+ * call me", "put your stop above the entry"), and a direction read out of a sentence like that is a live
+ * order in the wrong market - so they count only when the word is attached to an instrument or a price,
+ * which is the shape of an instruction: `CALL GOLD`, `PUT on EURUSD`, `SELL - BUY 1.0850` stays a
+ * contradiction rather than a coin flip.
+ */
+const DIRECTION_WORDS = /\b(BUY|SELL|LONG|SHORT|BUYING|SELLING)\b/gi;
+const OPTION_WORDS = /\b(CALL|PUT)\b(?:\s+(?:ON|AT))?[^\w\n]{0,3}[ \t]*(?:[A-Z]{3,10}\d{0,5}|\d)/gi;
+const SELLISH = new Set(['SELL', 'SHORT', 'PUT', 'SELLING']);
 const STOP_WORDS = new Set([
   'BUY', 'SELL', 'LONG', 'SHORT', 'TAKE', 'PROFIT', 'TARGET', 'STOP', 'LOSS', 'STOPLOSS',
   'ENTRY', 'PRICE', 'AT', 'MARKET', 'LIMIT', 'ORDER', 'SIGNAL', 'SIGNALS', 'TRADE', 'TRADES',
@@ -9,6 +27,37 @@ const STOP_WORDS = new Set([
 function parseNumber(value) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+/**
+ * The decoration a Telegram message carries, taken out before anything is read.
+ *
+ * Emojis, markdown emphasis, links and @mentions are how a channel shouts, and none of them are ever a
+ * trading instruction - but they sit *inside* the things that are: `**SELL GOLD:**` puts asterisks against
+ * the metal, `t.me/vipchannel` hands the symbol scanner a candidate, and `🚀🚀 BUY 🚀 EURUSD` splits a
+ * direction word from its pair. Stripping them is not tidying for its own sake: every one of those made a
+ * complete instruction unreadable.
+ *
+ * Deliberately absent: anything a message's *meaning* could live in. Numbers, labels, line breaks, brackets
+ * and colons stay, and prose is left alone - a disclaimer that happens to contain the word "risk" is not
+ * noise to this function, and removing whole lines on a keyword would delete the stop of a signal that
+ * mentioned one.
+ */
+const EMOJI = /[\u{1F000}-\u{1FAFF}\u{1F1E6}-\u{1F1FF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}\u{2190}-\u{21FF}]/gu;
+const LINKS = /\b(?:https?:\/\/|www\.|t\.me\/|discord\.gg\/|vip\s*channel\b)[^\s|)]*/gi;
+const MENTIONS = /@[A-Za-z][A-Za-z0-9_]{3,31}/g;
+const EMPHASIS = /[*_~`#|]+/g;
+
+function stripNoise(text) {
+  return String(text ?? '')
+    .replace(LINKS, ' ')
+    .replace(MENTIONS, ' ')
+    .replace(EMOJI, ' ')
+    .replace(EMPHASIS, ' ')
+    // A run of spaces is one space, but line breaks are kept: `findMarkedValues` reads "TP 1 : 4029.50"
+    // across them, and a signal's labels are usually one per line.
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
 }
 
 function normalizeSymbol(value) {
@@ -115,23 +164,53 @@ function findSymbol(text) {
 }
 
 /**
- * Every price a message marks with a label, and the number it actually said.
+ * Every price a message marks with a label, and whether it marked a *distance* instead.
  *
  * The label is where this used to go wrong. Channels write "TP 1 : 4029.50", and a pattern that reads
  * `TP` then an optional separator then a number stopped at the *index* - the target became 1, and the
- * real price was left behind as an unlabelled number. So the label may consume a one- or two-digit
- * index when what follows it is a separator or another number ("TP 1 :", "TP 1 4029.50", "TP2: 4027.5"),
- * and a match is rejected when the number it found is itself followed by a separator, because that is
- * the shape of an index that had no price after it - "TP 3 : OPEN". Reading the index as the price was
- * how a numbered-target channel produced a take-profit of 1 point and a hundred and thirty-two broker
+ * real price was left behind as an unlabelled number. So the label may consume a one- or two-digit index
+ * when what follows it is a separator or another number ("TP 1 :", "TP 1 4029.50", "TP2: 4027.5"), and a
+ * match is rejected when the number it found is itself followed by a separator, because that is the shape
+ * of an index that had no price after it - "TP 3 : OPEN". Reading the index as the price was how a
+ * numbered-target channel produced a take-profit of 1 point and a hundred and thirty-two broker
  * rejections.
+ *
+ * The separator class now carries a dash and a bullet as well as `: = @`: `SL - 4011.00`, `SL • 4011`,
+ * `SL → 4011` are how a message with a template and no typographic care looks, and each of them used to
+ * leave the leg simply absent - which reads as "the channel forgot the stop" and hands the trade to the
+ * workspace's fallback distance instead of the one the trader wrote down.
  */
+/**
+ * A distance written *before* its label - `30 pips SL`, `50 pips TP` - which the labelled scan cannot see,
+ * because the number is not in front of the word it belongs to.
+ */
+/* A label and its price are usually separated by punctuation, but plenty of channels separate them with a
+   small word instead - `SL at 4010`, `TP is 4050`, `Invalidation level 4011`. A closed list of those words,
+   at most three of them, is what makes the number still belong to the label. The words are only connectives,
+   never level words: `entry`, `price`, `zone` and `target` are labels in their own right, and letting one
+   label skip over another produced `DCA Entry 1: 1.0850` read as "DCA" + "entry" + the number *1* - a third
+   match that won the ladder and made the entry 1.0. An open-ended skip would let a
+   label reach any number later in the message and call it a price, which is a worse failure than missing it. */
+const MARKED_CONNECTIVE = String.raw`(?:\s*(?:[:=@\u2013\u2014\u2022\u2192-]|\b(?:is|are|at|to|in|of|on|for|by|the|around|near|level|now|market|open|close)\b)\s*)`;
+const MARKED_GAP = `${MARKED_CONNECTIVE}{0,3}\\s*`;
+
+function findPipDistances(text, labelPattern) {
+  const regex = new RegExp(`\\b${NUMBER}\\s*(?:pips?|pts?|points?)\\s*(?:${labelPattern})\\b`, 'gi');
+  return [...text.matchAll(regex)].map((match) => parseNumber(match[1])).filter((value) => value !== null);
+}
+
 function findMarkedValues(text, labelPattern) {
   const index = '(?:\\s*\\d{1,2}(?:\\s*[:=@]|\\s+(?=[\\d.])))?';
-  const regex = new RegExp(`\\b(?:${labelPattern})\\b${index}\\s*[:=@]?\\s*${NUMBER}(?!\\s*[:=@])`, 'gi');
+  const regex = new RegExp(`\\b(?:${labelPattern})\\b${index}${MARKED_GAP}${NUMBER}(?!\\s*[:=@])`, 'gi');
   return [...text.matchAll(regex)].map((match) => {
-    const tail = text.slice(match.index + match[0].length);
-    return { value: parseNumber(match[1]), match, range: /^\s*(?:-|–|—|TO|\.\.)\s*(?:\d|\.)/i.test(tail) };
+    const end = match.index + match[0].length;
+    const tail = text.slice(end);
+    return {
+      value: parseNumber(match[1]),
+      match,
+      pips: isPipDistance(text, end),
+      range: /^\s*(?:-|–|—|TO|\.\.)\s*(?:\d|\.)/i.test(tail),
+    };
   });
 }
 
@@ -149,18 +228,79 @@ function findMarkedValues(text, labelPattern) {
  * a limit on *whether* to trade, not the price anything is filled at.
  */
 const RANGE_SEPARATOR = '\\s*(?:-|–|—|TO|\\.\\.)\\s*';
-const ENTRY_LABEL = '(?:ENTRY\\s+ZONE|SELL\\s+ZONE|BUY\\s+ZONE|ENTRY\\s+AREA|ENTRY(?:\\s+PRICE)?|PRICE|AT|ZONE|AREA)';
+/* The index clause is index-aware in exactly the way `findMarkedValues` is, and for the same reason.
+   `Entry 1: 1.0850` carries a level number; `Entry 4026.00` does not. Written loosely - "ENTRY" then one
+   or two digits - it matched the "40" of a 4026.00 price, called that the index, and returned 26.00 as the
+   entry, which is a readable number that is completely wrong. A digit run is only an index when a separator
+   or another number follows it. */
+const ENTRY_INDEX = '(?:\\s*\\d{1,2}(?:\\s*[:=@]|\\s+(?=[\\d.])))?';
+const ENTRY_LABEL = `(?:ENTRY${ENTRY_INDEX}ZONE|SELL${ENTRY_INDEX}ZONE|BUY${ENTRY_INDEX}ZONE|ENTRY${ENTRY_INDEX}AREA|ENTRY${ENTRY_INDEX}(?:\\s+PRICE)?|PRICE${ENTRY_INDEX}|ZONE|AREA|DCA)`;
+/* `@ 1.0850`, `@1.0850` and `EVERY PRICE @ 4011` - a price introduced by the at-sign and by no label at
+   all. Channels mark the level this way constantly, and it used to be invisible: an entry written as `@`
+   left no number on the row, which is the difference between a signal the engine can price-check and one
+   it has to take on trust at whatever the market is doing. */
+const ENTRY_MARKER = '@';
+const ENTRY_SEPARATORS = '[:=@–—-]';
+
+/**
+ * The most common signal shape, and the one no label catches: `BUY EURUSD 1.0850 SL 1.0800`.
+ *
+ * The price sits against the symbol with nothing in front of it, so a scanner that only reads labels never
+ * sees it, and the row goes out with no entry. That is not fatal - the order is a market order either way -
+ * but it throws away the one number that tells the engine the channel's level has already been passed. So
+ * it is read here, narrowly: a number within a few characters of the symbol the message used, only when
+ * nothing labelled claimed an entry, and never a quantity. Measure words are the trap: `BUY EURUSD 2 lots`
+ * states a size, and a stop 2.0 away from 1.08 is exactly the readable-but-wrong number this file exists
+ * to refuse. A price that matches a leg the labels already found is that leg restated, not an entry.
+ */
+const BARE_ENTRY_GUARD = '(?!\\s*(?:lots?|units?|deals?|%|pips?|pts?|points?|USD|EUR|digits?|minutes?|hours?|days?|traders?))';
+
+function parseBareEntry(text, names, taken) {
+  const pattern = (names || []).filter(Boolean).map((name) => String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  if (!pattern.length) return null;
+  const regex = new RegExp(`\\b(?:${pattern.join('|')})\\b[^\\d\\n]{0,12}${NUMBER}${BARE_ENTRY_GUARD}`, 'gi');
+  const found = [];
+  for (const match of text.matchAll(regex)) {
+    const value = parseNumber(match[1]);
+    if (value === null || taken.includes(value)) continue;
+    found.push(value);
+  }
+  return found.length === 1 ? found[0] : null;
+}
 
 function parseEntry(text) {
-  const regex = new RegExp(`\\b${ENTRY_LABEL}\\s*[:=@-]?\\s*${NUMBER}(?:${RANGE_SEPARATOR}${NUMBER})?`, 'gi');
+  /* The label has to be there; a small connective word after it is allowed, because channels write
+     `Entry at 1.0850` and `price is 140.512` as naturally as `Entry: 1.0850`. `at` used to be a *label* of
+     its own, and that is how `SELL US30 35000 - SL at 35100` came back with an entry of 35100: the English
+     word in front of the stop, read as the entry. A word an ordinary sentence uses cannot be a marker - it
+     can only ever be something a real label leans on. The same allowance is shared with `findMarkedValues`. */
+  const regex = new RegExp(`(?:\\b${ENTRY_LABEL}|${ENTRY_MARKER})${MARKED_GAP}${NUMBER}(?:${RANGE_SEPARATOR}${NUMBER})?`, 'gi');
   const matches = [...text.matchAll(regex)];
-  if (!matches.length) return { value: null, range: null, error: null };
-  if (matches.length > 1) return { value: null, range: null, error: 'More than one entry price was found.' };
+  if (!matches.length) return { value: null, range: null, error: null, levels: null, pips: false };
+  /* More than one entry is a dollar-cost-averaging plan when the message enumerates it - `Entry 1: 1.0850`
+     then `Entry 2: 1.0800` - which is an instruction with a first leg, not a contradiction. It stays a
+     contradiction when the levels are offered as alternatives ("entry 1.085 or 1.080"), because choosing
+     between two prices a human wrote as a choice is exactly the guessing this parser exists to avoid. So
+     an `or`, a slash, or an "if" between two candidates leaves the refusal in place. */
+  if (matches.length > 1) {
+    const between = matches.slice(0, -1).map((match, index) => text.slice(match.index + match[0].length, matches[index + 1].index)).join(' ');
+    const ladder = !/\b(?:or|else|if|otherwise)\b|\//i.test(between);
+    const listed = matches.map((match) => parseNumber(match[1])).filter((value) => value !== null);
+    if (ladder && listed.length === matches.length) {
+      return { value: listed[0], range: null, error: null, levels: listed, pips: isPipDistance(text, matches[0].index + matches[0][0].length) };
+    }
+    return { value: null, range: null, error: 'More than one entry price was found.', levels: null, pips: false };
+  }
   const low = parseNumber(matches[0][1]);
   const high = parseNumber(matches[0][2]);
-  if (matches[0][2] === undefined || high === null) return low ? { value: low, range: null, error: null } : { value: null, range: null, error: 'The entry price is not a valid price.' };
+  if (matches[0][2] === undefined || high === null) {
+    const pips = isPipDistance(text, matches[0].index + matches[0][0].length);
+    return low !== null
+      ? { value: pips ? null : low, range: null, error: null, pips, levels: null }
+      : { value: null, range: null, error: 'The entry price is not a valid price.', levels: null, pips: false };
+  }
   const range = { low: Math.min(low, high), high: Math.max(low, high) };
-  return { value: null, range, error: null };
+  return { value: null, range, error: null, levels: null, pips: false };
 }
 
 /** The bound of an entry range a signal is credited with, once the direction is known. */
@@ -182,8 +322,18 @@ function entryFromRange(range, side) {
  * judgement this function makes rather than reads - and a judged direction is never traded, only shown.
  */
 export function parseSignal(message) {
-  const text = String(message || '').slice(0, 5000);
-  const directions = [...text.matchAll(DIRECTION_WORDS)].map((match) => ['BUY', 'LONG'].includes(match[1].toUpperCase()) ? 'buy' : 'sell');
+  const raw = String(message || '').slice(0, 5000);
+  const numbers = normalizeSignalNumbers(stripNoise(raw));
+  const text = numbers.text;
+  /* Which numbers in this message could only be read by guessing. A leg that lands on one of them is
+     reported, not traded: `SL 4,011` means 4.011 to one market and 4011 to another, and a stop chosen by
+     a coin flip is worse than no stop, because it looks like a plan. */
+  const unclear = numbers.ambiguous;
+  const unclearValue = (value) => (value === null ? null : unclear.find((item) => item.value === value) || null);
+
+  const directions = [...text.matchAll(DIRECTION_WORDS), ...text.matchAll(OPTION_WORDS)]
+    .map((match) => match[1].toUpperCase())
+    .map((word) => (SELLISH.has(word) ? 'sell' : 'buy'));
   const uniqueDirections = [...new Set(directions)];
   let side = uniqueDirections.length === 1 ? uniqueDirections[0] : null;
   const ambiguousSideError = uniqueDirections.length > 1 ? 'More than one trade direction was found.' : null;
@@ -191,21 +341,48 @@ export function parseSignal(message) {
 
   const { symbol, error: symbolError } = findSymbol(text);
   const entry = parseEntry(text);
-  const stopMatches = findMarkedValues(text, 'SL|STOP(?:\\s*LOSS)?');
-  const takeProfitMatches = findMarkedValues(text, 'TP\\d*|TAKE\\s*PROFIT(?:\\s*\\d+)?|TARGET(?:\\s*\\d+)?');
+  /* A level a message gives as a distance ("SL 30 pips") is a *leg the channel stated*, and it is kept
+     apart from a price for two reasons. It cannot be turned into a price here - that needs the broker's tick
+     size, which only exists when the order is built - and treating it as absent would let a workspace's
+     fallback distance quietly replace the number the trader actually wrote down. */
+  const stopMatches = findMarkedValues(text, 'SL|STOP(?:\\s*LOSS)?|INVALIDATION|INVALIDATE(?:\\s*LEVEL)?|STOP\\s*OUT');
+  const takeProfitMatches = findMarkedValues(text, 'TP\\d*|TAKE\\s*PROFIT(?:\\s*\\d+)?|TARGET(?:\\s*\\d+)?|GOAL');
   /* A price named twice in one message is one price, not a choice: "SL 1.28 ... (SL 1.28 is above
      entry)" restates the stop inside its own commentary, and only two *different* numbers leave nothing
      to pick. Distinct-first-seen order is what both stops and targets are judged on. */
   const distinctPrices = (matches) => [...new Set(matches.map((match) => match.value).filter((value) => value !== null))];
-  const stopPrices = distinctPrices(stopMatches);
+  const stopPriceMatches = stopMatches.filter((match) => !match.pips);
+  const stopDistanceMatches = stopMatches.filter((match) => match.pips);
+  const targetPriceMatches = takeProfitMatches.filter((match) => !match.pips);
+  const targetDistanceMatches = takeProfitMatches.filter((match) => match.pips);
+  const stopPrices = distinctPrices(stopPriceMatches);
+  const stopPips = [...distinctPrices(stopDistanceMatches), ...findPipDistances(text, 'SL|STOP(?:\\s*LOSS)?|INVALIDATION')];
+  const targetPipsAll = [...distinctPrices(targetDistanceMatches), ...findPipDistances(text, 'TP\\d*|TAKE\\s*PROFIT|TARGET')];
+  const targetPips = [...new Set(targetPipsAll)];
   const stopLoss = stopPrices.length === 1 ? stopPrices[0] : null;
+  /* A leg expressed in pips counts as *present* - `missing` is what the fallback nets and the Safety blocks
+     read, and overwriting a distance the channel gave with a distance the workspace guessed is the kind of
+     helpfulness this file exists to refuse. */
+  const stopLossPips = stopPips.length === 1 ? stopPips[0] : null;
+  const takeProfitPips = targetPips.length === 1 ? targetPips[0] : null;
   /* A channel that numbers its targets is describing one trade with a scale-out plan, not a
      contradictory message: the first price it names is the exit this product trades, because closing
      at TP1 is strictly earlier than the plan rather than riskier than it. The other levels are kept so
      the row can say what the message really carried. */
-  const takeProfitLevels = distinctPrices(takeProfitMatches);
+  const takeProfitLevels = distinctPrices(targetPriceMatches);
   const takeProfit = takeProfitLevels.length ? takeProfitLevels[0] : null;
   let entryPrice = entry.value !== null ? entry.value : entryFromRange(entry.range, side);
+  const entryPips = entry.pips === true && entryPrice === null;
+  /* An entry named by nothing but its position, read only once the labelled legs are known - so that a
+     number already claimed as a stop or a target is never counted twice as an entry, and the message's own
+     scale is what tells "EURUSD 1.0850" from "EURUSD 2 lots". */
+  let entryWasBare = false;
+  if (entryPrice === null && entry.range === null && !entryPips) {
+    const names = [symbol, ...Object.keys(SYMBOL_ALIASES).filter((alias) => SYMBOL_ALIASES[alias] === symbol)];
+    const taken = [stopLoss, takeProfit, ...takeProfitLevels, stopLossPips, takeProfitPips].filter((value) => value !== null);
+    const bare = parseBareEntry(text, names, taken);
+    if (bare !== null) { entryPrice = bare; entryWasBare = true; }
+  }
 
   /* A target above the entry can only be reached by buying; a target below it only by selling. That is
      arithmetic, not a guess, so the direction is filled in for reading - but it stays out of the
@@ -229,17 +406,40 @@ export function parseSignal(message) {
   block('symbol', symbolError);
   block('entry', entry.error);
   if (entry.range && entryPrice === null) block('entry-range', 'Entry price is a range; this signal was saved but not auto-traded.');
-  if (stopMatches.length === 0) block('stop-loss-missing', 'A stop loss is required for automatic execution.');
+  if (stopDistanceMatches.length && stopPips.length > 1) block('stop-loss-pips-multiple', 'More than one stop-loss distance was found.');
+  if (stopPriceMatches.length === 0 && stopDistanceMatches.length === 0 && stopPips.length === 0) block('stop-loss-missing', 'A stop loss is required for automatic execution.');
   if (stopPrices.length > 1) block('stop-loss-multiple', 'More than one stop loss was found.');
   if (stopMatches.some((match) => match.range)) block('stop-loss-range', 'Stop-loss ranges are not supported for automatic execution.');
   if (takeProfitMatches.some((match) => match.range)) block('take-profit-range', 'Take-profit ranges are not supported for automatic execution.');
-  if (!blockers.some((item) => item.code.startsWith('stop-loss')) && !stopLoss) block('stop-loss-invalid', 'The stop loss is not a valid price.');
-  if (takeProfitMatches.length === 1 && !takeProfit) block('take-profit-invalid', 'The take-profit price is not a valid price.');
+  if (!blockers.some((item) => item.code.startsWith('stop-loss')) && !stopLoss && stopLossPips === null) block('stop-loss-invalid', 'The stop loss is not a valid price.');
+  if (targetDistanceMatches.length && targetPips.length > 1) block('take-profit-pips-multiple', 'More than one take-profit distance was found.');
+  /* An entry given only as a distance from nothing ("entry 20 pips") has no anchor to measure from, and no
+     honest reading: the order is a market order, so there is no price the distance could be applied to
+     before the trade exists. */
+  if (entryPips) block('entry-distance', 'The entry was given as a distance without a price to measure it from; the order will be filled at the market price.');
+  /* The number a leg landed on was only readable by choosing between two magnitudes. Naming it is the
+     whole point: a reader who can see `4,011` knows instantly which one it was, and the parser does not. */
+  for (const [code, label, value] of [['entry-format', 'the entry', entryPrice], ['stop-loss-format', 'the stop loss', stopLoss], ['take-profit-format', 'the take profit', takeProfit]]) {
+    const unclearLevel = unclearValue(value === null ? null : Number(value));
+    if (!unclearLevel) continue;
+    block(code, `A price was written in a form Signal Desk cannot read safely (${label}: ${unclearLevel.raw} may be ${unclearLevel.candidates.join(' or ')}), so this signal was saved for review.`);
+  }
+  if (targetPriceMatches.length === 1 && !takeProfit) block('take-profit-invalid', 'The take-profit price is not a valid price.');
   if (directionInferred) block('direction-inferred', 'The trade direction was inferred from the entry and target prices, so this signal is saved for review rather than traded.');
+
+  /* A trade whose entry and stop are the same number has no room to be wrong, which is never what a channel
+     wrote: it is one number read twice, and exactly the shape a bug produces when an entry gets taken from a
+     leg. Refusing costs a look at a row; accepting sends an order that closes the moment it opens. */
+  if (entryPrice !== null && stopLoss !== null && entryPrice === stopLoss) {
+    block('entry-stop-identical', 'The entry and the stop loss are the same price, so this signal cannot be executed as written.');
+  }
+  if (entryPrice !== null && takeProfit !== null && entryPrice === takeProfit) {
+    block('entry-target-identical', 'The entry and the take-profit target are the same price, so this signal cannot be executed as written.');
+  }
 
   const parseError = blockers[0]?.message ?? null;
   if (entryPrice === null && entry.entryPriceFromRange !== undefined) entryPrice = entry.entryPriceFromRange;
-  const hasTradingData = Boolean(symbol || side || entryPrice !== null || stopLoss !== null || takeProfit !== null);
+  const hasTradingData = Boolean(symbol || side || entryPrice !== null || stopLoss !== null || takeProfit !== null || stopLossPips !== null || takeProfitPips !== null);
 
   return {
     symbol,
@@ -253,7 +453,17 @@ export function parseSignal(message) {
     hasTradingData,
     entryRange: entry.range,
     takeProfitLevels,
-    missing: { entryPrice: entryPrice === null, stopLoss: stopLoss === null, takeProfit: takeProfit === null },
+    stopLossPips,
+    takeProfitPips,
+    entryWasBare,
+    entryLevels: entry.levels || null,
+    ambiguousLevels: unclear.map((item) => ({ raw: item.raw, candidates: item.candidates })),
+    /* Whether the message contains a price at all. It decides whether a workspace's fallback distance may
+       rescue this row, and a direction with no level anywhere is not an incomplete instruction - it is
+       enthusiasm. `BUY GOLD` does not tell anyone where to get in, so no default distance should turn it
+       into an order. */
+    hasPriceLevel: Boolean(entryPrice !== null || entry.range || stopLoss !== null || takeProfit !== null || stopLossPips !== null || takeProfitPips !== null),
+    missing: { entryPrice: entryPrice === null, stopLoss: stopLoss === null && stopLossPips === null, takeProfit: takeProfit === null && takeProfitPips === null },
     blockers,
   };
 }

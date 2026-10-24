@@ -68,6 +68,26 @@ export function readFallbackPoints(value, label = 'The fallback distance') {
   return { value: number, error: null };
 }
 
+/**
+ * What one pip is worth on this instrument, or `null` when the question has no honest answer.
+ *
+ * A pip is only a defined distance where the market quotes in decimals a pip can be read out of: four
+ * places for a currency pair, two for one quoted in yen. On gold, an index or a crypto asset brokers write
+ * "points", and a point is whatever that server decides it is - so `null` here is deliberate. Returning a
+ * confident guess would turn `TP 50 pips` into a price that nobody can check, which is the failure this
+ * whole file is arranged against; refusing says so in a sentence the trader can act on.
+ */
+const NOT_A_CURRENCY_PAIR = /^(?:XAU|XAG|XPT|XPD|BTC|ETH|LTC|XRP|SOL|DOGE|USOIL|UKOIL|WTI|BRENT|CFD)/;
+
+export function pipSizeFor(symbol) {
+  const code = String(symbol ?? '').toUpperCase().replace(/[^A-Z]/g, '');
+  // `XAUUSD` is six letters and no more a currency pair than `BTCUSD` is, so the metal and coin codes are
+  // excluded by name: reading a gold "pip" as 0.0001 would put a stop four decimal places from the price and
+  // the broker would refuse the order - or accept it, which is worse.
+  if (!/^[A-Z]{6}$/.test(code) || NOT_A_CURRENCY_PAIR.test(code)) return null;
+  return code.endsWith('JPY') ? 0.01 : 0.0001;
+}
+
 /** The same reading for a value already in the database: a bad row means "no net", never a guess. */
 function storedPoints(value) {
   const number = points(value);
@@ -99,7 +119,24 @@ function distanceInPoints(price, marketPrice, tickSize) {
  * is whether the *missing leg* is still a reason to refuse the signal: it is, unless a net is configured
  * to cover it or the workspace has deliberately allowed that leg to be absent.
  */
-export function captureSafety({ parsed, source = 'telegram', settings = {} } = {}) {
+export function captureSafety({ parsed, source = 'telegram', settings = {}, review = null } = {}) {
+  /* A row the pipeline will not stand behind is never rescued by a fallback distance, and this is the
+     place that decides it, because this is the moment `execution_ready` is written. The order matters
+     against the other rules: a net that can supply a leg is normally the end of the argument, and here the
+     argument is not about a missing leg but about whether anyone should be trusting the numbers at all. A
+     message the AI reader had to interpret, or could not, has already had its price levels verified against
+     the text - what is being refused is the *provenance*, and no distance in a settings panel changes
+     where a number came from. */
+  if (review?.required) {
+    return {
+      executionReady: false,
+      parseError: review.reason || 'This signal was saved for review and is not eligible for automatic execution.',
+      fallbacks: { stopLoss: null, takeProfit: null },
+      override: { stopLoss: false, takeProfit: false },
+      problems: [{ code: 'review-required', message: review.reason || 'Saved for review.' }],
+      reviewRequired: true,
+    };
+  }
   const blockers = parsed?.blockers ?? [];
   const codes = new Set(blockers.map((blocker) => blocker.code));
   const telegram = source === 'telegram';
@@ -114,7 +151,15 @@ export function captureSafety({ parsed, source = 'telegram', settings = {} } = {
   const resolved = new Set();
   const problems = [];
 
-  if (governed && codes.has('stop-loss-missing')) {
+  /* A message with no price anywhere in it is not an under-specified trade, it is an announcement, and no
+     distance in a settings panel may turn it into one: `BUY GOLD` with a 500-point fallback would be an
+     order placed on a sentiment. The legs stay missing, the nets stay furled, and the row says why. */
+  const priceless = governed && parsed?.hasPriceLevel === false;
+  if (priceless && (codes.has('stop-loss-missing') || parsed?.missing?.takeProfit === true)) {
+    problems.push({ code: 'no-price-level', message: 'The signal states a direction but no price, so the fallback distances were not applied and nothing was executed.' });
+  }
+
+  if (governed && !priceless && codes.has('stop-loss-missing')) {
     if (stopNet !== null) resolved.add('stop-loss-missing');
     else if (!blockStop && fixedLot) resolved.add('stop-loss-missing');
     // The code is what the client keys its badge on, so it names the reason, not just the leg: an order
@@ -127,7 +172,7 @@ export function captureSafety({ parsed, source = 'telegram', settings = {} } = {
   // problem when the workspace has asked for it to be one.
   // A message that named several exits has a target (`missing.takeProfit` is false), so this branch is
   // only ever reached when the channel stated no price at all - which is what the switch is about.
-  if (governed && parsed?.missing?.takeProfit === true && !codes.has('take-profit-range') && !codes.has('take-profit-invalid')) {
+  if (governed && !priceless && parsed?.missing?.takeProfit === true && !codes.has('take-profit-range') && !codes.has('take-profit-invalid')) {
     if (targetNet !== null) resolved.add('take-profit-missing');
     else if (!blockTarget) resolved.add('take-profit-missing');
     else problems.push({ code: 'take-profit-required', message: TARGET_REQUIRED_MESSAGE });
@@ -141,15 +186,16 @@ export function captureSafety({ parsed, source = 'telegram', settings = {} } = {
      blocker it answers. A failure the policy has nothing to say about (no direction, an unknown symbol)
      still leads, because no fallback distance fixes that. A rescued leg leaves nothing behind, so a
      signal that has become eligible quotes no error at all. */
-  const answered = new Set(problems.map((problem) => (problem.code === 'take-profit-required' ? 'take-profit-missing' : 'stop-loss-missing')));
+  const ANSWERED_BY = { 'take-profit-required': 'take-profit-missing', 'no-price-level': 'stop-loss-missing' };
+  const answered = new Set(problems.map((problem) => ANSWERED_BY[problem.code] ?? 'stop-loss-missing'));
   const otherBlocker = remaining.find((blocker) => !resolved.has(blocker.code) && !answered.has(blocker.code)) ?? null;
   const parseError = otherBlocker?.message ?? (problems[0]?.message ?? null);
   return {
     executionReady,
     parseError,
     fallbacks: {
-      stopLoss: governed && stopNet !== null && codes.has('stop-loss-missing') ? stopNet : null,
-      takeProfit: governed && targetNet !== null && parsed?.missing?.takeProfit === true ? targetNet : null,
+      stopLoss: governed && !priceless && stopNet !== null && codes.has('stop-loss-missing') ? stopNet : null,
+      takeProfit: governed && !priceless && targetNet !== null && parsed?.missing?.takeProfit === true ? targetNet : null,
     },
     override: {
       stopLoss: resolved.has('stop-loss-missing') && stopNet === null && governed,
@@ -175,6 +221,9 @@ export function applySafetyNets({
   stopsLevelPoints,
   stopLoss,
   takeProfit,
+  stopLossPips = null,
+  takeProfitPips = null,
+  symbol = null,
   fallbackStopLossPoints,
   fallbackTakeProfitPoints,
   blockExecutionWithoutStopLoss = true,
@@ -222,8 +271,34 @@ export function applySafetyNets({
     return { value: candidate };
   };
 
+  /* A leg the channel stated as a distance is that leg, not a missing one: it is computed here, against the
+     live quote and the symbol's own precision, and it outranks the workspace's fallback - the trader's 30
+     pips is a better answer than the platform's default 500 points. Where a pip has no definition for the
+     instrument, the distance cannot be honoured: that is reported, and the leg falls to the workspace's own
+     rule with the reason attached, rather than silently becoming someone else's number. */
+  const pip = pipSizeFor(symbol);
+  const pipLeg = (distance, direction, kind) => {
+    const pips = points(distance);
+    if (pips === null || pips <= 0) return { skipped: true };
+    if (pip === null) return { error: `pips are not a defined distance for ${symbol || 'this symbol'}, so "${pips} pips" cannot be turned into a price` };
+    if (price === null || price <= 0) return { error: 'no valid market price to measure from' };
+    const offset = pips * pip;
+    const candidate = alignPrice(direction === 'down' ? price - offset : price + offset, tick && tick > 0 ? tick : pip, direction);
+    if (!Number.isFinite(candidate) || candidate <= 0) return { error: 'that distance would put the price at or below zero' };
+    const reference = kind === 'stop' ? stopReference : targetReference;
+    if (reference !== null && (kind === 'stop' ? (side === 'buy' ? candidate >= reference : candidate <= reference) : (side === 'buy' ? candidate <= reference : candidate >= reference))) {
+      return { error: 'the distance is smaller than the current spread, so the level cannot sit on the correct side of the market' };
+    }
+    return { value: candidate };
+  };
+
   let resolvedStop = hasStop ? points(stopLoss) : null;
-  if (!hasStop) {
+  if (!hasStop && statesPrice(stopLossPips)) {
+    const outcome = pipLeg(stopLossPips, side === 'buy' ? 'down' : 'up', 'stop');
+    if (outcome.value !== undefined) { resolvedStop = outcome.value; sources.stopLoss = 'signal-pips'; }
+    else if (outcome.error) problems.push({ leg: 'stopLoss', code: 'stop-loss-pips-unusable', message: `The stop loss was given in pips and could not be read: ${outcome.error}.` });
+  }
+  if (!hasStop && resolvedStop === null) {
     sources.stopLoss = 'none';
     if (stopNet !== null) {
       const outcome = net(stopNet, side === 'buy' ? 'down' : 'up', 'stop');
@@ -244,7 +319,12 @@ export function applySafetyNets({
   }
 
   let resolvedTarget = hasTarget ? points(takeProfit) : null;
-  if (!hasTarget) {
+  if (!hasTarget && statesPrice(takeProfitPips)) {
+    const outcome = pipLeg(takeProfitPips, side === 'buy' ? 'up' : 'down', 'target');
+    if (outcome.value !== undefined) { resolvedTarget = outcome.value; sources.takeProfit = 'signal-pips'; }
+    else if (outcome.error) problems.push({ leg: 'takeProfit', code: 'take-profit-pips-unusable', message: `The take profit was given in pips and could not be read: ${outcome.error}.` });
+  }
+  if (!hasTarget && resolvedTarget === null) {
     sources.takeProfit = 'none';
     if (targetNet !== null) {
       const outcome = net(targetNet, side === 'buy' ? 'up' : 'down', 'target');

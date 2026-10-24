@@ -11,6 +11,14 @@ test('parses a strict BUY signal with an entry, stop loss, and one target', () =
     hasTradingData: true,
     entryRange: null,
     takeProfitLevels: [1.095],
+    // The legs the message stated as a *distance* rather than a price, the DCA plan it listed, and the
+    // numbers it wrote in a form nobody could settle: all null here, because this message is exact.
+    stopLossPips: null,
+    takeProfitPips: null,
+    entryLevels: null,
+    entryWasBare: false,
+    ambiguousLevels: [],
+    hasPriceLevel: true,
     missing: { entryPrice: false, stopLoss: false, takeProfit: false },
     blockers: [],
   });

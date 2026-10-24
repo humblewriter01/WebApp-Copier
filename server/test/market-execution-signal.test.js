@@ -93,7 +93,18 @@ test('the workspace decides, not the parser: the missing TP is a policy, the mis
   /* The row that gets written is what the dashboard and the engine both read, so the storage has to keep the
      stop even when the signal is refused - that is the difference between "not tradeable yet" and "nothing
      was said". */
-  assert.match(routes, /VALUES\(\$1,\$2,\$3,\$4,\$5,\$6,\$7,\$8,\$9,\$10,\$11,\$12,\$13,\$14,\$15,\$16::jsonb\)/);
+  /* The statement is checked by shape rather than by a literal run of placeholders: pinning `$1..$16` meant
+     every column added to the row broke a test about something else. What has to stay true is that the insert
+     is one statement, that its values line up with its columns, and that the provenance of a number is stored
+     with the number. */
+  const insert = routes.match(/INSERT INTO signals\(([\s\S]*?)\)\s*VALUES\(([^)]*)\)/);
+  assert.ok(insert, 'the capture site writes the row in one statement');
+  const columns = insert[1].split(',').map((name) => name.trim()).filter(Boolean);
+  const values = insert[2].split(',').map((value) => value.trim()).filter(Boolean);
+  assert.equal(columns.length, values.length, 'every stored column is given a value, in order');
+  for (const column of ['needs_review', 'parsed_by', 'parse_confidence', 'llm_used', 'stop_loss_pips', 'take_profit_pips']) {
+    assert.ok(columns.includes(column), `${column} is stored at capture, not patched in afterwards`);
+  }
   assert.match(routes, /\[userId, channel\.channelId \|\| null, channel\.title \|\| null, telegramMessageId, source, savedText, parsed\.symbol, parsed\.side, parsed\.entryPrice, parsed\.stopLoss, parsed\.takeProfit,/, 'entry, stop and target are stored as the parser read them, null included');
 });
 
