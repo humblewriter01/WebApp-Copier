@@ -27,7 +27,7 @@ await build({
   bundle: true,
   format: 'esm',
   platform: 'node',
-  external: ['react'],
+  external: ['react', 'react-dom'],
   define: { 'process.env.NODE_ENV': '"development"' },
   logLevel: 'silent',
 });

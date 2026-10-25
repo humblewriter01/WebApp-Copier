@@ -128,7 +128,7 @@ async function bundle(name) {
     bundle: true,
     format: 'esm',
     platform: 'node',
-    external: ['react'],
+    external: ['react', 'react-dom'],
     define: {
       'process.env.NODE_ENV': '"development"',
       'import.meta.env': JSON.stringify({ PROD: false, VITE_API_URL: 'http://localhost:5000' }),

@@ -174,9 +174,15 @@ values the engine already holds, so each one can be tested against a mocked adap
 
 The client id is the piece that makes the middle bullet survivable. `buildClientId` produces
 `SD_<SYMBOL>_<hash of the job id>` - the shape MetaAPI documents (`${strategyId}_${positionId}_${orderId}`),
-inside the length it documents too: MetaAPI stores the id in the order comment, so `comment` + `clientId`
-share a budget of 26 characters, and the app uses 25 and never truncates (`createMarketOrder` and
-`closePositionPartially` refuse an order with no id or one too long before the terminal is touched). It is
+inside the two lengths it documents too: `clientId` on its own is published as 24 characters at most, and the
+comment and the id share a budget of 26 because MetaAPI stores them in one field. The builder caps the symbol
+at 6 and the whole id at 23 - `SD_` + 6 + `_` + 12 hex - so a full-length id lands at 22 characters, 24 of the
+26 with the `SD` comment, one spare for the servers that join the two fields with a separator. The symbol is
+what truncates, because it is decoration for whoever reads the broker's own trade history; the 48 bits in the
+tail are what `findOrderByClientId` matches a previous attempt against, so they never yield to it.
+`execution-defense.test.js` pins the arithmetic and walks every symbol shape the code can be handed, and an id
+that could not fit throws before the terminal is touched (`createMarketOrder`,
+`createPendingOrder` and `closePositionPartially` refuse an order with no id or one too long). It is
 stable for the life of a job rather than per attempt, on purpose, and it is *not* a promise the broker keeps:
 MetaAPI publishes no unique constraint over `clientId`, so a duplicate is not refused for us. What the id
 buys is discovery - before a retry sends a job's order a second time, the engine asks the account for a
@@ -356,7 +362,7 @@ Signal Desk sells a free tier and three paid plans. Every price, limit, and labe
 
 | Plan | Default price | Trading accounts | Telegram channels | Signals/day |
 |---|---|---:|---:|---:|
-| Free | ₦0 | none (review only) | 1 | 50 |
+| Free | ₦0 | none (review only) | 2 | 50 |
 | Starter | ₦60,000 / month | 1 | 10 | 200 |
 | Pro | ₦105,000 / month | 3 | 50 | 500 |
 | Premium | ₦150,000 / month | 5 | 100 | 2,000 |
@@ -486,6 +492,38 @@ blank`, `received a number` - because "Choose at least one change to save." on a
 a broken button rather than a naming problem. Field *names* are echoed after an identifier check; values
 never are. The form carries the account it was opened for, so paging or searching with it open closes
 it instead of submitting against a row that is no longer on screen.
+
+### A dialog that survives the panel underneath it
+
+Suspend, Impersonate, and Adjust plan are dialogs, not rows: `AdminActionModal` is one component used by all
+three, and `ConfirmModal` stands in front of every permanent clear. Four rules make them usable, and each one
+exists because a real interaction broke without it.
+
+- **The dialog is portal-rendered into `document.body`.** A form that lives inside a conditionally rendered
+  subtree is a form that subtree can close: the panel refreshed its list, or swapped to a loading state, and
+  the reason an administrator had typed was gone with it. Its *state* stays with the caller - the panel needs
+  the reason to send it - but its place in the tree does not.
+- **The panel replaces itself with a spinner only on its first paint.** Gating the content on `loading` (or on
+  "the overview read worked") means every later search or page turn blanks the panel, which unmounts whatever
+  was open on top of it. `painted` is set in a `finally`, so a section that failed still counts as read and
+  the panel stays on screen showing what it knows.
+- **A refresh cannot close a dialog.** Suspension targets the account id captured when the dialog opened, and
+  the write uses that id and nothing else, so paging or searching the list behind it has no bearing on who is
+  about to be suspended. The old code closed the form on both paths, which discarded typed text to protect
+  against a mis-targeting that was already impossible.
+- **Focus is placed once per opening, and only if the caret is not already inside.** An effect that re-ran per
+  render re-focused the *first* field on every keystroke - out of the Reason input and into a `<select>`, which
+  on a phone closes the keyboard as it does so. Likewise Escape and the backdrop read the live `busy` flag
+  through a ref rather than as an effect dependency, so the wiring is not torn down and rebuilt per character,
+  and the backdrop only dismisses a press that *started* on it: closing a mobile keyboard shifts the layout
+  under the finger, and the release then lands outside the dialog.
+
+`client/test/admin-modal-interaction.test.mjs` mounts the panel in jsdom and drives it - open, type, search,
+switch tabs, press every button on every tab - because "the dialog is still open after a keystroke" is not a
+property static markup can show. That file is why `jsdom` is a devDependency of the client; nothing in `src/`
+imports it. The route behind each button is pinned too: every path the panel calls is walked through the
+server's router in declaration order, so a button whose endpoint was renamed or shadowed by a `:param` route
+fails a test instead of a user's afternoon.
 
 ### Global auto-trading kill switch
 

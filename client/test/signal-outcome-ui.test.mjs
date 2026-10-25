@@ -19,7 +19,7 @@ function bundle(name) {
     bundle: true,
     format: 'esm',
     platform: 'node',
-    external: ['react'],
+    external: ['react', 'react-dom'],
     define: {
       'process.env.NODE_ENV': '"development"',
       // The API helper reads Vite's env object at module scope, which only exists in a bundle.
