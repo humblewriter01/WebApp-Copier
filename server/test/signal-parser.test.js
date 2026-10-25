@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { countSignalEntryDeals, parseSignal, resolveBrokerSymbol } from '../services/signal-parser.js';
+import { captureSafety } from '../services/signal-safety.js';
 
 test('parses a strict BUY signal with an entry, stop loss, and one target', () => {
   const parsed = parseSignal('BUY EURUSD\nEntry: 1.0850\nSL: 1.0800\nTP1: 1.0950');
@@ -18,6 +19,9 @@ test('parses a strict BUY signal with an entry, stop loss, and one target', () =
     entryLevels: null,
     entryWasBare: false,
     ambiguousLevels: [],
+    // Not news: the message is an instruction, so nothing about the bulletin rule applies to it.
+    newsOnly: false,
+    newsMarkers: [],
     // The message publishes a price and never says `NOW`, so it is read as a level to be filled *at*. Not
     // because the channel asked for a pending order - it did not - but because a price that was written down
     // is a price the trader meant to get, and `orderTypeStated: false` is what keeps the two apart on screen.
@@ -200,3 +204,81 @@ test('a number glued to a unit word is a distance even when the unit is written 
   assert.equal(parseSignal('BUY GOLD @ 4011.50').entryPrice, 4011.5, 'and so is a decimal');
 });
 
+
+/* --------------------------------------------------------------------- market news is not a signal --------------------------------------------------------------------- */
+
+/** The message a monitored channel actually posted, with its emojis, its bold markers and its blank lines. */
+const NEWS_BULLETIN = [
+  '**JUST IN:** \u{1F6A8}\u{1F6A8} **Crypto is dumping**',
+  '',
+  '$SOL falls under $100',
+  '',
+  '$XRP falls under $1.30',
+  '',
+  '$ETH falls under $2,350',
+  '',
+  'Bitcoin $BTC falls under $80,000',
+].join('\n');
+
+test('a news bulletin yields nothing at all: no symbol, no direction, no price', () => {
+  /* Four instruments and four prices, and not one instruction. Before this rule the row came back with
+     `symbol: BTCUSD` on it, which made a headline look like a signal the platform had read halfway - and a
+     half-read signal is what a review badge, a fallback distance, or a reader in a hurry can turn into a
+     trade. The whole message is refused instead, so the row says what is true of it: nothing was found. */
+  const parsed = parseSignal(NEWS_BULLETIN);
+  assert.equal(parsed.newsOnly, true, 'and the reason is recorded, not inferred by the reader');
+  assert.equal(parsed.symbol, null, 'the coins it names are not extracted');
+  assert.equal(parsed.side, null, 'a price falling is not a sell');
+  assert.equal(parsed.entryPrice, null);
+  assert.equal(parsed.stopLoss, null);
+  assert.equal(parsed.takeProfit, null);
+  assert.equal(parsed.hasTradingData, false, 'so the client can call it "No clear signal" honestly');
+  assert.equal(parsed.hasPriceLevel, false, 'and no fallback distance has anything to attach to');
+  assert.equal(parsed.executionReady, false);
+});
+
+test('the row says it is news, and does not blame a leg nobody asked for', () => {
+  const parsed = parseSignal(NEWS_BULLETIN);
+  assert.deepEqual(parsed.blockers, [{
+    code: 'news-commentary',
+    message: 'This message is market news rather than a trade instruction, so nothing was taken from it.',
+  }], 'one reason, in plain words, instead of "a BUY or SELL direction was not found"');
+  assert.equal(parsed.parseError, 'This message is market news rather than a trade instruction, so nothing was taken from it.');
+  assert.equal(parsed.directionInferred, false, 'and no direction is read out of a headline by any route');
+  assert.equal(parsed.isScalping, false);
+  assert.deepEqual(parsed.takeProfitLevels, []);
+});
+
+test('news wording above a real instruction is read as the instruction', () => {
+  /* Channels shout. The same "JUST IN" over a complete gold setup must still be traded, which is why the
+     rule needs an absence of instruction as well as a presence of news words. */
+  const parsed = parseSignal('**JUST IN** \u{1F6A8} SELL GOLD 4016.00 - 4026.00 / SL: 4010.00 / TP: 4050.00');
+  assert.equal(parsed.newsOnly, false);
+  assert.equal(parsed.symbol, 'XAUUSD');
+  assert.equal(parsed.side, 'sell');
+  assert.equal(parsed.entryPrice, 4016);
+  assert.equal(parsed.executionReady, true, 'and it is eligible, hype prefix and all');
+});
+
+test('a signal that mentions a report is not refused for mentioning it', () => {
+  const parsed = parseSignal('GOLD 4016.00 SL: 4010.00 TP: 4050.00 (full report on the website)');
+  assert.equal(parsed.newsOnly, false, 'the leg labels outrank one journalism noun');
+  assert.equal(parsed.symbol, 'XAUUSD');
+  assert.equal(parsed.stopLoss, 4010);
+  assert.equal(parsed.takeProfit, 4050);
+});
+
+test('a headline cannot be finished into an order by a workspace fallback distance', () => {
+  /* The nets in Safety settings exist for a trader who forgot to write a stop, and a channel that never
+     asked for a trade has not forgotten anything. `hasPriceLevel` is the flag that keeps them furled. */
+  const safety = captureSafety({
+    parsed: parseSignal(NEWS_BULLETIN),
+    source: 'telegram',
+    settings: { lotSizeMode: 'fixed', blockExecutionWithoutStopLoss: true, blockExecutionWithoutTakeProfit: true, fallbackStopLossPoints: 500, fallbackTakeProfitPoints: 1000 },
+  });
+  assert.equal(safety.executionReady, false);
+  assert.deepEqual(safety.fallbacks, { stopLoss: null, takeProfit: null });
+  assert.equal(safety.override.stopLoss, false, 'and no policy override is claimed for a leg nobody asked about');
+  assert.equal(safety.problems.length, 0, 'and it is not reported as a missing leg on top of being news');
+  assert.equal(safety.parseError, 'This message is market news rather than a trade instruction, so nothing was taken from it.');
+});
