@@ -14,6 +14,7 @@ A deployable React/Vite and Express app for capturing Telegram channel messages,
 - **Paystack subscriptions:** a free review-only tier plus Starter, Pro, and Premium plans, with a hosted Paystack checkout, promo codes, verified webhooks, plan-based limits the server enforces, and automatic renewal through Paystack Plan Codes that are kept in step with the price an admin saves.
 - **Optional Auto-Trading:** a user can let clearly parsed Telegram signals place market orders on their own connected MT4/MT5 account, behind a chain of safety gates, with break-even and trailing stop protection for the positions it opened (see [Auto-Trading and break even](#auto-trading-and-break-even)).
 - **Break-even stop moves:** the stop of a trade Signal Desk opened is moved to the entry price (plus an optional offset) once the market has travelled the configured distance in favour of the trade.
+- **Limit and stop orders, with an expiry:** a signal that publishes a price the market has not reached is placed as a pending order on the broker instead of being skipped, carries that expiry as its own `ORDER_TIME_SPECIFIED` deadline, and is cancelled and reconciled by a sweeper if it never fills. A market order is judged against a drift allowance the workspace sets, and a fill better than the published price is always taken.
 
 ## Important safety and data notes
 
@@ -21,7 +22,7 @@ A deployable React/Vite and Express app for capturing Telegram channel messages,
 - **Capturing signals is not a paid feature and is never a trading decision.** A workspace that has connected Telegram and chosen at least one channel receives and stores every message from those channels, whatever its plan and whether or not it has a MetaAPI account at all. What a plan decides is whether the stored signal is *queued* for the broker; a signal that could not be executed is saved with the reason written next to it (`Not executed`, with the upgrade sentence where a plan is what is missing), so an inactive workspace reads an explanation instead of an empty panel.
 - **A captured signal can be deleted; the trade it produced cannot.** Removing a signal - by its owner from `Signals`, or by an administrator from Data management - unlinks any trade that points at it and leaves that trade's row, entry, and profit and loss exactly where they were, in one transaction, so clearing a history can never orphan or delete order history. A signal still queued for execution loses its pending job, which means an order that had not been sent will not be sent; both confirmations say so. See **Signal history: deletion**.
 - **The live-trading warning is a decision, not wallpaper.** The first time a workspace switches Auto-Trading on, a dialog states that live orders will be placed and that the losses are theirs, and asks for `I Understand`; the answer is stored on the workspace (`settings.has_accepted_risk_warning`) and the panel afterwards carries one quiet line under the switch. `Cancel` leaves the switch exactly where it was and is never reported as a failure.
-- Signal Desk never closes or partially closes a position and never widens a stop loss. It places market orders and, when break even or a trailing stop is enabled, moves the stop of a position it opened itself to a price that reduces risk — once, or repeatedly at a fixed distance.
+- Signal Desk never closes or partially closes a position and never widens a stop loss. It places market orders and, when a signal published a price the market had not reached, limit or stop orders that carry their own expiry; and, when break even or a trailing stop is enabled, it moves the stop of a position it opened itself to a price that reduces risk — once, or repeatedly at a fixed distance. Taking a resting order off the book is the one write it makes for an order it has not filled.
 - An ambiguous broker or network failure on an order or a stop move is recorded as `unknown` and is **not** retried automatically, because the broker may already have accepted the first request. The activity list says so; reconcile that position on the broker account.
 - The API uses `METAAPI_PROVISIONING_TOKEN` only on the server. Users enter their broker login and password on MetaAPI's HTTPS setup page; Signal Desk does not receive or store those credentials.
 - The MetaAPI client uses HTTPS and is limited to the operations above: account setup, account reads, market order submission, and stop-loss modification for break even. Trading credentials stay server-side.
@@ -124,7 +125,7 @@ Notices live in `account_activity_notices` (RLS-enabled, user-scoped) and are su
 
 Automatic execution is opt-in per workspace and lives in **Advanced Settings** (`/advanced`). The red warning above the toggle is required copy; the toggle saves on click so switching it off never waits for a form submit.
 
-Before an order is submitted the engine re-reads its inputs and fails closed on anything missing: the user's current Auto-Trading setting, the server-side `AUTO_TRADING_RUNTIME_ENABLED` switch, ownership and `DEPLOYED` state of the selected account, signal age (two minutes), synchronized positions/pending orders, the open-trade and daily-trade caps, the UTC-day equity baseline for the daily loss limit, a fresh valid quote, a stop loss on the correct side of that quote, and the broker's own minimum, maximum, and volume step. A signal with an entry price is only executed when the current quote is not worse than that entry for the signal's direction. The record is written to `trades` *before* the SDK call with a stable `clientId`, so a replay cannot duplicate an order.
+Before an order is submitted the engine re-reads its inputs and fails closed on anything missing: the user's current Auto-Trading setting, the server-side `AUTO_TRADING_RUNTIME_ENABLED` switch, ownership and `DEPLOYED` state of the selected account, signal age (two minutes), synchronized positions/pending orders, the open-trade and daily-trade caps, the UTC-day equity baseline for the daily loss limit, a fresh valid quote, a stop loss on the correct side of that quote, and the broker's own minimum, maximum, and volume step. The order type and the published price are decided together: a market order is sent when the quote is not worse than the entry by more than the workspace's drift allowance, and a limit or stop whose level the market has not reached is placed as a pending order rather than skipped. The record is written to `trades` *before* the SDK call with a stable `clientId`, so a replay cannot duplicate an order — for a resting order that row stays `pending` until the fill, the cancellation or the expiry is confirmed.
 
 ### Three layers between a signal and an order
 
@@ -193,6 +194,56 @@ and nothing is sent on an unknown.
 - Results are persisted per broker position in `break_even_moves` with the status `moved`, `already_beyond`, `closed`, `deferred`, `failed`, or `unknown`, the previous and new stop, the quote used, and the sanitized provider message. A terminal status is never retried. Deferrals retry on their own clock (15 seconds while the price is too close, 60 seconds when account data could not be read) without consuming an attempt, a broker rejection retries up to ten times, and `unknown` never retries. Changing either distance re-arms positions that were already handled, because the stored row keeps the settings it was decided under.
 - Moves run only while the execution runtime is available, Auto-Trading is on, **and** the user is on a paid plan, so "off" — or a lapsed subscription — always means "Signal Desk is not talking to your broker".
 
+### What an order type means here, and how long it waits
+
+A signal that names a price the market has not reached is a request to wait at that price, and a copier that
+skips it tells the user nothing useful: the signal looks unread, and the price they were offered is gone by the
+time they notice. So the engine now reads the type and routes on it, all of it decided in
+`server/services/order-routing.js` (pure: no pool, no adapter, no clock of its own) with the words themselves
+coming from `server/services/signal-parser.js`.
+
+- **Which type a message asked for.** An instruction line (`BUY GOLD LIMIT 4011 SL 4005 TP 4030`) is
+  authoritative: `LIMIT`/`STOP` next to the direction word, `MARKET ORDER`/`AT MARKET`, and `NOW`/`CMP`/`AT
+  ANY PRICE` are all read, and the immediate forms win over a `LIMIT` sitting in the same message. A bare
+  `STOP 4005` is a stop-loss leg, not a stop-entry order — that stays true when a `LIMIT` elsewhere in the
+  line makes the entry type explicit. When nothing is stated and a *single* entry price was published, the
+  order rests at that price as a limit (`order_type_stated = false`, because Signal Desk chose it); a price
+  zone or a range is a market order at the current price, which is what a zone has always meant here. Adding a
+  word to a channel's message is a change the reader can make: `NOW` overrules the inference.
+- **A market order is judged in the broker's points, not in prices.** `max_slippage_points` (the **Price Drift
+  Guard**) is how far worse than the published entry a fill may be. Better is always taken, and the trade note
+  says how many points in the user's favour. Blank or `0` — what every workspace starts on — keeps the old
+  strict behaviour: refuse and say so, naming the symbol's tick size in the sentence. A symbol whose broker
+  published no tick size cannot be measured in points at all, so the order is refused rather than guessed at,
+  and a level with nothing to compare it against is not a guard.
+- **A resting order carries its own deadline.** `limit_order_expiry_value` + `limit_order_expiry_unit`
+  (minutes, hours, days; 1 minute to 30 days, default 30 minutes) become both the row's `expires_at` and the
+  `ORDER_TIME_SPECIFIED` expiration sent to the platform, so an unfilled order does not survive Signal Desk
+  being offline — the ceiling exists because MT4 accepts only that one type and an unexpired pending order is
+  the failure this feature would otherwise create. A signal marked `SCALPING` overrides the setting with two
+  minutes and is taken as a market order at once if the market is already at its level. A stop whose level the
+  market has already passed is a market order too, and a level within the broker's `stops_level` is refused with
+  the number named rather than nudged onto a price the channel never published.
+- **Nothing rests unwatched.** `sweepExpiredOrders` (in the same engine, hooked into the worker's
+  every-`N`-seconds block) reads the rows `trades.status = 'pending'` keeps in `trades_pending_expiry_idx`,
+  groups them by account, and asks the broker once per account for positions, deals and open orders. Order gone
+  before its deadline → `cancelled`; gone after it → `expired` (a cancel we sent *because* the deadline passed
+  is an expiry by any name); a position or a deal found instead → `executed`, booked at the price and size the
+  broker actually produced, with the note that break-even and scale-out were not set up for it. An account that
+  cannot be read leaves every row exactly as it was; a row with no broker reference to match is `unknown` rather
+  than a guess. The sweep gates **writes** on the runtime switch but not reads, because reconciling history is
+  what protects a user while execution is paused.
+- **The vocabulary that goes with it.** `pending` and `cancelled` were added to the signal status check, the
+  job-status mirror and the client's outcome map; `expired` already existed and now means what the sweep does. A
+  resting order counts against the workspace's open-position cap and its scale-out plan is suppressed — there
+  is no position to split yet. Every one of these states is one the UI can render: `Waiting at your price` on
+  the signal, `on the book` on the trade, and a line under the row that says the level and how long is left.
+
+`server/test/order-routing.test.js` pins the arithmetic and the boundaries; `server/test/order-type-execution.test.js`
+runs the whole flow — parse to job to broker call to settled row — against a fake adapter, including the five
+end-to-end cases this feature is judged by; `server/test/metaapi-trading.test.js` pins the shape of the trade
+request both platforms receive.
+
 ### Trailing stop
 
 **Break even moves a stop once; a trailing stop keeps moving it.** `trailing_stop_enabled` and `trailing_stop_distance_points` sit beside the break-even settings and feed the same `sweepBreakEven()` — deliberately the same sweep, so there is only one code path that may write to a broker position and only one set of rules to audit. When both protections are on, the engine computes both targets and takes the **more protective** one (higher for a buy, lower for a sell), so turning trailing on can never weaken break even and turning break even on can never stall a trail.
@@ -231,7 +282,7 @@ Cadence is its own: `SCALE_OUT_SWEEP_INTERVAL_MS` (default `5000`, floor `1000`)
 The panel used to be one long page called **Risk settings** that mixed what a trade may cost with what may be sent to a broker with the button that deletes the workspace. That is three different kinds of decision, and only two of them are made twice a year, so they are three sidebar entries now — and `PUT /api/settings` did not change at all: the client still holds one `settings` object and saves that whole object, so whichever page saves writes the row as the server last returned it, and a save on one page cannot blank what another page set.
 
 - **Risk Settings** — the sidebar entry, still served from `/` because it has never had a path of its own — the four numbers: risk percent per position, maximum open trades, maximum daily trades, daily loss limit. No toggles, nothing folded, and the Auto-Trading switch is not there: this page changes what a trade risks, not whether one happens.
-- **Advanced Settings** (`/advanced`) — everything that decides what an order does, as three folded bars (`SettingsSection.jsx`): **Core Execution** (open) with the Auto-Trading toggle and its required red warning, the connected trading account and the lot size; **Trade Management** (closed) with break even, the trailing stop and **Multiple Target Handling**; and **Advanced Safety Nets** (closed) with the two blocks and the two fallback distances. It is the power-user page, and the runtime and platform-pause notices lead it above the bars, because they explain why nothing is moving.
+- **Advanced Settings** (`/advanced`) — everything that decides what an order does, as three folded bars (`SettingsSection.jsx`): **Core Execution** (open) with the Auto-Trading toggle and its required red warning, the connected trading account, the lot size and the **Price Drift Guard**; **Trade Management** (closed) with break even, the trailing stop, **Multiple Target Handling** and **Limit Order Expiry**; and **Advanced Safety Nets** (closed) with the two blocks and the two fallback distances. It is the power-user page, and the runtime and platform-pause notices lead it above the bars, because they explain why nothing is moving.
 - **Profile** (`/profile`) — the name, email, role and age of the account, the password flow, and the **Danger Zone** at the bottom. Identity is read-only because it is the credential, not a setting: the password is changed through the same emailed reset link the sign-in screen uses (`/api/auth/prepare-password-reset` then Supabase `resetPasswordForEmail`, redirecting to `/update-password`), which is one client helper — `src/lib/password-reset.js` — so the two surfaces cannot drift into preparing-or-not preparing separately. Account deletion is unchanged: same `DELETE /api/auth/account`, same password-plus-`DELETE` confirmation, now nowhere near a number that sizes a live position.
 
 Both settings pages own the fields they show, and no field is editable on two of them — `client/test/settings-navigation-ui.test.mjs` derives the field list from the route itself (`req.body.*` in `PUT /api/settings`) and fails if a field gains or loses an owner. The three pages are also the app's routes: `/advanced` and `/profile` are in `client/public/manus-routes.json` next to `/admin` and `/billing`, because a path the static host does not know is a 404 on refresh - see **Render deployment** for the rewrite that answers every path with the app shell.

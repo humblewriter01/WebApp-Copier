@@ -224,6 +224,9 @@ export function marketSlippage({ side = null, desired = null, bid = null, ask = 
  */
 export function pendingOrderPlan({ orderType = null, entryPrice = null, side = null, bid = null, ask = null, stopsLevelPoints = null, tickSize = null } = {}) {
   if (!ORDER_TYPES.includes(orderType)) return { kind: 'market', reason: 'not-a-resting-order' };
+  // Stated before the arithmetic rather than left to the caller's guard: a market order has no level to be
+  // on the right or wrong side of, and reading `market` through the stop branch would rest one at the price.
+  if (orderType === 'market') return { kind: 'market', reason: 'channel asked for the market' };
   const level = Number(entryPrice);
   if (!Number.isFinite(level) || level <= 0) {
     return { kind: 'market', reason: 'no-level-to-rest-at', note: 'This signal states no entry price, so there is nothing to rest an order at - it is sent as a market order.' };
@@ -281,8 +284,13 @@ export function pendingOrderOutcome({ readOk = false, orderStillOpen = false, po
       volume: Number(position?.volume ?? deal?.volume ?? NaN),
     };
   }
+  /* Our own cancellation, at or after the deadline, is an expiry by any name: the row has to say what made
+     the order leave the book, and what made it leave was the clock. A cancel we sent *before* the deadline is
+     the other case, and it does not exist yet in this app - which is why it is answered rather than omitted. */
+  if (expiryReached === true) {
+    return { action: 'expired', reason: cancelConfirmed === true ? 'expiry-passed-and-cancelled-here' : 'expiry-passed-and-order-gone' };
+  }
   if (cancelConfirmed === true) return { action: 'cancelled', reason: 'cancel-accepted' };
-  if (expiryReached === true) return { action: 'expired', reason: 'expiry-passed-and-order-gone' };
   // Not on the book, not filled, and not something we cancelled: the user took it off the account.
   return { action: 'cancelled', reason: 'removed-at-broker' };
 }
@@ -300,8 +308,12 @@ export function interpretCancelResponse({ error = null, result = null } = {}) {
   const code = error?.stringCode ?? error?.code ?? result?.stringCode ?? result?.code ?? null;
   const numeric = Number(error?.numericCode ?? error?.retcode ?? result?.numericCode ?? result?.retcode ?? NaN);
   const message = String(error?.message ?? result?.message ?? '').slice(0, 300);
-  if (error && !Number.isFinite(numeric) && !code) return { kind: 'unknown', message: message || 'The broker did not answer the cancellation.' };
   if (numeric === 10025 || /order_cancel|trade_retcode_done/i.test(String(code || ''))) return { kind: 'cancelled', message };
-  if (numeric === 10023 || numeric === 10024 || /not found|no order|does not exist|invalid price/i.test(message)) return { kind: 'gone', message };
+  if (numeric === 10023 || numeric === 10024 || /not found|no order|does not exist|already (been )?(closed|cancelled|dealt)|order state|invalid price/i.test(message)) {
+    return { kind: 'gone', message };
+  }
+  // Only after the two readings that mean something: MetaAPI throws far more often than it returns a code, so
+  // an error carrying prose and no number is "we cannot tell", not "refused".
+  if (error && !Number.isFinite(numeric) && !code) return { kind: 'unknown', message: message || 'The broker did not answer the cancellation.' };
   return { kind: 'rejected', message: message || `The broker refused the cancellation (${code || numeric || 'unknown code'}).` };
 }
