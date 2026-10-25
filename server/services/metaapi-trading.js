@@ -156,6 +156,57 @@ export function createMetaApiTradingAdapter({ MetaApiClass = MetaApi, now = () =
   }
 
   /**
+   * A resting order - a limit or a stop - at the price the channel published, with the same protective legs
+   * a market order would have carried, and a broker-side expiry.
+   *
+   * Two things about this call are not obvious from the SDK and are the reason it is wrapped rather than
+   * reached for directly. The first is the expiration: MetaAPI will accept an order with no deadline and hold
+   * it on the server indefinitely, and an order that outlives the setup it came from is money that moves
+   * while nobody is watching. So the caller passes the deadline it computed and this method hands it to the
+   * platform, which is the one place the rule can be enforced even when this service is asleep; the app's
+   * own sweeper is the belt, not the braces. The second is that `ORDER_TIME_SPECIFIED` is the only expiration
+   * type MT4 supports, so it is the one this uses on both platforms rather than the prettier MT5 variants.
+   *
+   * A market order is deliberately not this method's business: `expiration` is invalid on one, and silently
+   * dropping a deadline the caller believed it had set is worse than refusing.
+   */
+  async function createPendingOrder({ token, accountId, kind, side, symbol, volume, price, stopLoss, takeProfit, expiration, clientId }) {
+    const openPrice = Number(price);
+    if (!Number.isFinite(openPrice) || openPrice <= 0) throw new Error('A resting order needs the price it waits at.');
+    const orderKind = String(kind || '').toLowerCase();
+    const orderSide = String(side || '').toLowerCase();
+    const method = { 'limit:buy': 'createLimitBuyOrder', 'limit:sell': 'createLimitSellOrder', 'stop:buy': 'createStopBuyOrder', 'stop:sell': 'createStopSellOrder' }[`${orderKind}:${orderSide}`];
+    if (!method) throw new Error('A resting order needs a limit or stop kind and a buy or sell direction.');
+    const volumeNumber = Number(volume);
+    if (!Number.isFinite(volumeNumber) || volumeNumber <= 0) throw new Error('A positive volume is required to place an order.');
+    const options = { comment: CLIENT_ID_COMMENT, clientId: assertClientId(clientId) };
+    if (expiration && typeof expiration === 'object' && expiration.type && expiration.time instanceof Date && Number.isFinite(expiration.time.getTime())) {
+      options.expiration = { type: String(expiration.type), time: expiration.time };
+    }
+    const { connection } = await getConnection(token, accountId);
+    return connection[method](symbol, volumeNumber, openPrice, stopLoss ?? undefined, takeProfit ?? undefined, options);
+  }
+
+  /**
+   * Takes a resting order off the broker's book. MetaAPI's `cancelOrder(orderId)` accepts only the order id
+   * and is refused for a position - which is the correct division, and the reason the caller has to look for
+   * the order by id rather than guess at one from a position.
+   *
+   * A refusal is returned, not thrown: "the order is no longer there" is the outcome the sweeper was aiming
+   * at, and it has to be told apart from "the broker will not let me cancel" without unwinding a stack.
+   */
+  async function cancelOrder({ token, accountId, orderId } = {}) {
+    const id = String(orderId ?? '').trim();
+    if (!id) throw new Error('A broker order id is required to cancel an order.');
+    const { connection } = await getConnection(token, accountId);
+    try {
+      return { result: await connection.cancelOrder(id), error: null };
+    } catch (error) {
+      return { result: null, error };
+    }
+  }
+
+  /**
    * Moves the stop loss of an open position. MetaAPI's
    * `modifyPosition(positionId, stopLoss, takeProfit, trailingStopLoss, stopPriceBase)`
    * omits any stop that is undefined, so passing only a numeric stop loss leaves the
@@ -231,5 +282,5 @@ export function createMetaApiTradingAdapter({ MetaApiClass = MetaApi, now = () =
     clients.clear();
   }
 
-  return { getAccountState, createMarketOrder, modifyPosition, closePositionPartially, findOrderByClientId, close };
+  return { getAccountState, createMarketOrder, createPendingOrder, cancelOrder, modifyPosition, closePositionPartially, findOrderByClientId, close };
 }

@@ -1272,6 +1272,7 @@ app.get('/api/trades', authenticate, asyncRoute(async (req, res) => {
     `SELECT t.id,t.signal_id AS "signalId",t.metaapi_account_id AS "metaApiAccountId",t.symbol,t.side,t.quantity,
             t.entry_price AS "entryPrice",t.stop_loss AS "stopLoss",t.take_profit AS "takeProfit",t.exit_price AS "exitPrice",
             t.pnl,t.status,t.remaining_volume AS "remainingVolume",
+            t.order_type AS "orderType",t.expiry_timestamp AS "expiryTimestamp",t.drift_points AS "driftPoints",
             (SELECT json_agg(json_build_object(
                        'level', l.level_index, 'price', l.target_price, 'percent', l.close_percent,
                        'volume', l.planned_volume, 'closed', l.closed_volume, 'status', l.status,

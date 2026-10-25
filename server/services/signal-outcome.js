@@ -14,6 +14,12 @@ export const SIGNAL_STATUSES = Object.freeze({
   unexecuted: 'unexecuted',
   expired: 'expired',
   unknown: 'unknown',
+  /* A signal whose order is on the broker's book, unfilled, is neither executed nor unexecuted: it is the
+   * one state where the app has spent nothing and can still spend something. It gets a status of its own
+   * because "nothing happened yet" and "nothing will happen" must never read the same on a trading screen.
+   * `cancelled` is its pair: the order left the book without becoming a position. */
+  pending: 'pending',
+  cancelled: 'cancelled',
 });
 
 /** Outcomes that mean "a job is on its way", so nothing else may also start one. */
@@ -74,6 +80,9 @@ export function decideSignalOutcome(input = {}) {
  */
 export function signalStatusForJobStatus(jobStatus) {
   if (jobStatus === 'skipped') return SIGNAL_STATUSES.unexecuted;
+  // A job that ends with an order on the book is not a job that ended: `pending` travels to the signal row
+  // unchanged, which is what lets the expiry sweep own that row's next transition.
+  if (jobStatus === SIGNAL_STATUSES.pending) return SIGNAL_STATUSES.pending;
   if (jobStatus === 'expired') return SIGNAL_STATUSES.expired;
   if (jobStatus === 'unknown') return SIGNAL_STATUSES.unknown;
   if (jobStatus === 'executed' || jobStatus === 'filled') return jobStatus;
