@@ -48,7 +48,7 @@ test('the catalogue is one free tier and three paid tiers priced against MetaAPI
     },
   );
   assert.equal(FREE_PLAN.limits.maxTradingAccounts, 0, 'Free must not be able to connect an account to execute on');
-  assert.equal(FREE_PLAN.limits.maxTelegramChannels, 1);
+  assert.equal(FREE_PLAN.limits.maxTelegramChannels, 2, 'Free exists so a second source can be compared against the first');
   assert.equal(FREE_PLAN.limits.maxDailySignals, 50);
 });
 
@@ -149,6 +149,12 @@ test('plan limit errors describe the allowance and request an upgrade', () => {
   assert.equal(error.code, 'PLAN_LIMIT_REACHED');
   assert.equal(error.upgradeRequired, true);
   assert.equal(error.message, 'Your Starter plan allows 1 connected trading accounts. Upgrade your plan to add more.');
+  // The sentence a Free workspace reads at its third channel, built from the catalogue rather than written
+  // beside it, so the limit the server enforces and the number a user is told are one number.
+  const channels = buildLimitError({ limitKey: 'maxTelegramChannels', limit: FREE_PLAN.limits.maxTelegramChannels, planKey: 'free' });
+  assert.equal(channels.message, 'Your Free plan allows 2 monitored Telegram channels. Upgrade your plan to add more.');
+  assert.equal(channels.status, 402);
+  assert.equal(channels.code, 'PLAN_LIMIT_REACHED');
 });
 
 test('a limit of zero is announced as not included rather than zero allowance', () => {

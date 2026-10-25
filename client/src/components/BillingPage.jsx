@@ -163,7 +163,7 @@ export default function BillingPage({ token }) {
         </div>
         <div className="billing-limit-list">
           <span>{accountAllowance(data?.limits?.maxTradingAccounts)}</span>
-          <span>{data?.limits?.maxTelegramChannels ?? 1} Telegram channels</span>
+          <span>{data?.limits?.maxTelegramChannels ?? 2} Telegram channels</span>
         </div>
       </div>
       {currentPlan !== 'free' && <div className="button-row billing-actions">
@@ -180,7 +180,7 @@ export default function BillingPage({ token }) {
         <article className={`billing-plan-card ${currentPlan === 'free' ? 'current' : ''}`}>
           <header><h3>Free</h3><p>Monitor signals without automating a broker account.</p></header>
           <p className="billing-price">{formatMoney(0, currency)}<span>/month</span></p>
-          <ul><li className="billing-plan-absent">No trading accounts</li><li>1 Telegram channel</li><li>50 signals per day</li><li className="billing-plan-absent">No automated execution</li></ul>
+          <ul><li className="billing-plan-absent">No trading accounts</li><li>2 Telegram channels</li><li>50 signals per day</li><li className="billing-plan-absent">No automated execution</li></ul>
           <button type="button" className="button button-secondary" disabled>{currentPlan === 'free' ? 'Current plan' : 'Included'}</button>
         </article>
         {plans.map((plan) => {

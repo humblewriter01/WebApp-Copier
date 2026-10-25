@@ -42,12 +42,18 @@ export const PLAN_DEFINITIONS = Object.freeze({
  * real limit, not "unset": nobody can connect a trading account on Free, so there is
  * nothing for Auto-Trading to execute on. Accounts linked while a paid plan was active
  * stay connected and usable for review; only new links are refused.
+ *
+ * Two monitored channels, not one: a trader comparing the signal source they already follow
+ * against a second one is the question Free exists to answer, and the limit still stands where
+ * it is enforced (`enforcePlanLimit` on the channel-add route) rather than in the copy. The
+ * refusal sentence is built from this number, so the plan card, the error a user reads, and the
+ * count the server enforces cannot disagree with each other.
  */
 export const FREE_PLAN = Object.freeze({
   key: 'free',
   name: 'Free',
   description: 'Signal capture and review, with no automated execution.',
-  limits: Object.freeze({ maxTradingAccounts: 0, maxTelegramChannels: 1, maxDailySignals: 50 }),
+  limits: Object.freeze({ maxTradingAccounts: 0, maxTelegramChannels: 2, maxDailySignals: 50 }),
 });
 
 export const DEFAULT_CURRENCY = 'NGN';
