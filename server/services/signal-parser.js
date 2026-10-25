@@ -240,6 +240,56 @@ const ENTRY_LABEL = `(?:ENTRY${ENTRY_INDEX}ZONE|SELL${ENTRY_INDEX}ZONE|BUY${ENTR
    left no number on the row, which is the difference between a signal the engine can price-check and one
    it has to take on trust at whatever the market is doing. */
 const ENTRY_MARKER = '@';
+/*
+ * `SELL STOP 4010`, `BUY LIMIT @ 4011`, `SELL GOLD LIMIT 4011`: the number that follows an order type is the
+ * level the resting order waits at, and in these messages it is named by nothing else - no `ENTRY`, no `@`.
+ * `LIMIT` may have a symbol between it and the direction word because `LIMIT` is never the name of a
+ * protective leg. `STOP` may not, because `BUY GOLD stop 4005` really is a stop loss with the direction two
+ * words away, and reading that number as the entry would put the entry where the stop belongs. A level that
+ * is genuinely ambiguous is left to the other rules rather than guessed at.
+ */
+/*
+ * Which stop-looking number is a level rather than a leg: `SELL STOP 4010` and `BUY GOLD LIMIT 4011` name the
+ * price the resting order waits at, and in these messages nothing else names it - no `ENTRY`, no `@`.
+ * A symbol between the direction word and `LIMIT` is allowed because `LIMIT` is never the name of a protective
+ * leg. The same licence for `STOP` is given only when the protective leg has already been claimed by its own
+ * label elsewhere in the message: `BUY GOLD stop 4005 TP 4030` is shorthand for a stop loss, and taking that
+ * number as the entry would put the entry where the stop belongs and leave the trade unprotected.
+ */
+/* The two branches need distinct group names - a pattern cannot declare `price` twice - and the reader takes
+   whichever one the alternative that matched filled in. */
+const PENDING_LIMIT = (symbol) => String.raw`(?:BUY|SELL|LONG|SHORT)\s+${symbol}LIMIT\s*(?:ORDER\s*)?(?:AT|@|:|=|\s)\s*(?<limit>${NUMBER})`;
+const PENDING_STOP = (symbol) => String.raw`(?:BUY|SELL|LONG|SHORT)\s+${symbol}STOP\s*(?:ORDER\s+|ENTRY\s+)?(?:ABOVE|BELOW|AT|@|:|=)?\s*(?<stop>${NUMBER})`;
+const PENDING_SYMBOL = String.raw`(?:[A-Za-z][A-Za-z0-9._-]{1,9}\s+)?`;
+const LABELLED_STOP = /\b(?:SL|STOP[- ]?LOSS|STOPLOSS|INVALIDATION)\b\s*[:=@-]?\s*\d/i;
+
+function pendingLevelPattern(text) {
+  const stopAllowsSymbol = LABELLED_STOP.test(String(text || ''));
+  return new RegExp(`${PENDING_LIMIT(PENDING_SYMBOL)}|${PENDING_STOP(stopAllowsSymbol ? PENDING_SYMBOL : '')}`, 'gi');
+}
+
+/** The level itself, or null when the message states no resting price next to its order type. */
+function findPendingLevel(text) {
+  const values = [...String(text || '').matchAll(pendingLevelPattern(text))]
+    .map((match) => parseNumber(match.groups.limit ?? match.groups.stop));
+  const distinct = [...new Set(values.filter((value) => value !== null && value > 0))];
+  // Two different levels named this way is the same contradiction as two entry labels, and gets the same
+  // answer: refuse rather than pick, because both numbers look like the entry to a scanner this shallow.
+  if (distinct.length > 1) return { value: null, error: 'More than one entry price was found.' };
+  return { value: distinct.length === 1 ? distinct[0] : null, error: null };
+}
+
+/**
+ * The text the protective legs are scanned from, with any pending-order level blanked out.
+ *
+ * Blanking (rather than removing) keeps every index in the string pointing at the same character, which the
+ * pip-distance look-around depends on. Without this, `SELL STOP 4010, SL 4020` reads 4010 a second time as a
+ * stop price, two stops are found, and the message is refused for a contradiction that is only in the
+ * scanner's way.
+ */
+function withoutPendingLevel(text) {
+  return String(text || '').replace(pendingLevelPattern(text), (match) => ' '.repeat(match.length));
+}
 const ENTRY_SEPARATORS = '[:=@–—-]';
 
 /**
@@ -281,7 +331,15 @@ function parseEntry(text) {
      can only ever be something a real label leans on. The same allowance is shared with `findMarkedValues`. */
   const regex = new RegExp(`(?:\\b${ENTRY_LABEL}|${ENTRY_MARKER})${MARKED_GAP}${NUMBER}(?:${RANGE_SEPARATOR}${NUMBER})?`, 'gi');
   const matches = [...text.matchAll(regex)];
-  if (!matches.length) return { value: null, range: null, error: null, levels: null, pips: false };
+  if (!matches.length) {
+    const pending = findPendingLevel(text);
+    if (pending.error) return { value: null, range: null, error: pending.error, levels: null, pips: false };
+    // The label-based scan finding nothing is also the only safe moment to trust an order type as a price:
+    // a message that says `Entry 4020` and `SELL STOP 4010` has two candidates, and the label wins.
+    return pending.value === null
+      ? { value: null, range: null, error: null, levels: null, pips: false }
+      : { value: pending.value, range: null, error: null, levels: null, pips: false };
+  }
   /* More than one entry is a dollar-cost-averaging plan when the message enumerates it - `Entry 1: 1.0850`
      then `Entry 2: 1.0800` - which is an instruction with a first leg, not a contradiction. It stays a
      contradiction when the levels are offered as alternatives ("entry 1.085 or 1.080"), because choosing
@@ -326,6 +384,85 @@ function entryFromRange(range, side) {
  * told them the parser had failed when it had actually done its job. `directionInferred` marks the one
  * judgement this function makes rather than reads - and a judged direction is never traded, only shown.
  */
+/**
+ * How the channel wants the order put on the book: filled at the market, or resting at a price.
+ *
+ * The naive version of this - scan the message for `STOP`, `LIMIT` or `MARKET` - is wrong on almost every
+ * real signal this product has ever stored, because those words are ordinary English in trading prose.
+ * "Stop Loss: 4010" contains STOP; "daily loss limit" and "max positions limit" contain LIMIT; "trust your
+ * market mover" contains MARKET. A parser that read those as order types would quietly turn a channel's
+ * risk warnings into resting orders, and a resting order is money that moves while nobody is watching.
+ *
+ * So the search is scoped the way the rest of this file reads a message. Only a line that carries an
+ * instruction can set the order type; the labelled legs and their numbers are cut out of that line before it
+ * is read, because they are where the false `stop` and `limit` live; and an immediate word has to sit next to
+ * the word it modifies. `SELL GOLD Stop Loss: 4010` therefore says nothing at all about the entry type and
+ * stays a market order, exactly as it has always been.
+ *
+ * When the message says nothing, the shape of the entry decides. A single stated price with no instruction to
+ * pay the market is a level to be filled *at*, which is a limit. An entry published as a zone is not one price
+ * to rest at, and an entry that was never given has nothing to rest at - both stay market orders.
+ */
+const INSTRUCTION_LINE = /\b(?:BUY|SELL|LONG|SHORT|ENTRY|POSITION|ORDER|TRADE|LIMIT|STOP|SL|TP)\b/i;
+/* A leg label and the number attached to it, removed from the clause before order-type words are looked
+   for. Only the value is cut, not the rest of the line: a channel that writes `TP1 4050 - limit orders only`
+   has something to say about the order type after the number. */
+const LEG_WITH_VALUE = /\b(?:SL|STOP[- ]?LOSS|STOPLOSS|INVALIDATION|TP\d*|TAKE[- ]?PROFIT|TARGET)\b\s*[:=@-]?\s*\d[\d.,]*(?:\s*-\s*\d[\d.,]*)?(?:\s*(?:USD|pips?|points?|usd))?/gi;
+const PROSE_LIMIT = /\b(?:daily|per[- ]?day|total|maximum|max|min(?:imum)?|loss|drawdown|risk|position(?:s)?|trade(?:s)?|order(?:s)?|exposure|withdrawal|deposit|betting|trading|per[- ]?trade)\s+(?:loss\s+|order\s+)?limit(?:s)?\b/gi;
+const PROSE_STOP = /\b(?:trailing|break[- ]?even|guaranteed|emergency)\s+stop\b|\bstop[- ]?(?:out|hunt(?:ing)?|level|move|moving)\b/gi;
+const IMMEDIATE_IN_CLAUSE = /\b(?:BUY|SELL|LONG|SHORT|ENTER|ENTRY|EXECUTE|EXECUTION|OPEN|ORDER|TRADE|SETUP|POSITION)\b[^\n]{0,20}?\b(?:NOW|CMP|INSTANT(?:LY)?|IMMEDIATELY|AT\s+MARKET(?:\s+PRICE)?|MARKET\s+(?:ORDER|PRICE|EXECUTION|ENTRY|FILL))\b/i;
+/* `MARKET` on its own is only a trading instruction when nothing but punctuation separates it from the verb:
+   `BUY MARKET` yes, `do not trade if market closes` no. */
+const MARKET_AFTER_INSTRUCTION = /\b(?:BUY|SELL|LONG|SHORT|ENTER|ENTRY|EXECUTE|OPEN|ORDER|TRADE)\b[\s,!.:'"\-]{0,3}MARKET\b/i;
+const BARE_CMP = /\bCMP\b/;
+/* The number form of a limit needs the order type to be *pointing* at it (`LIMIT @ 4011`, `LIMIT: 4011`,
+   `LIMIT AT 4011`), because `limit 4011` with nothing between is also how a channel writes a risk cap
+   ("max positions limit 5"). A message that only says `BUY GOLD LIMIT 4011` still ends up a limit order - the
+   stated price decides that - so what this rule protects is the `stated` flag, and the refusal to read a
+   number belonging to somebody else's sentence as an entry level. */
+const LIMIT_ORDER = /\b(?:BUY|SELL|LONG|SHORT)\s+(?:[A-Za-z][A-Za-z0-9._-]{1,9}\s+)?LIMIT\b|\bLIMIT\s+(?:BUY|SELL|ORDER|ENTRY|PRICE)\b|\bLIMIT\s+(?:AT|@|:|=)\s*\d|\bPENDING\s+(?:BUY|SELL|LIMIT|ORDER)\b/i;
+const STOP_ORDER = /\b(?:BUY|SELL|LONG|SHORT)\s+STOP\b(?!\s*(?:LOSS|LOSSES|OUT|HUNT|HUNTING|LEVEL|MOVE|MOVING|TRAILING))|\bSTOP\s*(?:ORDER|ENTRY)\s*(?:AT|@|:)\s*\d|\b(?:STOPPED?|BREAKOUT)\s+(?:ABOVE|BELOW)\b|\bON\s+(?:STOP|BREAKOUT)\b/i;
+/* `fast` and `quick` on their own are adjectives in nearly every channel's prose, so they only count next to
+   a word that names the trade itself. `scalp` needs no such company. */
+const SCALP_WORDS = /\bSCALP(?:ING|ED|ER|S)?\b/i;
+const SCALP_PHRASE = /\b(?:FAST|QUICK)\s+(?:IN|ENTRY|EXECUTION|TRADE|SETUP|BUY|SELL|TP|TAKE\s*PROFIT)\b|\b(?:ENTRY|EXECUTION|SETUP|SCALP)\s+(?:FAST|QUICK)\b/i;
+
+function orderTypeClause(text) {
+  const lines = String(text || '').split(/\r?\n/).filter((line) => INSTRUCTION_LINE.test(line));
+  const scope = (lines.length ? lines.join('\n') : String(text || ''))
+    .replace(LEG_WITH_VALUE, ' ')
+    .replace(PROSE_LIMIT, ' ')
+    .replace(PROSE_STOP, ' ');
+  // A message with no instruction line cannot be attributed to an entry at all, so only the phrases that
+  // could not possibly mean anything else are allowed to speak for it.
+  return { scope, hasInstructionLine: lines.length > 0 };
+}
+
+/**
+ * `stated` separates what the channel asked for from what the shape of the message implied. It matters to the
+ * reader: a row that reads `Limit` because the channel wrote `LIMIT 4011` is a fact about the signal, and a
+ * row that reads `Limit` because a price was published with no instruction to take the market is a policy this
+ * product chose. The UI says them differently.
+ */
+export function detectOrderType(text, { entryPrice = null, entryIsRange = false } = {}) {
+  const { scope, hasInstructionLine } = orderTypeClause(text);
+  const immediate = IMMEDIATE_IN_CLAUSE.test(scope) || MARKET_AFTER_INSTRUCTION.test(scope) || BARE_CMP.test(scope);
+  // A request to be filled now outranks every other reading, and it is the safe one: it is what this product
+  // has always done, and it cannot leave an order on the book after the setup has gone.
+  if (immediate) return { orderType: 'market', stated: true };
+  if (STOP_ORDER.test(scope)) return { orderType: 'stop', stated: true };
+  if (hasInstructionLine && LIMIT_ORDER.test(scope)) return { orderType: 'limit', stated: true };
+  const level = Number(entryPrice);
+  if (Number.isFinite(level) && level > 0 && entryIsRange !== true) return { orderType: 'limit', stated: false };
+  return { orderType: 'market', stated: false };
+}
+
+export function detectScalping(text) {
+  const { scope, hasInstructionLine } = orderTypeClause(text);
+  if (SCALP_WORDS.test(scope)) return true;
+  return hasInstructionLine && SCALP_PHRASE.test(scope);
+}
+
 export function parseSignal(message) {
   const raw = String(message || '').slice(0, 5000);
   const numbers = normalizeSignalNumbers(stripNoise(raw));
@@ -350,8 +487,9 @@ export function parseSignal(message) {
      apart from a price for two reasons. It cannot be turned into a price here - that needs the broker's tick
      size, which only exists when the order is built - and treating it as absent would let a workspace's
      fallback distance quietly replace the number the trader actually wrote down. */
-  const stopMatches = findMarkedValues(text, 'SL|STOP(?:\\s*LOSS)?|INVALIDATION|INVALIDATE(?:\\s*LEVEL)?|STOP\\s*OUT');
-  const takeProfitMatches = findMarkedValues(text, 'TP\\d*|TAKE\\s*PROFIT(?:\\s*\\d+)?|TARGET(?:\\s*\\d+)?|GOAL');
+  const legText = withoutPendingLevel(text);
+  const stopMatches = findMarkedValues(legText, 'SL|STOP(?:\\s*LOSS)?|INVALIDATION|INVALIDATE(?:\\s*LEVEL)?|STOP\\s*OUT');
+  const takeProfitMatches = findMarkedValues(legText, 'TP\\d*|TAKE\\s*PROFIT(?:\\s*\\d+)?|TARGET(?:\\s*\\d+)?|GOAL');
   /* A price named twice in one message is one price, not a choice: "SL 1.28 ... (SL 1.28 is above
      entry)" restates the stop inside its own commentary, and only two *different* numbers leave nothing
      to pick. Distinct-first-seen order is what both stops and targets are judged on. */
@@ -361,8 +499,8 @@ export function parseSignal(message) {
   const targetPriceMatches = takeProfitMatches.filter((match) => !match.pips);
   const targetDistanceMatches = takeProfitMatches.filter((match) => match.pips);
   const stopPrices = distinctPrices(stopPriceMatches);
-  const stopPips = [...distinctPrices(stopDistanceMatches), ...findPipDistances(text, 'SL|STOP(?:\\s*LOSS)?|INVALIDATION')];
-  const targetPipsAll = [...distinctPrices(targetDistanceMatches), ...findPipDistances(text, 'TP\\d*|TAKE\\s*PROFIT|TARGET')];
+  const stopPips = [...distinctPrices(stopDistanceMatches), ...findPipDistances(legText, 'SL|STOP(?:\\s*LOSS)?|INVALIDATION')];
+  const targetPipsAll = [...distinctPrices(targetDistanceMatches), ...findPipDistances(legText, 'TP\\d*|TAKE\\s*PROFIT|TARGET')];
   const targetPips = [...new Set(targetPipsAll)];
   const stopLoss = stopPrices.length === 1 ? stopPrices[0] : null;
   /* A leg expressed in pips counts as *present* - `missing` is what the fallback nets and the Safety blocks
@@ -444,6 +582,10 @@ export function parseSignal(message) {
 
   const parseError = blockers[0]?.message ?? null;
   if (entryPrice === null && entry.entryPriceFromRange !== undefined) entryPrice = entry.entryPriceFromRange;
+  /* Read after every leg is settled, because the fallback rule is about the entry that survives resolution:
+     a bound taken from a zone, or an entry inferred from a target after the direction was guessed, is not a
+     price the channel asked to be filled at. */
+  const order = detectOrderType(text, { entryPrice, entryIsRange: Boolean(entry.range) });
   const hasTradingData = Boolean(symbol || side || entryPrice !== null || stopLoss !== null || takeProfit !== null || stopLossPips !== null || takeProfitPips !== null);
 
   return {
@@ -452,6 +594,9 @@ export function parseSignal(message) {
     entryPrice,
     stopLoss,
     takeProfit,
+    orderType: order.orderType,
+    orderTypeStated: order.stated,
+    isScalping: detectScalping(text),
     executionReady: !parseError,
     parseError,
     directionInferred,

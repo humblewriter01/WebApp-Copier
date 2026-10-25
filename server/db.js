@@ -561,6 +561,54 @@ const SCHEMA_SQL = `
      * distinction without touching a single stored row, because the signup insert omits both columns. */
     ALTER TABLE settings ALTER COLUMN fallback_stop_loss_points SET DEFAULT 500;
     ALTER TABLE settings ALTER COLUMN fallback_take_profit_points SET DEFAULT 1000;
+    /* ---------------- what kind of order a signal is, and how long it lives ----------------
+     * Until now every executable signal was a market order, because that was the only kind this product
+     * could send. A channel that publishes 'BUY GOLD LIMIT 4011' is asking for a resting order at 4011, and
+     * filling it at the current price is a different trade - so the type is read from the message and stored
+     * on the row, rather than re-derived at execution time where a parser change could quietly alter a trade
+     * somebody had already reviewed (the same reason the target ladder is stored).
+     *
+     * DEFAULT 'market' on every row is not a convenience: it is what keeps the several hundred signals this
+     * product has already executed from being re-read as pending orders by any code that looks at history.
+     * expiry_timestamp is NULL for a market order and for anything that never reached a broker; on a resting
+     * order it is the deadline both this app and the platform were told about, and the sweeper's only cue.
+     * max_slippage_points is nullable with no default on purpose, like the fallback distances above: an unset
+     * drift guard means "never fill worse than the published price", which is the behaviour every existing
+     * workspace already has, and a table default would have quietly loosened it for all of them.
+     */
+    ALTER TABLE signals ADD COLUMN IF NOT EXISTS order_type TEXT NOT NULL DEFAULT 'market';
+    /* Whether the channel asked for that order type or the shape of the message implied it. Kept because the
+     * difference is a fact about the trade, not a detail: 'GOLD SELL 4024' never asked to be a limit order,
+     * Signal Desk read it that way because a published price is a price the trader meant to get, and a
+     * reviewer looking at a resting order is entitled to know which of the two it was. 'direction_inferred'
+     * is the same idea, already on this table. */
+    ALTER TABLE signals ADD COLUMN IF NOT EXISTS order_type_stated BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE signals ADD COLUMN IF NOT EXISTS is_scalping BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE signals ADD COLUMN IF NOT EXISTS expiry_timestamp TIMESTAMPTZ;
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS order_type TEXT NOT NULL DEFAULT 'market';
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS expiry_timestamp TIMESTAMPTZ;
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS drift_points NUMERIC;
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS limit_order_expiry_value INTEGER NOT NULL DEFAULT 30;
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS limit_order_expiry_unit TEXT NOT NULL DEFAULT 'minutes';
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS max_slippage_points NUMERIC;
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'settings_limit_order_expiry_unit_check' AND conrelid = 'settings'::regclass) THEN
+        ALTER TABLE settings ADD CONSTRAINT settings_limit_order_expiry_unit_check CHECK (limit_order_expiry_unit IN ('minutes', 'hours', 'days'));
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'signals_order_type_check' AND conrelid = 'signals'::regclass) THEN
+        ALTER TABLE signals ADD CONSTRAINT signals_order_type_check CHECK (order_type IN ('market', 'limit', 'stop'));
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'trades_order_type_check' AND conrelid = 'trades'::regclass) THEN
+        ALTER TABLE trades ADD CONSTRAINT trades_order_type_check CHECK (order_type IN ('market', 'limit', 'stop'));
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'settings_limit_order_expiry_value_check' AND conrelid = 'settings'::regclass) THEN
+        ALTER TABLE settings ADD CONSTRAINT settings_limit_order_expiry_value_check CHECK (limit_order_expiry_value BETWEEN 1 AND 43200);
+      END IF;
+    END $$;
+    /* The sweep that cancels expired orders and notices the ones the user deleted by hand runs every minute
+     * against a table that is mostly history. A partial index on the live rows is the difference between a
+     * cheap lookup and a scan of every trade the workspace has ever made. */
+    CREATE INDEX IF NOT EXISTS trades_pending_expiry_idx ON trades(expiry_timestamp) WHERE status = 'pending';
 `;
 
 /** The schema exactly as it will be sent: one entry per statement, in the order it is written above. */

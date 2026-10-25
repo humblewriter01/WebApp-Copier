@@ -23,12 +23,13 @@
  */
 
 import { parseSignal } from './signal-parser.js';
+import { ORDER_TYPES } from './order-routing.js';
 
 /** The columns a backfill may write. Everything else on the table is out of scope by definition. */
 export const BACKFILL_COLUMNS = Object.freeze([
   'symbol', 'side', 'entry_price', 'stop_loss', 'take_profit',
   'stop_loss_pips', 'take_profit_pips', 'take_profit_levels',
-  'direction_inferred', 'parse_error',
+  'direction_inferred', 'order_type', 'order_type_stated', 'is_scalping', 'parse_error',
 ]);
 
 /**
@@ -51,7 +52,8 @@ export function backfillSelect({ userId = null } = {}) {
   if (userId) params.push(userId);
   return {
     text: `  SELECT s.id, s.user_id, s.source, s.message, s.symbol, s.side, s.entry_price, s.stop_loss, s.take_profit,
-           s.stop_loss_pips, s.take_profit_pips, s.take_profit_levels, s.direction_inferred, s.parse_error,
+           s.stop_loss_pips, s.take_profit_pips, s.take_profit_levels, s.direction_inferred,
+           s.order_type, s.order_type_stated, s.is_scalping, s.parse_error,
            s.status, s.execution_ready, s.created_at
       FROM signals s
      WHERE NOT EXISTS (SELECT 1 FROM trades t WHERE t.signal_id = s.id)
@@ -99,6 +101,11 @@ function valuesFromParse(parsed) {
     take_profit_pips: numeric(parsed.takeProfitPips),
     take_profit_levels: levels(parsed.takeProfitLevels),
     direction_inferred: parsed.directionInferred === true,
+    // Never null: the column is NOT NULL with a default precisely so an unknown order type cannot be written
+    // as an empty value, because the only honest meaning of "we do not know" is a market order.
+    order_type: ORDER_TYPES.includes(parsed.orderType) ? parsed.orderType : 'market',
+    order_type_stated: parsed.orderTypeStated === true,
+    is_scalping: parsed.isScalping === true,
     parse_error: text(parsed.parseError),
   };
 }
@@ -151,6 +158,9 @@ function storedValues(row) {
     take_profit_pips: numeric(row.take_profit_pips),
     take_profit_levels: levels(row.take_profit_levels),
     direction_inferred: bool(row.direction_inferred),
+    order_type: ORDER_TYPES.includes(row.order_type) ? row.order_type : 'market',
+    order_type_stated: bool(row.order_type_stated),
+    is_scalping: bool(row.is_scalping),
     parse_error: text(row.parse_error),
   };
 }
