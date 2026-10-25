@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createMetaApiTradingAdapter } from '../services/metaapi-trading.js';
 
-function mockMetaApi({ state = 'DEPLOYED', brokerConnected = true, accountInformation = { balance: 1000, equity: 1000 }, price = { bid: 1.1, ask: 1.1002, time: new Date().toISOString() }, specification = { symbol: 'EURUSD', minVolume: 0.01, maxVolume: 50, volumeStep: 0.01, tickSize: 0.00001 }, specifications = [specification] } = {}) {
+function mockMetaApi({ state = 'DEPLOYED', cancelThrows = false, brokerConnected = true, accountInformation = { balance: 1000, equity: 1000 }, price = { bid: 1.1, ask: 1.1002, time: new Date().toISOString() }, specification = { symbol: 'EURUSD', minVolume: 0.01, maxVolume: 50, volumeStep: 0.01, tickSize: 0.00001 }, specifications = [specification] } = {}) {
   const calls = [];
   const connection = {
     terminalState: {
@@ -21,6 +21,11 @@ function mockMetaApi({ state = 'DEPLOYED', brokerConnected = true, accountInform
     createMarketBuyOrder: async (...args) => { calls.push(['buy', ...args]); return { stringCode: 'TRADE_RETCODE_DONE', numericCode: 10009 }; },
     createMarketSellOrder: async (...args) => { calls.push(['sell', ...args]); return { stringCode: 'TRADE_RETCODE_DONE', numericCode: 10009 }; },
     closePositionPartially: async (...args) => { calls.push(['closePartial', ...args]); return { stringCode: 'TRADE_RETCODE_DONE_PARTIAL', numericCode: 10010, positionId: args[0], filledVolume: args[1] }; },
+    createLimitBuyOrder: async (...args) => { calls.push(['limitBuy', ...args]); return { stringCode: 'TRADE_RETCODE_PLACED', numericCode: 10009, orderId: 'resting-1' }; },
+    createLimitSellOrder: async (...args) => { calls.push(['limitSell', ...args]); return { stringCode: 'TRADE_RETCODE_PLACED', numericCode: 10009, orderId: 'resting-2' }; },
+    createStopBuyOrder: async (...args) => { calls.push(['stopBuy', ...args]); return { stringCode: 'TRADE_RETCODE_PLACED', numericCode: 10009, orderId: 'resting-3' }; },
+    createStopSellOrder: async (...args) => { calls.push(['stopSell', ...args]); return { stringCode: 'TRADE_RETCODE_PLACED', numericCode: 10009, orderId: 'resting-4' }; },
+    cancelOrder: async (...args) => { calls.push(['cancel', ...args]); if (cancelThrows) throw new Error('Trade is disabled'); return { stringCode: 'TRADE_RETCODE_DONE', numericCode: 10025 }; },
     modifyPosition: async (...args) => { calls.push(['modify', ...args]); return { stringCode: 'TRADE_RETCODE_DONE', numericCode: 10009 }; },
     close: async () => calls.push(['close']),
   };
@@ -185,4 +190,81 @@ test('the snapshot reports what the link itself says, including after it drops',
   const unsynced = await adapter.getAccountState({ token: TOKEN, accountId: 'account-1', symbol: 'EURUSD' });
   assert.equal(unsynced.link.synchronized, false);
   await adapter.close();
+});
+
+/* ------------------------------------------------------------------ the resting half of the trading surface ------------------------------------------------------------------ */
+
+test('a limit order is placed with the level, the legs, the deadline and the correlation id', async () => {
+  const { FakeMetaApi, calls } = mockMetaApi();
+  const adapter = createMetaApiTradingAdapter({ MetaApiClass: FakeMetaApi });
+  const expiration = { type: 'ORDER_TIME_SPECIFIED', time: new Date('2026-10-25T12:30:00.000Z') };
+  const result = await adapter.createPendingOrder({
+    token: TOKEN, accountId: 'account-1', kind: 'limit', side: 'buy', symbol: 'EURUSD',
+    volume: 0.02, price: 1.085, stopLoss: 1.08, takeProfit: 1.09, expiration, clientId: 'SD_EURUSD_job1',
+  });
+  assert.equal(result.orderId, 'resting-1');
+  const sent = calls.find(([name]) => name === 'limitBuy');
+  assert.deepEqual(sent.slice(1, 6), ['EURUSD', 0.02, 1.085, 1.08, 1.09], 'symbol, volume, open price, stop, target - the order the platform expects, in its own order');
+  assert.deepEqual(sent[6], {
+    comment: 'SD',
+    clientId: 'SD_EURUSD_job1',
+    expiration: { type: 'ORDER_TIME_SPECIFIED', time: expiration.time },
+  }, 'and the options carry the deadline plus the idempotency id, in the one object both platforms read');
+  await adapter.close();
+});
+
+test('the kind and the direction choose the method, and nothing else is guessed at', async () => {
+  for (const [kind, side, method] of [
+    ['limit', 'buy', 'limitBuy'], ['limit', 'sell', 'limitSell'],
+    ['stop', 'buy', 'stopBuy'], ['stop', 'sell', 'stopSell'],
+  ]) {
+    const { FakeMetaApi, calls } = mockMetaApi();
+    const adapter = createMetaApiTradingAdapter({ MetaApiClass: FakeMetaApi });
+    await adapter.createPendingOrder({ token: TOKEN, accountId: 'account-1', kind, side, symbol: 'EURUSD', volume: 0.01, price: 1.085, clientId: 'SD_EURUSD_job1' });
+    assert.ok(calls.some(([name]) => name === method), `${kind} ${side} has to reach ${method}`);
+    await adapter.close();
+  }
+});
+
+test('an order that cannot be described is refused before anything reaches the connection', async () => {
+  const { FakeMetaApi, calls } = mockMetaApi();
+  const adapter = createMetaApiTradingAdapter({ MetaApiClass: FakeMetaApi });
+  const base = { token: TOKEN, accountId: 'account-1', symbol: 'EURUSD', volume: 0.01, price: 1.085, clientId: 'SD_EURUSD_job1' };
+  await assert.rejects(() => adapter.createPendingOrder({ ...base, kind: 'market', side: 'buy' }), /limit or stop/);
+  await assert.rejects(() => adapter.createPendingOrder({ ...base, kind: 'limit', side: 'hold' }), /limit or stop/);
+  await assert.rejects(() => adapter.createPendingOrder({ ...base, kind: 'limit', side: 'buy', price: null }), /needs the price it waits at/);
+  await assert.rejects(() => adapter.createPendingOrder({ ...base, kind: 'limit', side: 'buy', volume: 0 }), /positive volume/);
+  await assert.rejects(() => adapter.createPendingOrder({ ...base, kind: 'limit', side: 'buy', clientId: 'x'.repeat(40) }), /clientId|comment/i);
+  assert.equal(calls.filter(([name]) => name.endsWith('Buy') || name.endsWith('Sell')).length, 0, 'and none of them touched the trading connection');
+  await adapter.close();
+});
+
+test('an expiration that is not a real date is dropped rather than sent as garbage', async () => {
+  const { FakeMetaApi, calls } = mockMetaApi();
+  const adapter = createMetaApiTradingAdapter({ MetaApiClass: FakeMetaApi });
+  await adapter.createPendingOrder({ token: TOKEN, accountId: 'account-1', kind: 'limit', side: 'buy', symbol: 'EURUSD', volume: 0.01, price: 1.085, expiration: { type: 'ORDER_TIME_SPECIFIED', time: 'tomorrow' }, clientId: 'SD_EURUSD_job1' });
+  const sent = calls.find(([name]) => name === 'limitBuy');
+  assert.equal('expiration' in sent[6], false, 'a deadline the platform cannot parse is not a deadline, and an unexpired order is the failure this whole feature exists to stop - so the field is left off and the sweeper is the guarantee');
+  await adapter.close();
+});
+
+test('a cancellation answers with the outcome, because "already gone" is not an error', async () => {
+  const ok = mockMetaApi();
+  const adapter = createMetaApiTradingAdapter({ MetaApiClass: ok.FakeMetaApi });
+  const accepted = await adapter.cancelOrder({ token: TOKEN, accountId: 'account-1', orderId: 'resting-1' });
+  assert.deepEqual(accepted, { result: { stringCode: 'TRADE_RETCODE_DONE', numericCode: 10025 }, error: null });
+  assert.deepEqual(ok.calls.find(([name]) => name === 'cancel').slice(1), ['resting-1'], 'and the platform is given only the order id, which is all cancelOrder takes');
+  await adapter.close();
+
+  const refused = mockMetaApi({ cancelThrows: true });
+  const second = createMetaApiTradingAdapter({ MetaApiClass: refused.FakeMetaApi });
+  const answer = await second.cancelOrder({ token: TOKEN, accountId: 'account-1', orderId: 'resting-1' });
+  assert.equal(answer.result, null);
+  assert.match(answer.error.message, /Trade is disabled/, 'the refusal travels back as data, so the sweep can tell a locked account from an order that left the book on its own');
+  await second.close();
+
+  const third = createMetaApiTradingAdapter({ MetaApiClass: mockMetaApi().FakeMetaApi });
+  await assert.rejects(() => third.cancelOrder({ token: TOKEN, accountId: 'account-1', orderId: '  ' }), /broker order id is required/);
+  await assert.rejects(() => third.cancelOrder({ token: TOKEN, accountId: 'account-1' }), /broker order id is required/);
+  await third.close();
 });

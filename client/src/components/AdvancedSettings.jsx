@@ -28,6 +28,21 @@ export const DEFAULT_TARGET_MODE = 'first_target';
 /** What the sweep does with the ladder, stated here because it is the promise the setting makes. */
 export const SCALE_OUT_PLAN = 'Half closes at the first target and its stop moves to break even in the same breath; 30% at the next; the rest rides to the final target.';
 
+/**
+ * The units a workspace can state an expiry in. The values are the server's
+ * (`server/services/order-routing.js` `EXPIRY_UNITS`), and a test pins the two lists together for the same
+ * reason as the target modes above: a unit the panel can offer and the engine cannot read is a setting that
+ * quietly stops meaning anything.
+ */
+export const LIMIT_ORDER_EXPIRY_UNITS = [
+  { value: 'minutes', label: 'Minutes' },
+  { value: 'hours', label: 'Hours' },
+  { value: 'days', label: 'Days' },
+];
+export const DEFAULT_LIMIT_ORDER_EXPIRY = { value: 30, unit: 'minutes' };
+/** The ceiling the route refuses beyond, stated here so the input can refuse visually what the API refuses in words. */
+export const MAX_EXPIRY_DAYS = 30;
+
 const targetModeOf = (settings) => (MULTIPLE_TARGET_MODES.some((mode) => mode.value === settings?.multipleTargetHandling) ? settings.multipleTargetHandling : DEFAULT_TARGET_MODE);
 
 const BREAK_EVEN_LABELS = {
@@ -78,6 +93,26 @@ export function scaleOutSummary(trade) {
   }[String(status || 'pending')] || String(status));
   const parts = levels.map((level) => `${level.price} ${outcome(level.status)}${Number(level.percent) ? ` (${level.percent}%)` : ''}`);
   return `Scale-out: ${parts.join(' · ')}`;
+}
+
+/**
+ * The one line a resting order earns in the activity list.
+ *
+ * A pending order is the only row on this screen whose meaning changes while the user is reading it, so the
+ * sentence names the level, and which way the deadline and the order stand relative to each other.
+ * "Limit at 4011, expires in 24 min" can be acted on; "pending" cannot. Past the deadline the sweep has not
+ * necessarily run yet, and the line says that instead of implying the order is still being held.
+ */
+export function restingOrderSummary(trade, now = () => Date.now()) {
+  if (String(trade?.status || '').toLowerCase() !== 'pending') return '';
+  const type = trade?.orderType === 'stop' ? 'Stop order' : 'Limit order';
+  const level = trade?.entryPrice == null ? '' : ` at ${trade.entryPrice}`;
+  const deadline = trade?.expiryTimestamp ? Date.parse(trade.expiryTimestamp) : NaN;
+  if (!Number.isFinite(deadline)) return `${type}${level} is on your broker account.`;
+  const minutes = Math.round((deadline - now()) / 60_000);
+  if (minutes <= 0) return `${type}${level} passed its expiry; Signal Desk is taking it off your broker account.`;
+  const left = minutes >= 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60}m` : `${minutes} min`;
+  return `${type}${level} is on your broker account, cancelled unfilled in ${left}.`;
 }
 
 /**
@@ -196,6 +231,14 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
             <input id="fixed-lot-size" type="number" min="0.01" max="100" step="0.01" value={settings.fixedLotSize} onChange={(event) => set('fixedLotSize', event.target.value)} required />
             <small>The broker's minimum, maximum, and volume step are checked before an order is sent.</small>
           </label>}
+          <div className="execution-section-heading">
+            <h4>Price Drift Guard</h4>
+            <p>How far from the price a channel published a market order may still be taken.</p>
+          </div>
+          <label htmlFor="max-slippage-points">Maximum drift (points)
+            <input id="max-slippage-points" type="number" min="0" max="100000" step="1" placeholder="Blank &mdash; never fill worse" value={settings.maxSlippagePoints ?? ''} disabled={saving} onChange={(event) => set('maxSlippagePoints', event.target.value === '' ? null : event.target.value)} />
+            <small>A fill better than the published price is always taken. A worse one is skipped unless it is within this many points &mdash; blank or 0 means never, which is what every workspace started with. On most FX pairs 10 points is one pip.</small>
+          </label>
           {settings.lotSizeMode === 'risk_based' && <p className="field-help">Risk-Based sizing uses your account balance, risk percent, stop-loss distance, and the broker's current symbol tick values. If the safe size is below the broker minimum, the signal is skipped rather than rounded up.</p>}
         </SettingsSection>
 
@@ -265,6 +308,24 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
             </div>
           )}
           <p className="field-help">This changes what happens to the next signal that is executed; a trade already open keeps the exit it was sent with.</p>
+
+          <div className="execution-section-heading">
+            <h4>Limit Order Expiry</h4>
+            <p>How long an order that waits at a price stays on your broker&rsquo;s book before Signal Desk takes it off.</p>
+          </div>
+          <div className="form-row">
+            <label htmlFor="limit-order-expiry">Expiry
+              <input id="limit-order-expiry" type="number" min="1" max={MAX_EXPIRY_DAYS * 24 * 60} step="1" value={settings.limitOrderExpiryValue ?? DEFAULT_LIMIT_ORDER_EXPIRY.value} disabled={saving} onChange={(event) => set('limitOrderExpiryValue', event.target.value)} required />
+              <small>Between 1 minute and 30 days. An order that has not filled by then is cancelled and the signal is marked expired.</small>
+            </label>
+            <label htmlFor="limit-order-expiry-unit">Unit
+              <select id="limit-order-expiry-unit" value={LIMIT_ORDER_EXPIRY_UNITS.some((unit) => unit.value === settings.limitOrderExpiryUnit) ? settings.limitOrderExpiryUnit : DEFAULT_LIMIT_ORDER_EXPIRY.unit} disabled={saving} onChange={(event) => set('limitOrderExpiryUnit', event.target.value)}>
+                {LIMIT_ORDER_EXPIRY_UNITS.map((unit) => <option key={unit.value} value={unit.value}>{unit.label}</option>)}
+              </select>
+              <small>The same deadline is sent to the platform as the order&rsquo;s own expiration, so a resting order does not survive Signal Desk being offline.</small>
+            </label>
+          </div>
+          <p className="field-help">A signal the channel marked as scalping ignores this number: its orders live for two minutes, because a scalp that has not filled is a different trade. A market order never rests, so nothing here delays one.</p>
         </SettingsSection>
 
         <SettingsSection
@@ -321,7 +382,8 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
         <div className="execution-section-heading"><h3 id="execution-history-title">Recent execution activity</h3><p>Order outcomes and safe rejection reasons for this workspace.</p></div>
         {!trades.length ? <p className="field-help">No execution activity yet. Signals are only considered while Auto-Trading is on.</p> : <div className="execution-trade-list">{trades.slice(0, 8).map((trade) => <article className="execution-trade-row" key={trade.id}>
           <div><strong>{trade.side?.toUpperCase() || 'TRADE'} {trade.symbol || ''}</strong><small>{trade.quantity ? `${trade.quantity} lots${trade.remainingVolume != null && Number(trade.remainingVolume) !== Number(trade.quantity) ? ` · ${trade.remainingVolume} lots left` : ''}` : 'Size unavailable'} · {trade.createdAt ? new Date(trade.createdAt).toLocaleString() : 'Recent'}</small></div>
-          <span className={`badge execution-status-${String(trade.status || '').toLowerCase()}`}>{trade.status || 'unknown'}</span>
+          <span className={`badge execution-status-${String(trade.status || '').toLowerCase()}`}>{trade.status === 'pending' ? 'on the book' : (trade.status || 'unknown')}</span>
+          {restingOrderSummary(trade) && <p className="execution-resting-summary">{restingOrderSummary(trade)}</p>}
           {scaleOutSummary(trade) && <p className="execution-scale-out-summary">{scaleOutSummary(trade)}</p>}
           {trade.breakEvenStatus && <span className={`badge execution-breakeven-badge execution-breakeven-${trade.breakEvenStatus}`}>{breakEvenSummary(trade)}</span>}
           {trade.errorMessage && <p className="execution-error-message">{trade.errorMessage}</p>}

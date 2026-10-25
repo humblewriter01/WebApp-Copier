@@ -74,6 +74,10 @@ test('running it twice changes nothing the second time, and numeric spelling is 
     ...staleManageRow,
     symbol: 'XAUUSD', side: 'buy', entry_price: '4026.0000', stop_loss: '4011.00', take_profit: null,
     take_profit_pips: '50', parse_error: null,
+    // The order-type columns as a migrated and refreshed row holds them: this message says `BUY MORE NOW`,
+    // which is a market order the channel asked for. Left out of a fixture, they read as an unlabelled
+    // default and the row looks different for a reason that has nothing to do with numeric spelling.
+    order_type: 'market', order_type_stated: true, is_scalping: false,
   }]);
   assert.deepEqual(typed.changes.map((change) => change.id), [], 'and a row stored with trailing zeroes is not "different"');
 });

@@ -374,6 +374,9 @@ test('a market that has already run past the zone is refused, and the sentence s
   const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true });
   const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
   assert.equal(result.status, 'skipped');
-  assert.match(result.message, /worse than the signal entry price/);
+  // The sentence names the bound that failed and by how much, in the broker's own points: "worse" was the
+  // old answer and it told nobody what to do about it.
+  assert.match(result.message, /the bid is 150 points below the signal price of 4031\.5/);
+  assert.match(result.message, /allows no drift at all/);
   assert.equal(orderCalls(trading).length, 0, 'nothing reaches the broker on the wrong side of the zone');
 });

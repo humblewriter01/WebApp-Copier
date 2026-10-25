@@ -8,6 +8,9 @@ const OUTCOMES = {
   received: { label: 'Saved for review', tone: 'muted' },
   unparsed: { label: 'No clear signal', tone: 'muted' },
   queued: { label: 'Sent for execution', tone: 'busy' },
+  // The order is on the broker's book and this app is watching it: neither a trade nor a refusal.
+  pending: { label: 'Waiting at your price', tone: 'busy' },
+  cancelled: { label: 'Cancelled', tone: 'muted' },
   submitting: { label: 'Sending to broker', tone: 'busy' },
   unexecuted: { label: 'Not executed', tone: 'warn' },
   skipped: { label: 'Not executed', tone: 'warn' },
@@ -99,8 +102,37 @@ export function signalBadges(signal) {
      one look identical. Deliberately keyed off a *stated* price rather than `signalHasTradingData`, which
      also answers true for a row that only yielded a word for a symbol - that one has nothing to be a market
      order about, and it already wears a "Missing SL" badge. */
-  if (signal?.entryPrice == null && signal?.source === 'telegram' && signalStatesAPrice(signal)) {
+  /* A row with no order type is not a row of unknown type: the column is NOT NULL with a default, and every
+     signal captured before it existed was, in fact, a market order. Defaulting to that reading is the honest
+     one, and it is what keeps history from losing its badge. */
+  const orderType = String(signal?.orderType || 'market').toLowerCase();
+  const telegram = signal?.source === 'telegram';
+  /* Which kind of order the message asks for, and - just as importantly - whether it asked or we inferred.
+     A channel that wrote `LIMIT 4011` wants an order on the book; a channel that wrote a price and nothing
+     else gets one because a price that was published is a price the trader meant to be filled at. The second
+     case wears a warning tone because it is this product making a choice on the reader's behalf, and the
+     sentence says exactly how to overrule it. */
+  const resting = orderType === 'limit' || orderType === 'stop';
+  if (telegram && resting) {
+    const level = signal?.entryPrice;
+    badges.push({
+      key: 'order-type',
+      label: orderType === 'stop' ? 'Stop Order' : 'Limit Order',
+      tone: signal?.orderTypeStated === true ? 'busy' : 'warn',
+      title: signal?.orderTypeStated === true
+        ? `The channel asked for this trade to rest at ${level ?? 'its price'} rather than be filled at the market. Signal Desk places it as a pending order on your broker account, and takes it off when its expiry passes.`
+        : `Nothing in this message said LIMIT or STOP. It published ${level ?? 'an entry price'} without asking to be filled at the market, so an order is rested at that price instead of paying whatever the market is doing. Write NOW or CMP in the channel if you want it taken immediately.`,
+    });
+  }
+  /* The one market case worth a pill is the one that otherwise reads as a gap: a telegram signal whose entry
+     line is empty looks like a signal that forgot its price, when it is a signal that refused to name one.
+     A market order that *did* publish a price needs no badge, because nearly every signal is one, and a pill
+     on it would teach nobody to read it. */
+  if (!resting && telegram && signal?.entryPrice == null && signalStatesAPrice(signal)) {
     badges.push({ key: 'market', label: 'Market', tone: 'muted', title: 'The message did not name an entry price, so it is not waiting for one: it goes to the broker as a market order, filled at the current ask for a buy or the current bid for a sell.' });
+  }
+  if (signal?.isScalping === true) {
+    badges.push({ key: 'scalping', label: 'Scalping', tone: 'muted', title: 'The message was marked as a scalp. An order for it lives for two minutes instead of your Limit Order Expiry setting, and if the market is already at the level it is taken at once rather than waited for.' });
   }
   /* A stop given as `SL 30 pips` is not a missing stop, and saying it is would point the reader at a Safety
      setting they do not need to touch - the distance is there, it is only in the unit only the broker can

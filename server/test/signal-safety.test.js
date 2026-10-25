@@ -316,7 +316,10 @@ test('the worker reads the nets in the same query that claims the job', () => {
   assert.equal(engine.includes('block_execution_without_take_profit ?'), false, 'the gate must not be re-implemented in the engine');
   // An executed job that borrowed a leg leaves the explanation on the signal row, which is where a
   // reader looks for it; an ordinary trade leaves the note empty as before.
-  assert.match(engine, /await updateJob\(job\.id, job\.user_id, 'executed', null, \[safetyNoteText, planNote\]\.filter\(Boolean\)\.join\(' '\) \|\| null\)/, 'a borrowed leg and a scale-out plan share the one note a reader finds later');
+  assert.match(engine, /const notes = \[safetyNoteText, planNote\];/, 'a borrowed leg and a scale-out plan share the one note a reader finds later');
+  // A resting order is settled through the same write, with the same note in front of it: two paths would be
+  // two chances for the explanation to go missing on the half of trades that has the longest to wait.
+  assert.match(engine, /await updateJob\(job\.id, job\.user_id, resting \? 'pending' : 'executed', null, notes\.filter\(Boolean\)\.join\(' '\) \|\| null\)/, 'and a pending order is settled by that one call, not a copy of it');
   // The ladder travels with the same read that claims the job, so an order can never be sized under one
   // policy and executed under another because a second query agreed at a different moment.
   assert.ok(engine.lastIndexOf('recordScaleOutPlan({') > engine.indexOf('await trading.createMarketOrder'), 'the plan is written after the order reaches the broker, never before');

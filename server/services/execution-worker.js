@@ -113,6 +113,11 @@ export function createExecutionWorker({ pool, engine, pollIntervalMs = 1200, sta
         jobsSinceSweep = 0;
         await runSweep('Break-even stop moved', engine.sweepBreakEven, 'moved');
         await runSweep('Scale-out target closed', engine.sweepTakeProfitLevels, 'closed');
+        /* Resting orders: cancel what has passed its expiry, and notice the ones that left the broker's book
+         * by themselves. The engine throttles this to once a minute on its own, and the read is cheap next to
+         * the two above, so it shares their slot rather than needing a timer of its own - which is also what
+         * keeps a single stale-account failure from being able to stop the protection sweeps behind it. */
+        await runSweep('Resting order sweep', engine.sweepExpiredOrders, 'attempted');
       }
     } catch (error) {
       logger.error?.(JSON.stringify({ level: 'error', message: 'Execution worker iteration failed', error: safeWorkerError(error) }));

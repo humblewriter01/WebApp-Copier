@@ -9,6 +9,7 @@ import {
 } from './execution-defense.js';
 import { countSignalEntryDeals as countDailySignalEntryDeals, resolveBrokerSymbol } from './signal-parser.js';
 import { applySafetyNets, safetyNote } from './signal-safety.js';
+import { interpretCancelResponse, marketSlippage, pendingOrderOutcome, pendingOrderPlan, resolveOrderExpiry, ORDER_TYPES } from './order-routing.js';
 import { planScaleOutLevels, resolveCloseVolume, selectTarget, targetReached } from './scale-out.js';
 import { isPaidSubscriber, PAID_STATUSES } from './plan-limits.js';
 import { signalStatusForJobStatus } from './signal-outcome.js';
@@ -130,6 +131,8 @@ export const BREAK_EVEN_DEFERRED_RETRY_MS = 15_000;
 export const BREAK_EVEN_FAILED_RETRY_MS = 60_000;
 export const BREAK_EVEN_TRACKING_DAYS = 30;
 export const BREAK_EVEN_SWEEP_LIMIT = 20;
+/** How many resting orders one pass of the expiry sweep will look at. */
+export const EXPIRY_SWEEP_LIMIT = 50;
 
 /**
  * MetaTrader trade return codes that describe a *condition* rather than a refusal:
@@ -375,7 +378,7 @@ export function classifyBreakEvenFailure(error) {
   return { status: 'failed', retry: true, message: message || 'The broker rejected the stop-loss change.' };
 }
 
-export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnabled = false, isTradingPaused = async () => false, now = () => Date.now(), breakEvenIntervalMs = 5_000, takeProfitSweepIntervalMs = 5_000, breakEvenMaxAttempts = BREAK_EVEN_MAX_ATTEMPTS, quoteMaxAgeMs = MAX_QUOTE_AGE_MS, maxOrderAttempts = MAX_ORDER_ATTEMPTS, retryBaseMs = RETRY_BASE_DELAY_MS, retryMaxMs = RETRY_MAX_DELAY_MS, logger = console } = {}) {
+export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnabled = false, isTradingPaused = async () => false, now = () => Date.now(), breakEvenIntervalMs = 5_000, takeProfitSweepIntervalMs = 5_000, breakEvenMaxAttempts = BREAK_EVEN_MAX_ATTEMPTS, quoteMaxAgeMs = MAX_QUOTE_AGE_MS, expirySweepIntervalMs = 60_000, maxOrderAttempts = MAX_ORDER_ATTEMPTS, retryBaseMs = RETRY_BASE_DELAY_MS, retryMaxMs = RETRY_MAX_DELAY_MS, logger = console } = {}) {
   if (!pool?.query || !trading?.getAccountState || !trading?.createMarketOrder || typeof resolveToken !== 'function') {
     throw new TypeError('Execution engine dependencies are incomplete.');
   }
@@ -570,10 +573,13 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
         `SELECT ej.id AS job_id,ej.user_id,ej.status AS job_status,ej.attempt_count AS "attemptCount",ej.expires_at,
                 s.id AS signal_id,s.source,s.created_at AS signal_created_at,s.symbol,s.side,s.entry_price,s.stop_loss,s.take_profit,
                 s.execution_ready,s.parse_error,s.needs_review,s.stop_loss_pips,s.take_profit_pips,
+                s.order_type AS "orderType",s.order_type_stated AS "orderTypeStated",s.is_scalping AS "isScalping",
                 st.auto_trading_enabled,st.lot_size_mode,st.fixed_lot_size,st.risk_percent,st.max_open_positions,
                 st.max_daily_trades,st.daily_loss_limit,st.execution_account_id,st.block_execution_without_stop_loss,
                 st.block_execution_without_take_profit,st.fallback_stop_loss_points,st.fallback_take_profit_points,
                 st.multiple_target_handling AS "multipleTargetHandling",s.take_profit_levels AS "takeProfitLevels",
+                st.limit_order_expiry_value AS "limitOrderExpiryValue",st.limit_order_expiry_unit AS "limitOrderExpiryUnit",
+                st.max_slippage_points AS "maxSlippagePoints",
                 ma.metaapi_account_id,ma.managed_by_app,ma.state AS account_state,
                 u.subscription_status,u.subscription_plan
          FROM execution_jobs ej
@@ -651,7 +657,7 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
       const { rows: localTrades } = await pool.query(
         `SELECT COUNT(*)::int AS count FROM trades
          WHERE user_id=$1 AND metaapi_account_id=$2 AND created_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
-           AND status IN ('submitting','executed','unknown','filled')`,
+           AND status IN ('submitting','pending','executed','unknown','filled')`,
         [job.user_id, item.metaapi_account_id],
       );
       const dailyTrades = Math.max(providerDailyTrades, Number(localTrades[0]?.count || 0));
@@ -672,9 +678,68 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
       const ask = Number(quote?.ask);
       const marketPrice = item.side === 'buy' ? ask : item.side === 'sell' ? bid : NaN;
       if (![bid, ask, marketPrice].every((value) => Number.isFinite(value) && value > 0)) return stop(job, 'skipped', 'MetaAPI did not provide a valid market quote.');
-      if (item.entry_price != null) {
-        const desired = Number(item.entry_price);
-        if (!Number.isFinite(desired) || (item.side === 'buy' && ask > desired) || (item.side === 'sell' && bid < desired)) return stop(job, 'skipped', 'The current market price is worse than the signal entry price.');
+      /* ---------------- the order the channel asked for, and whether the market still allows it ----------------
+       *
+       * This block used to be four lines that refused any market order whose quote was worse than the signal's
+       * price, and every signal was a market order. Three rules live here now, and they share one idea: the
+       * published price means something different depending on the kind of order it was published for.
+       *
+       *  - A market order at a *better* price than published is not a violation to be refused, it is the same
+       *    trade on better terms. That was the bug this replaces: `BUY NOW 4110` with the ask at 4109 used to
+       *    be cancelled while a user's screen said "executed" for the signals that were unlucky enough to be
+       *    quoted exactly.
+       *  - A market order at a *worse* price is the workspace's decision, held in `max_slippage_points` - the
+       *    Price Drift Guard. Blank means zero, which is the strict behaviour every existing workspace has.
+       *  - A limit or stop is not priced against the current quote at all: it is an order to rest at a level.
+       *    `pendingOrderPlan` asks the one question that decides everything downstream - is that level still
+       *    resting, or has the market reached it? - and a level already reached becomes a market order, which
+       *    is then judged by the drift guard like any other. That is also the whole of the scalping rule, so
+       *    a scalp gets no special path: it has a two-minute fuse instead of the workspace's expiry.
+       */
+      const orderType = ORDER_TYPES.includes(item.orderType) ? item.orderType : 'market';
+      const statedEntry = item.entry_price == null ? null : Number(item.entry_price);
+      let plan = { kind: 'market', reason: 'order-type-market' };
+      if (orderType !== 'market') {
+        plan = pendingOrderPlan({
+          orderType,
+          entryPrice: statedEntry,
+          side: item.side,
+          bid,
+          ask,
+          stopsLevelPoints: state.specification?.stopsLevel,
+          tickSize: state.specification?.tickSize,
+        });
+        if (plan.kind === 'skip') return stop(job, 'skipped', plan.message);
+      }
+      const resting = plan.kind === 'pending';
+      /* The drift guard is consulted for anything that goes to the market now - a market order, and a resting
+         order whose level the market has already reached, which is the same event from the other side. */
+      const drift = marketSlippage({
+        side: item.side,
+        desired: statedEntry,
+        bid,
+        ask,
+        maxSlippagePoints: item.maxSlippagePoints,
+        tickSize: state.specification?.tickSize,
+      });
+      if (!resting && drift.action === 'skip') return stop(job, 'skipped', drift.message);
+      const expiry = resolveOrderExpiry({
+        value: item.limitOrderExpiryValue,
+        unit: item.limitOrderExpiryUnit,
+        isScalping: item.isScalping === true,
+        pendingOrder: resting,
+        now: now(),
+      });
+      /* The price the order carries, and therefore the price its legs are measured from. A resting buy limit
+         at 4011 with a 500-point fallback stop means a stop at 4006, not a stop 500 points under whatever the
+         market happens to be doing at the moment the order was written down - and the wrong-side tests below
+         have to be asked against the same number, or a correct pending order is refused for being nothing like
+         the current quote, which is the entire point of a pending order. */
+      const orderPrice = resting ? plan.price : marketPrice;
+      const legBid = resting ? orderPrice : bid;
+      const legAsk = resting ? orderPrice : ask;
+      if (plan.note) {
+        logger?.info?.(JSON.stringify({ level: 'info', message: plan.note, userId: job.user_id, jobId: job.id, signalId: item.signal_id }));
       }
       /* A signal with no stop arrives here as SQL NULL, and `Number(null)` is 0 - a number that is on
          the correct side of any price, so the old check read it as a stop at zero and sent 0 to both the
@@ -690,9 +755,9 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
          loud rather than quietly ignored. */
       const safety = applySafetyNets({
         side: item.side,
-        marketPrice,
-        bid,
-        ask,
+        marketPrice: orderPrice,
+        bid: legBid,
+        ask: legAsk,
         tickSize: state.specification?.tickSize,
         stopsLevelPoints: state.specification?.stopsLevel,
         stopLoss: Number.isFinite(signalStopLoss) ? signalStopLoss : null,
@@ -724,14 +789,14 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
       const stopLoss = safety.stopLoss;
       const hasStopLoss = stopLoss !== null && Number.isFinite(stopLoss);
       const takeProfit = safety.takeProfit;
-      if (hasStopLoss && Number.isFinite(signalStopLoss) && (item.side === 'buy' ? stopLoss >= bid : stopLoss <= ask)) {
+      if (hasStopLoss && Number.isFinite(signalStopLoss) && (item.side === 'buy' ? stopLoss >= legBid : stopLoss <= legAsk)) {
         return stop(job, 'skipped', 'The signal stop loss is on the wrong side of the market.');
       }
       const safetyNoteText = safetyNote(safety.sources, {
         stopLoss: item.fallback_stop_loss_points,
         takeProfit: item.fallback_take_profit_points,
       }, item.side);
-      if (takeProfit != null && (!Number.isFinite(takeProfit) || (item.side === 'buy' ? takeProfit <= ask : takeProfit >= bid))) return stop(job, 'skipped', 'The signal take profit is on the wrong side of the market.');
+      if (takeProfit != null && (!Number.isFinite(takeProfit) || (item.side === 'buy' ? takeProfit <= legAsk : takeProfit >= legBid))) return stop(job, 'skipped', 'The signal take profit is on the wrong side of the market.');
 
       const volume = calculateOrderVolume({
         mode: item.lot_size_mode,
@@ -739,7 +804,7 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
         balance,
         riskPercent: item.risk_percent,
         side: item.side,
-        entryPrice: marketPrice,
+        entryPrice: orderPrice,
         stopLoss: hasStopLoss ? stopLoss : null,
         specification: state.specification,
         price: quote,
@@ -748,13 +813,13 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
          becomes a plan. Both are decided from the stored level list rather than by re-reading the
          message, so a parser change can never move the target of a signal somebody had already reviewed. */
       const target = selectTarget({ mode: item.multipleTargetHandling, takeProfit, levels: item.takeProfitLevels });
-      let scaleOut = { eligible: false, reason: 'mode' };
+      let scaleOut = { eligible: false, reason: resting ? 'pending-order' : 'mode' };
       /* Scale-out starts from the first target and only moves the exit out once the plan is known to be
          tradeable, because the plan needs the volume the sizing just produced. That order matters: if the
          position is too small to split, a workspace that asked to scale out is left holding the *earlier*
          exit rather than a target nobody will be swept into. */
       let sendTakeProfit = target.mode === 'scale_out' ? takeProfit : target.takeProfit;
-      if (target.mode === 'scale_out' && takeProfit != null) {
+      if (target.mode === 'scale_out' && takeProfit != null && !resting) {
         scaleOut = planScaleOutLevels({
           levels: item.takeProfitLevels,
           side: item.side,
@@ -768,7 +833,7 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
       }
       // The price the position will actually exit at has to clear the same test the channel's first
       // target cleared: a final target is only an exit if the market can be reached from this side.
-      if (sendTakeProfit != null && (!Number.isFinite(sendTakeProfit) || (item.side === 'buy' ? sendTakeProfit <= ask : sendTakeProfit >= bid))) {
+      if (sendTakeProfit != null && (!Number.isFinite(sendTakeProfit) || (item.side === 'buy' ? sendTakeProfit <= legAsk : sendTakeProfit >= legBid))) {
         return stop(job, 'skipped', 'The signal take profit is on the wrong side of the market.');
       }
       const { rows: latestSettings } = await pool.query(
@@ -791,12 +856,18 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
       /* One client id for the whole life of the job, deliberately not one per attempt: it is what makes a
          second send of the same order recognisable as the same order. */
       const clientId = buildClientId({ jobId: job.id, symbol: resolved.symbol });
+      /* A resting order's deadline is stored the moment it is computed, on both rows: on the trade because it
+         is what the sweeper compares against, and on the signal because that is the row a reader looks at when
+         they want to know why nothing happened. A market entry has no deadline of its own - the job's window
+         already bounds it - unless the signal was a scalp, in which case the two minutes the channel asked for
+         is a fact worth keeping on the row. */
+      const expiryStamp = resting || item.isScalping === true ? new Date(expiry.expiresAt) : null;
       const { rows: tradeRows } = await pool.query(
-        `INSERT INTO trades(user_id,signal_id,execution_job_id,metaapi_account_id,symbol,side,quantity,entry_price,stop_loss,take_profit,status,client_id)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'submitting',$11)
+        `INSERT INTO trades(user_id,signal_id,execution_job_id,metaapi_account_id,symbol,side,quantity,entry_price,stop_loss,take_profit,status,client_id,order_type,expiry_timestamp,drift_points)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'submitting',$11,$12,$13,$14)
          ON CONFLICT(execution_job_id) WHERE execution_job_id IS NOT NULL DO NOTHING
          RETURNING id`,
-        [job.user_id, item.signal_id, job.id, item.metaapi_account_id, resolved.symbol, item.side, volume, marketPrice, hasStopLoss ? stopLoss : null, sendTakeProfit, clientId],
+        [job.user_id, item.signal_id, job.id, item.metaapi_account_id, resolved.symbol, item.side, volume, orderPrice, hasStopLoss ? stopLoss : null, sendTakeProfit, clientId, orderType, expiryStamp, drift.driftPoints ?? null],
       );
       if (tradeRows[0]) {
         tradeId = tradeRows[0].id;
@@ -810,10 +881,10 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
         // it is updated to the size and legs *this* attempt will send, because a market that moved in the
         // meantime would otherwise leave the trade describing a trade nobody is placing.
         const { rows: prior } = await pool.query(
-          `UPDATE trades SET symbol=$3,side=$4,quantity=$5,entry_price=$6,stop_loss=$7,take_profit=$8,client_id=$9
+          `UPDATE trades SET symbol=$3,side=$4,quantity=$5,entry_price=$6,stop_loss=$7,take_profit=$8,client_id=$9,order_type=$10,expiry_timestamp=$11,drift_points=$12
            WHERE execution_job_id=$1 AND user_id=$2 AND status='submitting'
            RETURNING id`,
-          [job.id, job.user_id, resolved.symbol, item.side, volume, marketPrice, hasStopLoss ? stopLoss : null, sendTakeProfit, clientId],
+          [job.id, job.user_id, resolved.symbol, item.side, volume, orderPrice, hasStopLoss ? stopLoss : null, sendTakeProfit, clientId, orderType, expiryStamp, drift.driftPoints ?? null],
         );
         if (!prior[0]) return stop(job, 'unknown', 'A trade record already exists for this job; automatic retry was blocked for safety.');
         tradeId = prior[0].id;
@@ -832,14 +903,28 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
       let result = null;
       let rejection = null;
       try {
-        result = await trading.createMarketOrder({ token, accountId: item.metaapi_account_id, side: item.side, symbol: resolved.symbol, volume, stopLoss: hasStopLoss ? stopLoss : undefined, takeProfit: sendTakeProfit, clientId });
+        result = resting
+          ? await trading.createPendingOrder({
+              token,
+              accountId: item.metaapi_account_id,
+              kind: orderType,
+              side: item.side,
+              symbol: resolved.symbol,
+              volume,
+              price: orderPrice,
+              stopLoss: hasStopLoss ? stopLoss : undefined,
+              takeProfit: sendTakeProfit,
+              expiration: expiry.brokerExpiration,
+              clientId,
+            })
+          : await trading.createMarketOrder({ token, accountId: item.metaapi_account_id, side: item.side, symbol: resolved.symbol, volume, stopLoss: hasStopLoss ? stopLoss : undefined, takeProfit: sendTakeProfit, clientId });
       } catch (error) {
         rejection = error;
       }
       const providerResponse = safeProviderResponse(result || rejection, token);
       if (rejection || !successfulTradeResponse(result)) {
         const failure = classifyBrokerFailure({ result: rejection ? null : result, error: rejection, submitted: true });
-        const detail = safeText(failure.message || `MetaAPI rejected the order (${failure.code || 'unknown provider code'}).`, [token]);
+        const detail = safeText(failure.message || `MetaAPI rejected the ${resting ? `${orderType} order at ${orderPrice}` : 'market order'} (${failure.code || 'unknown provider code'}).`, [token]);
         const message = failure.code ? `${detail} (${failure.code})` : detail;
 
         if (failure.kind === 'ambiguous') {
@@ -874,10 +959,22 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
         await updateJob(job.id, job.user_id, status, message);
         return { status, message, failure: failure.kind };
       }
-      await pool.query(
-        `UPDATE trades SET status='executed',provider_response=$1,broker_order_id=$2,broker_position_id=$3,executed_at=NOW() WHERE id=$4 AND user_id=$5`,
-        [providerResponse, result?.orderId ? String(result.orderId) : null, result?.positionId ? String(result.positionId) : null, tradeId, job.user_id],
-      );
+      if (resting) {
+        /* No position id, no executed_at, and the entry price the row already holds is the *level*, not a
+           fill. This row is now a promise the broker is keeping for us, and the only thing that can be said
+           about it is when it stops being one. */
+        await pool.query(
+          `UPDATE trades SET status='pending',provider_response=$1,broker_order_id=$2,expiry_timestamp=$3 WHERE id=$4 AND user_id=$5`,
+          [providerResponse, result?.orderId != null ? String(result.orderId) : null, new Date(expiry.expiresAt), tradeId, job.user_id],
+        );
+        if (expiryStamp) await pool.query('UPDATE signals SET expiry_timestamp=$2 WHERE id=$1', [item.signal_id, new Date(expiry.expiresAt)]).catch(() => {});
+      } else {
+        await pool.query(
+          `UPDATE trades SET status='executed',provider_response=$1,broker_order_id=$2,broker_position_id=$3,executed_at=NOW() WHERE id=$4 AND user_id=$5`,
+          [providerResponse, result?.orderId ? String(result.orderId) : null, result?.positionId ? String(result.positionId) : null, tradeId, job.user_id],
+        );
+        if (expiryStamp) await pool.query('UPDATE signals SET expiry_timestamp=$2 WHERE id=$1', [item.signal_id, expiryStamp]).catch(() => {});
+      }
       /* A filled order is the proof that whatever was wrong with this account is not wrong now, so the
          sentence saying so has to leave with it - a stale "check your credentials" under a trading account
          that is trading is a false alarm the user cannot un-see. */
@@ -898,11 +995,25 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
       }
       // A completed order normally clears the row's note; when a leg came from the workspace rather than
       // from the channel, that is the one thing worth leaving on the signal for the reader to find later.
-      await updateJob(job.id, job.user_id, 'executed', null, [safetyNoteText, planNote].filter(Boolean).join(' ') || null);
+      /* What the reader of this signal is owed, in one sentence each: the price the fill was taken at when it
+         was not the published one, and the deadline when the order is resting. A "better price" is not a
+         warning, so it is a note and not an error; a limit order that will be cancelled at 14:32 is neither,
+         so it is a note too. */
+      const notes = [safetyNoteText, planNote];
+      if (resting) {
+        const minutes = Math.round(expiry.windowMs / 60_000);
+        const from = expiry.source === 'scalping' ? 'the two-minute scalping window' : (expiry.source === 'default' ? 'the default 30-minute expiry' : `your ${minutes}-minute expiry setting`);
+        notes.push(`${orderType === 'stop' ? 'Stop' : 'Limit'} order placed at ${orderPrice}, valid for ${minutes} minutes (${from}); it will be cancelled automatically if it has not filled by ${new Date(expiry.expiresAt).toISOString().slice(11, 16)} UTC.`);
+      } else if (drift.favourable === true && Number(drift.driftPoints) > 0) {
+        notes.push(`Filled ${drift.driftPoints} points better than the signal price of ${statedEntry}.`);
+      } else if (drift.reason === 'within-drift-guard') {
+        notes.push(drift.message);
+      }
+      await updateJob(job.id, job.user_id, resting ? 'pending' : 'executed', null, notes.filter(Boolean).join(' ') || null);
       // Executing for a user counts as activity, so an account that is trading is never
       // swept up by the inactivity policy.
       await pool.query('UPDATE users SET last_active_at=NOW() WHERE id=$1', [job.user_id]).catch(() => {});
-      return { status: 'executed', tradeId, providerResponse };
+      return { status: resting ? 'pending' : 'executed', tradeId, providerResponse, orderType, expiryTimestamp: resting ? new Date(expiry.expiresAt).toISOString() : null };
     } catch (error) {
       const message = safeText(error?.message || error, [token]);
       const failure = classifyBrokerFailure({ error, submitted: orderSubmitted });
@@ -1520,7 +1631,238 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
     return summary;
   }
 
-  return { processJob, captureDailyBaseline, captureUtcDayBaselines, sweepBreakEven, sweepTakeProfitLevels, runtimeEnabled: Boolean(runtimeEnabled) };
+  /* --------------------- resting orders: expiry, fills, and the ones the user deleted ---------------------
+   *
+   * Two failures live in this one sweep, and they are opposite. The first is an order that outlives its
+   * setup: a limit order left on the book overnight fills at 03:00 against a market the signal meant nothing
+   * about, and the user's account is holding a position their copier never traded. The second is the ghost:
+   * the order is gone from the broker - deleted by hand, or expired by the platform's own clock - while this
+   * app's row still reads `pending`, so the panel keeps promising a trade that will never arrive and nobody
+   * has to do anything about the lie.
+   *
+   * So one pass reads the broker's book once per account and answers both: expired here, cancel it; gone
+   * from the book, find out whether it became a position before calling it cancelled.
+   *
+   * Two rules about *when it acts* are worth stating, because both cut against a rule elsewhere in the file:
+   *
+   *  - It reads whatever accounts are reachable, without asking whether auto-trading is on. A row's status
+   *    is a statement of fact about the user's account, and turning the copier off is not a reason to let it
+   *    go on asserting something false.
+   *  - It cancels even when auto-trading is off, as long as the runtime is up and the platform is not paused.
+   *    "Auto-trading off" means *stop opening trades for me*; it cannot mean *leave the ones you already
+   *    promised waiting to fill*. Refusing to cancel here would be the safe-looking choice and the less safe
+   *    one, which is why it is written down rather than inferred.
+   */
+  let lastExpirySweep = 0;
+
+  /** Which resting orders this app is holding a promise about, oldest deadline first. */
+  async function restingCandidates() {
+    const { rows } = await pool.query(
+      `SELECT t.id AS trade_id,t.user_id,t.execution_job_id,t.signal_id,t.metaapi_account_id,
+              t.broker_order_id,t.client_id,t.symbol,t.side,t.entry_price,t.quantity,t.order_type,t.status,
+              t.expiry_timestamp,t.created_at,t.error_message
+       FROM trades t
+       JOIN settings st ON st.user_id=t.user_id AND st.execution_account_id=t.metaapi_account_id
+       LEFT JOIN metaapi_accounts ma ON ma.user_id=t.user_id AND ma.metaapi_account_id=t.metaapi_account_id
+       WHERE t.status='pending'
+         AND UPPER(COALESCE(ma.state,''))='DEPLOYED'
+       ORDER BY t.expiry_timestamp NULLS LAST,t.created_at ASC
+       LIMIT $1`,
+      [EXPIRY_SWEEP_LIMIT],
+    );
+    return rows;
+  }
+
+  /**
+   * Whether a record on the broker's book is the order this row is about.
+   *
+   * MetaAPI copies a `clientId` into the order comment rather than storing it as a constraint, so a match on
+   * the id is checked in both places, and an order's own id is compared against the position's `orderId` -
+   * which is how a filled limit is recognised: the pending order is gone and a position exists that names it.
+   */
+  function sameBrokerRecord(candidate, { orderId, clientId }) {
+    if (!candidate) return false;
+    const id = orderId == null ? null : String(orderId);
+    if (id && (String(candidate.orderId ?? '') === id || String(candidate.id ?? '') === id || String(candidate.positionId ?? '') === id)) return true;
+    const client = clientId == null ? null : String(clientId);
+    if (!client) return false;
+    return String(candidate.clientId ?? '') === client || String(candidate.comment ?? '').includes(client);
+  }
+
+  /**
+   * One row, one answer, one write. `settleRestingOrder` is the only place a resting trade changes status
+   * outside the engine's own submission, so the guard `AND status='pending'` sits on it: a sweep that runs
+   * twice, or runs while a manual fix is being made, must not overwrite what somebody else decided first.
+   */
+  async function settleRestingOrder(trade, { status, note, position = null, providerResponse = null, signalStatus = null }) {
+    const message = note ? safeText(note) : null;
+    const { rows } = await pool.query(
+      `UPDATE trades SET status=$2,
+              error_message=COALESCE($3,error_message),
+              broker_position_id=COALESCE($4,broker_position_id),
+              entry_price=CASE WHEN $5::numeric IS NULL THEN entry_price ELSE $5 END,
+              quantity=CASE WHEN $6::numeric IS NULL THEN quantity ELSE $6 END,
+              executed_at=CASE WHEN $2='executed' AND executed_at IS NULL THEN NOW() ELSE executed_at END,
+              provider_response=COALESCE($7,provider_response),
+              expiry_timestamp=NULL
+       WHERE id=$1 AND status='pending'
+       RETURNING id,signal_id,execution_job_id`,
+      [trade.trade_id, status, message, position?.positionId ?? position?.id ?? null,
+        position ? Number(position.openPrice ?? position.price ?? NaN) || null : null,
+        position ? Number(position.volume ?? NaN) || null : null,
+        providerResponse],
+    );
+    if (!rows[0]) return false;
+    // The signal row is what the panel reads, and the job row is what the admin history reads. Both are
+    // told, best-effort and in that order: a signal whose row moved while the job did not is a stale status,
+    // which is a smaller wrong than a trade written as expired that the user's own row still calls pending.
+    if (trade.signal_id) {
+      await pool.query('UPDATE signals SET status=COALESCE($2,status),execution_note=COALESCE($3,execution_note) WHERE id=$1', [trade.signal_id, signalStatus, message]).catch(() => {});
+    }
+    if (trade.execution_job_id) {
+      await pool.query('UPDATE execution_jobs SET status=$2,error_message=COALESCE($3,error_message),updated_at=NOW() WHERE id=$1 AND status=$4', [trade.execution_job_id, status, message, 'pending']).catch(() => {});
+    }
+    return true;
+  }
+
+  async function sweepExpiredOrders() {
+    const summary = { attempted: 0, expired: 0, cancelled: 0, filled: 0, deferred: 0, waiting: 0, failed: 0, skipped: 0 };
+    if (!runtimeEnabled) return { ...summary, reason: 'runtime-disabled' };
+    if (typeof trading.getAccountState !== 'function') return { ...summary, reason: 'provider-unsupported' };
+    const timestamp = now();
+    const intervalMs = Math.max(1_000, Number(expirySweepIntervalMs) || 60_000);
+    if (timestamp - lastExpirySweep < intervalMs) return { ...summary, reason: 'throttled' };
+    lastExpirySweep = timestamp;
+
+    let rows;
+    try {
+      rows = await restingCandidates();
+    } catch (error) {
+      logger.error?.(JSON.stringify({ level: 'error', message: 'Resting order candidates could not be read', error: safeText(error?.message || error) }));
+      return { ...summary, reason: 'candidates-unavailable' };
+    }
+    if (!rows.length) return summary;
+
+    const groups = new Map();
+    for (const row of rows) {
+      const key = `${row.user_id}|${row.metaapi_account_id || ''}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(row);
+    }
+
+    // Cancellation is a broker write, so the platform switch is asked once for the whole pass rather than
+    // between rows: an administrator engaging it halfway through a sweep must not have it half-applied.
+    const mayCancel = !(await tradingPaused());
+    for (const group of groups.values()) {
+      const [{ user_id: userId, metaapi_account_id: accountId }] = group;
+      let state = null;
+      let token = null;
+      let readOk = false;
+      try {
+        const { rows: accountRows } = await pool.query(
+          'SELECT managed_by_app,state FROM metaapi_accounts WHERE user_id=$1 AND metaapi_account_id=$2 LIMIT 1',
+          [userId, accountId],
+        );
+        if (!accountRows[0] || String(accountRows[0].state || '').toUpperCase() !== 'DEPLOYED') throw new Error('not deployed');
+        token = await resolveToken(userId, accountId, accountRows[0].managed_by_app);
+        if (!token) throw new Error('token unavailable');
+        state = await trading.getAccountState({ token, accountId });
+        readOk = Array.isArray(state?.orders) && Array.isArray(state?.positions) && state?.link?.connectedToBroker !== false;
+      } catch (error) {
+        // An account that cannot be read is not an account whose orders have vanished: every row in the group
+        // is left exactly as it is, which is the only answer that cannot cancel a live order by accident.
+        summary.deferred += group.length;
+        logger.warn?.(JSON.stringify({ level: 'warn', message: 'Resting orders left untouched: the account could not be read', userId, account: accountId, error: safeText(error?.message || error) }));
+        continue;
+      }
+
+      for (const trade of group) {
+        summary.attempted += 1;
+        const expiryReached = trade.expiry_timestamp != null && timestamp >= Date.parse(String(trade.expiry_timestamp));
+        if (!trade.broker_order_id && !trade.client_id) {
+          summary.failed += 1;
+          await settleRestingOrder(trade, {
+            status: 'unknown',
+            signalStatus: 'unknown',
+            note: 'This resting order has no broker reference to match it against, so it could not be checked against your account. Confirm it on the platform, then update this trade.',
+          }).catch(() => {});
+          continue;
+        }
+        const openOrder = state.orders.find((order) => sameBrokerRecord(order, { orderId: trade.broker_order_id, clientId: trade.client_id }));
+        const position = state.positions.find((candidate) => sameBrokerRecord(candidate, { orderId: trade.broker_order_id, clientId: trade.client_id }));
+        const deal = (Array.isArray(state.deals) ? state.deals : []).find((candidate) => sameBrokerRecord(candidate, { orderId: trade.broker_order_id, clientId: trade.client_id }));
+        let decision = pendingOrderOutcome({
+          readOk,
+          orderStillOpen: Boolean(openOrder),
+          positionFound: Boolean(position),
+          dealFound: Boolean(deal),
+          expiryReached,
+          position: position || null,
+          deal: deal || null,
+        });
+        if (decision.action === 'wait' && expiryReached) {
+          if (!mayCancel || typeof trading.cancelOrder !== 'function') {
+            summary.waiting += 1;
+            continue;
+          }
+          let cancel = { result: null, error: null };
+          try {
+            cancel = await trading.cancelOrder({ token, accountId, orderId: openOrder?.id ?? openOrder?.orderId ?? trade.broker_order_id });
+          } catch (error) {
+            cancel = { result: null, error };
+          }
+          const interpreted = interpretCancelResponse(cancel);
+          if (interpreted.kind === 'rejected' || interpreted.kind === 'unknown') {
+            summary.failed += 1;
+            // The order stays `pending` and says why, so the next pass tries again and the user can read
+            // this without knowing that a cancel was ever attempted.
+            await pool.query('UPDATE trades SET error_message=$2 WHERE id=$1', [trade.trade_id, safeText(`The order had passed its expiry but your broker refused to cancel it: ${interpreted.message}`)]).catch(() => {});
+            logger.warn?.(JSON.stringify({ level: 'warn', message: 'Expired order could not be cancelled', userId, tradeId: trade.trade_id, error: safeText(interpreted.message) }));
+            continue;
+          }
+          decision = pendingOrderOutcome({
+            readOk: true,
+            orderStillOpen: false,
+            positionFound: Boolean(position),
+            dealFound: Boolean(deal),
+            expiryReached,
+            cancelConfirmed: interpreted.kind === 'cancelled',
+            position: position || null,
+            deal: deal || null,
+          });
+          // 10025 means the broker took the cancellation; "already gone" means something else happened first,
+          // and the row has to describe *that* instead - which is why the answer is recomputed rather than
+          // assumed, so an order the broker filled a moment before our cancel arrives is recorded as a fill.
+        }
+
+        if (decision.action === 'defer') { summary.deferred += 1; continue; }
+        if (decision.action === 'wait') { summary.waiting += 1; continue; }
+        if (decision.action === 'filled') {
+          const filledAt = Number(decision.entryPrice);
+          await settleRestingOrder(trade, {
+            status: 'executed',
+            signalStatus: 'executed',
+            position: { positionId: decision.positionId, openPrice: Number.isFinite(filledAt) ? filledAt : null, volume: Number(decision.volume) || null },
+            note: `Your ${trade.order_type || 'limit'} order at ${trade.entry_price} filled${Number.isFinite(filledAt) ? ` at ${filledAt}` : ''}. Break-even and scale-out were not set up for it: a resting order carries the stop and target it was placed with.`,
+          });
+          summary.filled += 1;
+          continue;
+        }
+        const expired = decision.action === 'expired';
+        await settleRestingOrder(trade, {
+          status: expired ? 'expired' : 'cancelled',
+          signalStatus: expired ? 'expired' : 'cancelled',
+          note: expired
+            ? `Cancelled ${new Date(timestamp).toISOString().slice(0, 16).replace('T', ' ')} UTC: the order had passed the expiry it was placed with (${trade.order_type === 'stop' ? 'stop' : 'limit'} at ${trade.entry_price}), so it was taken off your broker account. Nothing was opened.`
+            : `This order is no longer on your broker account and never became a position, so it was recorded as cancelled rather than left waiting. If you removed it yourself, nothing further is needed.`,
+        });
+        if (expired) summary.expired += 1; else summary.cancelled += 1;
+      }
+    }
+    return summary;
+  }
+
+  return { processJob, captureDailyBaseline, captureUtcDayBaselines, sweepBreakEven, sweepTakeProfitLevels, sweepExpiredOrders, runtimeEnabled: Boolean(runtimeEnabled) };
 }
 
 export function stableClientId(seed, symbol = null) {

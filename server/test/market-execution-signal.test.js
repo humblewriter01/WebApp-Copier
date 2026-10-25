@@ -246,7 +246,7 @@ test('the entry-price guard is skipped because there is no entry, not failed', a
 
   const stated = await runEngine({ item: itemFromParse({ ...parsed, entryPrice: 4050.1 }, { fallback_take_profit_points: 500 }) });
   assert.equal(stated.result.status, 'skipped');
-  assert.equal(stated.result.message, 'The current market price is worse than the signal entry price.', 'the guard is real - it is the *absence* of an entry that switches it off');
+  assert.match(stated.result.message, /the ask is 10 points above the signal price of 4050\.1/, 'the guard is real - it is the *absence* of an entry that switches it off');
 
   // And with no entry stated, nothing has to be re-qualified when the market has run far from where the
   // channel was typing: `now` is answered by whatever `now` is, and the fallback net is measured from there.
