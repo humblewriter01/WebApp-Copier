@@ -376,14 +376,30 @@ export function canRetry({ attempt, maxAttempts = MAX_ORDER_ATTEMPTS, retriable 
 
 export const CLIENT_ID_COMMENT = 'SD';
 /**
- * One character of slack under the strictest published budget: `SD` + 23 = 25 of 26. Some MetaAPI
- * servers join the two fields with a separator before storing them, and an id that is rejected only on
- * the user's broker is the worst kind of bug to find.
+ * The id's own hard ceiling. Two numbers are published about it: the trade page and the model documentation
+ * both state that `comment` + `clientId` must not exceed 26 characters in total, and the id on its own is
+ * documented as 24 at most. One character of slack is kept under the 26 anyway, because some MetaAPI servers
+ * join the two fields with a separator before storing them, and an id that is rejected only on the user's
+ * broker is the worst kind of bug to find.
  */
 export const CLIENT_ID_MAX_LENGTH = 23;
+/** The published ceiling for `clientId` alone. Nothing may build an id longer than this. */
+export const CLIENT_ID_PUBLISHED_MAX = 24;
 const CLIENT_ID_STRATEGY = 'SD';
-const CLIENT_ID_SYMBOL_MAX = 10;
-const CLIENT_ID_HASH_MIN = 8;
+/**
+ * MetaAPI's documented shape puts the symbol in the middle of the id, and the symbol is the decorative half:
+ * it exists so a person reading the broker's own trade history can tell whose order this was. Six characters
+ * separate `XAUUSD` from `EURUSD` at a glance, and that is all it is for, so it is the part that truncates
+ * when the budget runs short.
+ */
+export const CLIENT_ID_SYMBOL_MAX = 6;
+/**
+ * The tail is the half that has to be unique. MetaAPI publishes no rule that it rejects a repeated `clientId`,
+ * so uniqueness here is what lets `findOrderByClientId` recognise an earlier attempt of *this* intent - and a
+ * collision would read as "already sent", which skips a real order. Twelve hex digits is 48 bits, and the
+ * ceiling leaves room for all of it, so the budget is spent on uniqueness rather than left unused.
+ */
+export const CLIENT_ID_HASH_LENGTH = 12;
 
 function normalizeSymbolPart(symbol) {
   const cleaned = String(symbol || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -412,12 +428,16 @@ export function buildClientId({ jobId, symbol = null } = {}) {
   if (!seed) throw new Error('A durable job id is required to build a broker client id.');
   const digest = crypto.createHash('sha256').update(seed).digest('hex');
   const prefix = `${CLIENT_ID_STRATEGY}_${normalizeSymbolPart(symbol)}_`;
-  // The id part is what makes two different jobs produce two different ids, so it never yields to the
-  // symbol: a broker with a 20-character symbol name gets its symbol shortened, not the hash. With the
-  // symbol capped at 10 the prefix is at most 14 characters, so the tail is always at least 9 of them and
-  // the whole id always fits; `clientIdFits` below is what turns that arithmetic into a loud failure
-  // instead of a quiet one if the constants above ever stop agreeing with each other.
-  const clientId = `${prefix}${digest.slice(0, CLIENT_ID_MAX_LENGTH - prefix.length)}`;
+  // The tail never yields to the symbol, so a broker with a 30-character symbol name gets its symbol shortened
+  // and its id stays exactly as findable. With the symbol capped at 6 the prefix is at most 10 characters, so
+  // the tail is always the full 12 and the id never exceeds 22 - inside both published numbers.
+  const clientId = `${prefix}${digest.slice(0, Math.min(CLIENT_ID_HASH_LENGTH, CLIENT_ID_MAX_LENGTH - prefix.length))}`;
+  if (clientId.length > CLIENT_ID_PUBLISHED_MAX) {
+    // Not reachable with the constants above, and the reason it is written anyway: this is the one number
+    // MetaAPI could start enforcing on a Friday, and a builder that quietly grew past it would fail every
+    // order in the workspace at once. The constants are pinned against it by `execution-defense.test.js`.
+    throw new Error(`The broker client id ${clientId} is ${clientId.length} characters, over MetaAPI's published ${CLIENT_ID_PUBLISHED_MAX}.`);
+  }
   const fit = clientIdFits({ clientId, comment: CLIENT_ID_COMMENT });
   if (!fit.ok) throw new Error(`The broker client id could not be built within MetaAPI's comment budget: ${fit.reason}`);
   return clientId;

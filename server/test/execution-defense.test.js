@@ -17,6 +17,7 @@ import { createExecutionWorker } from '../services/execution-worker.js';
 import {
   DAILY_LOSS_LIMIT_MESSAGE, MAX_OPEN_POSITIONS_MESSAGE, STALE_CONNECTION_MESSAGE, STALE_QUOTE_MESSAGE,
   buildClientId, canRetry, classifyBrokerFailure, clientIdFits, dailyLossPercent, guardQuote, retryDelayMs,
+  CLIENT_ID_PUBLISHED_MAX, CLIENT_ID_MAX_LENGTH, CLIENT_ID_SYMBOL_MAX, CLIENT_ID_HASH_LENGTH,
 } from '../services/execution-defense.js';
 
 const SPEC = { symbol: 'EURUSD', minVolume: 0.01, maxVolume: 20, volumeStep: 0.01, tickSize: 0.0001 };
@@ -343,7 +344,7 @@ test('a retry re-sends under the same client id, so the earlier attempt is still
   await engineFor({ pool: second, adapter: secondAdapter }).processJob({ id: 'job-1', user_id: 'user-1' });
   const sentTwice = [firstAdapter.ordersSent()[0].order.clientId, secondAdapter.ordersSent()[0].order.clientId];
   assert.equal(sentTwice[0], sentTwice[1], 'one intent, one id, whatever the attempt number');
-  assert.match(sentTwice[0], /^SD_EURUSD_[0-9a-f]{9,}$/);
+  assert.match(sentTwice[0], /^SD_EURUSD_[0-9a-f]{12}$/, 'the shape MetaAPI documents: strategy, symbol, hash');
   const restamp = second.find("UPDATE trades SET symbol=");
   assert.ok(restamp, 'the retried attempt re-stamps its own row, so the trade describes the order that was actually sent');
   assert.equal(restamp.params[0], 'job-1', 'and it can only claim the row belonging to this job');
@@ -544,10 +545,40 @@ test('the guard functions answer for a bare call, so the engine is not the only 
 test('the client id builder follows the shape MetaAPI documents, and survives an awkward symbol', () => {
   assert.equal(buildClientId({ jobId: 'job-1', symbol: 'EURUSD' }), buildClientId({ jobId: 'job-1', symbol: 'eur_usd' }), 'the symbol part is a label; the same job gets the same id');
   const long = buildClientId({ jobId: 'job-2', symbol: 'GOLD.us.micro2024.mt5' });
+  assert.equal(long, buildClientId({ jobId: 'job-2', symbol: 'GOLDUS' }), 'the symbol is folded to alphanumerics and truncated, so the broker\'s suffix never reaches the id');
   assert.equal(long.length <= 23, true, `${long} must fit beside the order comment`);
   assert.equal(clientIdFits({ clientId: long }).ok, true);
   assert.notEqual(buildClientId({ jobId: 'job-3', symbol: 'EURUSD' }), buildClientId({ jobId: 'job-4', symbol: 'EURUSD' }), 'two jobs never share an id');
   assert.throws(() => buildClientId({}), /durable job id is required/);
   assert.equal(clientIdFits({ clientId: '' }).reason.includes('A client id is required'), true, 'an order cannot leave without one');
   assert.equal(clientIdFits({ clientId: 'SD_EURUSD_deadbeefdeadbeefdead', comment: 'SD' }).ok, false, 'and neither can one that is too long for the comment field');
+});
+
+/* The ceiling is a broker rule, not ours, so it is pinned against the worst input the code can be handed
+ * rather than against one example: an id that grew past 24 would be rejected on the user's account, where
+ * nothing in this app can see it happen. */
+test('no symbol, however the broker spells it, can build an id past the published ceiling', () => {
+  const symbols = ['EURUSD', 'XAUUSD.c', 'EURUSD.a', 'GOLD.us.micro2024.mt5', 'USDJPY-Micro', 'A'.repeat(40), '', null, 42];
+  for (const symbol of symbols) {
+    const id = buildClientId({ jobId: `job-${symbol}`, symbol });
+    assert.equal(id.length <= CLIENT_ID_PUBLISHED_MAX, true, `${id} built from ${String(symbol)} is over MetaAPI's published ${CLIENT_ID_PUBLISHED_MAX}`);
+    assert.equal(id.length <= CLIENT_ID_MAX_LENGTH, true, `${id} is over the app's own budget of ${CLIENT_ID_MAX_LENGTH}, which keeps a character of slack for the comment separator`);
+    assert.equal(clientIdFits({ clientId: id }).ok, true, `${id} plus the order comment has to fit in one field`);
+    assert.match(id, /^SD_[A-Z0-9]{1,6}_[0-9a-f]{1,12}$/);
+  }
+  assert.equal(CLIENT_ID_MAX_LENGTH <= CLIENT_ID_PUBLISHED_MAX, true, 'the builder\'s budget may never exceed what the platform publishes');
+  // Six characters of symbol and twelve of hash are the whole arithmetic behind those lengths: the id is
+  // `SD_` + symbol + `_` + hash, and the hash is what must not repeat.
+  assert.equal(3 + CLIENT_ID_SYMBOL_MAX + 1 + CLIENT_ID_HASH_LENGTH <= CLIENT_ID_PUBLISHED_MAX, true);
+});
+
+test('the hash, not the symbol, is what keeps two intents apart', () => {
+  // A broker whose symbols all start with the same six characters (`.a`, `.pro`, `.micro` suffixes are
+  // common) would collide on the symbol half alone, so the tail has to carry the difference.
+  const ids = new Set();
+  for (let index = 0; index < 5000; index += 1) ids.add(buildClientId({ jobId: `user-1-${index}`, symbol: 'EURUSD.a' }));
+  assert.equal(ids.size, 5000, '5,000 distinct jobs produced 5,000 distinct ids');
+  const [sample] = [...ids];
+  assert.equal(sample.split('_')[1], 'EURUSD', 'and the symbol still reads as the symbol, folded to its alphanumerics');
+  assert.equal(buildClientId({ jobId: 'user-1-0', symbol: 'EURUSD.a' }), sample, 'the same job and symbol always produce the same id, which is what a retry can find');
 });
