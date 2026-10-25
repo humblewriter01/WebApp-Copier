@@ -400,8 +400,12 @@ function entryFromRange(range, side) {
  * stays a market order, exactly as it has always been.
  *
  * When the message says nothing, the shape of the entry decides. A single stated price with no instruction to
- * pay the market is a level to be filled *at*, which is a limit. An entry published as a zone is not one price
- * to rest at, and an entry that was never given has nothing to rest at - both stay market orders.
+ * pay the market is a level to be filled *at*, which is a limit - and so is a zone, at the bound the row is
+ * credited with: a range is a price to wait at rather than one to chase. What a zone does once the order is
+ * being built is a different question, with three answers that need a live quote and are given in
+ * `pendingOrderPlan` (`order-routing.js`): above the zone it rests at the near edge, inside it the trade is
+ * taken at the market, and past the far edge the setup is gone and nothing is sent. An entry that was never
+ * given at all has nothing to rest at and stays a market order.
  */
 const INSTRUCTION_LINE = /\b(?:BUY|SELL|LONG|SHORT|ENTRY|POSITION|ORDER|TRADE|LIMIT|STOP|SL|TP)\b/i;
 /* A leg label and the number attached to it, removed from the clause before order-type words are looked
@@ -444,7 +448,7 @@ function orderTypeClause(text) {
  * row that reads `Limit` because a price was published with no instruction to take the market is a policy this
  * product chose. The UI says them differently.
  */
-export function detectOrderType(text, { entryPrice = null, entryIsRange = false } = {}) {
+export function detectOrderType(text, { entryPrice = null } = {}) {
   const { scope, hasInstructionLine } = orderTypeClause(text);
   const immediate = IMMEDIATE_IN_CLAUSE.test(scope) || MARKET_AFTER_INSTRUCTION.test(scope) || BARE_CMP.test(scope);
   // A request to be filled now outranks every other reading, and it is the safe one: it is what this product
@@ -453,7 +457,10 @@ export function detectOrderType(text, { entryPrice = null, entryIsRange = false 
   if (STOP_ORDER.test(scope)) return { orderType: 'stop', stated: true };
   if (hasInstructionLine && LIMIT_ORDER.test(scope)) return { orderType: 'limit', stated: true };
   const level = Number(entryPrice);
-  if (Number.isFinite(level) && level > 0 && entryIsRange !== true) return { orderType: 'limit', stated: false };
+  /* Both a single published price and the bound credited from a zone are levels to be filled *at*. The range
+     is not lost here - it travels on the row as `entryRange`, and it is that range's far edge which later
+     refuses the trade, which is the whole difference between waiting for a setup and chasing one. */
+  if (Number.isFinite(level) && level > 0) return { orderType: 'limit', stated: false };
   return { orderType: 'market', stated: false };
 }
 
@@ -461,6 +468,76 @@ export function detectScalping(text) {
   const { scope, hasInstructionLine } = orderTypeClause(text);
   if (SCALP_WORDS.test(scope)) return true;
   return hasInstructionLine && SCALP_PHRASE.test(scope);
+}
+
+/**
+ * Market news, and why it is not a signal.
+ *
+ * A headline is built out of exactly what a signal scanner looks for: instruments, prices, and verbs about
+ * prices moving. `JUST IN: Crypto is dumping - $SOL falls under $100, $BTC falls under $80,000` is therefore
+ * five mentions of markets with numbers attached, and if such a message is ever allowed a *direction*, a
+ * channel's editorial becomes somebody's live short. Layer 1 does not invent directions - it reads a stated
+ * BUY/SELL/LONG/SHORT or nothing - but it did happily return `symbol: BTCUSD` for that bulletin, and a row
+ * naming a coin with no instruction is what makes a news post look like a signal the platform failed to read
+ * instead of a message that never asked anyone to trade.
+ *
+ * So the classification happens here, before anything is stored, and it is deliberately narrow. Both halves
+ * must hold:
+ *
+ *   1. the text carries news wording - a bulletin lead, a journalism noun, a verb of a price *moving*, or a
+ *      list of cashtags; and
+ *   2. the text states no trade of its own - no direction, no labelled entry, no zone, no stop, no target.
+ *
+ * The second half is what stops this being a keyword blocklist that refuses real signals. Channels put
+ * `JUST IN` above genuine instructions constantly, and a hype prefix over `SELL GOLD 4016 SL 4010 TP 4050`
+ * must still be read as the trade it is. What is refused here is only the message whose whole content is a
+ * movement being reported, because that is the only kind a reader could mistake for an instruction.
+ */
+/** The shout at the top of a bulletin. */
+const NEWS_LEAD = /\b(?:JUST\s+IN|BREAKING|DEVELOPING|HEADLINES?|MARKET\s+(?:WRAP|ROUNDUP|RECAP)|DAILY\s+RECAP|WEEKLY\s+OUTLOOK|NEWS\s*(?:FLASH|DESK|ROOM|WIRE)|UPDATE\s*:)\b/i;
+/** Nouns that belong to a publication rather than to an order. */
+const NEWS_NOUN = /\b(?:NEWS|REPORT(?:ED|S|ING)?|OUTLET|JOURNALIST|SOURCES\s+SAY|ANALYSTS?|ECONOMISTS?|COMMENTARY|EDITORIAL|FORECAST|PROJECTIONS?|SELL-side\s+RESEARCH)\b/i;
+/** A price described as moving, which is not the same thing as a price to act at. */
+const NEWS_MOVE = /\b(?:DUMP(?:S|ED|ING)|CRASH(?:ES|ED|ING)?|PLUNGE(?:S|ED|ING)?|SINK(?:S|ING)?|SOAR(?:S|ING)?|SURGE(?:S|D|ING)?|SPIKE(?:S|D|ING)?|TUMBLE(?:S|D|ING)?|SLUMP(?:S|ED|ING)?|RALL(?:Y|IES|YING)|PUMP(?:S|ED|ING)?|CORRECTION|SELL-?OFF|SELLING\s+SPREE|CAPITULATION|VOLATILITY|RALLYING)\b/i;
+/** The headline idiom: a level being crossed, written in prose, with no imperative in sight. */
+const NEWS_LEVEL_MOVE = /\b(?:FALLS?|DROPS?|SLIPS?|DIPS?|SINKS?|TUMBLES?|PLUNGES?|CRASHES?|BREAKS?|TOUCHES?|HITS?)\s+(?:UNDER|BELOW|TO|THROUGH|PAST)\b|\b(?:RISES?|CLIMBS?|GAINS?|JUMPS?|SOARS?|SURGES?|BREAKS?|SHOOTS?)\s+(?:ABOVE|OVER|TO|THROUGH|PAST)\b|\b(?:TRADES?|CHANGES?|SITS?|STANDS?|EXCHANGES?)\s+(?:AT|NEAR|AROUND|FOR)\b|\bAT\s+(?:AN\s+)?(?:ALL-TIME\s+)?(?:RECORD|HIGH|LOW)\b/i;
+/** `$SOL $XRP $ETH` - a *list* of cashtags is a roundup; a single one is how a channel names its coin. */
+const CASHTAGS = /\$[A-Za-z][A-Za-z0-9]{1,9}\b/g;
+const CASHTAG_LIST_MIN = 3;
+
+/** The blocker code and the sentence that go on a row classified as news. */
+export const NEWS_BLOCKER_CODE = 'news-commentary';
+export const NEWS_BLOCKER_MESSAGE = 'This message is market news rather than a trade instruction, so nothing was taken from it.';
+
+/**
+ * Which news tells a message this is. Every marker is reported, never counted blindly: a single journalism
+ * noun is not enough (a real signal says "no trading during the news" too), while a bulletin lead or a price
+ * *described* as moving is, because no channel writes an instruction that way.
+ */
+export function findNewsMarkers(text) {
+  const value = String(text ?? '');
+  const markers = [];
+  if (NEWS_LEAD.test(value)) markers.push('lead');
+  if (NEWS_MOVE.test(value) || NEWS_LEVEL_MOVE.test(value)) markers.push('price-move');
+  if (/\b(?:FALLS?|DROPS?)\s+UNDER\b/i.test(value)) markers.push('level-broken');
+  if ((value.match(CASHTAGS) || []).length >= CASHTAG_LIST_MIN) markers.push('ticker-list');
+  if (NEWS_NOUN.test(value)) markers.push('news-wording');
+  return markers;
+}
+
+/**
+ * Whether news wording makes this message unread as an instruction, given what the scan already found.
+ *
+ * The news markers are only half the test. A message that states a direction, or names a level the channel
+ * labelled as an entry, a zone, a stop or a target, is about a trade whatever else it says, and refusing it
+ * would lose a signal to a rule meant to protect one.
+ */
+function readsAsNews({ markers, side, entry, entryPips, stopMatches, takeProfitMatches }) {
+  if (!markers.length) return false;
+  if (side !== null) return false;
+  if (entry.value !== null || entry.range !== null || entryPips) return false;
+  if (stopMatches.length || takeProfitMatches.length) return false;
+  return true;
 }
 
 export function parseSignal(message) {
@@ -585,10 +662,25 @@ export function parseSignal(message) {
   /* Read after every leg is settled, because the fallback rule is about the entry that survives resolution:
      a bound taken from a zone, or an entry inferred from a target after the direction was guessed, is not a
      price the channel asked to be filled at. */
-  const order = detectOrderType(text, { entryPrice, entryIsRange: Boolean(entry.range) });
+  const order = detectOrderType(text, { entryPrice });
   const hasTradingData = Boolean(symbol || side || entryPrice !== null || stopLoss !== null || takeProfit !== null || stopLossPips !== null || takeProfitPips !== null);
 
-  return {
+  /* Market news gets the last word, because it is the one reading that changes what may be *stored*. A
+     bulletin that names a coin and quotes four prices has already been scanned for a trade and found to
+     carry none - no direction, no labelled level - and leaving `symbol: BTCUSD` in the row would present a
+     headline as a signal this platform could not finish reading. Cleared instead, so the row says "no clear
+     signal" and quotes the reason the message is news. */
+  const newsMarkers = findNewsMarkers(text);
+  const newsOnly = readsAsNews({
+    markers: newsMarkers,
+    side,
+    entry,
+    entryPips,
+    stopMatches,
+    takeProfitMatches,
+  });
+
+  const parsed = {
     symbol,
     side,
     entryPrice,
@@ -608,6 +700,13 @@ export function parseSignal(message) {
     entryWasBare,
     entryLevels: entry.levels || null,
     ambiguousLevels: unclear.map((item) => ({ raw: item.raw, candidates: item.candidates })),
+    /* Whether this message was read as market news rather than as a signal at all. It is the one flag a
+       reader should be able to tell a "needs review" row apart from a "not a signal" row by, and it is what
+       keeps the fallback layer from being consulted about a headline. */
+    newsOnly,
+    /* Which news wording the message carries, kept even on a row that stays a signal. A headline that quotes
+       levels is still a headline, and this is what stops a direction being taken from one. */
+    newsMarkers,
     /* Whether the message contains a price at all. It decides whether a workspace's fallback distance may
        rescue this row, and a direction with no level anywhere is not an incomplete instruction - it is
        enthusiasm. `BUY GOLD` does not tell anyone where to get in, so no default distance should turn it
@@ -615,6 +714,37 @@ export function parseSignal(message) {
     hasPriceLevel: Boolean(entryPrice !== null || entry.range || stopLoss !== null || takeProfit !== null || stopLossPips !== null || takeProfitPips !== null),
     missing: { entryPrice: entryPrice === null, stopLoss: stopLoss === null && stopLossPips === null, takeProfit: takeProfit === null && takeProfitPips === null },
     blockers,
+  };
+
+  if (!newsOnly) return parsed;
+  /* Nothing at all is taken from a news message: not the symbol it named, and above all not a direction read
+     out of a price falling. The legs are null because the text never stated them, and `missing` stays
+     all-true so no workspace fallback distance can finish a headline into an order. */
+  return {
+    ...parsed,
+    symbol: null,
+    side: null,
+    entryPrice: null,
+    stopLoss: null,
+    takeProfit: null,
+    stopLossPips: null,
+    takeProfitPips: null,
+    takeProfitLevels: [],
+    entryRange: null,
+    entryLevels: null,
+    entryWasBare: false,
+    directionInferred: false,
+    isScalping: false,
+    orderType: 'market',
+    orderTypeStated: false,
+    hasTradingData: false,
+    hasPriceLevel: false,
+    missing: { entryPrice: true, stopLoss: true, takeProfit: true },
+    newsOnly: true,
+    newsMarkers,
+    executionReady: false,
+    parseError: NEWS_BLOCKER_MESSAGE,
+    blockers: [{ code: NEWS_BLOCKER_CODE, message: NEWS_BLOCKER_MESSAGE }],
   };
 }
 

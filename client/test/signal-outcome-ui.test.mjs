@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { build } from 'esbuild';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
-import { signalBadges, signalHasTradingData, signalOutcomeView, signalsAwaitingUpgrade } from '../src/lib/signal-outcome.js';
+import { entryZoneView, signalBadges, signalHasTradingData, signalOutcomeView, signalsAwaitingUpgrade } from '../src/lib/signal-outcome.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -244,4 +244,83 @@ test('a 400 keeps its instructions, and a success is returned untouched', async 
   // An accepted response with no body stays a payload rather than a parse failure.
   answering({ status: 202, body: '' });
   assert.deepEqual(await request('/api/anything', 'token', { method: 'POST' }), {});
+});
+
+/* -------------------------------- the entry zone: what the row shows, and what it means -------------------------------- */
+
+const zoneSignal = (over = {}) => ({
+  id: 'signal-zone', source: 'telegram', channelTitle: 'Gold Signals', symbol: 'XAUUSD', side: 'buy',
+  entryPrice: 4026, entryRange: { low: 4016, high: 4026 }, stopLoss: 4010, takeProfit: 4050,
+  orderType: 'limit', orderTypeStated: false, status: 'pending',
+  message: 'BUY GOLD ZONE 4016.00 - 4026.00 / SL: 4010.00 / TP: 4050.00',
+  createdAt: '2026-10-25T12:00:00.000Z',
+  ...over,
+});
+const renderRow = (signal) => renderToStaticMarkup(React.createElement(SignalTable, { signals: [signal] }));
+
+test('a zone row shows the range it was published as, not the single bound it was credited with', () => {
+  const markup = renderRow(zoneSignal());
+  assert.match(markup, /Entry 4016 - 4026/, 'both bounds, on the meta line, in the same place a single price has always been');
+  assert.equal(markup.includes('Entry 4026<'), false, 'and never the bound alone, which reads as a channel that offered one price');
+
+  const title = /title="([^"]*Entry zone as published[^"]*)"/.exec(markup)?.[1] ?? '';
+  assert.ok(title, 'the credited anchor is one hover away');
+  assert.match(title, /credited with 4026, the upper edge/, 'which bound is in force, and which edge of the range it is');
+  assert.match(title, /worst for a buy/, 'and why that bound rather than the other one');
+  assert.match(title, /[Aa]bove the zone.*waits for the market to come to it.*taken at once.*refused/s, 'the three answers, since the row is what a user reads');
+});
+
+test('a sell names the lower edge, because the bound in force is side-dependent and the tooltip must not lie', () => {
+  const title = entryZoneView(zoneSignal({ side: 'sell', entryPrice: 4016 })).title;
+  assert.match(title, /credited with 4016, the lower edge - the bound worst for a sell/);
+});
+
+test('a row that carried a single price is displayed exactly as it always was', () => {
+  const markup = renderRow(zoneSignal({ entryRange: null }));
+  assert.match(markup, /Entry 4026</, 'the price, alone, with no zone language around it');
+  assert.equal(/title="[^"]*Entry zone/.test(markup), false, 'and no tooltip about a zone this message never had');
+});
+
+test('a stored value that is not a range degrades to the price, not to undefined', () => {
+  for (const junk of [null, undefined, 'nope', {}, { low: 4026, high: 4016 }, { low: 4026, high: 4026 }, { low: 'x', high: 'y' }]) {
+    assert.equal(entryZoneView(zoneSignal({ entryRange: junk })), null, `${JSON.stringify(junk)} is not a range`);
+  }
+  const markup = renderRow(zoneSignal({ entryRange: 'nope' }));
+  assert.match(markup, /Entry 4026</, 'the row falls back to the bound it was credited with');
+  assert.equal(markup.includes('undefined'), false, 'and never renders the word');
+});
+
+test('a zone with no direction still shows its range, and says no bound was credited', () => {
+  // The parser cannot pick a bound without a side, so the row has no entry price - but the range is still the
+  // most useful thing on it, and "we did not pick a bound" has to be said rather than left as a blank.
+  const view = entryZoneView({ entryRange: { low: 1.1, high: 1.12 }, orderType: 'market' });
+  assert.equal(view.text, '1.1 - 1.12');
+  assert.equal(view.credited, null);
+  assert.match(view.title, /No bound is credited, because the message stated no direction/);
+  assert.match(view.title, /does not wait for the zone/, 'and it says plainly that nothing will rest here');
+  assert.match(renderRow(zoneSignal({ entryPrice: null, entryRange: { low: 1.1, high: 1.12 }, orderType: 'market', side: null })), /Entry 1\.1 - 1\.12/);
+});
+
+test('the Overview reads the same columns, so the two screens cannot disagree about a zone', () => {
+  /* The compact list on the dashboard is the same `SignalTable` fed by a different query. If that query stops
+     selecting the range, the Overview shows `Entry 4026` while the Signals page shows `Entry 4016 - 4026` -
+     two readings of one row, which is the kind of thing a user files as a bug in whichever screen they trust
+     less. */
+  const serverRoot = path.join(here, '..', '..', 'server');
+  const dashboardSource = readFileSync(path.join(serverRoot, 'services', 'dashboard-signals.js'), 'utf8');
+  assert.match(dashboardSource, /entry_range AS "entryRange"/, 'the dashboard column list carries the zone');
+});
+
+test('the Limit badge explains a zone differently from an inferred price', () => {
+  const [badge] = signalBadges(zoneSignal());
+  assert.equal(badge.label, 'Limit Order');
+  assert.equal(badge.tone, 'warn', 'still this product making the choice, because the channel did not write LIMIT');
+  assert.match(badge.title, /published a zone rather than a price/);
+  assert.match(badge.title, /waits at 4026 until the market comes into 4016 - 4026/);
+  assert.match(badge.title, /refused once the market has moved past the far edge/);
+  assert.match(badge.title, /Write NOW or CMP/, 'and the way to overrule it is still on the row');
+
+  const inferred = signalBadges(zoneSignal({ entryRange: null }))[0];
+  assert.match(inferred.title, /It published 4026 without asking to be filled at the market/);
+  assert.equal(/zone/.test(inferred.title), false, 'a single price keeps the sentence it has always had');
 });

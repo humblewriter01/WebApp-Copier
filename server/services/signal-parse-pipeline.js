@@ -67,12 +67,24 @@ function mergeGaps(layer1, fields, { pipValues }) {
   const merged = { ...layer1 };
   const filled = [];
   const dropped = [];
+  /* A message Layer 1 read as market news has no gaps, because it has no signal in it. Filling `symbol` or
+     `side` here is precisely how a headline ends up on screen as a direction nobody asked for, so a news row
+     is closed to the model from both ends: the caller refuses to ask, and this refuses to write. */
+  if (layer1.newsOnly === true) return { merged, filled, dropped };
+  /* News wording that stopped short of a full bulletin - a headline that quotes levels, a report with a
+     target in it - still may not be completed with a direction. A price the message wrote down is verifiable
+     against the text; "buy" or "sell" is not, and it is the half of a signal a headline can never state. */
+  const directionOffLimits = (layer1.newsMarkers?.length ?? 0) > 0;
   for (const gap of GAPS) {
     // `gap.from` is the translation layer: the model answers with `stop_loss`, the row calls it `stopLoss`,
     // and reading one with the other's name is a bug that looks identical to a model that refused.
     const proposed = gap.from(fields);
     if (proposed === null || proposed === undefined) continue;
     if (layer1[gap.key] !== null && layer1[gap.key] !== undefined) continue;
+    if (gap.key === 'side' && directionOffLimits) {
+      dropped.push({ key: gap.key, value: proposed, because: 'the message reads as market news, and a direction is never taken from a headline' });
+      continue;
+    }
     if (gap.key === 'entryPrice' && layer1.entryRange !== null) continue;
     if ((gap.key === 'stopLoss' || gap.key === 'takeProfit') && layer1[gap.key.endsWith('Loss') ? 'stopLossPips' : 'takeProfitPips'] !== null) continue;
     if (gap.key === 'takeProfit' && pipValues.has(Number(proposed))) {

@@ -22,7 +22,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { parseSignal } from '../services/signal-parser.js';
-import { llmConfig, needsLayer2, extractJsonObject, validateExtraction, numbersInText, llmParseSignal, DEFAULT_MIN_CONFIDENCE } from '../services/signal-llm.js';
+import { llmConfig, needsLayer2, extractJsonObject, validateExtraction, numbersInText, llmParseSignal, buildMessages, DEFAULT_MIN_CONFIDENCE } from '../services/signal-llm.js';
 import { parseSignalTwoLayer } from '../services/signal-parse-pipeline.js';
 import { captureSafety, applySafetyNets, pipSizeFor } from '../services/signal-safety.js';
 import { createExecutionEngine } from '../services/execution-engine.js';
@@ -440,4 +440,88 @@ test('a row flagged for review cannot reach the broker even through a queued job
   assert.equal(result.status, 'skipped');
   assert.match(result.message, /saved for review/, '`stop()` reports the refusal on `message`, and this is the sentence the reader of the job sees');
   assert.equal(sent.length, 0, 'no order, and not even a quote looked at');
+});
+
+/* --------------------------------------------------------------------- market news is not a signal to ask about --------------------------------------------------------------------- */
+
+/** The bulletin from the brief, exactly as the channel posted it. */
+const NEWS_BULLETIN = [
+  '**JUST IN:** \u{1F6A8}\u{1F6A8} **Crypto is dumping**',
+  '',
+  '$SOL falls under $100',
+  '',
+  '$XRP falls under $1.30',
+  '',
+  '$ETH falls under $2,350',
+  '',
+  'Bitcoin $BTC falls under $80,000',
+].join('\n');
+
+/** The settings a workspace with both nets up would have. */
+const NETS = {
+  lotSizeMode: 'fixed',
+  blockExecutionWithoutStopLoss: true,
+  blockExecutionWithoutTakeProfit: true,
+  fallbackStopLossPoints: 500,
+  fallbackTakeProfitPoints: 1000,
+};
+
+test('a news headline is never asked about, so it cannot come back with a direction', async () => {
+  /* An eager model that would have answered "BTCUSD, buy, 80000" with total confidence. Nothing about this
+     row can therefore be attributed to a cautious answer - the only thing keeping a BUY off a headline is
+     that the question is never asked. */
+  const fetch = countingFetch(llmReply({ symbol: 'BTCUSD', side: 'buy', entry: 80000, stop_loss: null, take_profit: null, confidence: 1 }));
+  const outcome = await parseSignalTwoLayer(NEWS_BULLETIN, { source: 'telegram', config: CONFIG, fetchImpl: fetch.fetchImpl });
+  assert.equal(fetch.calls.length, 0, 'refused before it costs a request');
+  assert.equal(outcome.parsed.newsOnly, true);
+  assert.equal(outcome.parsed.symbol, null);
+  assert.equal(outcome.parsed.side, null);
+  assert.equal(outcome.provenance.llmUsed, false);
+  assert.equal(outcome.review.required, false, 'and it is not "a signal that needs review" - there is no signal in it');
+});
+
+test('the row written for a news bulletin stores no trade and reads as no clear signal', async () => {
+  const fetch = countingFetch(llmReply({ symbol: 'BTCUSD', side: 'buy', confidence: 1 }));
+  const outcome = await parseSignalTwoLayer(NEWS_BULLETIN, { source: 'telegram', config: CONFIG, fetchImpl: fetch.fetchImpl });
+  // The same three lines `saveSignal` runs before it binds the INSERT, so these are the columns.
+  const safety = captureSafety({ parsed: outcome.parsed, source: 'telegram', settings: NETS, review: outcome.review });
+  const executionReady = safety.executionReady === true;
+  assert.deepEqual([outcome.parsed.symbol, outcome.parsed.side, outcome.parsed.entryPrice, outcome.parsed.stopLoss, outcome.parsed.takeProfit],
+    [null, null, null, null, null], 'symbol, side and every leg, all empty');
+  assert.equal(outcome.parsed.directionInferred, false);
+  assert.equal(outcome.parsed.isScalping, false);
+  assert.equal(outcome.parsed.orderTypeStated, false);
+  assert.equal(executionReady, false, 'nothing is queued');
+  assert.equal(outcome.review.required === true, false, 'nothing is flagged for review');
+  assert.equal(executionReady ? 'received' : 'unparsed', 'unparsed', 'which is the status the client calls "No clear signal"');
+  assert.equal(safety.parseError, 'This message is market news rather than a trade instruction, so nothing was taken from it.');
+});
+
+test('a headline that quotes levels may be completed on price, never on direction', async () => {
+  /* News wording without a full instruction: the numbers in it are verifiable against the text and so are
+     still worth asking about, but the model's "sell" is refused at the merge. A headline states what a price
+     did; it does not state what to do, and that is the one gap nothing may be allowed to fill. */
+  const text = 'JUST IN: Bitcoin BTC dumps below 80000, TP 70000';
+  const fetch = countingFetch(llmReply({ symbol: 'BTCUSD', side: 'sell', entry: 80000, stop_loss: null, take_profit: 70000, confidence: 1 }));
+  const outcome = await parseSignalTwoLayer(text, { source: 'telegram', config: CONFIG, fetchImpl: fetch.fetchImpl });
+  assert.equal(fetch.calls.length, 1, 'the message is signal-shaped enough to ask about');
+  assert.equal(outcome.parsed.side, null, 'while the direction it never stated stays unstated');
+  assert.equal(outcome.parsed.takeProfit, 70000, 'and the target the message did write down is kept');
+  assert.ok(outcome.provenance.dropped.some((item) => item.key === 'side'), 'the refusal is recorded, not quiet');
+  assert.match(outcome.provenance.dropped.find((item) => item.key === 'side').because, /headline/i);
+});
+
+test('the fallback layer is not entered by a news row that looks half-readable', () => {
+  // A synthetic Layer 1 result with everything `needsLayer2` normally asks for, and the news flag on top.
+  const layer1 = { ...parseSignal('GOLD 4016.00 SL 4010.00'), newsOnly: true, hasPriceLevel: true, symbol: 'XAUUSD' };
+  assert.equal(needsLayer2(layer1), false);
+  assert.equal(needsLayer2({ ...layer1, newsOnly: false }), true, 'while the same message without the news reading is still worth a request');
+});
+
+test('the prompt says out loud that a headline has no direction in it', () => {
+  const [system] = buildMessages('anything at all', CONFIG);
+  assert.match(system.content, /news headline or market commentary/i);
+  assert.match(system.content, /return null for the direction/i);
+  assert.match(system.content, /falls under/i, 'naming the wording that was actually misread');
+  assert.match(system.content, /dumping/i);
 });

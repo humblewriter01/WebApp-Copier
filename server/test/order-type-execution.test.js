@@ -7,12 +7,13 @@
  * because the failure mode of this feature is not a wrong query - it is an order that should not have been
  * sent, or one that should have been cancelled and was not.
  *
- * Five behaviours are the contract, and each has a test named for it:
+ * Six behaviours are the contract, and each has a test named for it:
  *   a market order at a better price is taken, not refused;
  *   a market order at a worse price is judged by the workspace's drift guard;
  *   a scalp is executed immediately when the market is already at its level, and its order lives two minutes;
  *   a limit order past its expiry is cancelled through the broker and recorded as expired;
- *   an order the user deleted on the platform is recorded as cancelled, not left as a ghost.
+ *   an order the user deleted on the platform is recorded as cancelled, not left as a ghost;
+ *   and an entry published as a zone rests above the range, fills inside it, and is refused past it.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -47,6 +48,9 @@ function signalItem(message, over = {}) {
     symbol: parsed.symbol, side: parsed.side,
     entry_price: parsed.entryPrice, stop_loss: parsed.stopLoss, take_profit: parsed.takeProfit,
     orderType: parsed.orderType, orderTypeStated: parsed.orderTypeStated, isScalping: parsed.isScalping,
+    // Exactly what `signals.entry_range` holds: the bounds the channel published, or NULL for a row that
+    // named one price - including every row captured before the column existed.
+    entryRange: parsed.entryRange,
     execution_ready: true, parse_error: null, needs_review: false,
     stop_loss_pips: parsed.stopLossPips, take_profit_pips: parsed.takeProfitPips,
     auto_trading_enabled: true, lot_size_mode: 'fixed', fixed_lot_size: 0.01, risk_percent: 1,
@@ -433,4 +437,99 @@ test('a resting order counts against the workspace while it waits', async () => 
   // counted is a channel of ten signals turning into eleven trades.
   const source = await import('node:fs').then(({ readFileSync }) => readFileSync(new URL('../services/execution-engine.js', import.meta.url), 'utf8'));
   assert.match(source, /AND status IN \('submitting','pending','executed','unknown','filled'\)/);
+});
+
+/* ----------------------------------------------------- 6. an entry published as a zone ----------------------------------------------------- */
+
+/* The message the audit was written about, and the three positions a market can take relative to a zone. The
+   bound in force never changed - a buy is still credited with the top of its range, so a fill anywhere inside it
+   is never reported as worse than what was published - but what the engine *does* with a zone now depends on
+   where the quote is. Each answer is asserted against what the mocked broker was called with, not against a
+   plan object, because the failure this guards against is an order sent or not sent. */
+const ZONE_BUY = 'BUY GOLD ZONE 4016.00 - 4026.00 / SL: 4010.00 / TP: 4050.00';
+const ZONE_SELL = 'SELL GOLD ZONE 4016.00 - 4026.00 / SL: 4030.00 / TP: 4000.00';
+
+test('a market above the zone rests a limit at the near edge and waits for the price to come into it', async () => {
+  const run = runEngine({ message: ZONE_BUY, adapterOptions: { price: goldQuote(4030, 4030.2) } });
+  const result = await run.result();
+  assert.equal(result.status, 'pending');
+  assert.equal(run.adapter.marketOrders().length, 0, 'nothing is bought at 4030, a price the channel never offered');
+  const [order] = run.adapter.pendingOrders();
+  assert.equal(order.kind, 'limit');
+  assert.equal(order.side, 'buy');
+  assert.equal(order.price, 4026, 'the bound credited to the row is the bound the order waits at');
+  assert.equal(order.stopLoss, 4010);
+  assert.equal(order.takeProfit, 4050);
+  assert.equal(order.expiration.time.getTime() - AT, 30 * 60_000, 'a zone order is a limit order, so the workspace expiry applies to it');
+  const written = run.pool.calls.find((call) => call.sql.includes('UPDATE signals SET expiry_timestamp=$2'));
+  assert.ok(written, 'and the deadline is mirrored onto the signal row, where a reader looks for it');
+  assert.match(signalNote(run.pool).note, /Limit order placed at 4026 \(the upper edge of a 4016 - 4026 entry zone\), valid for 30 minutes/);
+});
+
+test('a market already inside the zone is taken at once, and the row says the zone was honoured', async () => {
+  const run = runEngine({ message: ZONE_BUY, adapterOptions: { price: goldQuote(4020, 4020) } });
+  const result = await run.result();
+  assert.equal(result.status, 'executed', 'there is nothing to wait for when the price is already in the range');
+  assert.equal(run.adapter.pendingOrders().length, 0, 'and nothing is rested at a level the market is through');
+  const [order] = run.adapter.marketOrders();
+  assert.equal(order.price, undefined, 'a market order still carries no price field');
+  const inserted = run.pool.calls.find((call) => call.sql.includes('INSERT INTO trades'));
+  assert.equal(inserted.params[7], 4020, 'booked at the market, not at the bound');
+  const { status, note } = signalNote(run.pool);
+  assert.equal(status, 'executed');
+  assert.match(note, /The market was already inside the 4016 - 4026 entry zone/, 'the reader is told the range was respected, not ignored');
+  assert.match(note, /Filled 600 points better than the signal price of 4026/, 'and what the fill was worth, in points');
+});
+
+test('a market past the far edge of the zone is refused: a dead setup, not a bargain', async () => {
+  /* 4010 is better than every price in the zone, which is exactly why it used to be traded. A channel that
+     published 4016 - 4026 described where it wanted to be entered, and a market that has run through the whole
+     range has already done the thing the setup was built to trade on. */
+  const run = runEngine({ message: ZONE_BUY, adapterOptions: { price: goldQuote(4010, 4010.2) } });
+  const result = await run.result();
+  assert.equal(result.status, 'skipped');
+  assert.match(result.message, /The market has moved past the entire entry zone\./);
+  assert.match(result.message, /this buy zone ran 4016 to 4026/);
+  assert.equal(run.adapter.calls.length, 0, 'no market order, and no resting order left waiting to be filled lower');
+  assert.equal(signalNote(run.pool).status, 'unexecuted', 'the row says it was not executed, in the engine\'s own words');
+  assert.match(signalNote(run.pool).note, /moved past the entire entry zone/, 'and quotes the same sentence the job got');
+});
+
+test('the same three answers for a sell, with the arithmetic upside down', async () => {
+  const above = runEngine({ message: ZONE_SELL, adapterOptions: { price: goldQuote(4030, 4030.2) } });
+  assert.match((await above.result()).message, /The bid is 4030 and this sell zone ran 4016 to 4026/, 'a bid above the top of a sell zone is the setup gone, not a better price');
+  assert.equal(above.adapter.calls.length, 0);
+
+  const inside = runEngine({ message: ZONE_SELL, adapterOptions: { price: goldQuote(4020, 4020.2) } });
+  assert.equal((await inside.result()).status, 'executed');
+  assert.equal(inside.adapter.pendingOrders().length, 0);
+
+  const below = runEngine({ message: ZONE_SELL, adapterOptions: { price: goldQuote(4010, 4010.2) } });
+  assert.equal((await below.result()).status, 'pending');
+  const [order] = below.adapter.pendingOrders();
+  assert.equal(order.price, 4016, 'the sell waits at the bottom edge for the market to come back up into the zone');
+});
+
+test('a row with no stored zone keeps the behaviour it was captured with', async () => {
+  // Every signal captured before `entry_range` exists, and every single-price signal, lands here: a level the
+  // market has passed is still taken, because there is no range to have been past.
+  const run = runEngine({ message: 'BUY GOLD LIMIT 4011 SL 4005 TP 4030', over: { entryRange: null }, adapterOptions: { price: goldQuote(4010, 4010.2) } });
+  assert.equal((await run.result()).status, 'executed');
+  assert.match(signalNote(run.pool).note, /Filled 80 points better than the signal price of 4011/);
+});
+
+test('an unfilled zone order is taken off the book by the expiry sweep, like any other resting order', async () => {
+  // Resting at noon with the default half hour on it; the sweep runs at 12:31 and the order is still open.
+  const run = runSweep({
+    trades: [pendingTradeRow({ entry_price: 4026, client_id: 'SD_XAUUSD_zone1' })],
+    at: AT + 31 * 60_000,
+    adapterOptions: { orders: [{ id: 'resting-1', symbol: 'XAUUSD', clientId: 'SD_XAUUSD_zone1' }], price: goldQuote(4011) },
+  });
+  const summary = await run.sweep();
+  assert.equal(summary.expired, 1, 'the zone bought its order an expiry, and the expiry takes it away');
+  const [cancel] = run.adapter.cancels();
+  assert.equal(cancel.orderId, 'resting-1');
+  const settled = run.pool.calls.find((call) => call.sql.includes('UPDATE trades SET status=$2,'));
+  assert.equal(settled.params[1], 'expired');
+  assert.match(settled.params[2], /limit at 4026/, 'the note names the bound the order waited at, because that price never came');
 });

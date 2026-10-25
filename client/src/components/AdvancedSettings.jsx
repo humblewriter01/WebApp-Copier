@@ -325,7 +325,7 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
               <small>The same deadline is sent to the platform as the order&rsquo;s own expiration, so a resting order does not survive Signal Desk being offline.</small>
             </label>
           </div>
-          <p className="field-help">A signal the channel marked as scalping ignores this number: its orders live for two minutes, because a scalp that has not filled is a different trade. A market order never rests, so nothing here delays one.</p>
+          <p className="field-help">A signal the channel marked as scalping ignores this number: its orders live for two minutes, because a scalp that has not filled is a different trade. A limit waiting at the edge of an entry zone is covered by this too. A market order never rests, so nothing here delays one.</p>
         </SettingsSection>
 
         <SettingsSection

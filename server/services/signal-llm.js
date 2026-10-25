@@ -46,6 +46,7 @@ const SYSTEM_PROMPT = [
   '- If a field is absent, unclear, contradictory or needs arithmetic to obtain, return null for it. Null is the correct answer far more often than a guess, and a guessed price causes a real trade.',
   '- symbol is only reported when the message names the instrument. Use the broker form: XAUUSD for gold, XAGUSD for silver, UKOIL for Brent, USOIL for WTI, US30 for the Dow, NAS100 for the Nasdaq 100, US500 for the S&P 500, GER40 for the DAX, BTCUSD, ETHUSD, or a six-letter currency pair such as EURUSD or GBPJPY.',
   '- side is "buy" for BUY, LONG or CALL and "sell" for SELL, SHORT or PUT. A message that says both is contradictory: return null for every field and confidence 0.',
+  '- If the text is a news headline or market commentary rather than a trade instruction, return null for the direction. "JUST IN", "breaking", "report", "headline", "news", a market "dumping" or a price that "falls under" or "rises above" a level are reporting what happened, not telling anyone what to do: return null for side, and null for any other field the message does not state as an instruction. A direction must never be chosen from the tone of a headline.',
   '- An entry of "now", "market" or "current price" means entry null. That is not a missing value; do not fill it in.',
   '- A target or stop given in pips or points is a distance, not a price: return null for that field.',
   '- confidence is how sure you are that this message is a trade instruction and that you read it correctly: 1 only when every value you returned is written in the message in plain form.',
@@ -90,10 +91,16 @@ export function llmConfig(env = process.env, defaults = {}) {
  * Only signal-shaped text is: something in it looked like a trade instruction (a direction, a symbol, a
  * price or a marked level) and Layer 1 could not finish reading it. A "good morning" or a VIP advertisement
  * has neither, and sending those to the model would spend a rate limit on a non-signal while teaching the
- * pipeline to trade on anything with an imperative verb in it.
+ * pipeline to trade on anything with an imperative verb in it. A message Layer 1 identified as market news is
+ * refused for the same reason with the opposite shape: it *looks* like a signal - instruments and prices, all
+ * day long - which is exactly why a model must not be handed it and asked what trade it implies.
  */
 export function needsLayer2(parsed) {
   if (!parsed) return false;
+  /* A message Layer 1 classified as market news is not an unfinished signal, and asking a model about it is
+     how a headline ends up with a direction attached: the model is paid to find a trade, it will find one.
+     Refusing the request outright is cheaper and surer than hoping the answer is cautious. */
+  if (parsed.newsOnly === true) return false;
   const complete = parsed.executionReady === true && parsed.missing
     && parsed.missing.stopLoss === false && parsed.missing.takeProfit === false && parsed.missing.entryPrice === false;
   if (complete) return false;

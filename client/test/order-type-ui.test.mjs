@@ -88,6 +88,7 @@ test('both settings say what they refuse as well as what they allow', () => {
   assert.match(markup, /blank or 0 means never/);
   assert.match(markup, /Between 1 minute and 30 days/);
   assert.match(markup, /scalping ignores this number: its orders live for two minutes/);
+  assert.match(markup, /A limit waiting at the edge of an entry zone is covered by this too/, 'a zone order really does rest now, so the expiry has to mention it or the sentence under the setting is a half-truth');
   assert.match(markup, /A market order never rests/);
   // Rendered text carries the typographic apostrophe React leaves alone, not an entity - so the assertion
   // matches the sentence as a reader sees it.
@@ -119,7 +120,12 @@ test('a pending order is described by its level and how long it has left', () =>
 test('the activity list shows the resting line, and marks the row as waiting rather than unknown', () => {
   const markup = render({}, [{
     id: 'trade-1', side: 'buy', symbol: 'XAUUSD', quantity: 0.01, status: 'pending', orderType: 'limit', entryPrice: 4011,
-    createdAt: '2026-10-25T11:30:00.000Z', expiryTimestamp: new Date(Date.parse('2026-10-25T12:24:00.000Z')).toISOString(),
+    createdAt: '2026-10-25T11:30:00.000Z',
+    /* The deadline is read against the wall clock, because `restingOrderSummary` is called by the component
+       with no clock of its own. A pinned timestamp here aged: on 2026-10-25 afternoon this row was already
+       past 12:24 and the line correctly became "passed its expiry", failing a test about a sentence that had
+       not changed. Relative to `now`, the row is always a resting order with time left, whatever day runs. */
+    expiryTimestamp: new Date(Date.now() + 24 * 60 * 60_000).toISOString(),
   }]);
   assert.match(markup, /class="badge execution-status-pending">on the book</);
   assert.match(markup, /execution-resting-summary[^<]*<\/p>/, 'the sentence is rendered, not only computed');

@@ -28,7 +28,8 @@ export const DASHBOARD_SIGNAL_LIMIT = 3;
 export const DASHBOARD_SIGNAL_COLUMNS = `id,channel_title AS "channelTitle",source,message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",direction_inferred AS "directionInferred",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt",
   needs_review AS "needsReview",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",
   llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",
-  order_type AS "orderType",order_type_stated AS "orderTypeStated",is_scalping AS "isScalping",expiry_timestamp AS "expiryTimestamp"`;
+  order_type AS "orderType",order_type_stated AS "orderTypeStated",is_scalping AS "isScalping",expiry_timestamp AS "expiryTimestamp",
+  entry_range AS "entryRange"`;
 
 /* Which rows are worth a place on a summary screen, decided against the production table rather than
  * against the column names that look like they would work:
