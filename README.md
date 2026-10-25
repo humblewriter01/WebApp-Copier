@@ -213,9 +213,16 @@ coming from `server/services/signal-parser.js`.
   ANY PRICE` are all read, and the immediate forms win over a `LIMIT` sitting in the same message. A bare
   `STOP 4005` is a stop-loss leg, not a stop-entry order — that stays true when a `LIMIT` elsewhere in the
   line makes the entry type explicit. When nothing is stated and a *single* entry price was published, the
-  order rests at that price as a limit (`order_type_stated = false`, because Signal Desk chose it); a price
-  zone or a range is a market order at the current price, which is what a zone has always meant here. Adding a
-  word to a channel's message is a change the reader can make: `NOW` overrules the inference.
+  order rests at that price as a limit (`order_type_stated = false`, because Signal Desk chose it). A price
+  **zone** rests too, at the bound the row is credited with - the least favourable edge for that side - and the
+  market's position relative to the range decides which of three things happens, every one of them answered
+  where a live quote exists (`pendingOrderPlan`, not the parser): **above** the zone the order waits at the near
+  edge for the price to come into it; **inside** the zone it is taken at the current price and the signal row
+  says the range was honoured rather than ignored; **past the far edge** it is refused, because a market that
+  has run through the entire range a channel described is a dead setup, not a bargain - which is the one case
+  where "the fill would have been better than published" is not a reason to take the trade. A zone with no
+  direction in it has no bound to rest at and stays a market order. Adding a word to a channel's message is the
+  change the reader can make: `NOW` overrules all of it.
 - **A market order is judged in the broker's points, not in prices.** `max_slippage_points` (the **Price Drift
   Guard**) is how far worse than the published entry a fill may be. Better is always taken, and the trade note
   says how many points in the user's favour. Blank or `0` — what every workspace starts on — keeps the old
@@ -229,7 +236,9 @@ coming from `server/services/signal-parser.js`.
   the failure this feature would otherwise create. A signal marked `SCALPING` overrides the setting with two
   minutes and is taken as a market order at once if the market is already at its level. A stop whose level the
   market has already passed is a market order too, and a level within the broker's `stops_level` is refused with
-  the number named rather than nudged onto a price the channel never published.
+  the number named rather than nudged onto a price the channel never published. A limit waiting at the edge of
+  an entry zone is swept by the same deadline: an order that never saw the market come into its range is taken
+  off the book at the expiry, recorded as `expired`, and the signal stops promising a trade.
 - **Nothing rests unwatched.** `sweepExpiredOrders` (in the same engine, hooked into the worker's
   every-`N`-seconds block) reads the rows `trades.status = 'pending'` keeps in `trades_pending_expiry_idx`,
   groups them by account, and asks the broker once per account for positions, deals and open orders. Order gone
@@ -246,8 +255,9 @@ coming from `server/services/signal-parser.js`.
   the signal, `on the book` on the trade, and a line under the row that says the level and how long is left.
 
 `server/test/order-routing.test.js` pins the arithmetic and the boundaries; `server/test/order-type-execution.test.js`
-runs the whole flow — parse to job to broker call to settled row — against a fake adapter, including the five
-end-to-end cases this feature is judged by; `server/test/metaapi-trading.test.js` pins the shape of the trade
+runs the whole flow — parse to job to broker call to settled row — against a fake adapter, including the six
+end-to-end cases this feature is judged by (three of them the positions of a market relative to an entry zone,
+and the sweep that cancels a zone order nobody came to); `server/test/metaapi-trading.test.js` pins the shape of the trade
 request both platforms receive.
 
 ### Trailing stop
@@ -311,7 +321,7 @@ Distances are MetaTrader **points**, the same unit as the break-even and trailin
 
 ### What a captured message says about itself
 
-The parser returns facts, and the row stores them, so the panel never has to guess: `directionInferred`, and the three `missing` prices are what `Signals` renders as **Inferred**, **Missing SL**, and **Missing TP** badges. A message that yielded no trading data at all reads **No clear signal**; a message that was legible but unusable reads **Needs review** with the server's own sentence under it, because "unclear" was sent to people whose channel had written a perfectly readable note with one line missing.
+The parser returns facts, and the row stores them, so the panel never has to guess: `directionInferred`, and the three `missing` prices are what `Signals` renders as **Inferred**, **Missing SL**, and **Missing TP** badges. A message that yielded no trading data at all reads **No clear signal**; a message that was legible but unusable reads **Needs review** with the server's own sentence under it, because "unclear" was sent to people whose channel had written a perfectly readable note with one line missing. A row whose entry was published as a zone shows the range - `Entry 4016 - 4026` - rather than the one bound the order was credited with, because a single number on a row the channel wrote as a range reads like a price somebody invented; the bound in force, why it is the worst edge for that side, and what the order does at each position of the market relative to the zone are the hover text.
 
 A channel that writes `Gold Buy now` and `SL: 4041.50` has said everything it intends to say: the metal, the direction, and the level that kills the trade. The entry is absent *on purpose*, and it is the one leg that must never be treated as a defect, so the parse yields `entry_price = NULL` with no blocker and no error, and the execution engine's entry guard - which refuses a limit-style entry when the live quote has moved past it - is skipped because there is nothing to be worse than. The order goes to MetaAPI as a true market order (no price field is ever sent) at the ask for a buy and the bid for a sell, and a missing target is completed from the workspace's fallback distance measured from that live price. The only refusal this shape can earn is the take-profit block the user switched on themselves, which is worded as such. `Market` is shown as a badge next to `Missing SL`/`Missing TP` so the absent entry reads as a decision and not as a gap: it appears when a Telegram message carries a stop or a target but no entry, and never on a message that named no price at all. The asset half of this depends on a symbol surviving the punctuation real channels use, so alias matching is bounded by alphanumerics only - `Gold,` `Gold.` `Gold:` `#Gold` and `*Gold*` all resolve, while `DOWN` still does not contain `DOW` and `ETHICAL` still does not contain `ETH`.
 
@@ -319,7 +329,7 @@ A channel that writes `Gold Buy now` and `SL: 4041.50` has said everything it in
 
 Telegram signals arrive as advertising copy, so the parser is two layers with a rule between them.
 
-**Layer 1 is deterministic and free** (`services/signal-parser.js`, with number handling in `signal-numbers.js`). It reads the aliases channels use (`GOLD` → `XAUUSD`, `SILVER` → `XAGUSD`, `LONG`/`CALL` → buy, `SHORT`/`PUT` → sell), both decimal traditions (`1,0850` and `1.0850`), the separators that are not colons (`SL - 4011.00`, `Invalidation: 4011.00`, `TP 3 : 4029.50`), entries written as a zone (`4026.00 - 4016.00`, whose *least favourable* bound is the one the row is credited with) or as a DCA ladder (whose first level is the entry), `@`- and `$`-decorated prices, and legs given as distances (`TP 50 pips`, and the reversed `30 pips SL`). Emoji, join-links and risk disclaimers are stripped before any of that is read. A number that could only be read by guessing - `4,011` with nothing nearby to anchor it - is *not* guessed: the message's own unambiguous numbers vote, and a tie leaves the leg flagged as ambiguous and unreadable rather than missing, so no fallback can quietly stand in for a coin flip.
+**Layer 1 is deterministic and free** (`services/signal-parser.js`, with number handling in `signal-numbers.js`). It reads the aliases channels use (`GOLD` → `XAUUSD`, `SILVER` → `XAGUSD`, `LONG`/`CALL` → buy, `SHORT`/`PUT` → sell), both decimal traditions (`1,0850` and `1.0850`), the separators that are not colons (`SL - 4011.00`, `Invalidation: 4011.00`, `TP 3 : 4029.50`), entries written as a zone (`4026.00 - 4016.00`, whose *least favourable* bound is the one the row is credited with, and whose two bounds are stored beside it as `entry_range`) or as a DCA ladder (whose first level is the entry), `@`- and `$`-decorated prices, and legs given as distances (`TP 50 pips`, and the reversed `30 pips SL`). Emoji, join-links and risk disclaimers are stripped before any of that is read. A number that could only be read by guessing - `4,011` with nothing nearby to anchor it - is *not* guessed: the message's own unambiguous numbers vote, and a tie leaves the leg flagged as ambiguous and unreadable rather than missing, so no fallback can quietly stand in for a coin flip.
 
 **Layer 2 is a language model** (`services/signal-llm.js`) and fires only when Layer 1 found something price-shaped and could not finish reading it, which keeps the cost at zero for a well-formed channel and for hype. It is asked to answer with `symbol`, `side`, `entry`, `stop_loss`, `take_profit`, `confidence` - `null` for anything unclear, refusal explicitly preferred - and three things are then true of its answer:
 

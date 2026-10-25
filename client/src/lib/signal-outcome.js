@@ -53,6 +53,44 @@ export function signalStatesAPrice(signal) {
 }
 
 /**
+ * The entry a zone signal shows: the range the channel published, with the bound in force named on hover.
+ *
+ * A row that reads `Entry 4026` for `BUY GOLD ZONE 4016 - 4026` is half wrong twice. The channel never offered
+ * one number, and the number displayed is deliberately the *worst* edge of the range - that is what lets a fill
+ * anywhere inside the zone be taken without ever looking worse than what was published. Both halves are facts
+ * the reader is owed, so the meta line widens to the zone and the hover text names the credited edge and what
+ * the order does at each position of the market relative to it.
+ *
+ * Returns null for a row with no zone, or one whose stored range is not a range: the single-price display is
+ * then left exactly as it was, rather than showing `Entry undefined - undefined` for a corrupt column.
+ */
+export function entryZoneView(signal) {
+  const range = signal?.entryRange;
+  if (!range || typeof range !== 'object') return null;
+  const low = Number(range.low);
+  const high = Number(range.high);
+  if (!Number.isFinite(low) || !Number.isFinite(high) || !(low < high)) return null;
+  const credited = Number(signal?.entryPrice);
+  const hasCredited = Number.isFinite(credited) && credited > 0;
+  const selling = String(signal?.side || '').toLowerCase() === 'sell';
+  const edge = hasCredited
+    ? `The order is credited with ${credited}, the ${selling ? 'lower' : 'upper'} edge - the bound worst for a ${selling ? 'sell' : 'buy'} - so a fill anywhere inside the zone is never reported as a worse price than the channel published.`
+    : 'No bound is credited, because the message stated no direction to pick one with.';
+  const orderType = String(signal?.orderType || 'market').toLowerCase();
+  const resting = orderType === 'limit' || orderType === 'stop';
+  const behaviour = resting
+    ? 'Above the zone the order rests at that edge and waits for the market to come to it; inside the zone it is taken at once; past the far edge it is refused, because a market that ran through the whole range is a dead setup rather than a bargain.'
+    : 'This row does not wait for the zone - the message asked to be filled at the market - so the range is shown for context.';
+  return {
+    low,
+    high,
+    credited: hasCredited ? credited : null,
+    text: `${low} - ${high}`,
+    title: `Entry zone as published: ${low} - ${high}. ${edge} ${behaviour}`,
+  };
+}
+
+/**
  * A free or unlinked workspace still captures every message; what it sees is an outcome that names
  * the missing piece. Upgrade wording is recognised so the panel can offer the way forward instead of
  * leaving the user to conclude that Signal Desk ignored them.
@@ -115,13 +153,18 @@ export function signalBadges(signal) {
   const resting = orderType === 'limit' || orderType === 'stop';
   if (telegram && resting) {
     const level = signal?.entryPrice;
+    const zoneForBadge = entryZoneView(signal);
     badges.push({
       key: 'order-type',
       label: orderType === 'stop' ? 'Stop Order' : 'Limit Order',
       tone: signal?.orderTypeStated === true ? 'busy' : 'warn',
       title: signal?.orderTypeStated === true
         ? `The channel asked for this trade to rest at ${level ?? 'its price'} rather than be filled at the market. Signal Desk places it as a pending order on your broker account, and takes it off when its expiry passes.`
-        : `Nothing in this message said LIMIT or STOP. It published ${level ?? 'an entry price'} without asking to be filled at the market, so an order is rested at that price instead of paying whatever the market is doing. Write NOW or CMP in the channel if you want it taken immediately.`,
+        : (zoneForBadge
+          // A zone is the one case where resting the order is not a choice made *instead* of reading the
+          // message - the range is the message - so the sentence says what the order does at each side of it.
+          ? `Nothing in this message said LIMIT or STOP, and it published a zone rather than a price. The order waits at ${level ?? 'the bound worst for this side'} until the market comes into ${zoneForBadge.text}, is taken at the market if the price is already inside the zone, and is refused once the market has moved past the far edge. Write NOW or CMP in the channel if you want it taken immediately.`
+          : `Nothing in this message said LIMIT or STOP. It published ${level ?? 'an entry price'} without asking to be filled at the market, so an order is rested at that price instead of paying whatever the market is doing. Write NOW or CMP in the channel if you want it taken immediately.`),
     });
   }
   /* The one market case worth a pill is the one that otherwise reads as a gap: a telegram signal whose entry

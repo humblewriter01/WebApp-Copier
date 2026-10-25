@@ -212,6 +212,23 @@ export function marketSlippage({ side = null, desired = null, bid = null, ask = 
 }
 
 /**
+ * The two bounds of an entry zone, or null when the row states no zone.
+ *
+ * `signals.entry_range` is jsonb written from the parse, and a maintenance script, an old row, or a hand edit
+ * can each leave it in a shape that is not one. Refusing to read a malformed range is the conservative answer:
+ * the entry price the row already holds is a real level, and a corrupt zone must not be allowed to refuse a
+ * trade the message itself asked for.
+ */
+export function entryRangeBounds(value) {
+  const source = typeof value === 'string' ? (() => { try { return JSON.parse(value); } catch { return null; } })() : value;
+  if (!source || typeof source !== 'object') return null;
+  const low = Number(source.low);
+  const high = Number(source.high);
+  if (!Number.isFinite(low) || !Number.isFinite(high) || low <= 0 || high <= 0 || !(low < high)) return null;
+  return { low, high };
+}
+
+/**
  * Does this level still describe a resting order, or has the market already reached it?
  *
  * A pending order is a request to be filled at a *specific* price, and both platforms refuse one whose price
@@ -221,8 +238,15 @@ export function marketSlippage({ side = null, desired = null, bid = null, ask = 
  * becomes a market order, and `marketSlippage` then decides whether the price is still acceptable. That is
  * also exactly the scalping rule, applied to everything - `isScalping` does not get a special path, it just
  * has a shorter fuse.
+ *
+ * An entry published as a **limit against a zone** is the case where "already passed" is not the whole
+ * question, so `entryRange` is asked first. A buy zone of 4016 - 4026 with the ask at 4010 has not been offered a bargain:
+ * the market has fallen through the entire range the channel described, and a trade taken there is a trade
+ * nobody published. That is a refusal. The other two answers fall out of the arithmetic below once the far
+ * edge has been ruled out - above the zone the credited bound is still on the resting side of the quote, so
+ * the order waits at it, and inside the zone the quote has already reached it, so the trade is taken now.
  */
-export function pendingOrderPlan({ orderType = null, entryPrice = null, side = null, bid = null, ask = null, stopsLevelPoints = null, tickSize = null } = {}) {
+export function pendingOrderPlan({ orderType = null, entryPrice = null, side = null, bid = null, ask = null, stopsLevelPoints = null, tickSize = null, entryRange = null } = {}) {
   if (!ORDER_TYPES.includes(orderType)) return { kind: 'market', reason: 'not-a-resting-order' };
   // Stated before the arithmetic rather than left to the caller's guard: a market order has no level to be
   // on the right or wrong side of, and reading `market` through the stop branch would rest one at the price.
@@ -233,6 +257,23 @@ export function pendingOrderPlan({ orderType = null, entryPrice = null, side = n
   }
   const market = side === 'buy' ? Number(ask) : Number(bid);
   if (!Number.isFinite(market) || market <= 0) return { kind: 'skip', reason: 'no-quote', message: 'A live quote is needed to decide how to send this order.' };
+  /* Only a **limit** is measured against the range. A stop entry waits for the market to break *through* its
+     level, so a price on the far side of a zone is exactly what that order is for, and refusing it would
+     remove the one case where being early is the plan. */
+  const zone = orderType === 'limit' ? entryRangeBounds(entryRange) : null;
+  if (zone) {
+    /* The far edge of a zone is the end of the setup, not a better price. Asked before the resting test on
+       purpose: a market that has gone through the whole zone also "fills immediately" by the arithmetic below,
+       and answering that with a market entry is exactly the mistake being refused here. */
+    const pastTheZone = side === 'buy' ? market < zone.low : market > zone.high;
+    if (pastTheZone) {
+      return {
+        kind: 'skip',
+        reason: 'zone-past-far-edge',
+        message: `The market has moved past the entire entry zone. The ${side === 'buy' ? 'ask' : 'bid'} is ${market} and this ${side === 'buy' ? 'buy' : 'sell'} zone ran ${zone.low} to ${zone.high}, so the setup the channel published has already been and gone. Nothing was sent to your broker.`,
+      };
+    }
+  }
   const resting = orderType === 'limit'
     ? (side === 'buy' ? level < market : level > market)
     : (side === 'buy' ? level > market : level < market);
@@ -240,7 +281,12 @@ export function pendingOrderPlan({ orderType = null, entryPrice = null, side = n
     return {
       kind: 'market',
       reason: 'level-would-fill-now',
-      note: `The market is already at a price where your ${orderType} level of ${level} fills immediately, so this is sent as a market entry rather than rested.`,
+      note: zone
+        ? `The market is already inside the entry zone (${zone.low} - ${zone.high}), so this is taken at the current price rather than waited for.`
+        : `The market is already at a price where your ${orderType} level of ${level} fills immediately, so this is sent as a market entry rather than rested.`,
+      /* A market fill against a signal that published a range has to be explained on the row and not only in
+         the log: the range was honoured, the market simply happened to already be inside it. */
+      ...(zone ? { readerNote: `The market was already inside the ${zone.low} - ${zone.high} entry zone, so the trade was taken at the current price instead of waited for.`, zone } : {}),
     };
   }
   const perPoint = Number(tickSize) > 0 ? Number(tickSize) : null;
@@ -257,7 +303,7 @@ export function pendingOrderPlan({ orderType = null, entryPrice = null, side = n
       message: `Skipped: the ${orderType} price of ${level} is ${distance} points from the market and this broker requires pending orders at least ${minimum} points away. Nothing was sent to your broker.`,
     };
   }
-  return { kind: 'pending', reason: 'level-resting', price: level };
+  return { kind: 'pending', reason: 'level-resting', price: level, ...(zone ? { zone } : {}) };
 }
 
 /**

@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 import {
   EXPIRY_UNITS, MAX_EXPIRY_DAYS, SCALP_EXPIRY_MS,
   expiryCeiling, expiryUnitMs, expiryWindowMs, isUsableExpiry,
-  interpretCancelResponse, marketSlippage, pendingOrderOutcome, pendingOrderPlan,
+  entryRangeBounds, interpretCancelResponse, marketSlippage, pendingOrderOutcome, pendingOrderPlan,
   readExpirySetting, readSlippageSetting, resolveOrderExpiry,
 } from '../services/order-routing.js';
 
@@ -203,4 +203,84 @@ test('a cancel is accepted, already-done, or refused - and only the last one is 
   assert.equal(interpretCancelResponse({ error: { numericCode: 10017, message: 'Trade is disabled' } }).kind, 'rejected');
   assert.equal(interpretCancelResponse({}).kind, 'rejected');
   assert.match(interpretCancelResponse({ error: { numericCode: 10017, message: 'Trade is disabled' } }).message, /Trade is disabled/);
+});
+
+/* ----------------------------------------------------- the entry zone, as a rule rather than a wiring ----------------------------------------------------- */
+
+const ZONE = { low: 4016, high: 4026 };
+const zonePlan = (side, market, entryPrice) => pendingOrderPlan({
+  orderType: 'limit', entryPrice, side, bid: market, ask: market, tickSize: 0.01, stopsLevelPoints: 10, entryRange: ZONE,
+});
+
+test('a zone is read as two bounds or not at all', () => {
+  assert.deepEqual(entryRangeBounds(ZONE), { low: 4016, high: 4026 });
+  assert.deepEqual(entryRangeBounds('{"low":4016,"high":4026}'), { low: 4016, high: 4026 }, 'a jsonb value that arrived as text is still a zone');
+  assert.deepEqual(entryRangeBounds({ low: '4016.50', high: '4026.00' }), { low: 4016.5, high: 4026 }, 'and numeric strings are numbers here');
+  for (const junk of [null, undefined, 0, 'nope', {}, { low: 4016 }, { low: 4026, high: 4016 }, { low: 4016, high: 4016 }, { low: -1, high: 5 }]) {
+    assert.equal(entryRangeBounds(junk), null, `${JSON.stringify(junk)} is not a range, and must not be allowed to refuse a trade`);
+  }
+});
+
+test('the far edge of a zone is asked before the resting test, because that is where the trap is', () => {
+  /* A buy zone whose market sits at 4010 "would fill immediately" by the arithmetic that decides resting -
+     and filling immediately at a price outside the range is the exact behaviour this rule exists to remove. */
+  assert.deepEqual(
+    { kind: zonePlan('buy', 4010, 4026).kind, reason: zonePlan('buy', 4010, 4026).reason },
+    { kind: 'skip', reason: 'zone-past-far-edge' },
+  );
+  assert.deepEqual(
+    { kind: zonePlan('sell', 4030, 4016).kind, reason: zonePlan('sell', 4030, 4016).reason },
+    { kind: 'skip', reason: 'zone-past-far-edge' },
+    'and the sell is the same question with the edges exchanged',
+  );
+});
+
+test('the refusal names both bounds and the side, in the sentence the reader sees', () => {
+  const plan = zonePlan('buy', 4010, 4026);
+  assert.match(plan.message, /^The market has moved past the entire entry zone\./);
+  assert.match(plan.message, /The ask is 4010 and this buy zone ran 4016 to 4026/);
+  assert.match(plan.message, /Nothing was sent to your broker\./);
+  assert.match(zonePlan('sell', 4030, 4016).message, /The bid is 4030 and this sell zone ran 4016 to 4026/);
+});
+
+test('the edges themselves are the boundary, not the middle of the zone', () => {
+  // A market exactly at the far bound is still inside the range the channel published, and is traded.
+  assert.equal(zonePlan('buy', 4016, 4026).kind, 'market', 'the bottom edge of a buy zone is a price it will take');
+  assert.equal(zonePlan('buy', 4015.99, 4026).kind, 'skip', 'one tick under it is not');
+  assert.equal(zonePlan('sell', 4026, 4016).kind, 'market');
+  assert.equal(zonePlan('sell', 4026.01, 4016).kind, 'skip');
+  assert.equal(zonePlan('buy', 4026, 4026).kind, 'market', 'and the edge the order would rest at is a fill, not a wait');
+});
+
+test('inside the zone the trade is taken now, and the row is told the range was respected', () => {
+  const plan = zonePlan('buy', 4020, 4026);
+  assert.equal(plan.kind, 'market');
+  assert.equal(plan.reason, 'level-would-fill-now');
+  assert.match(plan.note, /already inside the entry zone \(4016 - 4026\)/);
+  assert.match(plan.readerNote, /already inside the 4016 - 4026 entry zone/, 'a sentence for the signal row, not only the log');
+  assert.deepEqual(plan.zone, ZONE, 'and the bounds travel with the plan, so the note about the order can quote them');
+});
+
+test('above the zone it rests at the credited bound, carrying the zone for the note', () => {
+  const plan = zonePlan('buy', 4030, 4026);
+  assert.equal(plan.kind, 'pending');
+  assert.equal(plan.price, 4026);
+  assert.deepEqual(plan.zone, ZONE);
+  assert.deepEqual(pendingOrderPlan({ ...{ orderType: 'limit', entryPrice: 4026, side: 'buy', bid: 4030, ask: 4030.2, tickSize: 0.01 }, entryRange: null }), { kind: 'pending', reason: 'level-resting', price: 4026 }, 'no zone, no extra keys: the old answer unchanged');
+});
+
+test('the rule belongs to limits, and a stop keeps its own logic', () => {
+  /* A buy stop waits for the market to break *up* through its level, so a quote below the range is not a dead
+     setup - it is the order sitting where a stop is supposed to sit. Measuring a stop against a zone would
+     refuse the breakout entries this product has always placed. */
+  const plan = pendingOrderPlan({ orderType: 'stop', entryPrice: 4030, side: 'buy', bid: 4010, ask: 4010.2, tickSize: 0.01, entryRange: ZONE });
+  assert.equal(plan.kind, 'pending', 'the stop rests, at the level the channel named');
+  assert.equal(plan.price, 4030);
+  assert.equal(plan.zone, undefined, 'and the zone is not even read for it');
+});
+
+test('a market order is never asked about the zone, because it is not waiting for anything', () => {
+  // The refusal belongs to a resting order's question. A channel that wrote NOW at 4010 below its own zone is
+  // telling the platform to take the market, and the drift guard - not the zone - is the rule that judges it.
+  assert.deepEqual(pendingOrderPlan({ orderType: 'market', entryPrice: 4026, side: 'buy', bid: 4010, ask: 4010.2, entryRange: ZONE }), { kind: 'market', reason: 'channel asked for the market' });
 });

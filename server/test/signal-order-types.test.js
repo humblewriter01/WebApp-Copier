@@ -52,10 +52,26 @@ test('a single stated price with no instruction to take the market is a limit', 
   assert.equal(parsed.orderTypeStated, false, 'this is the product choosing, not the channel asking, and the UI says so');
 });
 
-test('an entry published as a zone has no single level to rest at, so it stays a market order', () => {
+test('an entry published as a zone rests at the bound it was credited with', () => {
+  /* A zone used to be the one entry shape that could never be a pending order, on the reasoning that a range
+     is not a single price to rest at. That threw away the useful half of the range: the channel said exactly
+     where it was willing to be filled, and the bound the row is credited with is a price. What the market's
+     position relative to the *whole* range means is answered at order time, where a quote exists
+     (`pendingOrderPlan`), and it has three answers: rest above the zone, take inside it, refuse past it. */
   const parsed = parseSignal('GOLD SELL Entry Zone 4026-4016 SL 4010 TP 4050');
-  assert.equal(parsed.entryPrice, 4016, 'the bound the sell is credited with is still read');
-  assert.equal(parsed.orderType, 'market');
+  assert.equal(parsed.entryPrice, 4016, 'the bound the sell is credited with is unchanged by this');
+  assert.deepEqual(parsed.entryRange, { low: 4016, high: 4026 }, 'and the range itself travels with the row');
+  assert.equal(parsed.orderType, 'limit');
+  assert.equal(parsed.orderTypeStated, false, 'the channel did not ask for a pending order; the zone implied one');
+  assert.equal(parsed.executionReady, true, 'and a zone is no less executable for being a range');
+
+  const now = parseSignal('GOLD SELL NOW IN ZONE 4026-4016 SL 4010 TP 4050');
+  assert.equal(now.orderType, 'market', 'an explicit NOW still outranks the zone, exactly as it outranks a price');
+  assert.equal(now.orderTypeStated, true);
+
+  const directionless = parseSignal('EURUSD IN ZONE 1.10-1.12 SL 1.08');
+  assert.equal(directionless.orderType, 'market', 'while a zone with no direction has no bound to rest at');
+  assert.equal(directionless.entryPrice, null);
 });
 
 test('a signal with no entry level at all is a market order', () => {

@@ -400,8 +400,12 @@ function entryFromRange(range, side) {
  * stays a market order, exactly as it has always been.
  *
  * When the message says nothing, the shape of the entry decides. A single stated price with no instruction to
- * pay the market is a level to be filled *at*, which is a limit. An entry published as a zone is not one price
- * to rest at, and an entry that was never given has nothing to rest at - both stay market orders.
+ * pay the market is a level to be filled *at*, which is a limit - and so is a zone, at the bound the row is
+ * credited with: a range is a price to wait at rather than one to chase. What a zone does once the order is
+ * being built is a different question, with three answers that need a live quote and are given in
+ * `pendingOrderPlan` (`order-routing.js`): above the zone it rests at the near edge, inside it the trade is
+ * taken at the market, and past the far edge the setup is gone and nothing is sent. An entry that was never
+ * given at all has nothing to rest at and stays a market order.
  */
 const INSTRUCTION_LINE = /\b(?:BUY|SELL|LONG|SHORT|ENTRY|POSITION|ORDER|TRADE|LIMIT|STOP|SL|TP)\b/i;
 /* A leg label and the number attached to it, removed from the clause before order-type words are looked
@@ -444,7 +448,7 @@ function orderTypeClause(text) {
  * row that reads `Limit` because a price was published with no instruction to take the market is a policy this
  * product chose. The UI says them differently.
  */
-export function detectOrderType(text, { entryPrice = null, entryIsRange = false } = {}) {
+export function detectOrderType(text, { entryPrice = null } = {}) {
   const { scope, hasInstructionLine } = orderTypeClause(text);
   const immediate = IMMEDIATE_IN_CLAUSE.test(scope) || MARKET_AFTER_INSTRUCTION.test(scope) || BARE_CMP.test(scope);
   // A request to be filled now outranks every other reading, and it is the safe one: it is what this product
@@ -453,7 +457,10 @@ export function detectOrderType(text, { entryPrice = null, entryIsRange = false 
   if (STOP_ORDER.test(scope)) return { orderType: 'stop', stated: true };
   if (hasInstructionLine && LIMIT_ORDER.test(scope)) return { orderType: 'limit', stated: true };
   const level = Number(entryPrice);
-  if (Number.isFinite(level) && level > 0 && entryIsRange !== true) return { orderType: 'limit', stated: false };
+  /* Both a single published price and the bound credited from a zone are levels to be filled *at*. The range
+     is not lost here - it travels on the row as `entryRange`, and it is that range's far edge which later
+     refuses the trade, which is the whole difference between waiting for a setup and chasing one. */
+  if (Number.isFinite(level) && level > 0) return { orderType: 'limit', stated: false };
   return { orderType: 'market', stated: false };
 }
 
@@ -655,7 +662,7 @@ export function parseSignal(message) {
   /* Read after every leg is settled, because the fallback rule is about the entry that survives resolution:
      a bound taken from a zone, or an entry inferred from a target after the direction was guessed, is not a
      price the channel asked to be filled at. */
-  const order = detectOrderType(text, { entryPrice, entryIsRange: Boolean(entry.range) });
+  const order = detectOrderType(text, { entryPrice });
   const hasTradingData = Boolean(symbol || side || entryPrice !== null || stopLoss !== null || takeProfit !== null || stopLossPips !== null || takeProfitPips !== null);
 
   /* Market news gets the last word, because it is the one reading that changes what may be *stored*. A

@@ -19,7 +19,7 @@ import { parseSignalTwoLayer } from './services/signal-parse-pipeline.js';
 import { llmConfig } from './services/signal-llm.js';
 import { TARGET_MODES } from './services/scale-out.js';
 import { captureSafety, readFallbackPoints } from './services/signal-safety.js';
-import { readExpirySetting, readSlippageSetting, ORDER_TYPES } from './services/order-routing.js';
+import { entryRangeBounds, readExpirySetting, readSlippageSetting, ORDER_TYPES } from './services/order-routing.js';
 import { buildDashboardActionableSignalsQuery, buildDashboardRecentSignalsQuery, chooseDashboardSignals } from './services/dashboard-signals.js';
 import { createTelegramListener } from './services/telegram-listener.js';
 import { createMetaApiTradingAdapter } from './services/metaapi-trading.js';
@@ -321,6 +321,20 @@ const inactivityService = createInactivityService({
  * carries the plan a reader saw on the signal row, and `null` means the message named a single exit -
  * which is what makes "no ladder" distinguishable from "a ladder we forgot to store".
  */
+/**
+ * The entry zone a message published, kept as the two bounds the channel wrote and nothing else.
+ *
+ * It is stored rather than re-derived for the two readers that need it after capture: the execution engine,
+ * which refuses an order once the market has passed through the whole range, and the signal row, which can
+ * then show what was offered instead of only the bound it was credited with. A message that named a single
+ * price stores NULL - not an empty object, so "no zone" stays distinguishable from "a zone we lost".
+ */
+function entryRangeValue(parsed) {
+  // The same reader the execution engine uses, so the bounds stored and the bounds acted on cannot drift.
+  const bounds = entryRangeBounds(parsed?.entryRange);
+  return bounds ? JSON.stringify(bounds) : null;
+}
+
 function scaleOutLadder(parsed) {
   const levels = Array.isArray(parsed?.takeProfitLevels) ? parsed.takeProfitLevels.filter((value) => Number.isFinite(Number(value)) && Number(value) > 0).map(Number) : [];
   return levels.length > 1 ? JSON.stringify(levels) : null;
@@ -357,21 +371,21 @@ async function saveSignal(userId, message, channel = {}) {
   const parseError = safety.parseError || null;
   const { rows } = await pool.query(
     `INSERT INTO signals(user_id,channel_id,channel_title,telegram_message_id,source,message,symbol,side,entry_price,stop_loss,take_profit,execution_ready,parse_error,status,direction_inferred,take_profit_levels,
-       needs_review,parsed_by,parse_confidence,llm_used,stop_loss_pips,take_profit_pips,order_type,order_type_stated,is_scalping)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+       needs_review,parsed_by,parse_confidence,llm_used,stop_loss_pips,take_profit_pips,order_type,order_type_stated,is_scalping,entry_range)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26::jsonb)
      ON CONFLICT DO NOTHING
      RETURNING id,channel_id AS "channelId",channel_title AS "channelTitle",telegram_message_id AS "telegramMessageId",source,message,symbol,side,
        entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt",
-       direction_inferred AS "directionInferred",take_profit_levels AS "takeProfitLevels",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",needs_review AS "needsReview",order_type AS "orderType",order_type_stated AS "orderTypeStated",is_scalping AS "isScalping"`,
+       direction_inferred AS "directionInferred",take_profit_levels AS "takeProfitLevels",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",needs_review AS "needsReview",order_type AS "orderType",order_type_stated AS "orderTypeStated",is_scalping AS "isScalping",entry_range AS "entryRange"`,
     [userId, channel.channelId || null, channel.title || null, telegramMessageId, source, savedText, parsed.symbol, parsed.side, parsed.entryPrice, parsed.stopLoss, parsed.takeProfit, executionReady, parseError, executionReady ? 'received' : 'unparsed', parsed.directionInferred === true, scaleOutLadder(parsed),
-      review.required === true, provenance.parsedBy, provenance.confidence, provenance.llmUsed === true, parsed.stopLossPips, parsed.takeProfitPips, ORDER_TYPES.includes(parsed.orderType) ? parsed.orderType : 'market', parsed.orderTypeStated === true, parsed.isScalping === true],
+      review.required === true, provenance.parsedBy, provenance.confidence, provenance.llmUsed === true, parsed.stopLossPips, parsed.takeProfitPips, ORDER_TYPES.includes(parsed.orderType) ? parsed.orderType : 'market', parsed.orderTypeStated === true, parsed.isScalping === true, entryRangeValue(parsed)],
   );
   let signal = rows[0];
   if (!signal && telegramMessageId) {
     const existing = await pool.query(
       `SELECT id,channel_id AS "channelId",channel_title AS "channelTitle",telegram_message_id AS "telegramMessageId",source,message,symbol,side,
          entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",direction_inferred AS "directionInferred",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt",
-         take_profit_levels AS "takeProfitLevels",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",needs_review AS "needsReview",order_type AS "orderType",order_type_stated AS "orderTypeStated",is_scalping AS "isScalping"
+         take_profit_levels AS "takeProfitLevels",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",needs_review AS "needsReview",order_type AS "orderType",order_type_stated AS "orderTypeStated",is_scalping AS "isScalping",entry_range AS "entryRange"
        FROM signals WHERE user_id=$1 AND channel_id=$2 AND telegram_message_id=$3 AND source='telegram' LIMIT 1`,
       [userId, channel.channelId, telegramMessageId],
     );
@@ -900,7 +914,7 @@ app.delete('/api/channels/:id', authenticate, asyncRoute(async (req, res) => {
 
 app.get('/api/signals', authenticate, asyncRoute(async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
-  const { rows } = await pool.query(`SELECT id,channel_title AS "channelTitle",source,message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",direction_inferred AS "directionInferred",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",take_profit_levels AS "takeProfitLevels",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",needs_review AS "needsReview",order_type AS "orderType",order_type_stated AS "orderTypeStated",is_scalping AS "isScalping",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2`, [req.userId, limit]);
+  const { rows } = await pool.query(`SELECT id,channel_title AS "channelTitle",source,message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",direction_inferred AS "directionInferred",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",take_profit_levels AS "takeProfitLevels",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",needs_review AS "needsReview",order_type AS "orderType",order_type_stated AS "orderTypeStated",is_scalping AS "isScalping",entry_range AS "entryRange",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2`, [req.userId, limit]);
   res.json({ signals: rows });
 }));
 app.post('/api/signals', authenticate, asyncRoute(async (req, res) => {
@@ -1561,7 +1575,7 @@ const adminSignalColumns = `s.id,s.user_id AS "userId",u.name AS "userName",u.em
   s.direction_inferred AS "directionInferred",s.execution_ready AS "executionReady",
   s.parse_error AS "parseError",s.execution_note AS "executionNote",s.status,s.created_at AS "createdAt",
   s.parsed_by AS "parsedBy",s.parse_confidence AS "parseConfidence",s.llm_used AS "llmUsed",s.stop_loss_pips AS "stopLossPips",s.take_profit_pips AS "takeProfitPips",s.needs_review AS "needsReview",
-  s.order_type AS "orderType",s.is_scalping AS "isScalping",s.expiry_timestamp AS "expiryTimestamp",
+  s.order_type AS "orderType",s.is_scalping AS "isScalping",s.expiry_timestamp AS "expiryTimestamp",s.entry_range AS "entryRange",
   (SELECT COUNT(*)::int FROM trades t WHERE t.signal_id=s.id) AS "tradeCount",
   left(s.message,300) AS "message",COUNT(*) OVER()::int AS "totalCount"`;
 const ADMIN_SIGNAL_FILTER = `WHERE ($1::text=''

@@ -257,3 +257,19 @@ test('the execution switches belong to every workspace, with the live-money ackn
   // The engine still refuses the order itself, which is where the plan limit actually lives.
   assert.match(engineSource, /if \(!isPaidSubscriber\(\{ subscription_status: item\.subscription_status \}\)\) \{/);
 });
+
+test('the zone a message published is stored beside the bound the row was credited with', () => {
+  /* Two decisions are taken after capture from this column - the order that must be refused once the market
+     has run through the range, and the row that has to show what was offered - and both read the stored value
+     rather than re-parsing the message. So the write is pinned here: a row that lost its zone would quietly
+     go back to trading a dead setup as a bargain. */
+  assert.match(saveSignalBody, /is_scalping,entry_range\)/, 'the INSERT carries the column');
+  assert.match(saveSignalBody, /\$26::jsonb/, 'as jsonb, like the target ladder beside it');
+  assert.match(saveSignalBody, /entryRangeValue\(parsed\)\]/, 'from the parse, not from a re-read of the message');
+  assert.match(saveSignalBody, /entry_range AS "entryRange"/, 'and the row read back has it, so the client sees the row that was written');
+
+  const helper = section(index, 'function entryRangeValue(parsed) {', '\nasync function saveSignal(');
+  assert.match(helper, /entryRangeBounds\(parsed\?\.entryRange\)/, 'normalised through the same reader the execution engine uses');
+  assert.match(helper, /JSON\.stringify\(bounds\)/, 'stored as the two bounds');
+  assert.match(helper, /return bounds \? JSON\.stringify\(bounds\) : null/, 'and NULL for a message that named a single price');
+});

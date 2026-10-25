@@ -585,6 +585,16 @@ const SCHEMA_SQL = `
     ALTER TABLE signals ADD COLUMN IF NOT EXISTS order_type_stated BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE signals ADD COLUMN IF NOT EXISTS is_scalping BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE signals ADD COLUMN IF NOT EXISTS expiry_timestamp TIMESTAMPTZ;
+    /* The entry a channel published as a zone, kept as both bounds: {"low":4016,"high":4026}. It is stored
+     * rather than re-derived, because two decisions have to be taken after the capture and both are facts
+     * about the message: an order must be refused when the market has already passed through the whole zone
+     * (a price outside the range the trader described is not a bargain, it is a dead setup), and the row must
+     * be able to show what was offered rather than only the bound it was credited with. NULL for every signal
+     * that named a single price, and for every row captured before this column existed - which is why it has
+     * no default and nothing is back-filled: an absent range means "this message stated one number", which is
+     * the true reading of a hundred-year-old row too.
+     */
+    ALTER TABLE signals ADD COLUMN IF NOT EXISTS entry_range JSONB;
     ALTER TABLE trades ADD COLUMN IF NOT EXISTS order_type TEXT NOT NULL DEFAULT 'market';
     ALTER TABLE trades ADD COLUMN IF NOT EXISTS expiry_timestamp TIMESTAMPTZ;
     ALTER TABLE trades ADD COLUMN IF NOT EXISTS drift_points NUMERIC;

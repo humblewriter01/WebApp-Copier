@@ -577,7 +577,7 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
                 st.auto_trading_enabled,st.lot_size_mode,st.fixed_lot_size,st.risk_percent,st.max_open_positions,
                 st.max_daily_trades,st.daily_loss_limit,st.execution_account_id,st.block_execution_without_stop_loss,
                 st.block_execution_without_take_profit,st.fallback_stop_loss_points,st.fallback_take_profit_points,
-                st.multiple_target_handling AS "multipleTargetHandling",s.take_profit_levels AS "takeProfitLevels",
+                st.multiple_target_handling AS "multipleTargetHandling",s.take_profit_levels AS "takeProfitLevels",s.entry_range AS "entryRange",
                 st.limit_order_expiry_value AS "limitOrderExpiryValue",st.limit_order_expiry_unit AS "limitOrderExpiryUnit",
                 st.max_slippage_points AS "maxSlippagePoints",
                 ma.metaapi_account_id,ma.managed_by_app,ma.state AS account_state,
@@ -708,6 +708,10 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
           ask,
           stopsLevelPoints: state.specification?.stopsLevel,
           tickSize: state.specification?.tickSize,
+          // An entry the channel published as a zone carries its other bound for one reason: the far edge is
+          // where the setup ends. `pendingOrderPlan` asks that before it asks whether the level would fill,
+          // so a market that has run through the whole zone is refused instead of taken as a bargain.
+          entryRange: item.entryRange,
         });
         if (plan.kind === 'skip') return stop(job, 'skipped', plan.message);
       }
@@ -1000,14 +1004,21 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
          warning, so it is a note and not an error; a limit order that will be cancelled at 14:32 is neither,
          so it is a note too. */
       const notes = [safetyNoteText, planNote];
+      const zoneClause = plan.zone ? ` (the ${item.side === 'buy' ? 'upper' : 'lower'} edge of a ${plan.zone.low} - ${plan.zone.high} entry zone)` : '';
       if (resting) {
         const minutes = Math.round(expiry.windowMs / 60_000);
         const from = expiry.source === 'scalping' ? 'the two-minute scalping window' : (expiry.source === 'default' ? 'the default 30-minute expiry' : `your ${minutes}-minute expiry setting`);
-        notes.push(`${orderType === 'stop' ? 'Stop' : 'Limit'} order placed at ${orderPrice}, valid for ${minutes} minutes (${from}); it will be cancelled automatically if it has not filled by ${new Date(expiry.expiresAt).toISOString().slice(11, 16)} UTC.`);
-      } else if (drift.favourable === true && Number(drift.driftPoints) > 0) {
-        notes.push(`Filled ${drift.driftPoints} points better than the signal price of ${statedEntry}.`);
-      } else if (drift.reason === 'within-drift-guard') {
-        notes.push(drift.message);
+        notes.push(`${orderType === 'stop' ? 'Stop' : 'Limit'} order placed at ${orderPrice}${zoneClause}, valid for ${minutes} minutes (${from}); it will be cancelled automatically if it has not filled by ${new Date(expiry.expiresAt).toISOString().slice(11, 16)} UTC.`);
+      } else {
+        /* A zone that needed no waiting says so on the row, and then says what the fill cost - the two
+           sentences answer different questions ("why is this a market trade when a range was published?" and
+           "was the price I was offered respected?"), so neither replaces the other. */
+        if (plan.readerNote) notes.push(plan.readerNote);
+        if (drift.favourable === true && Number(drift.driftPoints) > 0) {
+          notes.push(`Filled ${drift.driftPoints} points better than the signal price of ${statedEntry}.`);
+        } else if (drift.reason === 'within-drift-guard') {
+          notes.push(drift.message);
+        }
       }
       await updateJob(job.id, job.user_id, resting ? 'pending' : 'executed', null, notes.filter(Boolean).join(' ') || null);
       // Executing for a user counts as activity, so an account that is trading is never
