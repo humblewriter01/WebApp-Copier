@@ -38,7 +38,7 @@ await build({
   bundle: true,
   format: 'esm',
   platform: 'node',
-  external: ['react'],
+  external: ['react', 'react-dom'],
   define: {
     'process.env.NODE_ENV': '"development"',
     'import.meta.env': JSON.stringify({ PROD: false, VITE_API_URL: 'http://localhost:5000' }),
@@ -288,9 +288,15 @@ test('the suspend form acts on the account it was opened for, not on whatever th
     false,
     're-finding the row at submit time does nothing at all once paging or a search replaced that page',
   );
-  // Paging or searching replaces the rows, so an open form pointing at one of them is closed with them.
-  assert.match(panel, /closeSuspensionForm\(\);\n\s+setSearch\(nextSearch\);/);
-  assert.match(panel, /closeSuspensionForm\(\);\n\s+setOffset\(nextOffset\);/);
+  /* A refresh of the list is not a reason to throw the form away. This used to assert the opposite - "paging
+     or searching replaces the rows, so an open form pointing at one of them is closed with them" - and that
+     is exactly the regression it caused: the dialog discarded whatever the administrator had typed because
+     something *behind* it moved. It cannot point at the wrong account, because `startSuspension` captured the
+     id when the dialog opened and the write below uses that id and nothing else, so the safety the old rule
+     was defending is already held elsewhere. The behaviour itself is pinned by a real mount in
+     `admin-modal-interaction.test.mjs`; this pin only keeps the call from creeping back. */
+  assert.equal(/closeSuspensionForm\(\)/.test(panel), false, 'nothing closes the suspension dialog because the list moved');
+  assert.match(panel, /await updateUser\(suspension\.userId, \{ isSuspended: true, suspensionReason: reason \}/, 'the write goes to the account the dialog was opened for');
   // And the dialog names the account, so an administrator can see who is about to be suspended.
   assert.match(panel, /title=\{`Suspend \$\{suspension\.name \|\| 'this account'\}`\}/);
   // It is a dialog over the panel now: a `<form>` after the table could be scrolled out of sight, while a

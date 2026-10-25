@@ -26,7 +26,7 @@ await build({
   bundle: true,
   format: 'esm',
   platform: 'node',
-  external: ['react'],
+  external: ['react', 'react-dom'],
   define: { 'process.env.NODE_ENV': '"development"', 'import.meta.env': '{}' },
   logLevel: 'silent',
 });
@@ -68,7 +68,13 @@ test('the billing page sells the free tier as review-only and the three paid tie
   assert.match(sources.billing, /<h3>Free<\/h3>/);
   assert.match(sources.billing, /No trading accounts/);
   assert.match(sources.billing, /No automated execution/);
-  assert.match(sources.billing, /1 Telegram channel/);
+  // The free card is the one plan card whose numbers are written in the component instead of read from the
+  // catalogue, so it has to be re-pinned whenever Free changes - and it is pinned against the server file
+  // that decides the number, not against a copy of it typed here.
+  assert.match(sources.billing, /2 Telegram channels/);
+  assert.match(sources.billing, /maxTelegramChannels \?\? 2\}/, 'the current-plan strip falls back to the number the server enforces');
+  const freeCatalogue = readFileSync(path.join(here, '..', '..', 'server', 'services', 'billing.js'), 'utf8');
+  assert.match(freeCatalogue, /maxTelegramChannels: 2\b/, 'the card says 2 because the catalogue says 2');
   assert.match(sources.billing, /50 signals per day/);
   assert.doesNotMatch(sources.billing, /<li>1 trading account<\/li>/, 'the old free allowance must not survive');
   assert.match(sources.billing, /Signal capture and review only\. Automated execution and trading accounts need a paid plan\./);

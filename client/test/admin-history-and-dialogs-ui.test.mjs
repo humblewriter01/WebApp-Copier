@@ -31,7 +31,7 @@ await build({
   bundle: true,
   format: 'esm',
   platform: 'node',
-  external: ['react'],
+  external: ['react', 'react-dom'],
   define: { 'process.env.NODE_ENV': '"development"' },
   logLevel: 'silent',
 });
@@ -187,11 +187,79 @@ test('the modal is a form, so Escape and the backdrop cancel and Enter confirms'
   const source = readFileSync(path.join(srcDir, 'components', 'AdminActionModal.jsx'), 'utf8');
   assert.match(source, /className="panel modal admin-action-modal"/, 'it borrows the panel and modal styling rather than inventing a third look');
   assert.match(source, /onSubmit=\{\(event\) => \{ event\.preventDefault\(\); void onSubmit\?\.\(\); \}\}/);
-  assert.match(source, /event\.key === 'Escape' && !busy/);
-  assert.match(source, /event\.target === event\.currentTarget && !busy/, 'a click outside closes it, but not while the write is running');
-  assert.match(source, /querySelector\?\.\('input,select,textarea'\)/, 'focus lands on the first field, so typing starts without another click');
+  assert.match(source, /event\.key === 'Escape' && !live\.current\.busy/, 'Escape cancels, and reads the busy flag at the moment it is pressed');
+  assert.match(source, /event\.target === event\.currentTarget && !busy/, 'a release outside closes it, but not while the write is running');
+  assert.match(source, /pressedOnBackdrop\.current = event\.target === event\.currentTarget/, 'and only if the press started there - a keyboard closing on a phone shifts the layout under the finger');
+  assert.match(source, /querySelector\?\.\('input:not\(\[disabled\]\),select:not\(\[disabled\]\),textarea'\)/, 'focus lands on the first enabled field, so typing starts without another click');
+  // The mechanism the disappearing-form bug was made of: an effect that re-runs per render re-focuses this
+  // first field per keystroke, which pulls the caret out of whatever the administrator is typing into.
+  assert.match(source, /\}, \[open\]\);/, 'and it is placed once per opening, keyed on nothing else');
+  assert.match(source, /!formRef\.current\.contains\(document\.activeElement\)/, 'skipped entirely when focus is already inside the dialog');
 });
 
+/* ------------------------------------------------------------------ the whole panel, against the whole router ------------------------------------------------------------------ */
+
+test('every request the panel makes is a route the server actually mounts, as an admin', () => {
+  // The audit the panel needs is not "does this button look right" but "does the thing behind it exist":
+  // `Retire`, `Restore access`, `Adjust plan` and the rest each call one path with one method, and a route
+  // that was renamed on one side of the boundary only shows up when somebody clicks it in production.
+  // So the paths are read out of the component and matched against the router, parameters and all.
+  const calls = [];
+  const pattern = /request\(\s*['`]([^'`$]+(?:\$\{[^}]*\})?[^'`]*)['`]\s*,\s*token(?:\s*,\s*\{([^}]*)\})?/g;
+  for (const match of panel.matchAll(pattern)) {
+    const [, rawPath, options = ''] = match;
+    if (rawPath.includes('${') && !/^\/api\//.test(rawPath)) continue;
+    const method = /method:\s*'([A-Z]+)'/.exec(options)?.[1] || 'get';
+    // A query string is part of the URL, not of the route: the announcements list asks for `?limit=50` and
+    // the router mounts the path alone. Anything whose query is built at runtime is not a literal to check.
+    if (rawPath.includes('?${')) continue;
+    calls.push({ path: rawPath.split('?')[0], method: method.toLowerCase() });
+  }
+  // `entry.endpoint` is how the three clear buttons reach their paths; they are pinned against
+  // `CLEAR_HISTORY` above, so they are excluded here rather than duplicated.
+  assert.equal(/request\(entry\.endpoint/.test(panel), true, 'the clears still go through the one map');
+  assert.ok(calls.length >= 12, `the sweep found ${calls.length} requests to check, which is the panel's whole surface`);
+  const seen = new Set();
+  for (const { path: clientPath, method } of calls) {
+    const key = `${method} ${clientPath}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const escaped = clientPath.split('/').map((segment) => (segment.includes('${') ? '[^/]+' : segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))).join('/');
+    const route = new RegExp(`app\\.${method}\\('${escaped}'[^)]*authenticate[^)]*requireAdmin`);
+    assert.match(serverRoutes, route, `the panel's ${key} has no admin-guarded route behind it`);
+  }
+});
+
+test('each request reaches the handler it means, not whichever route was declared first', () => {
+  /* Existence is not reachability. The banner history clear was once answered with "Choose a valid
+     announcement." because `DELETE /api/admin/announcements/:id` had been declared first and `history` became
+     an id - every route existed, every test that checked for routes passed, and the button was dead. So each
+     path this panel calls is walked through the router the way Express walks it, in declaration order, first
+     match wins, with the parameters replaced by the sort of value a real click produces. */
+  const DECLARATION = /app\.(get|post|put|patch|delete|all)\(\s*(['"])(\/[^'"]*)\2/g;
+  const matcher = (pattern) => new RegExp(`^${pattern
+    .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+    .replace(/:[A-Za-z_][A-Za-z0-9_]*/g, '[^/]+')}/?$`);
+  const routes = [...serverRoutes.matchAll(DECLARATION)].map((match) => ({ verb: match[1], path: match[3] }));
+  const calls = [];
+  for (const match of panel.matchAll(/request\(\s*['`]([^'`]+)['`]\s*,\s*token(?:\s*,\s*\{([^}]*)\})?/g)) {
+    const [, rawPath, options = ''] = match;
+    if (rawPath.includes('entry.endpoint') || rawPath.includes('?${')) continue;
+    const method = (/method:\s*'([A-Z]+)'/.exec(options)?.[1] || 'GET').toLowerCase();
+    const path = rawPath.split('?')[0];
+    // A path assembled from a template is walked with a value of the shape the panel actually sends, so the
+    // server's own guards cannot be what makes the match - only the order of the routes can.
+    const probe = path.replace(/\$\{[^}]*\}/g, '3f1a2b3c-0000-4000-8000-abcdefabcdef');
+    const reached = routes.find((route) => (route.verb === method || route.verb === 'all') && matcher(route.path).test(probe));
+    // Only a path the panel spells out literally has to be reached by that exact route. One assembled from
+    // a template is matched by a `:param` route by design, and what matters there is the verb, not the id.
+    const wanted = !path.includes('${') && serverRoutes.includes(`app.${method}('${path}'`);
+    assert.ok(reached, `${method.toUpperCase()} ${path} reaches no route at all`);
+    if (wanted) assert.equal(reached.path, path, `${method.toUpperCase()} ${path} is answered by ${reached.verb.toUpperCase()} ${reached.path} instead`);
+    calls.push(path);
+  }
+  assert.ok(calls.length >= 12, `the walk covered ${calls.length} calls, which is the panel's whole surface`);
+});
 test('at 360px the dialog is the screen, and its buttons are thumb-sized', () => {
   const modalRule = /\.admin-action-modal\{[^}]*\}/.exec(styles)?.[0] || '';
   assert.match(modalRule, /max-width:min\(620px,100%\)/, 'it takes the full width a phone has, and no more of a desktop');

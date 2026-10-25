@@ -115,6 +115,9 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   // is the worst failure an admin panel can have - no request, no error, no audit row.
   const [suspension, setSuspension] = useState({ userId: '', name: '', reason: '' });
   const [loading, setLoading] = useState(true);
+  // False only until the first refresh attempt has finished, one way or the other. `loading` on its own is
+  // not a safe thing to gate the panel's content on: it goes true again on every search and every page turn.
+  const [painted, setPainted] = useState(false);
   const [savingPromo, setSavingPromo] = useState(false);
   const [savingPricing, setSavingPricing] = useState(false);
   const [syncingPlans, setSyncingPlans] = useState(false);
@@ -194,7 +197,11 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const loadHealth = useCallback(async (hours) => {
     const windowHours = Number(hours) || 24;
     const data = await request(`/api/admin/health?hours=${encodeURIComponent(String(windowHours))}&limit=25`, token);
-    setHealth(data);
+    /* Shaped here, once, instead of defended at each read: the health payload is the only one on this panel
+     * whose lists are walked without a `?.`, and a render that throws takes the whole tree - and the dialog
+     * open on top of it - down with it. A gateway that answers with something JSON-shaped but not a snapshot
+     * is a real thing that happens to a service waking up on Render. */
+    setHealth({ ...data, checks: data.checks || [], errors: data.errors || [], counts: data.counts || {} });
   }, [token]);
 
   const loadAnnouncements = useCallback(async () => {
@@ -286,6 +293,11 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
       setError(loadError.message);
     } finally {
       setLoading(false);
+      /* The one place that decides whether the panel has content to show at all. It is set in a `finally`,
+       * so a section that failed still counts as read: the alternative - inferring it from `stats` - let a
+       * workspace whose overview request failed sit in a panel where every later refresh swapped the whole
+       * tree for a spinner, closing whatever dialog the administrator was typing into. */
+      setPainted(true);
     }
   }, [loadOverview, loadUsers, loadPromoCodes, loadBilling, loadPricing, loadAnnouncements, search, offset]);
 
@@ -318,7 +330,9 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const applySearch = async (event) => {
     event.preventDefault();
     const nextSearch = searchInput.trim();
-    closeSuspensionForm();
+    // An open Suspend dialog is deliberately left alone here: it holds the id of the account it targets, not
+    // a reference to a row that is about to scroll away, so closing it because the list moved would only
+    // throw away what the administrator had typed.
     setSearch(nextSearch);
     setOffset(0);
     setLoading(true);
@@ -352,7 +366,6 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const changePage = async (direction) => {
     const nextOffset = Math.max(0, offset + direction * PAGE_SIZE);
     if (nextOffset === offset) return;
-    closeSuspensionForm();
     setOffset(nextOffset);
     setLoading(true);
     await loadEverything(search, nextOffset);
@@ -388,7 +401,6 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
 
   const startSuspension = (user) => setSuspension({ userId: user.id, name: user.name || user.email, reason: '' });
   const cancelSuspension = () => setSuspension({ userId: '', name: '', reason: '' });
-  const closeSuspensionForm = () => setSuspension({ userId: '', name: '', reason: '' });
   /**
    * Sends exactly the two fields the endpoint writes: a real boolean and the trimmed reason. The
    * reason is required here as well as on the server, because a blank one is the difference between
@@ -773,7 +785,10 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     }
   };
 
-  if (loading && !stats) return <section className="panel"><div className="loading-shell inline-loading"><div className="spinner" /><span>Loading the admin dashboard…</span></div></section>;
+  // Only ever on the first paint. A refresh - a search, a page turn, the write that just landed - must never
+  // replace the panel with a spinner, because the panel is where the dialogs are opened from and a subtree
+  // that is swapped away takes the open form, and the reason being typed into it, with it.
+  if (!painted) return <section className="panel"><div className="loading-shell inline-loading"><div className="spinner" /><span>Loading the admin dashboard…</span></div></section>;
 
   const currencyCode = pricing?.currency || billing?.summary?.currency || 'NGN';
   const pendingChanges = Object.keys(changedPlans()).length;
