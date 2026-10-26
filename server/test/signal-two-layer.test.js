@@ -157,6 +157,31 @@ test('a complete message never costs a request', async () => {
   assert.equal(parsed.executionReady, true);
 });
 
+test('and it never stands in the reader queue, which is the half that costs seconds', async () => {
+  /* A request that is never made cannot be queued - but "the queue is not on the fast path" is a property of
+     the call site, not of `needsLayer2`, and it is the property a launch depends on. The gate holds at most
+     `maxConcurrent` calls open, so a completed signal that had to wait for a slot would be late for a reason
+     nothing in the parser could see in its own timings. Counting `gate.run` is what keeps that visible: a
+     message Layer 1 finished must never reach it, and a live capture must be served ahead of a replay. */
+  const calls = [];
+  const gate = {
+    async run(task, options = {}) { calls.push(options.priority ?? null); return task(); },
+    summary: () => ({ maxConcurrent: 2, active: 0, waiting: { realtime: 0, replay: 0 }, gated: 0 }),
+  };
+  const fetch = countingFetch(llmReply({ symbol: 'EURUSD', side: 'buy', entry: 1.085, stop_loss: 1.08, take_profit: 1.095 }));
+  const complete = await parseSignalTwoLayer('BUY EURUSD\nEntry: 1.0850\nSL: 1.0800\nTP: 1.0950', { source: 'telegram', config: CONFIG, fetchImpl: fetch.fetchImpl, logger: { warn() {}, info() {} }, gate });
+  assert.equal(complete.parsed.executionReady, true, 'the deterministic read stands on its own');
+  assert.deepEqual(calls, [], 'and no queue entry was made for it');
+  assert.equal(fetch.calls.length, 0, 'nor a request');
+
+  const missingLeg = 'BUY EURUSD Entry 1.0850 TP 1.0950 - stop should be 1.0800';
+  const live = await parseSignalTwoLayer(missingLeg, { source: 'telegram', config: CONFIG, fetchImpl: fetch.fetchImpl, logger: { warn() {}, info() {} }, gate, priority: 'realtime' });
+  assert.deepEqual(calls, ['realtime'], 'the message that needs the model is the one that asks, once');
+  assert.equal(live.provenance.llmUsed, true, 'and it is the row that got the answer');
+  await parseSignalTwoLayer(missingLeg, { source: 'telegram', config: CONFIG, fetchImpl: fetch.fetchImpl, logger: { warn() {}, info() {} }, gate, priority: 'replay' });
+  assert.deepEqual(calls, ['realtime', 'replay'], 'a catch-up replay queues behind it, in its own lane, and is given up on rather than allowed to hold a live signal');
+});
+
 test('a price the model invented is refused, and the row goes to review', async () => {
   /* The message states no stop at all. A model that answers 7.77 - a number nowhere in the text - is not
      reading, it is filling a template, and this is the single rule that makes it safe to have a language

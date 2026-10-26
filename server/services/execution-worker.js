@@ -7,12 +7,31 @@ function safeWorkerError(error) {
     .slice(0, 1000);
 }
 
-export function createExecutionWorker({ pool, engine, pollIntervalMs = 1200, staleLockMs = 5 * 60_000, logger = console }) {
+/**
+ * The queue, drained as fast as it can be and never faster than the broker's own protection sweeps.
+ *
+ * `pollIntervalMs` is the *idle* wait, not the delay a signal sits in: the moment the capture path writes a
+ * queued job it calls `notify()`, which starts a pass on the spot. Before that wake-up existed, the first order
+ * of a quiet minute waited for the next tick - up to 1.2 s of a 120 s window in which the price the channel
+ * published is still the price the trader meant. A pass that claimed a job also goes straight into the next one,
+ * bounded by `followUpLimit`, so a burst of signals is drained in consecutive round trips instead of one per
+ * interval; the bound is what keeps a busy channel from starving the break-even and scale-out sweeps that the
+ * same loop carries for positions already open.
+ */
+export function createExecutionWorker({ pool, engine, pollIntervalMs = 1200, staleLockMs = 5 * 60_000, logger = console, followUpLimit = 8 } = {}) {
   if (!pool?.connect || !pool?.query || typeof engine?.processJob !== 'function') throw new TypeError('Execution worker dependencies are incomplete.');
   let stopped = true;
   let timer = null;
   let active = null;
   let jobsSinceSweep = 0;
+  /* Set by `notify()` when a pass is already in flight: the pass that is running goes into another one as soon
+     as it finishes, so a signal arriving mid-sweep is not queued behind the next interval as well. */
+  let wakeRequested = false;
+  let followOns = 0;
+  /* Whether a pass is in flight *for the scheduler*, which is not the same question as `active` (the promise the
+     stop path awaits): between the await and the next scheduling decision the pass is over but nothing has been
+     queued yet, and a `notify()` landing there must not start a second one. */
+  let running = false;
 
   async function expireOldJobs() {
     await pool.query(
@@ -119,34 +138,71 @@ export function createExecutionWorker({ pool, engine, pollIntervalMs = 1200, sta
          * keeps a single stale-account failure from being able to stop the protection sweeps behind it. */
         await runSweep('Resting order sweep', engine.sweepExpiredOrders, 'attempted');
       }
+      return { claimed: Boolean(job) };
     } catch (error) {
       logger.error?.(JSON.stringify({ level: 'error', message: 'Execution worker iteration failed', error: safeWorkerError(error) }));
+      return { claimed: false };
     }
   }
 
   async function tick() {
-    if (stopped) return;
+    if (stopped || running) return;
+    running = true;
     active = runOnce();
-    await active;
-    active = null;
-    if (!stopped) {
-      timer = setTimeout(tick, pollIntervalMs);
-      timer.unref?.();
+    let result;
+    try {
+      result = await active;
+    } finally {
+      active = null;
+      running = false;
     }
+    if (stopped) return;
+    /* Two reasons to run again without waiting: somebody queued a job while this pass was working, or this pass
+       took a job and there may be another one behind it. The chain is bounded twice over - `followUpLimit`
+       caps how many claimed passes may follow one another, and a pass that claimed nothing resets the count -
+       so a busy channel cannot hold the break-even and scale-out sweeps at arm's length. */
+    const woken = wakeRequested;
+    const more = result?.claimed === true && followOns + 1 < followUpLimit;
+    if (woken || more) {
+      followOns = more && !woken ? followOns + 1 : 0;
+      wakeRequested = false;
+      void tick().catch(() => {});
+      return;
+    }
+    followOns = 0;
+    wakeRequested = false;
+    timer = setTimeout(() => { void tick().catch(() => {}); }, pollIntervalMs);
+    timer.unref?.();
+  }
+
+  /**
+   * "There is work now." Called by the capture path the instant a job is queued, and safe to call from anywhere:
+   * it never runs a second pass at once, never throws, and does nothing while the worker is stopped.
+   */
+  function notify() {
+    if (stopped) return false;
+    wakeRequested = true;
+    if (running) return true;
+    if (timer) { clearTimeout(timer); timer = null; }
+    followOns = 0;
+    void tick().catch(() => {});
+    return true;
   }
 
   function start() {
     if (!stopped) return;
     stopped = false;
-    void tick();
+    void tick().catch(() => {});
   }
 
   async function stop() {
     stopped = true;
+    wakeRequested = false;
+    followOns = 0;
     if (timer) clearTimeout(timer);
     timer = null;
     if (active) await active.catch(() => {});
   }
 
-  return { start, stop, runOnce, claimOne };
+  return { start, stop, runOnce, claimOne, notify };
 }

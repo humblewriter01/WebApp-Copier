@@ -16,7 +16,7 @@ import { build } from 'esbuild';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
-import { FRIENDLY_NOTES, TECHNICAL_NOTE_MARKERS, friendlySignalNote, isTechnicalNote, signalOutcomeView } from '../src/lib/signal-outcome.js';
+import { FRIENDLY_NOTES, TECHNICAL_NOTE_MARKERS, friendlySignalNote, isTechnicalNote, signalOutcomeView, signalsAwaitingUpgrade } from '../src/lib/signal-outcome.js';
 import { autoTradingBannerView } from '../src/lib/platform-view.js';
 import * as serverWording from '../../server/services/signal-wording.js';
 import {
@@ -53,6 +53,7 @@ function bundle(name) {
 
 const { default: SignalTable } = await bundle('SignalTable.jsx');
 const { default: AdvancedSettings } = await bundle('AdvancedSettings.jsx');
+const appSource = readFileSync(path.join(here, '..', 'src', 'App.jsx'), 'utf8');
 const metaApiPanelSource = readFileSync(path.join(here, '..', 'src', 'components', 'MetaApiPanel.jsx'), 'utf8');
 
 const captured = (extra = {}) => ({
@@ -64,7 +65,7 @@ const captured = (extra = {}) => ({
   status: 'unexecuted', parseError: null, executionNote: null, createdAt: '2026-10-25T09:00:00.000Z', ...extra,
 });
 
-const renderRow = (signal) => renderToStaticMarkup(React.createElement(SignalTable, { signals: [signal] }));
+const renderRow = (signal, props = {}) => renderToStaticMarkup(React.createElement(SignalTable, { signals: [signal], ...props }));
 
 /* --------------------------------------------------------------- nothing technical reaches the screen */
 
@@ -232,4 +233,27 @@ test('an order outcome and an account note are read by the same rule as a signal
   assert.match(markup, /The broker declined this order\.|The platform could not finish processing it\./, 'and each raw answer is replaced by a sentence about the order');
   // The account card fetches its own rows, so it is pinned where the field is rendered rather than in markup.
   assert.match(metaApiPanelSource, /friendlySignalNote\(account\.executionNote\)/, 'the account note goes through the same filter');
+});
+
+test('the pair the Overview shows for a Free workspace: banner and card, one answer', () => {
+  /* The report this pins: the banner had been right and the card wrong for the same workspace. The fix is on
+     the read path - `withLiveBlockers` re-decides a row whose stored sentence belongs to the registry - so what
+     the client has to guarantee is narrower and worth stating anyway: given the pair the server now produces,
+     the two halves say the same thing, the card offers the way out, and nothing on the screen blames a switch
+     that is on. */
+  const free = { autoTradingEnabled: true, runtimeEnabled: true, platformPause: null, linkedAccounts: [], executionAccountId: '', subscriptionStatus: 'free' };
+  const banner = autoTradingBannerView(free);
+  const row = captured({ status: 'unexecuted', executionReady: true, executionNote: PLAN_NO_EXECUTION_NOTE });
+  const markup = renderRow(row, { onUpgrade: () => {} });
+
+  assert.equal(banner.state, 'plan', 'the banner is on the plan, not on the account or the platform');
+  assert.match(markup, new RegExp(PLAN_NO_EXECUTION_NOTE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'and the card carries the same sentence, word for word');
+  assert.match(markup, /See plans/, 'with the one action that resolves it');
+  assert.equal(/Auto-Trading is off/.test(markup), false, 'and no leftover sentence about a switch nobody has touched');
+  assert.equal(signalsAwaitingUpgrade([row]), true, 'the history note above the list is shown for exactly this row');
+
+  const upgraded = autoTradingBannerView({ ...free, subscriptionStatus: 'active' });
+  assert.notEqual(upgraded.state, 'plan', 'turn the plan on and the banner moves to the account');
+  assert.equal(signalOutcomeView(captured({ executionNote: PLAN_NO_EXECUTION_NOTE })).upgradeRequired, true, 'while a row that is still quoting the plan keeps saying so - a stale sentence is a lie, not a history');
+  assert.match(appSource, /subscriptionStatus: dashboard\?\.subscription\?\.status \?\? null/, 'both halves are built from the one field the dashboard read returns');
 });

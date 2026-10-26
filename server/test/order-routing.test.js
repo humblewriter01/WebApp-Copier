@@ -284,3 +284,24 @@ test('a market order is never asked about the zone, because it is not waiting fo
   // telling the platform to take the market, and the drift guard - not the zone - is the rule that judges it.
   assert.deepEqual(pendingOrderPlan({ orderType: 'market', entryPrice: 4026, side: 'buy', bid: 4010, ask: 4010.2, entryRange: ZONE }), { kind: 'market', reason: 'channel asked for the market' });
 });
+
+test('crediting a zone at its worst bound is what keeps every fill inside the zone acceptable', () => {
+  /* The row is anchored at 4016.70 - the bottom of a sell's published zone - and that choice is load-bearing
+     for the drift guard, which measures the fill against the anchor and treats an adverse gap as slippage.
+     For a short, "adverse" means selling for less. Anchoring at the top instead would make the fills the
+     channel itself published - anywhere below it inside the zone - a 700-point breach of a guard set for
+     ordinary market noise, and the order would be refused for being filled where it was told to be filled. */
+  const ZONE = { low: 4016.7, high: 4023.7 };
+  const guard = { maxSlippagePoints: 30, tickSize: 0.01 };
+  for (const bid of [ZONE.low, 4020.0, ZONE.high]) {
+    const drift = marketSlippage({ side: 'sell', desired: ZONE.low, bid, ask: bid + 0.02, ...guard });
+    assert.equal(drift.action, 'execute', `a fill at ${bid} inside the published zone is taken, not judged`);
+    assert.equal(drift.favourable, bid >= ZONE.low, 'and every one of them reads as favourable or neutral against the anchor');
+  }
+  const flipped = marketSlippage({ side: 'sell', desired: ZONE.high, bid: ZONE.low, ask: ZONE.low + 0.02, ...guard });
+  assert.equal(flipped.action, 'skip', 'the best bound as the anchor refuses the bottom of the same zone');
+  assert.equal(flipped.reason, 'drift-exceeded', 'and says it is a slippage problem, which is the bug in disguise');
+  // A market order at a quote that has left the zone on the wrong side is still refused, anchor or no anchor.
+  const gone = marketSlippage({ side: 'sell', desired: ZONE.low, bid: 4000.0, ask: 4000.02, ...guard });
+  assert.equal(gone.action, 'skip', 'a market that fell 16 dollars through the zone is not a fill the channel described');
+});

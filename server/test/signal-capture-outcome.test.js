@@ -50,9 +50,11 @@ test('the capture path asks the database for the switch on every message, and re
      row, not from anything held in a variable between calls. A cache here would be defensible design (a
      setting that changes mid-signal is its own hazard), but it does not exist, and this pin is what keeps
      somebody from adding one quietly. */
-  const readAt = saveSignalBody.indexOf('await pool.query(SIGNAL_OUTCOME_CONTEXT_SQL, [userId])');
+  const readAt = saveSignalBody.indexOf('pool.query(SIGNAL_OUTCOME_CONTEXT_SQL, [userId])');
   assert.ok(readAt > 0, 'the workspace switch is read from `settings` inside saveSignal, through the one statement built for it');
-  assert.ok(readAt < saveSignalBody.indexOf('decideSignalOutcome({'), 'after the row is stored, before the outcome is decided');
+  assert.ok(readAt < saveSignalBody.indexOf('decideSignalOutcome({'), 'before the outcome is decided');
+  assert.ok(readAt > saveSignalBody.indexOf('INSERT INTO signals'), 'and after the row is stored, so a toggle during a slow parse is answered from the state at the moment of the annotation');
+  assert.match(saveSignalBody, /const \[contextResult, pausedNow\] = await Promise\.all\(\[/, 'the switch read and the kill-switch read are issued in one window, not two');
   assert.match(saveSignalBody, /autoTradingEnabled: context\.autoTrading === true/, 'and the decision is built from that read');
   assert.match(saveSignalBody, /accountSelected: Boolean\(context\.executionAccountId\)/, 'as is whether an account is selected at all');
   assert.equal(/let (cached)?autoTrading\b/.test(index), false, 'no module-level copy of the switch exists to go stale');
@@ -60,7 +62,9 @@ test('the capture path asks the database for the switch on every message, and re
   // same one: a banner and a row that disagree about the account are only possible if they ask separately.
   const outcomeService = readFileSync(new URL('../services/signal-outcome.js', import.meta.url), 'utf8');
   assert.match(outcomeService, /export const SIGNAL_OUTCOME_CONTEXT_SQL = `SELECT s\.auto_trading_enabled AS autoTrading/);
-  assert.equal((index.match(/pool\.query\(SIGNAL_OUTCOME_CONTEXT_SQL/g) || []).length, 2, 'queried twice: the capture, and the read helper every list route goes through');
+  assert.equal((index.match(/pool\.query\(SIGNAL_OUTCOME_CONTEXT_SQL/g) || []).length, 1, 'the capture asks once per message, and keeps no other copy of the read');
+  assert.match(index, /createSignalOutcomeReader\(\{/, 'the routes that display rows go through the reader beside the decision it feeds, rather than a second one here');
+  assert.equal((outcomeService.match(/pool\.query\(SIGNAL_OUTCOME_CONTEXT_SQL/g) || []).length, 1, 'and that reader issues the statement exactly once, for every list it is applied to');
   /* The one auto-trading value that IS read once, at boot, is the deployment's runtime flag - and it is used
      as itself, never as the user\'s switch. Conflating the two is how "it is on but nothing trades" starts. */
   assert.match(saveSignalBody, /runtimeEnabled: autoTradingRuntimeEnabled/, 'the runtime flag is passed separately');
@@ -187,6 +191,16 @@ test('only a fully eligible Telegram signal is queued, and a hand-written note n
   const unparsed = decideSignalOutcome({ ...eligible, executionReady: false });
   assert.equal(unparsed.status, SIGNAL_STATUSES.unparsed);
   assert.equal(unparsed.note, null);
+});
+
+test('a queued signal is handed to the worker on the spot, and the emit is not held up by the order', () => {
+  const queueAt = saveSignalBody.indexOf("INSERT INTO execution_jobs(user_id,signal_id,status,expires_at)");
+  const notifyAt = saveSignalBody.indexOf('executionWorker.notify()');
+  const emitAt = saveSignalBody.indexOf("emit('signal:received'");
+  assert.ok(queueAt > 0 && notifyAt > queueAt, 'the wake-up follows the statement that put the job in the table, and cannot run before there is anything to claim');
+  assert.ok(emitAt > notifyAt, 'and it is fire-and-forget: the row reaches the browser on the same tick, not after the broker answers');
+  assert.equal(/await executionWorker\.notify|notify\(\)\.then/.test(saveSignalBody), false, 'nothing awaits it, so a slow order cannot delay a delivery');
+  assert.ok(saveSignalBody.indexOf('if (outcome.queue) {') < notifyAt, 'inside the queueing branch only - a row that will never trade does not wake the loop');
 });
 
 test('capture runs before any execution decision, so a signal cannot be lost to a plan or an account', () => {

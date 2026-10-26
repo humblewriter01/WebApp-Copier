@@ -35,7 +35,7 @@ import { createBillingService } from './services/billing-service.js';
 import { createPricingStore, normalizePricingUpdate, normalizeBillingSettings, planChargeDecision, publicPricing } from './services/pricing.js';
 import { createPlanSynchronizer } from './services/plan-sync.js';
 import { planLimitsFor, buildLimitError } from './services/plan-limits.js';
-import { SIGNAL_OUTCOME_CONTEXT_SQL, decideSignalOutcome, overlayLiveBlocker } from './services/signal-outcome.js';
+import { SIGNAL_OUTCOME_CONTEXT_SQL, createSignalOutcomeReader, decideSignalOutcome, overlayLiveBlocker } from './services/signal-outcome.js';
 import { friendlySignalNote } from './services/signal-wording.js';
 import {
   createInactivityService, daysInactiveSince,
@@ -347,38 +347,14 @@ function scaleOutLadder(parsed) {
   return levels.length > 1 ? JSON.stringify(levels) : null;
 }
 
-/**
- * The live picture behind "could this workspace trade right now?", read the same way when a signal is captured
- * and when a list of them is displayed.
- *
- * Returning `null` on a failed read is the point of the function. An unknown pause is not a reason to tell
- * somebody their platform is paused, and an unknown plan is not a reason to tell them to pay: when any part of
- * the picture is missing, the rows keep the sentences they were given at capture and nothing is re-derived.
- */
-async function readOutcomeContext(userId) {
-  const [context, pause] = await Promise.all([
-    pool.query(SIGNAL_OUTCOME_CONTEXT_SQL, [userId]),
-    platformControls.read().catch(() => null),
-  ]);
-  const row = context.rows[0];
-  if (!row || !pause) return null;
-  return {
-    autoTradingEnabled: row.autoTrading === true,
-    runtimeEnabled: autoTradingRuntimeEnabled,
-    paused: pause.state !== 'live',
-    subscriptionStatus: row.subscriptionStatus,
-    accountSelected: Boolean(row.executionAccountId),
-    accountState: row.accountState,
-  };
-}
-
-/** Re-derives the blocker sentence on rows that carry one, for the routes that show a list of signals. */
-async function withLiveBlockers(userId, rows) {
-  if (!Array.isArray(rows) || !rows.some((row) => row?.executionNote)) return rows;
-  const context = await readOutcomeContext(userId).catch(() => null);
-  if (!context) return rows;
-  return rows.map((row) => overlayLiveBlocker(row, context));
-}
+/* The re-decision a list route performs is not written here: it is a factory over the same `overlayLiveBlocker`
+   the write path uses, so the read can be driven from a test without booting this file, and so the Overview and
+   the Signals tab cannot grow two different answers to one question. */
+const { withLiveBlockers } = createSignalOutcomeReader({
+  pool,
+  platformControls,
+  runtimeEnabled: () => autoTradingRuntimeEnabled,
+});
 
 async function saveSignal(userId, message, channel = {}) {
   const source = channel.source === 'manual' ? 'manual' : 'telegram';
@@ -390,16 +366,30 @@ async function saveSignal(userId, message, channel = {}) {
   /* The one thing that has to be known before the row is written is how strict this workspace wants
      capture to be. Nothing about the plan, the trading account, or the runtime belongs here: the
      message is stored whatever those say, and they decide only what happens afterwards. */
-  const { rows: guardRows } = await pool.query(
-    'SELECT lot_size_mode AS lotSizeMode,block_execution_without_stop_loss AS blockExecutionWithoutStopLoss,block_execution_without_take_profit AS blockExecutionWithoutTakeProfit,fallback_stop_loss_points AS fallbackStopLossPoints,fallback_take_profit_points AS fallbackTakeProfitPoints FROM settings WHERE user_id=$1 LIMIT 1',
-    [userId],
-  );
-  const guard = guardRows[0] || {};
-  /* Both layers, in order, and the review decision with them. This is the only place the model is asked
-     anything, and it is deliberately before the insert: the row a reader sees later is the row that was
-     written, provenance and all, rather than a row that got upgraded after the fact by whatever the fallback
-     layer managed to read while the dashboard was already showing it. */
-  const { parsed, review, provenance } = await parseSignalTwoLayer(savedText, { source, config: parserConfig, logger: serviceLogger, gate: llmGate, priority: llmPriority });
+  const guardSql = 'SELECT lot_size_mode AS lotSizeMode,block_execution_without_stop_loss AS blockExecutionWithoutStopLoss,block_execution_without_take_profit AS blockExecutionWithoutTakeProfit,fallback_stop_loss_points AS fallbackStopLossPoints,fallback_take_profit_points AS fallbackTakeProfitPoints FROM settings WHERE user_id=$1 LIMIT 1';
+  /* The one read that has to happen before the parse is the workspace's own strictness, so it does not happen
+     *before* the parse: the two are issued together and the row is written as soon as both are back. A third
+     round trip used to sit in front of every captured message, which on a quiet workspace is a millisecond and
+     on a busy one is a place in the pool queue in front of a signal that is already late.
+
+     What the parse is not joined by is the plan, the account and the kill switch - those are read after the
+     insert, deliberately, so a workspace that toggles Auto-Trading on while a slow message is being read is
+     answered from the state at the moment the row is annotated rather than the moment it arrived. Failures are
+     captured rather than thrown so a rejection cannot become unhandled while the parse is still running; the
+     await below is where any of them surfaces. */
+  const prelude = Promise.all([
+    pool.query(guardSql, [userId]),
+    parseSignalTwoLayer(savedText, { source, config: parserConfig, logger: serviceLogger, gate: llmGate, priority: llmPriority }),
+  ]).then((value) => ({ value }), (error) => ({ error }));
+  /* Both layers, in order, and the review decision with them. The model is asked here and nowhere else, and
+     only when Layer 1 could not finish the message - a signal the regex reading completed is never held up by a
+     provider call, and the row a reader sees later is the row that was written, provenance and all, rather than
+     a row upgraded after the fact by whatever the fallback layer managed to read while the panel was already
+     showing it. */
+  const pre = await prelude;
+  if (pre.error) throw pre.error;
+  const [guardResult, { parsed, review, provenance }] = pre.value;
+  const guard = guardResult.rows[0] || {};
   /* Which refusals this workspace's own safety rules can answer: a fallback distance may complete a leg
      the channel forgot, an override may send the order without it, and neither is true when the block is
      up and no net is set. A direction inferred from the prices never becomes eligible at all - reading a
@@ -444,9 +434,16 @@ async function saveSignal(userId, message, channel = {}) {
      the execution runtime and the platform switch decide only whether a job is queued, and the
      outcome recorded on the signal row. A free workspace with no MetaAPI account therefore
      captures every message exactly like a paid one and sees it as unexecuted, instead of the
-     listener staying quiet because trading could never have started. */
-  const { rows: contextRows } = await pool.query(SIGNAL_OUTCOME_CONTEXT_SQL, [userId]);
-  const context = contextRows[0] || {};
+     listener staying quiet because trading could never have started.
+
+     The two reads the decision needs are independent of each other, so they are issued together: on a stalled
+     pool the pause check used to be a second round trip paid for after the first one, for a value that only
+     decides a sentence - the engine asks `isTradingPaused` again when it claims the job. */
+  const [contextResult, pausedNow] = await Promise.all([
+    pool.query(SIGNAL_OUTCOME_CONTEXT_SQL, [userId]),
+    platformControls.isPaused().catch(() => true),
+  ]);
+  const context = contextResult.rows[0] || {};
   const deliverable = source === 'telegram' && Boolean(telegramMessageId) && executionReady;
   const outcome = decideSignalOutcome({
     manual: !deliverable,
@@ -455,26 +452,35 @@ async function saveSignal(userId, message, channel = {}) {
     runtimeEnabled: autoTradingRuntimeEnabled,
     // A pause and an upgrade are only worth mentioning for a signal that could have traded;
     // a note on a manual entry or an unparseable message would just be noise.
-    paused: deliverable ? await platformControls.isPaused().catch(() => true) : false,
+    paused: deliverable ? pausedNow === true : false,
     subscriptionStatus: context.subscriptionStatus,
     accountSelected: Boolean(context.executionAccountId),
     accountState: context.accountState,
   });
+  if (outcome.status !== signal.status || (outcome.note || '') !== (signal.executionNote || '')) {
+    /* The decision sentence goes through the same filter as everything else that reaches a row. Today
+       `decideSignalOutcome` is clean by construction; the filter is what turns that into a property of the write
+       path rather than a promise about one module, and a sentence that ever carries internals is stored clean
+       with its raw text beside it instead of on the card.
+
+       This happens before the job exists, on purpose. The engine mirrors an order's outcome onto the same two
+       columns, and a row that was queued and then annotated would be able to arrive *after* that mirror and
+       write 'queued' over 'executed' - a signal that traded, displayed as one that did not. Annotate, then
+       hand it over, and the two writers can only ever run in that order. */
+    const recordedNote = friendlySignalNote(outcome.note, { fallback: '' });
+    const { rows: recorded } = await pool.query('UPDATE signals SET status=$2,execution_note=$3,technical_note=COALESCE($4,technical_note) WHERE id=$1 RETURNING status,execution_note AS "executionNote"', [signal.id, outcome.status, recordedNote.text || null, recordedNote.original]);
+    if (recorded[0]) Object.assign(signal, recorded[0]);
+  }
   if (outcome.queue) {
     await pool.query(
       `INSERT INTO execution_jobs(user_id,signal_id,status,expires_at)
        VALUES($1,$2,'queued',NOW()+INTERVAL '2 minutes') ON CONFLICT(signal_id) DO NOTHING`,
       [userId, signal.id],
     );
-  }
-  if (outcome.status !== signal.status || (outcome.note || '') !== (signal.executionNote || '')) {
-    /* The decision sentence goes through the same filter as everything else that reaches a row. Today
-       `decideSignalOutcome` is clean by construction; the filter is what turns that into a property of the write
-       path rather than a promise about one module, and a sentence that ever carries internals is stored clean
-       with its raw text beside it instead of on the card. */
-    const recordedNote = friendlySignalNote(outcome.note, { fallback: '' });
-    const { rows: recorded } = await pool.query('UPDATE signals SET status=$2,execution_note=$3,technical_note=COALESCE($4,technical_note) WHERE id=$1 RETURNING status,execution_note AS "executionNote"', [signal.id, outcome.status, recordedNote.text || null, recordedNote.original]);
-    if (recorded[0]) Object.assign(signal, recorded[0]);
+    /* The order is not waited for - it is *started*. Waking the worker here is what turns "queued" into "on the
+       way to the broker" in the same event-loop turn instead of on the next poll, and it is fire-and-forget by
+       design: an order that takes a second must not hold up the row the trader is waiting to see. */
+    executionWorker.notify();
   }
   io.to(`user:${userId}`).emit('signal:received', signal);
   return signal;
