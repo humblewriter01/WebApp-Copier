@@ -523,7 +523,13 @@ const telegramCapture = createTelegramListener({
   /* The listener decides *when* a stream is not a stream; only this file can rebuild one, because a rebuild is a
      disconnect, a fresh authorized client, a re-attach and a replay. Handing the callback down instead of
      importing it keeps the watchdog testable without a server: a test injects a spy and asserts that it fired. */
-  onDeadStream: (userId, reason) => restoreTelegramClient(userId, { reason }),
+  /* The listener decides *when* a stream is not a stream; only this file can rebuild one, because a rebuild is
+     a disconnect, a fresh authorized client, a re-attach and a replay. Handing the callback down instead of
+     importing it keeps the watchdog testable without a server: a test injects a spy and asserts it fired.
+     `force` is the human override - the cooldown protects Telegram from a watchdog that misread a quiet channel,
+     and it has no argument with an operator reading the evidence - and a restore retakes the beat's baseline,
+     because a session that starts from zero counters would otherwise be accused of its own first minute. */
+  onDeadStream: (userId, reason, { force = false } = {}) => restoreTelegramClient(userId, { reason, force }),
 });
 const startTelegramListener = (userId, client) => telegramCapture.startTelegramListener(userId, client);
 
@@ -582,7 +588,7 @@ function telegramCaptureTransport() {
   return { wss: true, options: { ...base, useWSS: true } };
 }
 
-async function restoreTelegramClient(userId, { reason = 'restore' } = {}) {
+async function restoreTelegramClient(userId, { reason = 'restore', force = false } = {}) {
   const current = telegramClients.get(userId);
   if (current?.client?.connected === true && current.handler && telegramCapture.handlerIsLive(current.client, current.handler)) return current.client;
   if (current?.client && current.client.connected !== true) {
@@ -623,6 +629,7 @@ async function restoreTelegramClient(userId, { reason = 'restore' } = {}) {
     return null;
   }
   telegramClients.set(userId, { client, handler: null, stats: telegramCapture.EMPTY_STATS() });
+  telegramCapture.resetStreamBaseline(userId);
   await startTelegramListener(userId, client);
   await pool.query('UPDATE users SET telegram_connected=TRUE WHERE id=$1', [userId]);
   telegramCapture.markSessionResumed();
@@ -711,6 +718,56 @@ async function beatTelegramStreams({ reason = 'interval' } = {}) {
     log('warn', 'Telegram heartbeat cycle failed', { reason, error: `${error?.message || error}`.slice(0, 200) });
     return null;
   }
+}
+
+/**
+ * The operator's override, for the case the panel says "Listening" while nothing arrives.
+ *
+ * This is the one reconnect that does not depend on a detector being right, and it is deliberately outside the
+ * watchdog's throttle: a rebuild is a disconnect, a fresh authorized client, a re-attach and a replay of the
+ * backlog, which is exactly what a person wants when the logs already show a stream that is not delivering. The
+ * answer carries what that replay found, because the honest response to "reconnect it" is "the session is new,
+ * and here is what it had to catch up on" rather than `ok`. Both halves of the audit row matter here: "someone
+ * forced this at 14:02" is the first question after a rebuild that fixed something, and "we rebuilt it by hand
+ * twice" is the answer that rules the server out.
+ */
+async function forceTelegramReconnect(userId, { reason = 'manual-reconnect', actorId = null, actorEmail = null } = {}) {
+  let client;
+  try {
+    client = await restoreTelegramClient(userId, { reason, force: true });
+  } catch (error) {
+    log('warn', 'Telegram forced reconnect failed', { userId, actorId, reason, error: `${error?.message || error}`.slice(0, 200) });
+    const failure = new Error('Telegram did not accept the new connection.');
+    failure.telegramReconnectFailed = true;
+    failure.cause = error;
+    throw failure;
+  }
+  if (!client) {
+    const missing = new Error('There is no saved Telegram session to reconnect.');
+    missing.telegramNoSession = true;
+    throw missing;
+  }
+  const capture = telegramCapture.heartbeatSummary();
+  const outcome = await telegramCapture.runCatchUp(userId).catch((error) => {
+    // The reconnect itself landed, and a backlog read that fails afterwards is a note on the response rather
+    // than a failure of the action: the re-attach already flagged the catch-up, so the next sweep takes it from
+    // here, and saying so is what stops a person pressing the button twice.
+    log('warn', 'Telegram backlog after a forced reconnect did not run', { userId, error: error.message });
+    return null;
+  });
+  const caughtUp = Number(outcome?.stored) || 0;
+  const fresh = Number(outcome?.fresh) || 0;
+  await auditLog.record({
+    actorId,
+    actorEmail,
+    action: 'telegram.reconnectForced',
+    targetType: 'user',
+    targetId: userId,
+    summary: `Reconnected a workspace's Telegram session by hand and replayed its channels: ${caughtUp} missed message(s) stored, ${fresh} of them posted while the old handler was already attached.`,
+    metadata: { reason, caughtUp, fresh, heartbeatCycles: capture.cycles, deadBeats: capture.dead, stalledBeats: capture.stalled },
+  }).catch((error) => log('warn', 'Telegram forced reconnect could not be audited', { userId, error: error.message }));
+  log('warn', 'Telegram session reconnected by hand', { userId, actorId, reason, caughtUp, fresh, heartbeatCycles: capture.cycles, deadBeats: capture.dead, stalledBeats: capture.stalled });
+  return { caughtUp, fresh, heartbeat: { cycles: capture.cycles, dead: capture.dead, stalled: capture.stalled } };
 }
 
 /** Re-attach anything in memory that has lost its handler, and run the catch-up it flagged. */
@@ -1633,11 +1690,28 @@ app.post('/api/billing/webhook', webhookLimiter, asyncRoute(async (req, res) => 
  * the role is removed.
  */
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/*
+ * The columns the admin panel is allowed to see about an account, in one list because the list is read by the
+ * user table, the user detail, the impersonation hand-off and the row it just refreshed - and a column that
+ * exists in one of those and not the others is how a panel ends up rendering `undefined` as a fact.
+ *
+ * `telegramConnected` and `monitorCount` are here for the same reason they are on the row at all: the panel offers
+ * a manual Telegram reconnect, and a button that can only fail on an account that never linked Telegram is worse
+ * than no button, while a missing button on an account with three monitored channels is the reason somebody ends
+ * up reading logs at 2am. A linked session watching no channel is a different problem from a linked session that
+ * has stopped hearing, and the count is what tells them apart before the click. Every camelCase alias here is
+ * quoted: Postgres folds an unquoted one to lowercase, the property arrives `undefined`, and the client then
+ * states something false with a straight face - which is exactly how "Auto-Trading is off" once appeared on every
+ * row in the table.
+ */
 const adminUserColumns = `u.id,u.name,u.email,u.role,u.subscription_status AS "subscriptionStatus",
   u.subscription_plan AS "subscriptionPlan",u.is_suspended AS "isSuspended",
   u.suspension_reason AS "suspensionReason",u.created_at AS "createdAt",u.last_login AS "lastLogin",
   u.last_active_at AS "lastActiveAt",
   (u.supabase_user_id IS NOT NULL) AS "authLinked",
+  u.telegram_connected AS "telegramConnected",
+  (SELECT COUNT(*)::int FROM channels c WHERE c.user_id=u.id AND c.enabled=TRUE) AS "monitorCount",
+
   (SELECT COUNT(*)::int FROM signals s WHERE s.user_id=u.id) AS "signalCount",
   (SELECT s.current_period_end FROM subscriptions s WHERE s.user_id=u.id) AS "periodEnd",
   (SELECT s.status FROM subscriptions s WHERE s.user_id=u.id) AS "subscriptionRowStatus",
@@ -2452,6 +2526,26 @@ app.delete('/api/admin/announcements/:id', authenticate, requireAdmin, asyncRout
  * A support session is a one-hour, read-only token minted by an administrator. It never reads,
  * resets, or references the customer's password, and closing it revokes the token server-side.
  */
+/* The manual reconnect, for the moment an operator has already read the heartbeat counters and decided the
+   stream is dead. It answers with what the backlog recovery found rather than `ok`, and it is the one path in
+   this file that steps around the rebuild cooldown - by design, and only for an authenticated admin. */
+app.post('/api/admin/users/:id/telegram/reconnect', authenticate, requireAdmin, adminRoute('Reconnecting a Telegram session by hand', async (req, res) => {
+  const target = await pool.query('SELECT id, email FROM users WHERE id=$1', [req.params.id]);
+  if (!target.rows.length) return fail(res, 404, 'No workspace has that id, so there is no Telegram session to reconnect.');
+  markApplied(req);
+  try {
+    const result = await forceTelegramReconnect(target.rows[0].id, {
+      reason: String(req.body?.reason || 'manual-reconnect').slice(0, 160),
+      actorId: req.userId,
+      actorEmail: req.userEmail,
+    });
+    res.set('Cache-Control', 'no-store').json({ ok: true, ...result });
+  } catch (error) {
+    if (error.telegramNoSession) return fail(res, 409, `${error.message} The phone number has to sign in again from the workspace settings first.`);
+    return fail(res, 502, `${error.message} Try again in a minute - if it keeps failing, the stored session has to be re-authorised.`);
+  }
+}));
+
 app.post('/api/admin/users/:id/impersonate', authenticate, requireAdmin, asyncRoute(async (req, res) => {
   const targetId = String(req.params.id || '').trim();
   if (!UUID_PATTERN.test(targetId)) return fail(res, 400, 'Choose a valid user account.');
