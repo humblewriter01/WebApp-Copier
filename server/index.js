@@ -22,7 +22,7 @@ import { TARGET_MODES } from './services/scale-out.js';
 import { captureSafety, readFallbackPoints } from './services/signal-safety.js';
 import { entryRangeBounds, readExpirySetting, readSlippageSetting, ORDER_TYPES } from './services/order-routing.js';
 import { readDashboardSignals } from './services/dashboard-signals.js';
-import { createTelegramListener } from './services/telegram-listener.js';
+import { HEARTBEAT_INTERVAL_MS, createTelegramListener } from './services/telegram-listener.js';
 import { createMetaApiTradingAdapter } from './services/metaapi-trading.js';
 import { createExecutionEngine, PLATFORM_PAUSE_MESSAGE } from './services/execution-engine.js';
 import { createExecutionWorker } from './services/execution-worker.js';
@@ -520,6 +520,10 @@ const telegramCapture = createTelegramListener({
   pool,
   log: (level, message, meta) => log(level, message, meta),
   saveSignal: (userId, message, channel) => saveSignal(userId, message, channel),
+  /* The listener decides *when* a stream is not a stream; only this file can rebuild one, because a rebuild is a
+     disconnect, a fresh authorized client, a re-attach and a replay. Handing the callback down instead of
+     importing it keeps the watchdog testable without a server: a test injects a spy and asserts that it fired. */
+  onDeadStream: (userId, reason) => restoreTelegramClient(userId, { reason }),
 });
 const startTelegramListener = (userId, client) => telegramCapture.startTelegramListener(userId, client);
 
@@ -560,6 +564,24 @@ async function runSignalDelete(pair) {
  * re-attaching the handler is what a sleeping host needs, because a wake is a new process while the
  * flag in the database is inherited from the old one.
  */
+/**
+ * How the capture client reaches Telegram, and what that option is really for.
+ *
+ * GramJS on Node has no WebSocket transport: `useWSS` moves the data centre from port 80 to 443 and leaves the
+ * Node socket layer (`PromisedNetSockets`) speaking the same obfuscated MTProto over it - the WebSocket framing
+ * only exists in the browser build. So the honest description of `TELEGRAM_TRANSPORT=wss` is "carry the
+ * connection on 443 instead of 80", which is still worth being able to ask for: hosts that shape or reap idle
+ * flows on the API's plain port are common, and a different destination port is a different flow. The real
+ * defence against that reaping is the 30-second beat, not this; what this buys is a knob an operator can turn
+ * in one environment variable, and because a refused handshake would otherwise mean *no capture at all*, a
+ * connect that fails with the option on retries once on the default transport and says so.
+ */
+function telegramCaptureTransport() {
+  const base = { connectionRetries: 3, autoReconnect: true };
+  if (String(process.env.TELEGRAM_TRANSPORT || '').toLowerCase() !== 'wss') return { wss: false, options: base };
+  return { wss: true, options: { ...base, useWSS: true } };
+}
+
 async function restoreTelegramClient(userId, { reason = 'restore' } = {}) {
   const current = telegramClients.get(userId);
   if (current?.client?.connected === true && current.handler && telegramCapture.handlerIsLive(current.client, current.handler)) return current.client;
@@ -580,8 +602,19 @@ async function restoreTelegramClient(userId, { reason = 'restore' } = {}) {
     return null;
   }
   if (!process.env.API_ID || !process.env.API_HASH) throw new Error('Telegram API credentials are not configured');
-  const client = new TelegramClient(new StringSession(decryptSecret(rows[0].telegram_session)), Number(process.env.API_ID), process.env.API_HASH, { connectionRetries: 3, autoReconnect: true });
-  await client.connect();
+  const sessionString = decryptSecret(rows[0].telegram_session);
+  const transport = telegramCaptureTransport();
+  let client = new TelegramClient(new StringSession(sessionString), Number(process.env.API_ID), process.env.API_HASH, transport.options);
+  try {
+    await client.connect();
+  } catch (error) {
+    if (!transport.wss) throw error;
+    // The experiment is allowed to fail; capture is not allowed to be the thing that pays for it.
+    log('warn', 'Telegram WSS transport could not connect; reconnecting over the default transport', { userId, error: `${error?.message || error}`.slice(0, 160) });
+    await client.disconnect().catch(() => {});
+    client = new TelegramClient(new StringSession(sessionString), Number(process.env.API_ID), process.env.API_HASH, { connectionRetries: 3, autoReconnect: true });
+    await client.connect();
+  }
   if (!(await client.checkAuthorization())) {
     await client.disconnect().catch(() => {});
     await pool.query('UPDATE users SET telegram_connected=FALSE,telegram_session=NULL WHERE id=$1', [userId]);
@@ -593,7 +626,7 @@ async function restoreTelegramClient(userId, { reason = 'restore' } = {}) {
   await startTelegramListener(userId, client);
   await pool.query('UPDATE users SET telegram_connected=TRUE WHERE id=$1', [userId]);
   telegramCapture.markSessionResumed();
-  log('info', 'Telegram session restored for capture', { userId, reason });
+  log('info', 'Telegram session restored for capture', { userId, reason, transport: transport.wss ? '443' : 'default' });
   // The messages this session missed while nothing was running are pulled back in the background,
   // so a workspace that was asleep during a channel's signal does not have to wait for the next one.
   void telegramCapture.runCatchUp(userId).catch((error) => log('warn', 'Telegram catch-up failed', { userId, error: error.message }));
@@ -621,8 +654,6 @@ async function resumeTelegramSessions({ reason = 'restore' } = {}) {
   return { wanted: rows.length, restored };
 }
 
-const streamProbeUnreported = new Set();
-
 /**
  * Prove that every "listening" session is actually receiving, once a minute.
  *
@@ -636,54 +667,50 @@ const streamProbeUnreported = new Set();
  * and catches up), and a socket that answers but has heard nothing is cross-checked against the channel.
  */
 async function checkTelegramStreams({ reason = 'sweep' } = {}) {
-  const results = { checked: 0, rebuilt: 0, gapChecked: 0, probing: 0 };
+  const results = { checked: 0, gapChecked: 0, caughtUp: 0 };
   const checks = [];
-  for (const [userId, entry] of telegramClients.entries()) {
+  for (const [userId] of telegramClients.entries()) {
     const health = telegramCapture.streamHealth(userId);
     if (!health.listening) continue; // a session with no handler is `rearmTelegramListeners'` business
     results.checked += 1;
     checks.push((async () => {
-      /* A session that has heard nothing for `SILENCE_SUSPECT_MS` gets asked whether it can still answer at all.
-         This is the only branch that can tear anything down, and it only tears down a socket that failed a
-         bounded request - not a channel that happened to be quiet. */
-      if (health.suspect) {
-        const probe = await telegramCapture.probeUpdateStream(entry.client);
-        if (probe.state === 'unknown') {
-          results.probing += 1;
-          // A library change that removes `updates.GetState` must not turn into a log line per workspace per
-          // minute, so the fact that the probe is unavailable is said once per process and then only counted.
-          if (!streamProbeUnreported.has(userId)) {
-            streamProbeUnreported.add(userId);
-            log('info', 'Telegram update stream could not be probed on this build of the library', { userId, silenceSeconds: health.silenceMs == null ? null : Math.round(health.silenceMs / 1000) });
-          }
-        } else if (!probe.alive) {
-          log('warn', 'Telegram update stream is silent and the socket is not answering; rebuilding the session', {
-            userId,
-            state: probe.state,
-            silenceSeconds: health.silenceMs == null ? null : Math.round(health.silenceMs / 1000),
-            probeMs: probe.ms ?? null,
-            error: probe.error || null,
-          });
-          await restoreTelegramClient(userId, { reason: 'silent-update-stream' });
-          results.rebuilt += 1;
-          return;
-        }
-        // A healthy socket that is simply not being spoken to falls through to the same cross-check below:
-        // "quiet" is not the same claim as "fine", and only the channel can settle it.
-      }
       /* The periodic question, asked on the workspace's own offset: `pts` desync, a Telegram-side drop, a
          mid-stream gap that leaves another channel still arriving - every one of those keeps `lastAt` fresh
-         while a message sits unread, so the silence clock alone would never ask. The dedupe index makes the
-         overlap with a live push free, which is what lets this be a schedule rather than an accusation. */
+         while a message sits unread, so a silence clock alone would never ask. The dedupe index makes the
+         overlap with a live push free, which is what lets this be a schedule rather than an accusation.
+
+         The socket itself is no longer this function's job: `beatUpdateStreams` asks every connected session an
+         active question every 30 seconds, so "can you still answer" is never older than half a minute and is
+         never decided by whether a channel happened to post. What is left here is the question a ping cannot
+         answer - what did the channel say - and a replay that finds a message posted while the handler was
+         attached asks for a rebuild of its own. */
       if (health.catchUpOverdue) {
         const outcome = await telegramCapture.runCatchUp(userId);
-        if (outcome?.ran) results.gapChecked += 1;
+        if (outcome?.ran) {
+          results.gapChecked += 1;
+          results.caughtUp += Number(outcome.stored) || 0;
+        }
       }
     })().catch((error) => log('warn', 'Telegram stream check failed', { userId, error: error.message })));
   }
   if (checks.length) await Promise.allSettled(checks);
-  if (results.rebuilt || results.gapChecked || results.probing) log('info', 'Telegram streams checked', { reason, ...results });
+  if (results.gapChecked) log('info', 'Telegram streams checked', { reason, ...results });
   return results;
+}
+
+/**
+ * One heartbeat cycle, with a failure of the cycle logged rather than thrown.
+ *
+ * An interval callback that rejects once would otherwise stop the keep-alive permanently and quietly, which is
+ * the exact failure this exists to prevent, so nothing here is allowed to propagate.
+ */
+async function beatTelegramStreams({ reason = 'interval' } = {}) {
+  try {
+    return await telegramCapture.beatUpdateStreams({ reason });
+  } catch (error) {
+    log('warn', 'Telegram heartbeat cycle failed', { reason, error: `${error?.message || error}`.slice(0, 200) });
+    return null;
+  }
 }
 
 /** Re-attach anything in memory that has lost its handler, and run the catch-up it flagged. */
@@ -770,7 +797,23 @@ const healthPayload = () => ({
   bootedAt: BOOTED_AT.toISOString(),
   uptimeSeconds: Math.round((Date.now() - BOOTED_AT.getTime()) / 1000),
   gitCommit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || null,
+  /* The keep-alive watchdog, in counts only, for the same reason the block above is here: this route is public,
+     so it can say that every session was asked a question half a minute ago and how many had to be rebuilt, and
+     it can never say whose session was. `stale: true` is the one value on this route that means "look at the
+     logs now": the interval itself stopped, which is a different failure from a stream being deaf. */
+  telegram: telegramHeartbeatHealth(),
 });
+
+/** The public shape of the heartbeat: cycle counters and a session count, with no per-workspace detail. */
+function telegramHeartbeatHealth() {
+  try {
+    const { beats, ...counters } = telegramCapture.heartbeatSummary();
+    return { ...counters, sessions: Array.isArray(beats) ? beats.length : 0 };
+  } catch {
+    // A diagnostic must not be able to take the endpoint the platform's health check depends on with it.
+    return null;
+  }
+}
 /**
  * Whether the database answers, decided on a short deadline. A health route that awaits the database with
  * no limit hangs exactly as long as the database is hung, which turns one stalled dependency into an
@@ -2980,6 +3023,18 @@ async function beginRuntime() {
   // session must be listening whether or not anyone opens the dashboard, and a Telegram handshake
   // must never be able to hold up the first request the host is woken for.
   void resumeTelegramSessions({ reason: 'boot' }).catch((error) => log('warn', 'Telegram session sweep failed', { error: error.message }));
+  /* The keep-alive, on its own faster clock than everything else here.
+
+     This is the part that keeps the connection *existing* rather than the part that notices it died: an idle
+     MTProto session in this library sends no bytes at all until it has something to say, and an idle flow is
+     what a hosting NAT evicts. One request per session per half-minute costs nothing at Telegram (the answer is
+     the cheapest reply the API serves) and it is also the only measurement of `pts` movement we take - which is
+     how a live transport with a dead update loop is told apart from a quiet channel. */
+  void beatTelegramStreams({ reason: 'boot' });
+  const telegramHeartbeat = setInterval(() => {
+    void beatTelegramStreams({ reason: 'interval' });
+  }, HEARTBEAT_INTERVAL_MS);
+  telegramHeartbeat.unref?.();
   const telegramSweep = setInterval(() => {
     void resumeTelegramSessions({ reason: 'sweep' })
       .then(() => rearmTelegramListeners())

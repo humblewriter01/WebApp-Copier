@@ -20,7 +20,7 @@ import { Api, TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { _handleUpdate } from 'telegram/client/updates.js';
 import { NewMessage } from 'telegram/events/index.js';
-import { CATCH_UP_COOLDOWN_MS, GAP_CATCH_UP_MS, GAP_CATCH_UP_SPREAD_MS, SILENCE_SUSPECT_MS, createTelegramListener } from '../services/telegram-listener.js';
+import { CATCH_UP_COOLDOWN_MS, HEARTBEAT_INTERVAL_MS, STREAM_REBUILD_COOLDOWN_MS, GAP_CATCH_UP_MS, GAP_CATCH_UP_SPREAD_MS, SILENCE_SUSPECT_MS, createTelegramListener } from '../services/telegram-listener.js';
 import { telegramPeerIdVariants, telegramMessageText } from '../services/telegram-peer.js';
 
 const USER_ID = '5036a3d3-0671-4cbf-9728-e5e3bf1eea9b';
@@ -589,4 +589,232 @@ test('a handler that had to be put back asks the channel what it missed, even af
   assert.ok(Number.isFinite(Date.parse(harness.entry().attachedAt)), 'and the moment it went back on is recorded, so the summary can say how long a listener has really been up');
   assert.ok(harness.logs.some((entry) => entry.message === 'Telegram capture handler attached'),
     'the attach itself is logged, which is what a report is quoted from when someone asks whether the listener was ever there');
+});
+
+/* --------------------------------------------------------------------------- *
+ * The heartbeat.
+ *
+ * `MTProtoSender` in this version of GramJS has no keep-alive: while a monitored channel is quiet, the client
+ * sends nothing at all, and a NAT that evicts idle flows - which is what a sleeping host's network does to a
+ * free service - can leave a connection that accepts writes and answers none. No error reaches `autoReconnect`,
+ * because no request is ever made, so the socket stays `connected === true` forever and every message arrives by
+ * replay instead of by push. The beat fixes the first half (an outbound packet every 30 seconds keeps the flow
+ * registered) and settles the second half with a number rather than a guess: the account's own `pts` moving
+ * while `stats.seen` does not is proof that updates are being produced and not delivered, which is the one
+ * distinction a silence clock cannot make.
+ * --------------------------------------------------------------------------- */
+
+function makeBeatHarness({ pts = () => 100, mode = 'alive', stats = null, ...overrides } = {}) {
+  const clients = new Map();
+  const logs = [];
+  const rebuilt = [];
+  let clock = Date.parse('2026-10-23T13:00:00.000Z');
+  let beatIndex = 0;
+  const listener = createTelegramListener({
+    clients,
+    pool: makePool(),
+    log: (level, message, meta) => logs.push({ level, message, meta }),
+    saveSignal: async () => ({ id: 'signal-1' }),
+    now: () => clock,
+    onDeadStream: async (userId, reason) => { rebuilt.push({ userId, reason }); },
+    // The production constants, not numbers of the test's own: the cadence and the reconnect cooldown are the
+    // two things an operator can legitimately change, and a test that pinned a copy of them would survive the
+    // change silently.
+    heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
+    rebuildCooldownMs: STREAM_REBUILD_COOLDOWN_MS,
+    ...overrides,
+  });
+  const invoke = mode === 'alive'
+    ? async () => ({ pts: BigInt(pts(beatIndex)) })
+    : mode === 'hang'
+      ? () => new Promise(() => {})
+      : async () => { throw new Error('Cannot send requests while disconnected'); };
+  const client = { connected: true, invoke, addEventHandler() {}, removeEventHandler() {}, listEventHandlers: () => [{}, () => {}] };
+  clients.set(USER_ID, { client, handler: () => {}, stats: stats || listener.EMPTY_STATS(), attachedAt: new Date(clock).toISOString() });
+  return {
+    clients, client, logs, rebuilt, listener,
+    /** One 30-second cycle, and the clock advance that goes with it (the first cycle runs at the current time). */
+    async cycle() { beatIndex += 1; const result = await listener.beatUpdateStreams({ reason: 'test' }); clock += 30_000; return result; },
+    advance: (ms) => { clock += ms; },
+    entry: () => clients.get(USER_ID),
+    stats: () => clients.get(USER_ID).stats,
+  };
+}
+
+test('the heartbeat asks every connected session on its own clock, not when the last message arrived', async () => {
+  const harness = makeBeatHarness();
+  // Traffic five seconds ago: the silence threshold from the previous change would not even have looked.
+  harness.entry().stats.lastAt = new Date(Date.parse('2026-10-23T12:59:55.000Z').valueOf()).toISOString();
+  assert.equal(harness.listener.streamHealth(USER_ID).suspect, false, 'the session is not suspicious by silence at all');
+
+  let asked = 0;
+  harness.client.invoke = async () => { asked += 1; return { pts: 100n }; };
+  const cycle = await harness.cycle();
+  assert.equal(asked, 1, 'and it is still asked a question, because the point is the packet as much as the answer');
+  assert.deepEqual({ sent: cycle.sent, answered: cycle.answered, dead: cycle.dead, stalled: cycle.stalled }, { sent: 1, answered: 1, dead: 0, stalled: 0 });
+  assert.ok(harness.logs.some((entry) => entry.message === 'Telegram heartbeat sent'), 'the line an operator greps to prove the watchdog is alive');
+  assert.equal(harness.rebuilt.length, 0, 'a session that answers is left alone');
+});
+
+test('a beat that is not answered reconnects immediately, and the beat is what noticed', async () => {
+  const harness = makeBeatHarness({ mode: 'error' });
+  const cycle = await harness.cycle();
+  assert.equal(cycle.dead, 1, 'a request that errors is a dead stream, not a slow network');
+  assert.ok(harness.logs.some((entry) => entry.message === 'Telegram heartbeat sent' && entry.level === 'warn'), 'the cycle is a warning when it found a corpse');
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.deepEqual(harness.rebuilt, [{ userId: USER_ID, reason: 'heartbeat-no-answer' }], 'and the reconnect is requested on the spot rather than at the next sweep');
+
+  // The unresponsive socket - the shape Render's NAT actually leaves behind: writes succeed, nothing returns.
+  const hung = makeBeatHarness({ mode: 'hang' });
+  const hungProbe = hung.listener.beatUpdateStreams({ reason: 'test' });
+  const holdTheLoopOpen = setTimeout(() => {}, 8_000);
+  const hungCycle = await hungProbe;
+  clearTimeout(holdTheLoopOpen);
+  assert.equal(hungCycle.dead, 1, 'a probe that times out counts as dead in the same way');
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(hung.rebuilt.length, 1, 'and it reconnects too, because the alternative is to keep a listener nobody is answering');
+});
+
+test('a moving pts with a quiet handler is a dead update loop, and it is rebuilt after two beats', async () => {
+  const harness = makeBeatHarness({ pts: (index) => 100 + index });
+  await harness.cycle();          // first beat: no previous answer to compare with, so nothing can be concluded
+  assert.equal(harness.rebuilt.length, 0, 'the first beat only sets the baseline');
+  await harness.cycle();          // pts moved, handler silent: one suspicion
+  assert.equal(harness.rebuilt.length, 0, 'one beat of disagreement is not a verdict - an edit or a service message moves pts without being a NewMessage');
+  const stalls = harness.listener.streamBeatFor(USER_ID).stalls;
+  assert.equal(stalls, 1);
+  await harness.cycle();          // and the second one is
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.deepEqual(harness.rebuilt, [{ userId: USER_ID, reason: 'update-stream-stalled' }], 'two beats of "Telegram produced updates we never saw" is the one proof that a live socket and a dead listener can be told apart');
+
+  // The same movement, delivered: nothing to fix.
+  const healthy = makeBeatHarness({ pts: (index) => 100 + index });
+  await healthy.cycle();
+  await healthy.cycle();
+  healthy.entry().stats.seen = 1;   // the handler saw what the server counted
+  await healthy.cycle();
+  await healthy.cycle();
+  assert.equal(healthy.rebuilt.length, 0, 'and the rule is a comparison, not a suspicion of quietness');
+});
+
+test('a quiet channel is not a fault: no pts movement, no rebuild, ever', async () => {
+  const harness = makeBeatHarness({ pts: () => 42 });
+  for (let index = 0; index < 6; index += 1) await harness.cycle();   // three minutes of nothing
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(harness.rebuilt.length, 0, 'a workspace whose channel has not posted for an hour must not be reconnected once a minute');
+  assert.equal(harness.logs.filter((entry) => entry.message === 'Telegram heartbeat sent').length, 6, 'but it must still be beaten, and said so, every cycle');
+});
+
+test('a rebuild is one rebuild: the cooldown outlives every detector', async () => {
+  // One minute is how often the socket is asked; two minutes is how often it may be rebuilt for the answer.
+  assert.equal(HEARTBEAT_INTERVAL_MS, 30_000, 'the beat is the keep-alive, so its period is the idle window it has to stay inside');
+  assert.equal(STREAM_REBUILD_COOLDOWN_MS, 2 * 60_000, 'and the cooldown is strictly longer than it, or a broken stream is reconnected on every beat');
+  const harness = makeBeatHarness({ mode: 'error' });
+  await harness.cycle();
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(harness.rebuilt.length, 1);
+  await harness.cycle();
+  await harness.cycle();
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(harness.rebuilt.length, 1, 'the socket is still dead, and the watchdog is still shouting, but a reconnect loop is a worse outage than a deaf stream');
+  assert.ok(harness.logs.some((entry) => entry.message === 'Telegram stream rebuild already cooling down'), 'the suppression is written down, so a silent watchdog is never mistaken for a working one');
+  assert.equal(harness.listener.heartbeatSummary().suppressed, 2);
+  harness.advance(STREAM_REBUILD_COOLDOWN_MS + 1_000);
+  await harness.cycle();
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(harness.rebuilt.length, 2, 'and once the window passes, the same dead socket is rebuilt again');
+});
+
+test('the heartbeat reports itself in counts, and the per-session detail stays off the public route', async () => {
+  const harness = makeBeatHarness();
+  await harness.cycle();
+  const summary = harness.listener.heartbeatSummary();
+  assert.equal(summary.cycles, 1);
+  assert.equal(summary.answered, 1);
+  assert.equal(summary.intervalMs, 30_000);
+  assert.equal(summary.stale, false, 'the last cycle is half a minute old at most, which is the promise');
+  assert.equal(summary.beats.length, 1, 'the per-session beat is on the admin summary');
+  assert.equal(harness.listener.telegramFleetSummary().sessions[0].beatPts, 100, 'and each session carries its own counter, so "pts moved, nothing arrived" is visible per workspace');
+});
+
+test('a replay that finds a message posted while the handler was attached is evidence against the stream, not a recovery', async () => {
+  const rebuilt = [];
+  const clients = new Map();
+  const logs = [];
+  let clock = Date.parse('2026-10-23T13:00:00.000Z');
+  const pool = makePool();
+  const listener = createTelegramListener({
+    clients, pool, log: (level, message, meta) => logs.push({ level, message, meta }),
+    now: () => clock,
+    saveSignal: async () => ({ id: 'signal-1' }),
+    onDeadStream: async (userId, reason) => { rebuilt.push({ userId, reason }); },
+  });
+  const client = {
+    connected: true, getEntity: async () => ({ id: 1 }),
+    // The channel's newest post is dated after the attach, which is the definition of "we were listening and
+    // it never arrived": the silence clock cannot see this, because another channel keeps `lastAt` fresh.
+    getMessages: async () => [new Api.Message({ id: 5, peerId: new Api.PeerChannel({ channelId: BigInt(BARE_CHANNEL_ID) }), date: Math.floor((clock + 60_000) / 1000), message: SIGNAL_TEXT, out: false, mentioned: false, mediaUnstable: false, mediaUnread: false, unread: false, post: false })],
+  };
+  clients.set(USER_ID, { client, handler: () => {}, stats: listener.EMPTY_STATS(), attachedAt: new Date(clock).toISOString() });
+
+  const outcome = await listener.runCatchUp(USER_ID);
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(outcome.stored, 1);
+  assert.equal(outcome.fresh, 1, 'the pass reports what it had no business finding');
+  assert.deepEqual(rebuilt, [{ userId: USER_ID, reason: 'message-missed-while-listening' }], 'and asks for a rebuild on the spot');
+  assert.ok(logs.some((entry) => entry.message === 'Telegram replay found messages posted while the handler was attached'));
+
+  // The boot case: the same message dated *before* the attach is simply history we were asleep through. The
+  // clock moves past the replay cooldown first, because this is a second, separate recovery and not a retry of
+  // the one above.
+  rebuilt.length = 0;
+  clock += 61_000;
+  clients.set(USER_ID, { client: { ...client, getMessages: async () => [new Api.Message({ id: 5, peerId: new Api.PeerChannel({ channelId: BigInt(BARE_CHANNEL_ID) }), date: Math.floor((clock - 3_600_000) / 1000), message: SIGNAL_TEXT, out: false, mentioned: false, mediaUnstable: false, mediaUnread: false, unread: false, post: false })] }, handler: () => {}, stats: listener.EMPTY_STATS(), attachedAt: new Date(clock).toISOString() });
+  pool.known.clear();
+  const second = await listener.runCatchUp(USER_ID);
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(second.stored, 1, 'the backlog is still stored');
+  assert.equal(second.fresh, 0, 'and it is still called a backlog');
+  assert.equal(rebuilt.length, 0, 'an outage that ended before the attach is not a broken stream');
+});
+
+test('one cycle beats a fleet in bounded chunks, so a bigger workspace cannot become a request storm', async () => {
+  const harness = makeBeatHarness();
+  let open = 0;
+  let maxOpen = 0;
+  const shared = { connected: true, addEventHandler() {}, removeEventHandler() {}, listEventHandlers: () => [{}, () => {}] };
+  shared.invoke = async () => {
+    open += 1;
+    maxOpen = Math.max(maxOpen, open);
+    await new Promise((resolve) => { setImmediate(resolve); });
+    open -= 1;
+    return { pts: 100n };
+  };
+  for (let index = 0; index < 20; index += 1) harness.clients.set(`user-${index}`, { client: shared, handler: () => {}, stats: harness.listener.EMPTY_STATS() });
+
+  const cycle = await harness.cycle();
+  assert.equal(cycle.sessions, 21, 'the harness session plus twenty more');
+  assert.equal(cycle.answered, 21, 'and every one of them was asked');
+  assert.ok(maxOpen <= 8, `at most eight requests are open in one tick, saw ${maxOpen}`);
+  assert.ok(maxOpen >= 2, 'and they are genuinely concurrent rather than serialised one by one');
+});
+
+test('a rebuild is not mistaken for a stalled handler, because the new session starts from zero', async () => {
+  // `restoreTelegramClient` replaces the entry with fresh `stats`, so `seen` goes backwards on purpose. A
+  // watchdog that read that as silence would reconnect every session it had ever rebuilt, forever.
+  const harness = makeBeatHarness({ pts: (index) => 100 + index });
+  await harness.cycle();                                  // baseline: pts 100, seen 0
+  await harness.cycle();                                  // pts moved, handler silent -> one suspicion
+  assert.equal(harness.listener.streamBeatFor(USER_ID).stalls, 1, 'first, the case that is a stall: pts moved and nothing arrived');
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(harness.rebuilt.length, 0, 'one beat of it is not yet a verdict');
+
+  harness.entry().stats.seen = 5;                         // the session recovered and delivered updates
+  await harness.cycle();                                  // pts 102 with movement: no suspicion at all
+  assert.equal(harness.listener.streamBeatFor(USER_ID).stalls, 0, 'a delivered update clears the count');
+  harness.entry().stats.seen = 0;                         // and now the session is rebuilt, so its counters restart
+  await harness.cycle();
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(harness.listener.streamBeatFor(USER_ID).stalls, 0, 'a counter going backwards is a new session, not a deaf one');
+  assert.equal(harness.rebuilt.length, 0, 'and no rebuild is requested for it');
 });
