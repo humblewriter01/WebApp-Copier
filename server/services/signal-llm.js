@@ -24,6 +24,7 @@
  */
 
 import { normalizeSignalNumbers } from './signal-numbers.js';
+import { FRIENDLY_NOTES, describeTechnicalNote, friendlySignalNote } from './signal-wording.js';
 
 export const DEFAULT_LLM_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 export const DEFAULT_LLM_MODEL = 'llama-3.1-8b-instant';
@@ -252,13 +253,86 @@ export function validateExtraction(json, { rawMessage, config = {} } = {}) {
  * returns the same `{ ok: false }` shape as a timeout, which is what makes "the reader was busy" land on the
  * row as a review flag rather than as a failed capture.
  */
-export async function llmParseSignal(message, { config, fetchImpl = globalThis.fetch, logger, gate = null, priority = 'realtime' } = {}) {
-  if (!config?.enabled) return { ok: false, code: 'disabled', reason: config?.disabledReason || 'not configured' };
+/**
+ * Pulls the provider's own explanation out of a failure body, for the admin-only copy of this incident.
+ *
+ * Groq (and anything else speaking this dialect) answers a bad request with `{"error":{...,"message":"..."}}`.
+ * The message is the useful part and the JSON around it is not: the operator wants `model_not_found`, not a
+ * payload, and the trader wants neither.
+ */
+function providerErrorHint(text) {
+  if (typeof text !== 'string' || !text.trim()) return null;
+  try {
+    const parsed = JSON.parse(text);
+    const error = parsed?.error;
+    const hint = typeof error === 'string' ? error : (error?.message || error?.code || error?.type || null);
+    return hint ? String(hint).replace(/\s+/g, ' ').trim().slice(0, 200) : null;
+  } catch {
+    // Not JSON: the first line of whatever came back is still better than nothing, when it is short enough.
+    const line = String(text).replace(/\s+/g, ' ').trim();
+    return line.length > 0 && line.length <= 200 ? line : null;
+  }
+}
+
+/* The last time this process could not consult the reader, with the reason the rows are not allowed to carry.
+   Process state on purpose: it is a statement about *this instance*, it must be answerable without a database
+   round-trip while a signal is failing right now, and it is read only by Admin Panel -> System Health. */
+let lastReaderFailure = null;
+
+/** What the panel shows beside the queue stats. Never part of a signal row or a user-facing payload. */
+export function describeLastReaderFailure() {
+  return lastReaderFailure ? { ...lastReaderFailure } : null;
+}
+
+/** One line per unreadable signal, with the detail the card is not allowed to carry. Never a second copy. */
+function logReaderFailure(logger, result, priority) {
+  /* A reader that is switched off and a reader that is busy are reported by the health row as states, not as
+     failures; only a request that was actually made and did not produce a reading belongs here. */
+  if (result && result.ok !== true && result.code !== 'disabled' && result.code !== 'gated' && (result.technical || result.code)) {
+    lastReaderFailure = {
+      code: result.code || 'unknown',
+      technical: result.technical || null,
+      model: result.model || null,
+      queue: priority || 'realtime',
+      at: new Date().toISOString(),
+    };
+  }
+  if (!logger || !result || result.ok === true || !result.technical) return;
+  try {
+    logger.warn?.(JSON.stringify({
+      level: 'warn',
+      message: `[Parser] The AI reader could not be consulted (${result.code})`,
+      technical: result.technical,
+      queue: priority,
+      model: result.model || null,
+    }));
+  } catch { /* a logger that cannot format a line is not a reason to lose a signal */ }
+}
+
+export async function llmParseSignal(message, input = {}) {
+  const result = await readSignalWithModel(message, input);
+  if (result?.ok !== true) logReaderFailure(input.logger, result, input.priority);
+  return result;
+}
+
+async function readSignalWithModel(message, { config, fetchImpl = globalThis.fetch, logger, gate = null, priority = 'realtime' } = {}) {
+  // `disabledReason` names variables and endpoints, which is admin-facing information; it is kept on
+  // `technical` and never put on a sentence the trader reads.
+  if (!config?.enabled) {
+    return {
+      ok: false,
+      code: 'disabled',
+      reason: FRIENDLY_NOTES.readerUnavailable,
+      technical: describeTechnicalNote(config?.disabledReason || 'the AI reading assistant is not configured'),
+    };
+  }
   const request = () => llmRequest(message, { config, fetchImpl, logger });
   if (!gate) return request();
   const slot = await gate.run(request, { priority });
   if (slot?.ok !== true) {
-    return { ok: false, code: slot?.code || 'gated', reason: slot?.reason || 'The AI reader was busy, so this signal was saved for review.' };
+    // The gate's own reasons are already written for a trader; `technical` is only what the slot carried.
+    const note = friendlySignalNote(slot?.reason, { fallback: 'The AI reader was busy, so this signal was saved for review.' });
+    return { ok: false, code: slot?.code || 'gated', reason: note.text, technical: note.original || describeTechnicalNote(slot?.technical) };
   }
   return slot.value;
 }
@@ -291,22 +365,41 @@ async function llmRequest(message, { config, fetchImpl = globalThis.fetch, logge
       result = await send(false);
     }
     if (!result.ok) {
-      return { ok: false, code: 'http-error', status: result.status, reason: `The AI reader could not be reached (HTTP ${result.status}).` };
+      /* The status code and the provider's body are the only things that make this debuggable, and they are
+         not things a trader can act on: the sentence says what happened to their signal, the detail goes to
+         `technical`, which the log, the admin panel and `signals.technical_note` each read. */
+      return {
+        ok: false,
+        code: 'http-error',
+        status: result.status,
+        reason: FRIENDLY_NOTES.readerUnavailable,
+        model: config.model,
+        technical: describeTechnicalNote(`The AI reader answered HTTP ${result.status} for model ${config.model} at ${config.url}${providerErrorHint(result.text) ? `: ${providerErrorHint(result.text)}` : ''}.`),
+      };
     }
     let content;
     try {
       const payload = JSON.parse(result.text);
       content = payload?.choices?.[0]?.message?.content;
-      if (content === undefined || content === null) return { ok: false, code: 'empty-reply', reason: 'The AI reader returned no answer.' };
+      if (content === undefined || content === null) {
+        return { ok: false, code: 'empty-reply', reason: FRIENDLY_NOTES.readerUnavailable, technical: describeTechnicalNote('The AI reader returned an answer with no content in it.') };
+      }
     } catch {
-      return { ok: false, code: 'malformed-reply', reason: 'The AI reader returned something that was not an answer.' };
+      return { ok: false, code: 'malformed-reply', reason: FRIENDLY_NOTES.readerUnavailable, technical: describeTechnicalNote(`The AI reader returned something that was not an answer: ${result.text.slice(0, 200)}`) };
     }
     return validateExtraction(extractJsonObject(typeof content === 'string' ? content : JSON.stringify(content)), { rawMessage: message, config });
   } catch (error) {
     const aborted = error?.name === 'AbortError' || controller.signal.aborted;
-    return { ok: false, code: aborted ? 'timeout' : 'request-failed', reason: aborted
-      ? `The AI reader did not answer within ${Math.round(config.timeoutMs / 1000)} seconds, so this signal was saved for review.`
-      : 'The AI reader could not be reached.' };
+    // Both halves are the same event as far as the trader is concerned - the reading did not arrive - so both
+    // get the same sentence. The seconds, the error name and its message are the operator's half.
+    return {
+      ok: false,
+      code: aborted ? 'timeout' : 'request-failed',
+      reason: FRIENDLY_NOTES.readerUnavailable,
+      technical: describeTechnicalNote(aborted
+        ? `The AI reader did not answer within ${Math.round(config.timeoutMs / 1000)} seconds.`
+        : `The request to the AI reader failed: ${error?.message || error?.name || error || 'unknown error'}`),
+    };
   } finally {
     clearTimeout(timer);
   }

@@ -28,6 +28,8 @@ export const MIN_FALLBACK_POINTS = 1;
 /** The widest one, so a typo cannot become a stop forty charts away. */
 export const MAX_FALLBACK_POINTS = 1_000_000;
 
+import { friendlySignalNote } from './signal-wording.js';
+
 export const STOP_REQUIRED_MESSAGE = 'The signal has no stop loss, and your workspace requires one before an order is sent.';
 export const TARGET_REQUIRED_MESSAGE = 'Your Safety settings require a take-profit target, and this signal does not carry one.';
 export const SIZING_REQUIRES_STOP_MESSAGE = 'Risk-based sizing is calculated from the stop loss, so a signal without one cannot be sized safely.';
@@ -128,12 +130,18 @@ export function captureSafety({ parsed, source = 'telegram', settings = {}, revi
      the text - what is being refused is the *provenance*, and no distance in a settings panel changes
      where a number came from. */
   if (review?.required) {
+    /* Belt and braces against a writer far away from this file: the pipeline classifies its own sentences, and
+       this is the last place a refusal becomes a column, so it is where the rule is actually guaranteed.
+       `technicalNote` is the detail that made the sentence unusable, kept off the row the trader reads and into
+       `signals.technical_note`, which only the admin panel selects. */
+    const note = friendlySignalNote(review.reason, { fallback: 'This signal was saved for review and is not eligible for automatic execution.' });
     return {
       executionReady: false,
-      parseError: review.reason || 'This signal was saved for review and is not eligible for automatic execution.',
+      parseError: note.text,
+      technicalNote: note.replaced ? note.original : (review.technical || note.original || null),
       fallbacks: { stopLoss: null, takeProfit: null },
       override: { stopLoss: false, takeProfit: false },
-      problems: [{ code: 'review-required', message: review.reason || 'Saved for review.' }],
+      problems: [{ code: 'review-required', message: note.text }],
       reviewRequired: true,
     };
   }
@@ -192,10 +200,13 @@ export function captureSafety({ parsed, source = 'telegram', settings = {}, revi
   const ANSWERED_BY = { 'take-profit-required': 'take-profit-missing', 'no-price-level': 'stop-loss-missing' };
   const answered = new Set(problems.map((problem) => ANSWERED_BY[problem.code] ?? 'stop-loss-missing'));
   const otherBlocker = remaining.find((blocker) => !resolved.has(blocker.code) && !answered.has(blocker.code)) ?? null;
-  const parseError = otherBlocker?.message ?? (problems[0]?.message ?? null);
+  const blocker = otherBlocker?.message ?? (problems[0]?.message ?? null);
+  const note = friendlySignalNote(blocker, { fallback: '' });
   return {
     executionReady,
-    parseError,
+    parseError: note.text || null,
+    // Only ever set when a sentence carried internals: the raw text belongs on the row and nowhere a user reads.
+    technicalNote: note.replaced ? note.original : null,
     fallbacks: {
       stopLoss: governed && !priceless && stopNet !== null && codes.has('stop-loss-missing') ? stopNet : null,
       takeProfit: governed && !priceless && targetNet !== null && parsed?.missing?.takeProfit === true ? targetNet : null,

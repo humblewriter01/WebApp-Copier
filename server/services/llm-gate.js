@@ -27,6 +27,8 @@
  * caller's (`LLM_TIMEOUT_MS`), and a task that finishes after its slot was released still returns its answer.
  */
 
+import { FRIENDLY_NOTES, describeTechnicalNote } from './signal-wording.js';
+
 export const DEFAULT_MAX_CONCURRENT = 2;
 export const DEFAULT_REPLAY_QUEUE = 8;
 /** How long a replayed message waits for a free slot before it is left for review instead. */
@@ -80,7 +82,11 @@ export function createLlmGate({
           (error) => next.finish({
             ok: false,
             code: 'reader-failed',
-            reason: `The AI reader could not be consulted (${error?.message || 'the request itself failed'}), so this signal was saved for review.`,
+            // A thrown exception is the one failure whose text is pure internals - an error name, a file
+            // path, a line number - so the row gets the reading sentence and the detail travels with it on
+            // `technical`, where the log and the admin panel can still use it.
+            reason: FRIENDLY_NOTES.readerUnavailable,
+            technical: describeTechnicalNote(`The AI reader could not be consulted: ${error?.message || error?.name || String(error)}`),
             error,
           }),
         )

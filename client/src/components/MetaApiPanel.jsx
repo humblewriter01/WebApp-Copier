@@ -1,7 +1,10 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { request } from '../lib/api.js';
 import { useTelegramStatus } from './TelegramStatus.jsx';
+import { friendlySignalNote } from '../lib/user-note.js';
 import { MetaApiStatusPill, useMetaApiStatus } from './MetaApiStatus.jsx';
+// Provisioning writes a sentence for this field and the runtime sometimes writes what the SDK threw at it; only
+// the first kind was written for a trader, so both go through the filter that tells them apart.
 
 function accountStateLabel(state) {
   const normalized = String(state || '').toUpperCase();
@@ -244,7 +247,7 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
             <small>{[account.platform?.toUpperCase(), account.server, account.login && `Login ${account.login}`, accountStateLabel(account.state)].filter(Boolean).join(' · ')}</small>
             {/* The server's own sentence, in the one place an account is managed. Auto-Trading would keep
                 skipping signals silently otherwise, and "why is nothing trading" would have no answer here. */}
-            {account.executionNote ? <p className="account-execution-note" role="alert">{account.executionNote}</p> : null}
+            {account.executionNote ? <p className="account-execution-note" role="alert">{friendlySignalNote(account.executionNote)}</p> : null}
           </div>
           <div className="account-actions">
             <button type="button" className="button button-secondary button-small" disabled={busy} onClick={() => refreshAccount(account)}>Refresh status</button>

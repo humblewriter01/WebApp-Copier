@@ -1,3 +1,9 @@
+/* The wording rule itself lives in `user-note.js`, because it is not about signals: the same sentences and the
+   same filter are what a trade row and an account card are shown. Re-exported here so a consumer of either file
+   reads the one rule, and imported so this file can use it. */
+import { friendlySignalNote } from './user-note.js';
+export * from './user-note.js';
+
 /**
  * One reading of what happened to a captured signal. The server records the outcome and the reason;
  * this file only turns them into words, and never into an assumption: a signal with no note is
@@ -102,9 +108,13 @@ export function signalOutcomeView(signal) {
      decision wins when both exist. Falling back to the second is what stopped a cleared row - market news, a
      trade-management update - from showing a bare "No clear signal" with the explanation sitting one API call
      away and unread: the server wrote the reason, the row is the place to see it, and nothing here adds one. */
-  const note = [signal?.executionNote, signal?.parseError]
+  const stored = [signal?.executionNote, signal?.parseError]
     .map((value) => (typeof value === 'string' ? value.trim() : ''))
     .find((value) => value.length > 0) || '';
+  /* Whatever the row carries, the card shows a sentence a trader can act on. Legacy rows are the reason this is
+     here as well as a rule at write time: the database still holds notes written before the rule existed, and a
+     filter on the way out is the only thing that reaches them. */
+  const note = friendlySignalNote(stored);
   const known = OUTCOMES[status];
   // "No clear signal" is a claim about the message, not about the parser's mood, so it is only made
   // when nothing usable came out of it. A readable note that is missing a piece says "Needs review"

@@ -2,6 +2,9 @@ import React from 'react';
 import RiskWarningModal, { needsRiskAcknowledgement, RISK_REMINDER, RISK_WARNING_COPY } from './RiskWarningModal.jsx';
 import SettingsSection from './SettingsSection.jsx';
 import { autoTradingBannerView } from '../lib/platform-view.js';
+// The order outcomes list is a trader's screen too: a rejected order's raw answer - a retcode, a provider body,
+// the endpoint that timed out - is written by the engine into `trades.error_message`, and belongs in the log.
+import { friendlySignalNote } from '../lib/user-note.js';
 
 /**
  * Kept as the full sentence the warning used to be, for surfaces that need to quote it in one line.
@@ -129,7 +132,7 @@ export function platformPauseNotice(platformPause) {
     : `Automatic execution is paused by Signal Desk for every workspace. Your own settings are untouched, and new signals are saved for review until the pause is lifted.${reason}`;
 }
 
-export default function AdvancedSettings({ settings, accounts = [], trades = [], runtimeAvailable = false, platformPause = null, onChange, onSubmit, onToggle, onOpenRiskSettings = () => {}, onOpenTradingAccounts = () => {}, saving = false }) {
+export default function AdvancedSettings({ settings, accounts = [], trades = [], runtimeAvailable = false, platformPause = null, subscriptionStatus = null, onChange, onSubmit, onToggle, onOpenRiskSettings = () => {}, onOpenTradingAccounts = () => {}, onOpenPlan = () => {}, saving = false }) {
   const [riskWarningOpen, setRiskWarningOpen] = React.useState(false);
   const pauseNotice = platformPauseNotice(platformPause);
   // Turning the switch on is the only action here that spends money, so it is the only one that
@@ -204,11 +207,18 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
               platformPause,
               linkedAccounts: accounts,
               executionAccountId: settings.executionAccountId,
+              // Passed in rather than assumed: this page has not read the billing state, and a component that
+              // cannot see the plan must not speak about it. `App` does, and does.
+              subscriptionStatus: subscriptionStatus ?? null,
             });
-            if (readiness.state !== 'no-account' && readiness.state !== 'not-deployed') return null;
+            if (!['plan', 'no-account', 'not-deployed'].includes(readiness.state)) return null;
             return <p className="field-help auto-trading-readiness-prompt" data-state={readiness.state}>
               <span>{readiness.message}</span>
-              {readiness.action ? <button type="button" className="text-button" onClick={onOpenTradingAccounts}>{readiness.action.label}</button> : null}
+              {readiness.action ? (
+                <button type="button" className="text-button" onClick={() => (readiness.action.tab === 'billing' ? onOpenPlan() : onOpenTradingAccounts())}>
+                  {readiness.action.label}
+                </button>
+              ) : null}
             </p>;
           })()}
           <p className="risk-reminder">
@@ -405,8 +415,8 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
           {restingOrderSummary(trade) && <p className="execution-resting-summary">{restingOrderSummary(trade)}</p>}
           {scaleOutSummary(trade) && <p className="execution-scale-out-summary">{scaleOutSummary(trade)}</p>}
           {trade.breakEvenStatus && <span className={`badge execution-breakeven-badge execution-breakeven-${trade.breakEvenStatus}`}>{breakEvenSummary(trade)}</span>}
-          {trade.errorMessage && <p className="execution-error-message">{trade.errorMessage}</p>}
-          {trade.breakEvenError && <p className="execution-error-message">{trade.breakEvenError}</p>}
+          {trade.errorMessage && <p className="execution-error-message">{friendlySignalNote(trade.errorMessage)}</p>}
+          {trade.breakEvenError && <p className="execution-error-message">{friendlySignalNote(trade.breakEvenError)}</p>}
         </article>)}</div>}
       </div>
     </section>

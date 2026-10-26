@@ -16,7 +16,7 @@ import { withDeadline } from './services/schema-sql.js';
 import { createMetaApiConfigurationLink, metaApiRequest, toSafeMetaApiAccount } from './services/metaapi.js';
 import { getTelegramErrorCode, isTelegramPasswordNeeded, shouldDiscardTelegramLogin, telegramAuthErrorPayload } from './services/telegram-auth.js';
 import { parseSignalTwoLayer } from './services/signal-parse-pipeline.js';
-import { llmConfig, describeLlmConfig } from './services/signal-llm.js';
+import { llmConfig, describeLlmConfig, describeLastReaderFailure } from './services/signal-llm.js';
 import { createLlmGate } from './services/llm-gate.js';
 import { TARGET_MODES } from './services/scale-out.js';
 import { captureSafety, readFallbackPoints } from './services/signal-safety.js';
@@ -35,7 +35,8 @@ import { createBillingService } from './services/billing-service.js';
 import { createPricingStore, normalizePricingUpdate, normalizeBillingSettings, planChargeDecision, publicPricing } from './services/pricing.js';
 import { createPlanSynchronizer } from './services/plan-sync.js';
 import { planLimitsFor, buildLimitError } from './services/plan-limits.js';
-import { decideSignalOutcome } from './services/signal-outcome.js';
+import { SIGNAL_OUTCOME_CONTEXT_SQL, decideSignalOutcome, overlayLiveBlocker } from './services/signal-outcome.js';
+import { friendlySignalNote } from './services/signal-wording.js';
 import {
   createInactivityService, daysInactiveSince,
   INACTIVITY_WARNING_DAYS, INACTIVITY_DELETION_DAYS, INACTIVITY_SWEEP_LIMIT,
@@ -267,7 +268,7 @@ async function resolveExecutionToken(userId, accountId, managedByApp) {
  */
 const platformControls = createPlatformControls({ pool, logger: console });
 const auditLog = createAuditLogger({ pool, logger: console });
-const systemHealth = createSystemHealthService({ pool, controls: platformControls, runtimeEnabled: autoTradingRuntimeEnabled, logger: console, capture: () => ({ ...telegramCapture.telegramFleetSummary(), gitCommit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || null, startup: { ...boot } }), llm: () => ({ ...describeLlmConfig(parserConfig), ...llmGate.summary() }) });
+const systemHealth = createSystemHealthService({ pool, controls: platformControls, runtimeEnabled: autoTradingRuntimeEnabled, logger: console, capture: () => ({ ...telegramCapture.telegramFleetSummary(), gitCommit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || null, startup: { ...boot } }), llm: () => ({ ...describeLlmConfig(parserConfig), ...llmGate.summary(), lastFailure: describeLastReaderFailure() }) });
 const announcementService = createAnnouncementService({ pool, logger: console });
 const supportSessions = createSupportSessionService({ pool, logger: console });
 
@@ -346,6 +347,39 @@ function scaleOutLadder(parsed) {
   return levels.length > 1 ? JSON.stringify(levels) : null;
 }
 
+/**
+ * The live picture behind "could this workspace trade right now?", read the same way when a signal is captured
+ * and when a list of them is displayed.
+ *
+ * Returning `null` on a failed read is the point of the function. An unknown pause is not a reason to tell
+ * somebody their platform is paused, and an unknown plan is not a reason to tell them to pay: when any part of
+ * the picture is missing, the rows keep the sentences they were given at capture and nothing is re-derived.
+ */
+async function readOutcomeContext(userId) {
+  const [context, pause] = await Promise.all([
+    pool.query(SIGNAL_OUTCOME_CONTEXT_SQL, [userId]),
+    platformControls.read().catch(() => null),
+  ]);
+  const row = context.rows[0];
+  if (!row || !pause) return null;
+  return {
+    autoTradingEnabled: row.autoTrading === true,
+    runtimeEnabled: autoTradingRuntimeEnabled,
+    paused: pause.state !== 'live',
+    subscriptionStatus: row.subscriptionStatus,
+    accountSelected: Boolean(row.executionAccountId),
+    accountState: row.accountState,
+  };
+}
+
+/** Re-derives the blocker sentence on rows that carry one, for the routes that show a list of signals. */
+async function withLiveBlockers(userId, rows) {
+  if (!Array.isArray(rows) || !rows.some((row) => row?.executionNote)) return rows;
+  const context = await readOutcomeContext(userId).catch(() => null);
+  if (!context) return rows;
+  return rows.map((row) => overlayLiveBlocker(row, context));
+}
+
 async function saveSignal(userId, message, channel = {}) {
   const source = channel.source === 'manual' ? 'manual' : 'telegram';
   /* Which end of the AI reader's queue this message stands in. A message pushed by Telegram is live; a
@@ -380,14 +414,17 @@ async function saveSignal(userId, message, channel = {}) {
   const parseError = safety.parseError || null;
   const { rows } = await pool.query(
     `INSERT INTO signals(user_id,channel_id,channel_title,telegram_message_id,source,message,symbol,side,entry_price,stop_loss,take_profit,execution_ready,parse_error,status,direction_inferred,take_profit_levels,
-       needs_review,parsed_by,parse_confidence,llm_used,stop_loss_pips,take_profit_pips,order_type,order_type_stated,is_scalping,entry_range)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26::jsonb)
+       needs_review,parsed_by,parse_confidence,llm_used,stop_loss_pips,take_profit_pips,order_type,order_type_stated,is_scalping,entry_range,technical_note)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26::jsonb,$27)
      ON CONFLICT DO NOTHING
      RETURNING id,channel_id AS "channelId",channel_title AS "channelTitle",telegram_message_id AS "telegramMessageId",source,message,symbol,side,
        entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt",
        direction_inferred AS "directionInferred",take_profit_levels AS "takeProfitLevels",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",needs_review AS "needsReview",order_type AS "orderType",order_type_stated AS "orderTypeStated",is_scalping AS "isScalping",entry_range AS "entryRange"`,
     [userId, channel.channelId || null, channel.title || null, telegramMessageId, source, savedText, parsed.symbol, parsed.side, parsed.entryPrice, parsed.stopLoss, parsed.takeProfit, executionReady, parseError, executionReady ? 'received' : 'unparsed', parsed.directionInferred === true, scaleOutLadder(parsed),
-      review.required === true, provenance.parsedBy, provenance.confidence, provenance.llmUsed === true, parsed.stopLossPips, parsed.takeProfitPips, ORDER_TYPES.includes(parsed.orderType) ? parsed.orderType : 'market', parsed.orderTypeStated === true, parsed.isScalping === true, entryRangeValue(parsed)],
+      review.required === true, provenance.parsedBy, provenance.confidence, provenance.llmUsed === true, parsed.stopLossPips, parsed.takeProfitPips, ORDER_TYPES.includes(parsed.orderType) ? parsed.orderType : 'market', parsed.orderTypeStated === true, parsed.isScalping === true, entryRangeValue(parsed),
+      /* What the reader or the broker actually said. Stored for the admin panel and never selected by a route a
+         user reads. */
+      safety.technicalNote || review.technical || null],
   );
   let signal = rows[0];
   if (!signal && telegramMessageId) {
@@ -408,15 +445,7 @@ async function saveSignal(userId, message, channel = {}) {
      outcome recorded on the signal row. A free workspace with no MetaAPI account therefore
      captures every message exactly like a paid one and sees it as unexecuted, instead of the
      listener staying quiet because trading could never have started. */
-  const { rows: contextRows } = await pool.query(
-    `SELECT s.auto_trading_enabled AS autoTrading,s.execution_account_id AS executionAccountId,
-            ma.state AS accountState,u.subscription_status AS subscriptionStatus
-     FROM users u
-     LEFT JOIN settings s ON s.user_id=u.id
-     LEFT JOIN metaapi_accounts ma ON ma.user_id=u.id AND ma.metaapi_account_id=s.execution_account_id
-     WHERE u.id=$1 LIMIT 1`,
-    [userId],
-  );
+  const { rows: contextRows } = await pool.query(SIGNAL_OUTCOME_CONTEXT_SQL, [userId]);
   const context = contextRows[0] || {};
   const deliverable = source === 'telegram' && Boolean(telegramMessageId) && executionReady;
   const outcome = decideSignalOutcome({
@@ -439,7 +468,12 @@ async function saveSignal(userId, message, channel = {}) {
     );
   }
   if (outcome.status !== signal.status || (outcome.note || '') !== (signal.executionNote || '')) {
-    const { rows: recorded } = await pool.query('UPDATE signals SET status=$2,execution_note=$3 WHERE id=$1 RETURNING status,execution_note AS "executionNote"', [signal.id, outcome.status, outcome.note]);
+    /* The decision sentence goes through the same filter as everything else that reaches a row. Today
+       `decideSignalOutcome` is clean by construction; the filter is what turns that into a property of the write
+       path rather than a promise about one module, and a sentence that ever carries internals is stored clean
+       with its raw text beside it instead of on the card. */
+    const recordedNote = friendlySignalNote(outcome.note, { fallback: '' });
+    const { rows: recorded } = await pool.query('UPDATE signals SET status=$2,execution_note=$3,technical_note=COALESCE($4,technical_note) WHERE id=$1 RETURNING status,execution_note AS "executionNote"', [signal.id, outcome.status, recordedNote.text || null, recordedNote.original]);
     if (recorded[0]) Object.assign(signal, recorded[0]);
   }
   io.to(`user:${userId}`).emit('signal:received', signal);
@@ -909,20 +943,28 @@ app.get('/api/dashboard', authenticate, asyncRoute(async (req, res) => {
    * beside them, and `chooseDashboardSignals` makes the call. The full history belongs to the Signals tab,
    * which is why this route is allowed to be short.
    */
-  const [signalsCount, channelsCount, accountsCount, actionableSignals, recentSignals, settings] = await Promise.all([
+  const [signalsCount, channelsCount, accountsCount, actionableSignals, recentSignals, settings, subscription] = await Promise.all([
     pool.query('SELECT COUNT(*)::int AS count FROM signals WHERE user_id=$1', [req.userId]),
     pool.query('SELECT COUNT(*)::int AS count FROM channels WHERE user_id=$1 AND enabled=TRUE', [req.userId]),
     pool.query('SELECT COUNT(*)::int AS count FROM accounts WHERE user_id=$1', [req.userId]),
     pool.query(buildDashboardActionableSignalsQuery().sql, [req.userId]),
     pool.query(buildDashboardRecentSignalsQuery().sql, [req.userId]),
     pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled" FROM settings WHERE user_id=$1', [req.userId]),
+    // The plan is part of the execution picture, not a billing detail: `Auto-Trading is on, but your plan does
+    // not include automatic execution` is a sentence about the switch, and the banner cannot say it without it.
+    pool.query('SELECT subscription_status AS status,subscription_plan AS plan FROM users WHERE id=$1', [req.userId]),
   ]);
-  const dashboardSignals = chooseDashboardSignals({ actionable: actionableSignals.rows, recent: recentSignals.rows });
+  const [actionableSignalsLive, recentSignalsLive] = await Promise.all([
+    withLiveBlockers(req.userId, actionableSignals.rows),
+    withLiveBlockers(req.userId, recentSignals.rows),
+  ]);
+  const dashboardSignals = chooseDashboardSignals({ actionable: actionableSignalsLive, recent: recentSignalsLive });
   res.set('Cache-Control', 'no-store').json({
     stats: { totalSignals: signalsCount.rows[0].count, activeChannels: channelsCount.rows[0].count, accounts: accountsCount.rows[0].count },
     signals: dashboardSignals.rows,
     signalsScope: dashboardSignals.scope,
     settings: settings.rows[0] || { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 5, dailyLossLimit: 5, autoTradingEnabled: false },
+    subscription: { status: subscription.rows[0]?.status || null, plan: subscription.rows[0]?.plan || null },
     trading: { liveExecutionEnabled: autoTradingRuntimeEnabled, autoTradingEnabled: settings.rows[0]?.autoTradingEnabled === true, message: autoTradingRuntimeEnabled ? 'Auto-Trading starts on for new workspaces; review the live-trading warning and turn it off in Advanced Settings whenever you want.' : 'Automatic execution is unavailable right now. Signals can still be reviewed.' },
   });
 }));
@@ -963,7 +1005,11 @@ app.delete('/api/channels/:id', authenticate, asyncRoute(async (req, res) => {
 app.get('/api/signals', authenticate, asyncRoute(async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
   const { rows } = await pool.query(`SELECT id,channel_title AS "channelTitle",source,message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",direction_inferred AS "directionInferred",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",take_profit_levels AS "takeProfitLevels",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",needs_review AS "needsReview",order_type AS "orderType",order_type_stated AS "orderTypeStated",is_scalping AS "isScalping",entry_range AS "entryRange",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2`, [req.userId, limit]);
-  res.set('Cache-Control', 'no-store').json({ signals: rows });
+  // A row carries the sentence its workspace is in *now*, so the list can never contradict the banner above
+  // it. See `withLiveBlockers`: when the live picture cannot be read, the stored sentences are shown as they
+  // were written, because an unavailable setting is not a reason to invent one.
+  const signals = await withLiveBlockers(req.userId, rows);
+  res.set('Cache-Control', 'no-store').json({ signals });
 }));
 app.post('/api/signals', authenticate, asyncRoute(async (req, res) => {
   const message = String(req.body.message || '').trim().slice(0, 5000);
@@ -1621,7 +1667,7 @@ const adminSignalColumns = `s.id,s.user_id AS "userId",u.name AS "userName",u.em
   s.channel_id AS "channelId",s.channel_title AS "channelTitle",s.source,s.symbol,s.side,
   s.entry_price AS "entryPrice",s.stop_loss AS "stopLoss",s.take_profit AS "takeProfit",
   s.direction_inferred AS "directionInferred",s.execution_ready AS "executionReady",
-  s.parse_error AS "parseError",s.execution_note AS "executionNote",s.status,s.created_at AS "createdAt",
+  s.parse_error AS "parseError",s.execution_note AS "executionNote",s.technical_note AS "technicalNote",s.status,s.created_at AS "createdAt",
   s.parsed_by AS "parsedBy",s.parse_confidence AS "parseConfidence",s.llm_used AS "llmUsed",s.stop_loss_pips AS "stopLossPips",s.take_profit_pips AS "takeProfitPips",s.needs_review AS "needsReview",
   s.order_type AS "orderType",s.is_scalping AS "isScalping",s.expiry_timestamp AS "expiryTimestamp",s.entry_range AS "entryRange",
   (SELECT COUNT(*)::int FROM trades t WHERE t.signal_id=s.id) AS "tradeCount",

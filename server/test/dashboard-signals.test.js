@@ -100,7 +100,9 @@ test('setups win, and only three of them', () => {
 test('the dashboard route asks for both and picks, rather than filtering in JavaScript', () => {
   assert.match(routes, /pool\.query\(buildDashboardActionableSignalsQuery\(\)\.sql, \[req\.userId\]\)/);
   assert.match(routes, /pool\.query\(buildDashboardRecentSignalsQuery\(\)\.sql, \[req\.userId\]\)/);
-  assert.match(routes, /const dashboardSignals = chooseDashboardSignals\(\{ actionable: actionableSignals\.rows, recent: recentSignals\.rows \}\);/);
+  assert.match(routes, /const dashboardSignals = chooseDashboardSignals\(\{ actionable: actionableSignalsLive, recent: recentSignalsLive \}\);/,
+    'the two lists are picked after each has been re-read against the state the workspace is in now');
+  assert.match(routes, /withLiveBlockers\(req\.userId, actionableSignals\.rows\)/, 'and the re-read goes through the one helper the Signals tab uses too, not a second copy of the rule');
   assert.match(routes, /signals: dashboardSignals\.rows,/, 'the payload key the client already reads is unchanged');
   assert.match(routes, /signalsScope: dashboardSignals\.scope/, 'plus which list it is, so the wording cannot disagree with the query');
   assert.equal(routes.includes('ORDER BY created_at DESC LIMIT 10'), false, 'no ten-row dashboard query is left anywhere');

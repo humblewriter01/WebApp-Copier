@@ -361,6 +361,7 @@ function App() {
     platformPause: executionPaused,
     linkedAccounts,
     executionAccountId: settings.executionAccountId,
+    subscriptionStatus: dashboard?.subscription?.status ?? null,
   });
   const isAdmin = user?.role === 'admin';
   const tabs = navigationItemsForRole(user?.role).map(({ key, label }) => [key, label]);
@@ -417,7 +418,7 @@ function App() {
             the whole row as the server last returned it, so a save on Risk Settings can never blank what
             is set on Advanced Settings. `PUT /api/settings` is unchanged by the split. */}
         {tab === 'settings' && <RiskSettings settings={settings} onChange={setSettings} onSubmit={saveSettings} onOpenAdvanced={() => navigateToTab('advanced')} saving={settingsSaving} />}
-        {tab === 'advanced' && <AdvancedSettings settings={settings} accounts={linkedAccounts} trades={trades} runtimeAvailable={executionRuntimeEnabled} platformPause={executionPaused} onChange={setSettings} onSubmit={saveSettings} onToggle={toggleAutoTrading} onOpenRiskSettings={() => navigateToTab('settings')} onOpenTradingAccounts={() => navigateToTab('metaapi')} saving={settingsSaving} />}
+        {tab === 'advanced' && <AdvancedSettings settings={settings} accounts={linkedAccounts} trades={trades} runtimeAvailable={executionRuntimeEnabled} platformPause={executionPaused} onChange={setSettings} onSubmit={saveSettings} onToggle={toggleAutoTrading} onOpenRiskSettings={() => navigateToTab('settings')} onOpenTradingAccounts={() => navigateToTab('metaapi')} onOpenPlan={() => navigateToTab('billing')} subscriptionStatus={dashboard?.subscription?.status ?? null} saving={settingsSaving} />}
         {tab === 'profile' && <ProfileSettings user={user} token={authToken} onDeleted={logout} readOnly={readOnlySupport} />}
       </div>
       <footer className="footer">Not financial advice. Use at your own risk.</footer>

@@ -19,7 +19,8 @@ const server = read('../server/services/execution-engine.js');
 const routes = read('../server/index.js');
 
 test('a trading account carries the engine\'s own sentence when it cannot trade', () => {
-  assert.match(panel, /\{account\.executionNote \? <p className="account-execution-note" role="alert">\{account\.executionNote\}<\/p> : null\}/);
+  assert.match(panel, /\{account\.executionNote \? <p className="account-execution-note" role="alert">\{friendlySignalNote\(account\.executionNote\)\}<\/p> : null\}/,
+    'rendered through the filter, because the runtime sometimes puts the SDK\'s own words in that column');
   // Twice and only twice: the condition and the sentence itself. Anything more would mean the panel had
   // started inventing its own explanation of a broker failure, which is the server's job.
   assert.equal(panel.match(/account\.executionNote/g).length, 2);
