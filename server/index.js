@@ -15,7 +15,7 @@ import { pool, initializeDatabase } from './db.js';
 import { withDeadline } from './services/schema-sql.js';
 import { createMetaApiConfigurationLink, metaApiRequest, toSafeMetaApiAccount } from './services/metaapi.js';
 import { getTelegramErrorCode, isTelegramPasswordNeeded, shouldDiscardTelegramLogin, telegramAuthErrorPayload } from './services/telegram-auth.js';
-import { parseSignalTwoLayer } from './services/signal-parse-pipeline.js';
+import { CAPTURE_PARSE_BUDGET_MS, parseSignalTwoLayer } from './services/signal-parse-pipeline.js';
 import { llmConfig, describeLlmConfig, describeLastReaderFailure } from './services/signal-llm.js';
 import { createLlmGate } from './services/llm-gate.js';
 import { TARGET_MODES } from './services/scale-out.js';
@@ -383,7 +383,7 @@ async function saveSignal(userId, message, channel = {}) {
      await below is where any of them surfaces. */
   const prelude = Promise.all([
     pool.query(guardSql, [userId]),
-    parseSignalTwoLayer(savedText, { source, config: parserConfig, logger: serviceLogger, gate: llmGate, priority: llmPriority }),
+    parseSignalTwoLayer(savedText, { source, config: parserConfig, logger: serviceLogger, gate: llmGate, priority: llmPriority, captureBudgetMs: CAPTURE_PARSE_BUDGET_MS }),
   ]).then((value) => ({ value }), (error) => ({ error }));
   /* Both layers, in order, and the review decision with them. The model is asked here and nowhere else, and
      only when Layer 1 could not finish the message - a signal the regex reading completed is never held up by a
@@ -407,9 +407,14 @@ async function saveSignal(userId, message, channel = {}) {
   const executionReady = safety.executionReady === true;
   const parseError = safety.parseError || null;
   const { rows } = await pool.query(
+    /* `sent_at` is the channel's own timestamp, not ours, and it is the only way the difference between "the
+       channel was quiet" and "we were deaf" survives past the log buffer. The age guard, expiry and every
+       "stale" skip already measure against the moment the message was *written by the trader*, so a signal that
+       reaches us five minutes late must not be described as five minutes fresh - which is what a row with only
+       `created_at` would say. */
     `INSERT INTO signals(user_id,channel_id,channel_title,telegram_message_id,source,message,symbol,side,entry_price,stop_loss,take_profit,execution_ready,parse_error,status,direction_inferred,take_profit_levels,
-       needs_review,parsed_by,parse_confidence,llm_used,stop_loss_pips,take_profit_pips,order_type,order_type_stated,is_scalping,entry_range,technical_note)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26::jsonb,$27)
+       needs_review,parsed_by,parse_confidence,llm_used,stop_loss_pips,take_profit_pips,order_type,order_type_stated,is_scalping,entry_range,technical_note,sent_at)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26::jsonb,$27,$28::timestamptz)
      ON CONFLICT DO NOTHING
      RETURNING id,channel_id AS "channelId",channel_title AS "channelTitle",telegram_message_id AS "telegramMessageId",source,message,symbol,side,
        entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt",
@@ -418,7 +423,8 @@ async function saveSignal(userId, message, channel = {}) {
       review.required === true, provenance.parsedBy, provenance.confidence, provenance.llmUsed === true, parsed.stopLossPips, parsed.takeProfitPips, ORDER_TYPES.includes(parsed.orderType) ? parsed.orderType : 'market', parsed.orderTypeStated === true, parsed.isScalping === true, entryRangeValue(parsed),
       /* What the reader or the broker actually said. Stored for the admin panel and never selected by a route a
          user reads. */
-      safety.technicalNote || review.technical || null],
+      safety.technicalNote || review.technical || null,
+      channel.sentAt ? new Date(channel.sentAt) : null],
   );
   let signal = rows[0];
   if (!signal && telegramMessageId) {
@@ -613,6 +619,71 @@ async function resumeTelegramSessions({ reason = 'restore' } = {}) {
   }
   if (rows.length) log('info', 'Telegram sessions swept for capture', { reason, wanted: rows.length, restored });
   return { wanted: rows.length, restored };
+}
+
+const streamProbeUnreported = new Set();
+
+/**
+ * Prove that every "listening" session is actually receiving, once a minute.
+ *
+ * `connected === true` and a handler in GramJS's own list are both facts about objects in memory. Neither is a
+ * fact about the socket, and a socket can be open and entirely deaf - a `pts` gap Telegram stopped filling, an
+ * idle connection reaped by the host's NAT and quietly half-resumed, a reconnect that left the update manager
+ * attached to the previous transport. The old answer to that was `streamIdle` in the health panel, reported
+ * after fifteen quiet minutes, which on a scalping channel is fifteen minutes of missed entries and one
+ * unanswered support message. So the sweep now asks the question directly, and the two answers it can get are
+ * both acted on: a socket that will not answer a bounded request is torn down and rebuilt (which re-attaches
+ * and catches up), and a socket that answers but has heard nothing is cross-checked against the channel.
+ */
+async function checkTelegramStreams({ reason = 'sweep' } = {}) {
+  const results = { checked: 0, rebuilt: 0, gapChecked: 0, probing: 0 };
+  const checks = [];
+  for (const [userId, entry] of telegramClients.entries()) {
+    const health = telegramCapture.streamHealth(userId);
+    if (!health.listening) continue; // a session with no handler is `rearmTelegramListeners'` business
+    results.checked += 1;
+    checks.push((async () => {
+      /* A session that has heard nothing for `SILENCE_SUSPECT_MS` gets asked whether it can still answer at all.
+         This is the only branch that can tear anything down, and it only tears down a socket that failed a
+         bounded request - not a channel that happened to be quiet. */
+      if (health.suspect) {
+        const probe = await telegramCapture.probeUpdateStream(entry.client);
+        if (probe.state === 'unknown') {
+          results.probing += 1;
+          // A library change that removes `updates.GetState` must not turn into a log line per workspace per
+          // minute, so the fact that the probe is unavailable is said once per process and then only counted.
+          if (!streamProbeUnreported.has(userId)) {
+            streamProbeUnreported.add(userId);
+            log('info', 'Telegram update stream could not be probed on this build of the library', { userId, silenceSeconds: health.silenceMs == null ? null : Math.round(health.silenceMs / 1000) });
+          }
+        } else if (!probe.alive) {
+          log('warn', 'Telegram update stream is silent and the socket is not answering; rebuilding the session', {
+            userId,
+            state: probe.state,
+            silenceSeconds: health.silenceMs == null ? null : Math.round(health.silenceMs / 1000),
+            probeMs: probe.ms ?? null,
+            error: probe.error || null,
+          });
+          await restoreTelegramClient(userId, { reason: 'silent-update-stream' });
+          results.rebuilt += 1;
+          return;
+        }
+        // A healthy socket that is simply not being spoken to falls through to the same cross-check below:
+        // "quiet" is not the same claim as "fine", and only the channel can settle it.
+      }
+      /* The periodic question, asked on the workspace's own offset: `pts` desync, a Telegram-side drop, a
+         mid-stream gap that leaves another channel still arriving - every one of those keeps `lastAt` fresh
+         while a message sits unread, so the silence clock alone would never ask. The dedupe index makes the
+         overlap with a live push free, which is what lets this be a schedule rather than an accusation. */
+      if (health.catchUpOverdue) {
+        const outcome = await telegramCapture.runCatchUp(userId);
+        if (outcome?.ran) results.gapChecked += 1;
+      }
+    })().catch((error) => log('warn', 'Telegram stream check failed', { userId, error: error.message })));
+  }
+  if (checks.length) await Promise.allSettled(checks);
+  if (results.rebuilt || results.gapChecked || results.probing) log('info', 'Telegram streams checked', { reason, ...results });
+  return results;
 }
 
 /** Re-attach anything in memory that has lost its handler, and run the catch-up it flagged. */
@@ -2912,6 +2983,7 @@ async function beginRuntime() {
   const telegramSweep = setInterval(() => {
     void resumeTelegramSessions({ reason: 'sweep' })
       .then(() => rearmTelegramListeners())
+      .then(() => checkTelegramStreams({ reason: 'sweep' }))
       .catch((error) => log('warn', 'Telegram listener sweep failed', { error: error.message }));
   }, 60 * 1000);
   telegramSweep.unref?.();

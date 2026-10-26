@@ -129,7 +129,18 @@ function reviewSentence(reason, technical = null) {
   return { reason: note.text, technical: describeTechnicalNote(note.replaced ? note.original : (note.original || technical)) };
 }
 
-export async function parseSignalTwoLayer(message, { source = 'telegram', config, fetchImpl, logger, gate = null, priority = 'realtime' } = {}) {
+/**
+ * How long a capture may wait on Layer 2 before the row is written from Layer 1 alone.
+ *
+ * The row is what a trader looks at, and the model is an improvement on it; waiting on an improvement is how a
+ * 6-second provider timeout became a 6-second signal delay, and any retry on top of it is worse. So the write
+ * path is allowed to stop waiting, and says so on the row - `needs_review` with a sentence that names the reader
+ * rather than the number - which keeps the message, the prices Layer 1 read and the fact that nobody traded on
+ * a hunch. `server/db.js`'s re-read backfill then takes the row the rest of the way when the model is healthy.
+ */
+export const CAPTURE_PARSE_BUDGET_MS = 1_500;
+
+export async function parseSignalTwoLayer(message, { source = 'telegram', config, fetchImpl, logger, gate = null, priority = 'realtime', captureBudgetMs = null } = {}) {
   const layer1 = parseSignal(message);
   const base = {
     parsed: layer1,
@@ -159,7 +170,30 @@ export async function parseSignalTwoLayer(message, { source = 'telegram', config
   /* One request per message, and the queue decides which message asks first: a capture that arrived just now
      outranks a row catch-up is replaying, and a replay that cannot get a slot is left for review rather than
      made to wait behind other replays. Nothing here changes what Layer 1 already read. */
-  const result = await llmParseSignal(message, { config: settings, fetchImpl, logger, gate, priority });
+  // The budget race, when one is set. A Layer 2 answer that arrives after it is swallowed rather than thrown,
+  // and the request itself still occupies its slot for exactly as long as it needed - nothing is cancelled
+  // mid-flight and left in the gate thinking it is running.
+  const request = Promise.resolve().then(() => llmParseSignal(message, { config: settings, fetchImpl, logger, gate, priority }));
+  let result;
+  if (!(Number(captureBudgetMs) > 0)) {
+    result = await request;
+  } else {
+    let timer = null;
+    const budget = new Promise((resolve) => { timer = setTimeout(() => resolve(null), captureBudgetMs); timer.unref?.(); });
+    result = await Promise.race([request, budget]);
+    if (timer) clearTimeout(timer);
+    if (!result) {
+      request.catch(() => {});
+      return {
+        ...base,
+        review: {
+          required: true,
+          code: 'llm-deadline',
+          ...reviewSentence('Part of this signal was still being read when it was saved, so it was saved for review.'),
+        },
+      };
+    }
+  }
   const provenance = { llmUsed: true, parsedBy: 'regex', confidence: null, filled: [], dropped: [] };
   if (!result.ok) {
     return {

@@ -583,7 +583,7 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
     try {
       const { rows } = await pool.query(
         `SELECT ej.id AS job_id,ej.user_id,ej.status AS job_status,ej.attempt_count AS "attemptCount",ej.expires_at,
-                s.id AS signal_id,s.source,s.created_at AS signal_created_at,s.symbol,s.side,s.entry_price,s.stop_loss,s.take_profit,
+                s.id AS signal_id,s.source,COALESCE(s.sent_at, s.created_at) AS signal_created_at,s.symbol,s.side,s.entry_price,s.stop_loss,s.take_profit,
                 s.execution_ready,s.parse_error,s.needs_review,s.stop_loss_pips,s.take_profit_pips,
                 s.order_type AS "orderType",s.order_type_stated AS "orderTypeStated",s.is_scalping AS "isScalping",
                 st.auto_trading_enabled,st.lot_size_mode,st.fixed_lot_size,st.risk_percent,st.max_open_positions,
@@ -625,6 +625,10 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
       if (!isPaidSubscriber({ subscription_status: item.subscription_status })) {
         return stop(job, 'skipped', 'Automatic execution needs a paid plan, so this signal was saved for review only.');
       }
+      /* Age is measured from when the *channel* posted, not from when we got round to storing it. A session
+         that was briefly deaf and then caught up has a row written seconds ago describing a price from minutes
+         ago, and the two-minute bound exists precisely so that price is not traded: ageing it from `created_at`
+         would hand a five-minute-late entry to a live market and call it fresh. */
       const createdAt = new Date(item.signal_created_at).getTime();
       if (!Number.isFinite(createdAt) || now() - createdAt > MAX_SIGNAL_AGE_MS || now() < createdAt - 30_000) return stop(job, 'expired', 'This signal was too old to execute safely.');
       if (!item.execution_account_id || item.execution_account_id !== item.metaapi_account_id) return stop(job, 'skipped', 'Select an owned connected trading account in Execution Settings.');
