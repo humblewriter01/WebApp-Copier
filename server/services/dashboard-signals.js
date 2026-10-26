@@ -7,6 +7,12 @@
  * all the same, and it is stored, and it is recent. A summary screen became a log dump, and the one thing
  * the screen exists to show - a setup that could actually be traded - was somewhere in the middle.
  *
+ * Both lists are annotated here as well as chosen here. A row's note is a claim about the workspace's *live*
+ * settings - is the switch on, is the plan paid, is there an account - so a read that returns a stored sentence
+ * returns a claim that may have stopped being true the moment the user opened Billing. `readDashboardSignals`
+ * therefore takes the same re-decision the Signals tab performs, and the route is not handed the raw rows: a
+ * surface cannot forget a step it cannot see.
+ *
  * So the dashboard asks for something different from the Signals page, and the difference is stated here
  * rather than embedded in a route:
  *
@@ -81,4 +87,30 @@ export function buildDashboardRecentSignalsQuery() {
 export function chooseDashboardSignals({ actionable = [], recent = [] } = {}) {
   if (actionable.length) return { rows: actionable.slice(0, DASHBOARD_SIGNAL_LIMIT), scope: 'actionable' };
   return { rows: recent.slice(0, DASHBOARD_SIGNAL_LIMIT), scope: 'recent' };
+}
+
+/**
+ * The Overview's signal strip, read and annotated in one call.
+ *
+ * Both statements go out together - one round trip each, both bounded - and each list is re-decided against the
+ * workspace as it is now before the either/or is made. The choice happens *after* annotation on purpose: a row
+ * is actionable because of what it holds, not because of what it said about execution.
+ *
+ * `withLiveBlockers` is required rather than optional. Without it this function returns sentences the
+ * workspace has outgrown, and every caller in the product is a trader looking at one.
+ */
+export async function readDashboardSignals({ pool, userId, withLiveBlockers } = {}) {
+  if (!pool?.query) throw new TypeError('The dashboard signal read needs a pool to read from');
+  if (typeof withLiveBlockers !== 'function') {
+    throw new TypeError('The dashboard signal read needs the live-blocker reader, or its notes are history');
+  }
+  const [actionable, recent] = await Promise.all([
+    pool.query(buildDashboardActionableSignalsQuery().sql, [userId]),
+    pool.query(buildDashboardRecentSignalsQuery().sql, [userId]),
+  ]);
+  const [actionableLive, recentLive] = await Promise.all([
+    withLiveBlockers(userId, actionable.rows),
+    withLiveBlockers(userId, recent.rows),
+  ]);
+  return chooseDashboardSignals({ actionable: actionableLive, recent: recentLive });
 }

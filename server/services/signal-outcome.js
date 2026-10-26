@@ -61,11 +61,30 @@ export const EXECUTION_BLOCKER_NOTES = Object.freeze([
   PAUSED_NOTE,
 ]);
 
-const BLOCKER_SET = new Set(EXECUTION_BLOCKER_NOTES);
+/**
+ * The registry, keyed by a whitespace-normalised copy of itself.
+ *
+ * Matching is exact-after-normalising rather than fuzzy: the sentence has to *be* one of ours, because a note
+ * this module did not write is not its to rewrite. But a stored value can differ from the constant by nothing a
+ * reader would notice - a newline where a channel's text wrapped, a doubled space, a trailing one from a
+ * console fix-up - and a `Set` of literals calls all three "not mine" and quietly leaves the contradiction on
+ * the screen. Whitespace is normalised on both sides, so the comparison is about words.
+ */
+function normaliseBlockerNote(value) {
+  return typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '';
+}
+
+const BLOCKER_BY_TEXT = new Map(EXECUTION_BLOCKER_NOTES.map((note) => [normaliseBlockerNote(note), note]));
+
+/** Which of this module's sentences a stored note is, or null when the note is not one of ours. */
+export function matchExecutionBlockerNote(value) {
+  const key = normaliseBlockerNote(value);
+  return key === '' ? null : (BLOCKER_BY_TEXT.get(key) ?? null);
+}
 
 /** Whether a row's note is one this module owns, and may therefore re-derive. */
 export function isExecutionBlockerNote(note) {
-  return typeof note === 'string' && BLOCKER_SET.has(note.trim());
+  return matchExecutionBlockerNote(note) !== null;
 }
 
 function paid(status) {
@@ -141,19 +160,23 @@ export const SIGNAL_OUTCOME_CONTEXT_SQL = `SELECT s.auto_trading_enabled AS auto
  * for a row that was never blocked by these conditions.
  */
 export function overlayLiveBlocker(signal, context = {}) {
-  if (!signal || typeof signal !== 'object' || signal.executionReady !== true) return signal;
-  /* `source` is what says "a channel wrote this, a person did not", and it is the only fact needed. Reading a
-     second field - the Telegram message id - looked like belt and braces and was instead a switch that turned
-     this whole function off: the id is not a column either list query selects, so every row that reached a
-     trader failed the test and kept the sentence its workspace had outgrown. A re-decision is allowed to depend
-     on exactly the fields the projections it is applied to promise, and `test/signal-capture-outcome.test.js`
-     now holds both halves of that: this list, and the column lists that have to carry it. */
-  if (String(signal.source || '') !== 'telegram') return signal;
-  const stored = typeof signal.executionNote === 'string' ? signal.executionNote.trim() : '';
-  // Only a row that already carries one of these sentences is re-decided. A row with no sentence had nothing to
-  // report about its execution - a hand-written note, or a signal that went straight to the queue - and the
-  // reader is not owed a blocker that never applied to it.
-  if (stored === '' || !isExecutionBlockerNote(stored)) return signal;
+  if (!signal || typeof signal !== 'object') return signal;
+  /* A hand-written note belongs to the person who wrote it, whatever it says. Every other source this product
+     has - a channel push, a catch-up replay, an older release's label for the same idea - is a row this module
+     is entitled to re-describe, because the only way it reaches here is by already carrying one of our
+     sentences. The gate used to be `source === 'telegram'`: a fact about how a row was born rather than about
+     whether its sentence has gone stale, and it spared every row an older build filed under another label. */
+  if (String(signal.source || '') === 'manual') return signal;
+  /* One eligibility test, not three. `executionReady === true` was on this list on the reasoning that a row
+     which never could not trade has no business being re-decided - and it silenced the whole function for
+     exactly the rows this exists for, because that column is the parser's verdict on the *message*, and
+     releases before it was a separate flag wrote false here for rows the workspace's own conditions had
+     blocked. Carrying a sentence this module owns is the only evidence a re-decision needs. */
+  /* Two fields can carry the sentence: `execution_note` is where it belongs, and `parse_error` is where an
+     older build left it, because that was the only text field the card read. A row is eligible on either. */
+  const storedInNote = matchExecutionBlockerNote(signal.executionNote);
+  const storedInParseError = matchExecutionBlockerNote(signal.parseError);
+  if (!storedInNote && !storedInParseError) return signal;
   const decision = decideSignalOutcome({
     executionReady: true,
     manual: false,
@@ -164,8 +187,17 @@ export function overlayLiveBlocker(signal, context = {}) {
     accountSelected: context.accountSelected === true,
     accountState: context.accountState,
   });
-  if ((decision.note || '') === stored) return signal;
-  return { ...signal, executionNote: decision.note || null };
+  /* The live sentence goes into `execution_note`, the field the card reads first, so it shadows whatever the
+     legacy copy said; and a sentence of ours found in `parse_error` is dropped from the response, because that
+     field is the fallback the card reaches for the moment the note is empty, and leaving it there would put the
+     stale text back on the screen. Dropped from the response only - this function decorates a read, so the admin
+     panel, the operator log and "Clear parsing errors" still see what was actually stored. */
+  const shown = decision.note || null;
+  // A row that already says the true thing is handed back as it came, so a list of them stays the same list of
+  // objects and a client that compares rows sees no change where nothing changed.
+  if (!storedInParseError && (typeof signal.executionNote === 'string' ? signal.executionNote : null) === shown) return signal;
+  if (storedInParseError) return { ...signal, executionNote: shown, parseError: null };
+  return { ...signal, executionNote: shown };
 }
 
 /**

@@ -19,7 +19,9 @@ import {
   buildDashboardActionableSignalsQuery,
   buildDashboardRecentSignalsQuery,
   chooseDashboardSignals,
+  readDashboardSignals,
 } from '../services/dashboard-signals.js';
+import { AUTO_TRADING_OFF_NOTE, PLAN_NO_EXECUTION_NOTE, createSignalOutcomeReader } from '../services/signal-outcome.js';
 import { assertQueryParameters } from '../services/query-params.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -97,13 +99,114 @@ test('setups win, and only three of them', () => {
   assert.equal(nothing.scope, 'recent', 'an empty workspace is described as "nothing actionable", which is true, and the Telegram empty state takes over');
 });
 
-test('the dashboard route asks for both and picks, rather than filtering in JavaScript', () => {
-  assert.match(routes, /pool\.query\(buildDashboardActionableSignalsQuery\(\)\.sql, \[req\.userId\]\)/);
-  assert.match(routes, /pool\.query\(buildDashboardRecentSignalsQuery\(\)\.sql, \[req\.userId\]\)/);
-  assert.match(routes, /const dashboardSignals = chooseDashboardSignals\(\{ actionable: actionableSignalsLive, recent: recentSignalsLive \}\);/,
-    'the two lists are picked after each has been re-read against the state the workspace is in now');
-  assert.match(routes, /withLiveBlockers\(req\.userId, actionableSignals\.rows\)/, 'and the re-read goes through the one helper the Signals tab uses too, not a second copy of the rule');
+test('the dashboard read owns both lists and the re-decision, and the route cannot skip either', () => {
+  const service = readFileSync(path.join(here, '..', 'services', 'dashboard-signals.js'), 'utf8');
+  const start = service.indexOf('export async function readDashboardSignals');
+  assert.notEqual(start, -1, 'the Overview strip is composed in one function');
+  const block = service.slice(start, service.indexOf('\n}', start));
+  assert.match(block, /pool\.query\(buildDashboardActionableSignalsQuery\(\)\.sql, \[userId\]\)/);
+  assert.match(block, /pool\.query\(buildDashboardRecentSignalsQuery\(\)\.sql, \[userId\]\)/);
+  assert.match(block, /Promise\.all\(\[\n\s*pool\.query\(buildDashboardActionableSignalsQuery/, 'both statements go out together, not one after the other');
+  assert.match(block, /withLiveBlockers\(userId, actionable\.rows\)/, 'and both lists are re-read against the state the workspace is in now');
+  assert.match(block, /withLiveBlockers\(userId, recent\.rows\)/, 'including the fallback list, which is the one a quiet workspace actually sees');
+  assert.match(block, /chooseDashboardSignals\(\{ actionable: actionableLive, recent: recentLive \}\)/, 'picked after the re-read, never before');
+  assert.match(block, /typeof withLiveBlockers !== 'function'[\s\S]*throw new TypeError/, 'a caller without the reader is refused rather than served stale');
+
+  /* And the route is allowed to be boring, which is the point: it never sees an un-annotated row, so there is
+     no step left inside it to forget. The overlay itself was always correct - it was the route that stopped
+     calling it, and the trader kept a sentence their workspace had outgrown. Composition belongs where a test
+     can drive it, so the raw statements, the pick and the reader all live above, and this handler's whole
+     involvement is one call. */
+  const at = routes.indexOf("app.get('/api/dashboard'");
+  assert.notEqual(at, -1);
+  const handler = routes.slice(at, routes.indexOf("\napp.get('", at + 1));
+  assert.match(handler, /readDashboardSignals\(\{ pool, userId: req\.userId, withLiveBlockers \}\)/);
+  assert.equal(handler.includes('withLiveBlockers('), false, 'the handler does not annotate a list itself, so it cannot annotate one of two');
+  assert.equal(handler.includes('buildDashboard'), false, 'nor reaches past the service for the queries');
+  assert.equal(/from '\.\/services\/dashboard-signals\.js'.*buildDashboard/s.test(routes), false, 'and the builders are not even imported by the server any more');
   assert.match(routes, /signals: dashboardSignals\.rows,/, 'the payload key the client already reads is unchanged');
   assert.match(routes, /signalsScope: dashboardSignals\.scope/, 'plus which list it is, so the wording cannot disagree with the query');
   assert.equal(routes.includes('ORDER BY created_at DESC LIMIT 10'), false, 'no ten-row dashboard query is left anywhere');
+});
+
+test('GET /api/dashboard on a legacy off-note row and a Free workspace answers with the plan sentence', async () => {
+  /* The report, end to end: the switch is on, the plan is not, and the Overview still reads "Auto-Trading is
+     off". Everything between the two is what the client calls, with the two statements the route issues and the
+     same context read the route performs - no fake of the overlay in sight. */
+  const legacy = {
+    id: 'sig-1',
+    source: 'telegram',
+    message: 'XAUUSD SELL\nEntry 4016.70 - 4023.70\nSL: 4030\nTP 1: 4014.70',
+    symbol: 'XAUUSD', side: 'sell', entryPrice: 4016.7, stopLoss: 4030, takeProfit: 4014.7,
+    // The shape an older release wrote: the flag was the parser's verdict, and a row the workspace's own
+    // conditions blocked arrived marked as though it had never been readable at all.
+    executionReady: false,
+    status: 'unexecuted',
+    executionNote: AUTO_TRADING_OFF_NOTE,
+    parseError: null,
+  };
+  const seen = [];
+  let contextReads = 0;
+  const pool = {
+    async query(sql, params) {
+      seen.push(sql);
+      if (!sql.includes('FROM signals')) throw new Error(`unexpected statement: ${sql.slice(0, 60)}`);
+      /* Only the actionable statement finds the row - `execution_ready` is false and the status is the one a
+         refusal carries - which is how the Overview ends up on its fallback list, and why both lists have to
+         be annotated rather than just the first. */
+      const actionable = sql.includes('execution_ready = TRUE');
+      return { rows: actionable ? [] : [legacy] };
+    },
+  };
+  const reader = createSignalOutcomeReader({
+    pool: {
+      async query() {
+        contextReads += 1;
+        // Free plan, auto-trading on, an account deployed: the only thing missing is the plan.
+        return { rows: [{ autoTrading: true, executionAccountId: 'acct-1', accountState: 'DEPLOYED', subscriptionStatus: 'free' }] };
+      },
+    },
+    platformControls: { async read() { return { state: 'live' }; } },
+    runtimeEnabled: () => true,
+  });
+
+  const dashboard = await readDashboardSignals({ pool, userId: 'user-1', withLiveBlockers: reader.withLiveBlockers });
+  assert.equal(dashboard.scope, 'recent', 'the fallback list is what this workspace sees');
+  assert.equal(dashboard.rows.length, 1);
+  const [row] = dashboard.rows;
+  assert.equal(row.executionNote, PLAN_NO_EXECUTION_NOTE, 'the card says the plan is what is missing, because the plan is what is missing');
+  assert.equal(row.status, 'unexecuted', 'and only the sentence moved');
+  assert.equal(row.executionReady, false, 'the stored verdict on the message is left for the reviewer to read');
+  assert.equal(seen.filter((sql) => sql.includes('FROM signals')).length, 2, 'two bounded statements, as the Overview has always issued');
+  assert.equal(contextReads, 1, 'read once for the whole strip - and once only, because the actionable list came back empty rather than full of rows to re-decide');
+});
+
+test('a workspace with nothing to re-decide is not a workspace worth a context read', async () => {
+  // The overlay costs one query per list, and only when a row actually carries one of our sentences. A user who
+  // polls the Overview every second and has nothing blocked must not pay for the guarantee.
+  let contextReads = 0;
+  const pool = {
+    async query(sql) {
+      if (sql.includes('FROM signals')) return { rows: [{ id: 'sig-2', source: 'telegram', executionReady: true, status: 'queued', executionNote: null, parseError: null }] };
+      contextReads += 1;
+      return { rows: [] };
+    },
+  };
+  const reader = createSignalOutcomeReader({ pool, platformControls: { async read() { return { state: 'live' }; } }, runtimeEnabled: () => true });
+  const dashboard = await readDashboardSignals({ pool, userId: 'user-1', withLiveBlockers: reader.withLiveBlockers });
+  assert.equal(dashboard.rows[0].executionNote, null);
+  assert.equal(contextReads, 0, 'nothing was re-decided, so nothing was read to decide it with');
+});
+
+test('the Overview selects the columns the re-decision reads', () => {
+  /* A gate that looks at a column no query selects is a gate that is always false, which is how this bug
+     survived its own unit tests. The list is therefore pinned against the reader's needs, in the projection
+     the route actually uses, rather than against prose in a comment. */
+  const keys = DASHBOARD_SIGNAL_COLUMNS.split(',').map((part) => {
+    const alias = part.match(/AS "([^"]+)"/);
+    return (alias ? alias[1] : part.trim().split(/\s+/).at(-1)).trim();
+  });
+  for (const needed of ['executionNote', 'parseError', 'source', 'executionReady', 'status', 'id', 'createdAt']) {
+    assert.ok(keys.includes(needed), `${needed} is selected, or the overlay cannot see it`);
+  }
 });

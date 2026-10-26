@@ -12,6 +12,9 @@ import test from 'node:test';
 
 import { createSignalOutcomeReader } from '../services/signal-outcome.js';
 import {
+  isExecutionBlockerNote,
+  matchExecutionBlockerNote,
+  overlayLiveBlocker,
   ACCOUNT_NOT_READY_NOTE,
   AUTO_TRADING_OFF_NOTE,
   NO_ACCOUNT_NOTE,
@@ -130,4 +133,82 @@ test('the reader keeps the array identity it was handed when there is no work to
   const rows = [{ id: 2, source: 'telegram', executionNote: null }];
   assert.equal(await reader.withLiveBlockers('user-1', rows), rows, 'the same array, so a route that spread rows into a payload did not build a new list to nothing');
   assert.equal(await reader.withLiveBlockers('user-1', null), null, 'and a missing list is passed through rather than turned into an empty one');
+});
+
+/* --------------------------------------------------------------------------- *
+ * The eligibility test itself, on the shapes a live table actually holds.
+ *
+ * These four cases are the difference between "the unit works" and "the trader sees the truth": every one of
+ * them is a row the shipped function let through with a sentence its workspace had outgrown, because the gate
+ * asked about a column instead of about the sentence.
+ * --------------------------------------------------------------------------- */
+
+test('every legacy shape of a blocked row is still re-decided', () => {
+  /* Free plan, auto-trading on: the state the report was written in, and the reason the card should read
+     "your plan does not include automatic execution" rather than blaming the switch. */
+  const context = { autoTradingEnabled: true, subscriptionStatus: 'free' };
+  // `execution_ready` is the parser's verdict on the message, and releases before it was a separate flag wrote
+  // false here for rows the workspace conditions blocked; `source` has carried more than one label for "a
+  // channel sent this"; and a sentence can be stored with a line break from a console fix-up.
+  const legacy = [
+    ['execution_ready false', { executionReady: false, source: 'telegram', executionNote: AUTO_TRADING_OFF_NOTE }],
+    ['execution_ready missing', { source: 'telegram', executionNote: AUTO_TRADING_OFF_NOTE }],
+    ['an older source label', { executionReady: true, source: 'telegram_channel', executionNote: AUTO_TRADING_OFF_NOTE }],
+    ['no source at all', { executionReady: true, source: null, executionNote: AUTO_TRADING_OFF_NOTE }],
+    ['a wrapped line', { executionReady: true, source: 'telegram', executionNote: 'Auto-Trading is off, so this\n   signal was saved for review only.\n' }],
+    ['a doubled space', { executionReady: true, source: 'telegram', executionNote: 'Auto-Trading is off,  so this signal was saved for review only.' }],
+  ];
+  for (const [label, row] of legacy) {
+    const out = overlayLiveBlocker(row, context);
+    assert.equal(out.executionNote, PLAN_NO_EXECUTION_NOTE, `${label}: kept the stored sentence`);
+    assert.equal(out.status, row.status, `${label}: changed the status`);
+  }
+});
+
+test('a sentence the card falls back to is corrected too, in the response only', () => {
+  // Some builds put the blocker where the parser's refusal goes, and the card reads that field when the note is
+  // empty - so the legacy sentence there would win by being the only text on the row.
+  const row = { executionReady: true, source: 'telegram', executionNote: null, parseError: `  ${AUTO_TRADING_OFF_NOTE} ` };
+  const out = overlayLiveBlocker(row, { autoTradingEnabled: true, subscriptionStatus: 'free' });
+  assert.equal(out.executionNote, PLAN_NO_EXECUTION_NOTE);
+  assert.equal(out.parseError, null);
+  assert.equal(row.parseError, `  ${AUTO_TRADING_OFF_NOTE} `, 'the stored row was mutated');
+});
+
+test('a row with nothing of ours to say is not given a blocker', () => {
+  const rows = [
+    // An unreadable message in a workspace that cannot auto-trade: `unparsed`, and nothing this module wrote.
+    { executionReady: false, source: 'telegram', status: 'unparsed', executionNote: null, parseError: 'No usable price appeared in this message.' },
+    // A clean row in a workspace that can trade: it goes to the broker, and the card says so.
+    { executionReady: true, source: 'telegram', status: 'unexecuted', executionNote: null },
+    // A review flag from a person, with the parser's own explanation beside it.
+    { executionReady: true, source: 'telegram', status: 'needs-review', executionNote: 'Check the lot before sending.', parseError: 'No usable price appeared in this message.' },
+  ];
+  for (const row of rows) {
+    assert.equal(overlayLiveBlocker(row, { autoTradingEnabled: true, subscriptionStatus: 'free' }), row);
+  }
+});
+
+test('a hand-written note belongs to the person who wrote it, however wrong it reads', () => {
+  const row = { executionReady: true, source: 'manual', executionNote: AUTO_TRADING_OFF_NOTE };
+  assert.equal(overlayLiveBlocker(row, { autoTradingEnabled: true, subscriptionStatus: 'active', accountSelected: true, accountState: 'DEPLOYED' }), row);
+});
+
+test('a row that already tells the truth is handed back untouched, not copied', () => {
+  const row = { executionReady: true, source: 'telegram', status: 'unexecuted', executionNote: PLAN_NO_EXECUTION_NOTE };
+  const out = overlayLiveBlocker(row, { autoTradingEnabled: true, subscriptionStatus: 'free' });
+  assert.equal(out, row, 'the same object, so a list of correct rows changes nothing on the screen');
+  // ...and a row whose sentence is the same words with different spacing is still normalised.
+  const mangled = { ...row, executionNote: 'Auto-Trading is on,  but your plan\ndoes not include automatic execution. Upgrade to execute signals.' };
+  assert.equal(overlayLiveBlocker(mangled, { autoTradingEnabled: true, subscriptionStatus: 'free' }).executionNote, PLAN_NO_EXECUTION_NOTE);
+});
+
+test('the registry matches on words, and on nothing looser', () => {
+  assert.equal(matchExecutionBlockerNote(AUTO_TRADING_OFF_NOTE), AUTO_TRADING_OFF_NOTE);
+  assert.equal(matchExecutionBlockerNote(' Auto-Trading\tis off, so this signal was saved for review only.\n'), AUTO_TRADING_OFF_NOTE);
+  assert.equal(matchExecutionBlockerNote('Auto-Trading is off, so this signal was saved for review only maybe'), null);
+  assert.equal(matchExecutionBlockerNote(null), null);
+  assert.equal(matchExecutionBlockerNote(42), null);
+  // A paraphrase is not ours to rewrite, however close it reads.
+  assert.equal(isExecutionBlockerNote('Auto-Trading is OFF so this signal was saved for review only.'), false);
 });

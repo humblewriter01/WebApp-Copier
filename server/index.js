@@ -21,7 +21,7 @@ import { createLlmGate } from './services/llm-gate.js';
 import { TARGET_MODES } from './services/scale-out.js';
 import { captureSafety, readFallbackPoints } from './services/signal-safety.js';
 import { entryRangeBounds, readExpirySetting, readSlippageSetting, ORDER_TYPES } from './services/order-routing.js';
-import { buildDashboardActionableSignalsQuery, buildDashboardRecentSignalsQuery, chooseDashboardSignals } from './services/dashboard-signals.js';
+import { readDashboardSignals } from './services/dashboard-signals.js';
 import { createTelegramListener } from './services/telegram-listener.js';
 import { createMetaApiTradingAdapter } from './services/metaapi-trading.js';
 import { createExecutionEngine, PLATFORM_PAUSE_MESSAGE } from './services/execution-engine.js';
@@ -946,25 +946,20 @@ app.get('/api/dashboard', authenticate, asyncRoute(async (req, res) => {
   /*
    * Two lists rather than one filtered query, because the Overview either shows setups or says it could not:
    * both statements are bounded and complete, they are read in the same round-trip fan-out as the counts
-   * beside them, and `chooseDashboardSignals` makes the call. The full history belongs to the Signals tab,
-   * which is why this route is allowed to be short.
+   * beside them, and `readDashboardSignals` makes the call. The full history belongs to the Signals tab,
+   * which is why this route is allowed to be short - and the strip arrives already re-decided against this
+   * workspace's live settings, because that read is part of the service and not a step this route can skip.
    */
-  const [signalsCount, channelsCount, accountsCount, actionableSignals, recentSignals, settings, subscription] = await Promise.all([
+  const [signalsCount, channelsCount, accountsCount, dashboardSignals, settings, subscription] = await Promise.all([
     pool.query('SELECT COUNT(*)::int AS count FROM signals WHERE user_id=$1', [req.userId]),
     pool.query('SELECT COUNT(*)::int AS count FROM channels WHERE user_id=$1 AND enabled=TRUE', [req.userId]),
     pool.query('SELECT COUNT(*)::int AS count FROM accounts WHERE user_id=$1', [req.userId]),
-    pool.query(buildDashboardActionableSignalsQuery().sql, [req.userId]),
-    pool.query(buildDashboardRecentSignalsQuery().sql, [req.userId]),
+    readDashboardSignals({ pool, userId: req.userId, withLiveBlockers }),
     pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled" FROM settings WHERE user_id=$1', [req.userId]),
     // The plan is part of the execution picture, not a billing detail: `Auto-Trading is on, but your plan does
     // not include automatic execution` is a sentence about the switch, and the banner cannot say it without it.
     pool.query('SELECT subscription_status AS status,subscription_plan AS plan FROM users WHERE id=$1', [req.userId]),
   ]);
-  const [actionableSignalsLive, recentSignalsLive] = await Promise.all([
-    withLiveBlockers(req.userId, actionableSignals.rows),
-    withLiveBlockers(req.userId, recentSignals.rows),
-  ]);
-  const dashboardSignals = chooseDashboardSignals({ actionable: actionableSignalsLive, recent: recentSignalsLive });
   res.set('Cache-Control', 'no-store').json({
     stats: { totalSignals: signalsCount.rows[0].count, activeChannels: channelsCount.rows[0].count, accounts: accountsCount.rows[0].count },
     signals: dashboardSignals.rows,
