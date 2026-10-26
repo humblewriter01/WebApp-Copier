@@ -200,7 +200,7 @@ test('the card never has to explain a blocker twice, in two directions', () => {
   // screenshot. The server re-decides it before it reaches here (`overlayLiveBlocker`); the client only shows
   // what it is given, and that division is what keeps the two from ever disagreeing about the cause.
   const source = readFileSync(path.join(here, '..', 'src', 'lib', 'signal-outcome.js'), 'utf8');
-  assert.equal(/executionNote\s*=|signal\.executionNote\s*=/.test(source), false, 'the card does not write a note of its own');
+  assert.equal(/(?:signal[?.]*)?executionNote\s*=(?!=)/.test(source), false, 'the card does not write a note of its own');
   assert.match(source, /const note = friendlySignalNote\(stored\)/, 'it filters the note it was given');
 });
 

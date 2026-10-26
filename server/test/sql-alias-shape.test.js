@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -142,3 +142,25 @@ test('the two signal lists the workspace reads are ordered newest first, in SQL'
   assert.equal(/signals\.sort\(|\.sort\(\(a, b\) => a\.createdAt/.test(readFileSync(path.join(here, '..', '..', 'client', 'src', 'App.jsx'), 'utf8')), false, 'the client renders this order rather than inventing its own');
 });
 
+test('no camelCase alias in any server statement is left unquoted', () => {
+  /* `AS autoTrading` is not a style choice and no linter says so: the statement is a string, and Postgres
+     answers an unquoted alias with `autotrading`. The row then has no `autoTrading` key, `=== true` is false,
+     and every decision built from that row is built on `undefined` - in this codebase that meant a workspace's
+     Auto-Trading switch, its plan, its account, its safety switches and its fallback distances, silently
+     reading as off. Two shipped instances of it, both invisible to a suite whose fake pools returned whatever
+     keys the code asked for. So the shape of the alias is checked in every statement, in every file, here. */
+  const files = ['index.js', 'db.js', ...readdirSync(path.join(here, '..', 'services')).filter((name) => name.endsWith('.js')).map((name) => `services/${name}`)];
+  const offenders = [];
+  for (const file of files) {
+    const source = readFileSync(path.join(here, '..', file), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+    for (const literal of source.match(/'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`/g) || []) {
+      if (!/\b(SELECT|UPDATE|INSERT|WITH)\b/i.test(literal)) continue;
+      for (const match of literal.matchAll(/\bAS\s+([A-Za-z_][A-Za-z0-9_]*)/g)) {
+        if (/[A-Z]/.test(match[1])) offenders.push(`${file}: AS ${match[1]}`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, [], 'every camelCase alias in a statement is double-quoted');
+});
