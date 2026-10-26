@@ -14,6 +14,7 @@ import {
   UPGRADE_REQUIRED_NOTE,
 } from '../services/signal-outcome.js';
 import { createExecutionEngine } from '../services/execution-engine.js';
+import { captureSafety } from '../services/signal-safety.js';
 
 const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 // The capture loop moved into its own module so that a test can drive an update through it. The
@@ -61,7 +62,8 @@ test('the capture path asks the database for the switch on every message, and re
   // The statement itself lives beside the decision it feeds, and the routes that *display* signals read the
   // same one: a banner and a row that disagree about the account are only possible if they ask separately.
   const outcomeService = readFileSync(new URL('../services/signal-outcome.js', import.meta.url), 'utf8');
-  assert.match(outcomeService, /export const SIGNAL_OUTCOME_CONTEXT_SQL = `SELECT s\.auto_trading_enabled AS autoTrading/);
+  assert.match(outcomeService, /export const SIGNAL_OUTCOME_CONTEXT_SQL = `SELECT s\.auto_trading_enabled AS "autoTrading"/, 'the aliases are quoted, or Postgres folds them and the read silently returns undefined');
+  assert.match(outcomeService, /AS "executionAccountId",[\s\S]*AS "accountState",u\.subscription_status AS "subscriptionStatus",u\.id AS "userId"/, 'every one of them');
   assert.equal((index.match(/pool\.query\(SIGNAL_OUTCOME_CONTEXT_SQL/g) || []).length, 1, 'the capture asks once per message, and keeps no other copy of the read');
   assert.match(index, /createSignalOutcomeReader\(\{/, 'the routes that display rows go through the reader beside the decision it feeds, rather than a second one here');
   assert.equal((outcomeService.match(/pool\.query\(SIGNAL_OUTCOME_CONTEXT_SQL/g) || []).length, 1, 'and that reader issues the statement exactly once, for every list it is applied to');
@@ -69,6 +71,60 @@ test('the capture path asks the database for the switch on every message, and re
      as itself, never as the user\'s switch. Conflating the two is how "it is on but nothing trades" starts. */
   assert.match(saveSignalBody, /runtimeEnabled: autoTradingRuntimeEnabled/, 'the runtime flag is passed separately');
   assert.equal(/runtimeEnabled: settings\.autoTrading|autoTradingEnabled: autoTradingRuntimeEnabled/.test(index), false);
+});
+
+/**
+ * A fake result set keyed the way Postgres keys one.
+ *
+ * The whole reason this exists: an unquoted alias is folded to lowercase by the server, so
+ * `AS autoTrading` arrives as `autotrading`, `row.autoTrading` is `undefined`, `undefined === true` is false,
+ * and a workspace with its switch ON is decided as though it were OFF. Every fake pool in the suite handed
+ * back exactly the camelCase keys the code asked for, so three releases of this bug passed their tests.
+ * This one reads the aliases out of the statement it is handed and folds the unquoted ones, which makes the
+ * projection itself part of the contract under test.
+ */
+function foldedRow(sql, source) {
+  const lookup = new Map(Object.entries(source).map(([key, value]) => [key.toLowerCase(), value]));
+  const list = sql.slice(sql.search(/\bSELECT\b/i) + 6, sql.search(/\bFROM\b/i));
+  const row = {};
+  for (const part of list.split(',')) {
+    const token = part.replace(/`/g, '').trim();
+    if (!token) continue;
+    const aliased = /\sAS\s+("(?:[^"]+)"|[A-Za-z_]\w*)$/i.exec(token);
+    if (!aliased) {
+      const bare = /^[a-z_][a-z0-9_]*$/i.exec(token.includes('.') ? token.split('.').pop() : token);
+      if (bare) row[bare[1].toLowerCase()] = lookup.get(bare[1].toLowerCase()) ?? null;
+      continue;
+    }
+    const raw = aliased[1];
+    const key = raw.startsWith('"') ? raw.slice(1, -1) : raw.toLowerCase();
+    row[key] = lookup.get(key.toLowerCase()) ?? null;
+  }
+  return row;
+}
+
+test('the capture-time safety switches survive the round trip they are read on', () => {
+  /* The other statement with unquoted aliases in it, and the one with money on it: `captureSafety` is handed
+     `settings.<camelCase>` for the two block-unless switches and the fallback distances, and folded keys made
+     all five `undefined` - a workspace that refuses to capture a signal without a stop loss silently looked
+     like one that allowed it. Same fake database as in `signal-live-blocker-read.test.js`. */
+  const guardSql = /const guardSql = '([^']+)'/.exec(saveSignalBody)?.[1];
+  assert.ok(guardSql, 'the capture reads its strictness from `settings` in one statement');
+  const folded = foldedRow(guardSql, {
+    lotSizeMode: 'risk_percent',
+    blockExecutionWithoutStopLoss: true,
+    blockExecutionWithoutTakeProfit: false,
+    fallbackStopLossPoints: 500,
+    fallbackTakeProfitPoints: 700,
+  });
+  assert.equal(folded.blockExecutionWithoutStopLoss, true, 'the switch that must fail closed arrives as a true value');
+  assert.equal(folded.fallbackStopLossPoints, 500);
+  assert.equal(folded.lotSizeMode, 'risk_percent');
+  assert.equal(Object.values(folded).includes(undefined), false, 'and nothing is read as a missing key');
+
+  const safety = captureSafety({ parsed: { side: 'buy', symbol: 'EURUSD', entryPrice: 1.08, stopLoss: null, takeProfit: 1.12 }, source: 'telegram', settings: folded, review: {} });
+  assert.equal(safety.blocked === true || /stop/.test(String(safety.reason || '') + JSON.stringify(safety)), true,
+    'a workspace that blocks signals without a stop loss is obeyed, not quietly overruled by a folded column name');
 });
 
 test('the four states of the workspace produce exactly the four sentences, in this order', () => {

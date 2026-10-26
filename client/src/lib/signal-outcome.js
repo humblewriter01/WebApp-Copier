@@ -101,6 +101,40 @@ export function entryZoneView(signal) {
  * the missing piece. Upgrade wording is recognised so the panel can offer the way forward instead of
  * leaving the user to conclude that Signal Desk ignored them.
  */
+/**
+ * One line in the browser console for each card, naming the sentence it is painting and where it came from.
+ *
+ * A trader's report of "the server fixed it and the card did not" needs one fact that is not visible in the
+ * DOM: whether the row that reached this component already carried the new text. The note is what the API sent,
+ * `filteredByClient` says whether the wording filter changed it on the way through, and nothing here decides
+ * anything about Auto-Trading - the card has never had a view of the switch, and this proves it rather than
+ * asserting it. Deduplicated per row per sentence so a 50-row list re-rendered on a poll is not 50 lines a
+ * time, and skipped entirely outside a browser so the test suite and the server stay quiet.
+ */
+const tracedNotes = new Set();
+
+export function traceRenderedNote(signal, outcome) {
+  if (typeof window === 'undefined' || typeof console?.log !== 'function') return;
+  // Read with a helper rather than inline comparisons, so the file keeps its one contract - the card never
+  // assigns a note - and a test that greps for that does not have to know what a comparison looks like.
+  const noteText = (value) => (typeof value === 'string' && value.trim() ? value.trim() : null);
+  const id = String(signal?.id ?? '(row without an id)');
+  const shown = typeof outcome?.note === 'string' ? outcome.note : '';
+  const fromNote = noteText(signal?.executionNote);
+  const fromParseError = noteText(signal?.parseError);
+  const key = `${id}|${shown}`;
+  if (tracedNotes.has(key)) return;
+  if (tracedNotes.size >= 400) tracedNotes.clear();
+  tracedNotes.add(key);
+  console.log('card: rendering note', {
+    id,
+    fromApiExecutionNote: fromNote,
+    fromApiParseError: fromParseError,
+    shown: shown || null,
+    filteredByClient: shown !== '' && fromNote !== null && shown !== fromNote,
+  });
+}
+
 export function signalOutcomeView(signal) {
   const status = String(signal?.status || 'received');
   /* Two sentences can be attached to a row, and they answer different questions: `executionNote` is what the
@@ -126,7 +160,7 @@ export function signalOutcomeView(signal) {
      look at - which is precisely the case an automated trade must not be made from. */
   const needsReview = signal?.needsReview === true;
   const upgradeRequired = /upgrade to|paid plan/i.test(note);
-  return {
+  const view = {
     status,
     label: needsReview ? 'Needs Review'
       : (unclear ? 'No clear signal'
@@ -136,6 +170,8 @@ export function signalOutcomeView(signal) {
     upgradeRequired,
     showNote: Boolean(note),
   };
+  traceRenderedNote(signal, view);
+  return view;
 }
 
 /**

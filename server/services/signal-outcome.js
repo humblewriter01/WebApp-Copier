@@ -137,8 +137,15 @@ export function decideSignalOutcome(input = {}) {
  * The one read that answers "could this workspace trade right now?", shared by capture and by the reads that
  * display a row, so a signal list and the decision beside it can never be built from two different pictures.
  */
-export const SIGNAL_OUTCOME_CONTEXT_SQL = `SELECT s.auto_trading_enabled AS autoTrading,s.execution_account_id AS executionAccountId,
-       ma.state AS accountState,u.subscription_status AS subscriptionStatus,u.id AS userId
+/* Every alias here is double-quoted, and that is not style: Postgres folds an unquoted identifier to lowercase,
+   so `AS autoTrading` comes back as `autotrading`, `row.autoTrading` is `undefined`, `undefined === true` is
+   false, and a workspace whose switch is ON is decided as though it were OFF - permanently, on every read and
+   every write, with every unit test green because a fake pool hands back exactly the keys the code asked for.
+   `test/sql-alias-shape.test.js` now refuses an unquoted camelCase alias anywhere in the server's SQL, and
+   `test/signal-live-blocker-read.test.js` drives this statement through a pool that folds the way the real one
+   does. */
+export const SIGNAL_OUTCOME_CONTEXT_SQL = `SELECT s.auto_trading_enabled AS "autoTrading",s.execution_account_id AS "executionAccountId",
+       ma.state AS "accountState",u.subscription_status AS "subscriptionStatus",u.id AS "userId"
   FROM users u
   LEFT JOIN settings s ON s.user_id=u.id
   LEFT JOIN metaapi_accounts ma ON ma.user_id=u.id AND ma.metaapi_account_id=s.execution_account_id
@@ -164,6 +171,7 @@ const overlayStats = {
   rows: 0,
   eligible: 0,
   rewrites: 0,
+  unchanged: 0,
   skips: 0,
   contextFailures: 0,
   lastReadAt: null,
@@ -193,6 +201,9 @@ export function describeOverlayDiagnostics() {
     rows: overlayStats.rows,
     eligible: overlayStats.eligible,
     rewrites: overlayStats.rewrites,
+    // The branch that a wrong decision hides behind: "the live state really does say this". Without it,
+    // `rewrites: 0` is indistinguishable from "nothing was ever eligible".
+    unchanged: overlayStats.unchanged,
     skips: overlayStats.skips,
     contextFailures: overlayStats.contextFailures,
     lastReadAt: overlayStats.lastReadAt,
@@ -273,7 +284,8 @@ export function overlayLiveBlocker(signal, context = {}) {
   if (!storedInParseError && (typeof signal.executionNote === 'string' ? signal.executionNote : null) === shown) {
     // Already true, so nothing is rewritten - and this line is the answer to "the overlay ran and the card did
     // not change": it means the live settings really do still say this, and the sentence is not stale at all.
-    overlayTrace('unchanged', signal.id, { note: clipNote(shown) }, { dedupe: `same:${signal.id}:${shown}` });
+    overlayStats.unchanged += 1;
+    overlayTrace('unchanged', signal.id, { note: clipNote(shown), context }, { dedupe: `same:${signal.id}:${shown}` });
     return signal;
   }
   overlayStats.rewrites += 1;

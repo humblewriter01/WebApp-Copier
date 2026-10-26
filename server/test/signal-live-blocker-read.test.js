@@ -48,6 +48,36 @@ function harness({ settingsRow = null, pause = { state: 'live' }, runtimeEnabled
   return { queries, reader: readerUnderTest, setRuntime: (value) => { live = value; } };
 }
 
+/**
+ * A fake result set keyed the way Postgres keys one.
+ *
+ * The whole reason this exists: an unquoted alias is folded to lowercase by the server, so
+ * `AS autoTrading` arrives as `autotrading`, `row.autoTrading` is `undefined`, `undefined === true` is false,
+ * and a workspace with its switch ON is decided as though it were OFF. Every fake pool in the suite handed
+ * back exactly the camelCase keys the code asked for, so three releases of this bug passed their tests.
+ * This one reads the aliases out of the statement it is handed and folds the unquoted ones, which makes the
+ * projection itself part of the contract under test.
+ */
+function foldedRow(sql, source) {
+  const lookup = new Map(Object.entries(source).map(([key, value]) => [key.toLowerCase(), value]));
+  const list = sql.slice(sql.search(/\bSELECT\b/i) + 6, sql.search(/\bFROM\b/i));
+  const row = {};
+  for (const part of list.split(',')) {
+    const token = part.replace(/`/g, '').trim();
+    if (!token) continue;
+    const aliased = /\sAS\s+("(?:[^"]+)"|[A-Za-z_]\w*)$/i.exec(token);
+    if (!aliased) {
+      const bare = /^[a-z_][a-z0-9_]*$/i.exec(token.includes('.') ? token.split('.').pop() : token);
+      if (bare) row[bare[1].toLowerCase()] = lookup.get(bare[1].toLowerCase()) ?? null;
+      continue;
+    }
+    const raw = aliased[1];
+    const key = raw.startsWith('"') ? raw.slice(1, -1) : raw.toLowerCase();
+    row[key] = lookup.get(key.toLowerCase()) ?? null;
+  }
+  return row;
+}
+
 const blockedRow = (executionNote, extra = {}) => ({ id: 1, source: 'telegram', executionReady: true, status: 'unexecuted', executionNote, ...extra });
 const paid = { autoTrading: true, executionAccountId: 'acct-1', accountState: 'DEPLOYED', subscriptionStatus: 'active' };
 
@@ -293,4 +323,29 @@ test('a read path that cannot see the workspace says so out loud instead of fail
   const after = describeOverlayDiagnostics();
   assert.equal(after.contextFailures - before.contextFailures, 1);
   assert.ok(lines.some((line) => line.includes('overlay: skipped-list') && line.includes('context-unreadable')), 'and the reason is in the log, not only in the code');
+});
+
+test('the context read is proven against the names the database actually returns', async () => {
+  /* Not "does the SQL look right" - it looked right for three releases. The question is whether the row that
+     comes back has the keys the code reads, and the only honest way to ask it is to fold the aliases the way
+     the server does. Unquoted camelCase here, and every assertion below fails. */
+  const pool = {
+    async query(sql) {
+      return { rows: [foldedRow(sql, {
+        autoTrading: true,
+        executionAccountId: null,
+        accountState: null,
+        subscriptionStatus: 'free',
+        userId: 'user-1',
+      })] };
+    },
+  };
+  const reader = createSignalOutcomeReader({ pool, platformControls: { async read() { return { state: 'live' }; } }, runtimeEnabled: () => true });
+  const context = await reader.readOutcomeContext('user-1');
+  assert.equal(context.autoTradingEnabled, true, 'the workspace switch survives the round trip');
+  assert.equal(context.subscriptionStatus, 'free', 'and so does the plan');
+  assert.equal(context.accountSelected, false, 'and the absence of an account is still an absence');
+
+  const [row] = await reader.withLiveBlockers('user-1', [blockedRow(AUTO_TRADING_OFF_NOTE)]);
+  assert.equal(row.executionNote, PLAN_NO_EXECUTION_NOTE, 'so a Free workspace is told the truth about its plan instead of a switch that is on');
 });

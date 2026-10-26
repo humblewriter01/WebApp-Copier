@@ -366,7 +366,11 @@ async function saveSignal(userId, message, channel = {}) {
   /* The one thing that has to be known before the row is written is how strict this workspace wants
      capture to be. Nothing about the plan, the trading account, or the runtime belongs here: the
      message is stored whatever those say, and they decide only what happens afterwards. */
-  const guardSql = 'SELECT lot_size_mode AS lotSizeMode,block_execution_without_stop_loss AS blockExecutionWithoutStopLoss,block_execution_without_take_profit AS blockExecutionWithoutTakeProfit,fallback_stop_loss_points AS fallbackStopLossPoints,fallback_take_profit_points AS fallbackTakeProfitPoints FROM settings WHERE user_id=$1 LIMIT 1';
+    /* Quoted aliases, for the reason spelled out on `SIGNAL_OUTCOME_CONTEXT_SQL` - and the consequences here are
+     worse than a wrong sentence. Every one of these five values is read as `settings.<camelCase>` by
+     `captureSafety`, so folded to lowercase they all arrived as `undefined`: the two block-unless switches
+     (which must fail closed) read as off, and the fallback distances read as unset. */
+  const guardSql = 'SELECT lot_size_mode AS "lotSizeMode",block_execution_without_stop_loss AS "blockExecutionWithoutStopLoss",block_execution_without_take_profit AS "blockExecutionWithoutTakeProfit",fallback_stop_loss_points AS "fallbackStopLossPoints",fallback_take_profit_points AS "fallbackTakeProfitPoints" FROM settings WHERE user_id=$1 LIMIT 1';
   /* The one read that has to happen before the parse is the workspace's own strictness, so it does not happen
      *before* the parse: the two are issued together and the row is written as soon as both are back. A third
      round trip used to sit in front of every captured message, which on a quiet workspace is a millisecond and

@@ -361,3 +361,35 @@ test('an outcome note still speaks ahead of a parse error, and a real signal kee
   assert.equal(readable.note, 'The signal needs an entry price.', 'a legible row with a hole in it quotes its own reason');
   assert.equal(readable.label, 'Needs review', 'without becoming "no clear signal"');
 });
+
+/* ------------------------------------------------------------------ the card's own word */
+
+test('the card paints the sentence the API sent, and says so in the console it asked for', () => {
+  // The report this answers: "the endpoint returns the new text and the card still shows the old one". The card
+  // has no view of the workspace's switch - `executionNote`, then `parseError`, then nothing - and the trace
+  // line is what proves that from the browser, without a source read.
+  const plan = 'Auto-Trading is on, but your plan does not include automatic execution. Upgrade to execute signals.';
+  const off = 'Auto-Trading is off, so this signal was saved for review only.';
+  const row = { id: 'sig-card', status: 'received', executionNote: plan, parseError: null, autoTradingEnabled: false, settings: { autoTradingEnabled: false }, subscription: { plan: 'free' } };
+  assert.equal(signalOutcomeView(row).note, plan, 'a switch the row says is off changes nothing: the sentence is the server\'s');
+  const stale = { ...row, executionNote: off };
+  assert.equal(signalOutcomeView(stale).note, off, 'and it is passed through untouched when it is the old one, which is why the fix belongs upstream');
+
+  const logged = [];
+  const original = console.log;
+  const hadWindow = 'window' in globalThis;
+  globalThis.window = globalThis.window ?? {};
+  console.log = (...args) => logged.push(args);
+  try {
+    signalOutcomeView({ ...row, id: `sig-trace-${Math.random()}` });
+    signalOutcomeView({ ...row, id: `sig-trace-${Math.random()}` });
+  } finally {
+    console.log = original;
+    if (!hadWindow) delete globalThis.window;
+  }
+  assert.equal(logged.length, 2, 'one line per card, so a polled list does not become a flood');
+  const [, detail] = logged[0];
+  assert.equal(detail.fromApiExecutionNote, plan, 'the line quotes what the API sent');
+  assert.equal(detail.shown, plan, 'what is being painted');
+  assert.equal(detail.filteredByClient, false, 'and whether the wording filter touched it');
+});
