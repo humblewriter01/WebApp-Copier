@@ -145,6 +145,71 @@ export const SIGNAL_OUTCOME_CONTEXT_SQL = `SELECT s.auto_trading_enabled AS auto
   WHERE u.id=$1 LIMIT 1`;
 
 /**
+ * --------------------------------------------------------------------------- *
+ * Read-path tracing.
+ *
+ * A row that keeps a stale sentence is invisible from the outside: the card shows a sentence, the code says it
+ * should have been replaced, and nothing between the two says which branch ran. Every decision this module makes
+ * on a read therefore goes to stdout with its reason - once per row per decision, so a dashboard polling every
+ * twenty seconds does not turn one question into a flood - and the running totals are readable by an operator
+ * without a log search. `SIGNAL_OVERLAY_DEBUG=off` silences the lines, never the counters; an operator who can
+ * only see `/health` still learns whether the path is being walked at all.
+ * --------------------------------------------------------------------------- */
+const OVERLAY_LOG_ROWS = 400;
+const overlayTraceLines = new Set();
+const overlayStats = {
+  armedAt: new Date().toISOString(),
+  registry: EXECUTION_BLOCKER_NOTES.length,
+  reads: 0,
+  rows: 0,
+  eligible: 0,
+  rewrites: 0,
+  skips: 0,
+  contextFailures: 0,
+  lastReadAt: null,
+  lastSkipReason: null,
+  lastSkippedNote: null,
+};
+
+function overlayTrace(event, id = null, detail = '', { dedupe = null } = {}) {
+  if (dedupe !== null) {
+    if (overlayTraceLines.has(dedupe)) return;
+    if (overlayTraceLines.size >= OVERLAY_LOG_ROWS) overlayTraceLines.clear();
+    overlayTraceLines.add(dedupe);
+  }
+  if (String(process.env.SIGNAL_OVERLAY_DEBUG || '').toLowerCase() === 'off') return;
+  if (id === null) console.log(`overlay: ${event}`, detail);
+  else console.log(`overlay: ${event}`, id, detail);
+}
+
+const clipNote = (value) => (typeof value === 'string' && value.trim() ? value.trim().slice(0, 90) : null);
+
+/** What the read path has done so far - counts only, because `/health` is not authenticated. */
+export function describeOverlayDiagnostics() {
+  return {
+    armedAt: overlayStats.armedAt,
+    registry: overlayStats.registry,
+    reads: overlayStats.reads,
+    rows: overlayStats.rows,
+    eligible: overlayStats.eligible,
+    rewrites: overlayStats.rewrites,
+    skips: overlayStats.skips,
+    contextFailures: overlayStats.contextFailures,
+    lastReadAt: overlayStats.lastReadAt,
+    lastSkipReason: overlayStats.lastSkipReason,
+    lastSkippedNote: overlayStats.lastSkippedNote,
+  };
+}
+
+function overlaySkip(id, reason, note, parseError) {
+  overlayStats.skips += 1;
+  overlayStats.lastSkipReason = reason;
+  overlayStats.lastSkippedNote = clipNote(note) || clipNote(parseError);
+  overlayTrace('skipped', id ?? null, { reason, executionNote: clipNote(note), parseError: clipNote(parseError) },
+    { dedupe: `skip:${id}:${reason}:${overlayStats.lastSkippedNote}` });
+}
+
+/**
  * What a blocked row should say *now*, for a row that is being shown to somebody.
  *
  * A note is written when a signal arrives, and the conditions behind it are settings - which means a workspace
@@ -161,22 +226,32 @@ export const SIGNAL_OUTCOME_CONTEXT_SQL = `SELECT s.auto_trading_enabled AS auto
  */
 export function overlayLiveBlocker(signal, context = {}) {
   if (!signal || typeof signal !== 'object') return signal;
+  /* Two fields can carry the sentence: `execution_note` is where it belongs, and `parse_error` is where an
+     older build left it, because that was the only text field the card read. A row is eligible on either. */
+  const storedInNote = matchExecutionBlockerNote(signal.executionNote);
+  const storedInParseError = matchExecutionBlockerNote(signal.parseError);
+  if (!storedInNote && !storedInParseError) {
+    // Rows with nothing of ours on them are the majority and are not worth a line each; a row that is showing a
+    // sentence *is*, because that is the one somebody is reading and wondering about.
+    if (clipNote(signal.executionNote) || clipNote(signal.parseError)) {
+      overlaySkip(signal.id, 'note-not-in-registry', signal.executionNote, signal.parseError);
+    }
+    return signal;
+  }
   /* A hand-written note belongs to the person who wrote it, whatever it says. Every other source this product
      has - a channel push, a catch-up replay, an older release's label for the same idea - is a row this module
      is entitled to re-describe, because the only way it reaches here is by already carrying one of our
      sentences. The gate used to be `source === 'telegram'`: a fact about how a row was born rather than about
      whether its sentence has gone stale, and it spared every row an older build filed under another label. */
-  if (String(signal.source || '') === 'manual') return signal;
+  if (String(signal.source || '') === 'manual') {
+    overlaySkip(signal.id, 'manual-source', signal.executionNote, signal.parseError);
+    return signal;
+  }
   /* One eligibility test, not three. `executionReady === true` was on this list on the reasoning that a row
      which never could not trade has no business being re-decided - and it silenced the whole function for
      exactly the rows this exists for, because that column is the parser's verdict on the *message*, and
      releases before it was a separate flag wrote false here for rows the workspace's own conditions had
      blocked. Carrying a sentence this module owns is the only evidence a re-decision needs. */
-  /* Two fields can carry the sentence: `execution_note` is where it belongs, and `parse_error` is where an
-     older build left it, because that was the only text field the card read. A row is eligible on either. */
-  const storedInNote = matchExecutionBlockerNote(signal.executionNote);
-  const storedInParseError = matchExecutionBlockerNote(signal.parseError);
-  if (!storedInNote && !storedInParseError) return signal;
   const decision = decideSignalOutcome({
     executionReady: true,
     manual: false,
@@ -195,7 +270,14 @@ export function overlayLiveBlocker(signal, context = {}) {
   const shown = decision.note || null;
   // A row that already says the true thing is handed back as it came, so a list of them stays the same list of
   // objects and a client that compares rows sees no change where nothing changed.
-  if (!storedInParseError && (typeof signal.executionNote === 'string' ? signal.executionNote : null) === shown) return signal;
+  if (!storedInParseError && (typeof signal.executionNote === 'string' ? signal.executionNote : null) === shown) {
+    // Already true, so nothing is rewritten - and this line is the answer to "the overlay ran and the card did
+    // not change": it means the live settings really do still say this, and the sentence is not stale at all.
+    overlayTrace('unchanged', signal.id, { note: clipNote(shown) }, { dedupe: `same:${signal.id}:${shown}` });
+    return signal;
+  }
+  overlayStats.rewrites += 1;
+  overlayTrace('rewriting', signal.id, { from: clipNote(signal.executionNote) || clipNote(signal.parseError), to: clipNote(shown) });
   if (storedInParseError) return { ...signal, executionNote: shown, parseError: null };
   return { ...signal, executionNote: shown };
 }
@@ -211,6 +293,10 @@ export function overlayLiveBlocker(signal, context = {}) {
  */
 export function createSignalOutcomeReader({ pool, platformControls, runtimeEnabled = () => false } = {}) {
   if (!pool?.query) throw new TypeError('The outcome reader needs a pool to read from');
+
+  // One line per process, and it is the line that answers "is the corrected code even running": a deployment
+  // without it in its log is a deployment that did not build this.
+  overlayTrace('reader armed', null, { registry: EXECUTION_BLOCKER_NOTES.length, runtimeEnabled: runtimeEnabled() === true });
 
   /** The live answer to "could this workspace trade right now", or null when it cannot be answered. */
   async function readOutcomeContext(userId) {
@@ -238,9 +324,30 @@ export function createSignalOutcomeReader({ pool, platformControls, runtimeEnabl
        question to this function - a note it does not own is a note it will not touch - and the answer decides
        whether a list read costs a database round trip. A workspace whose rows carry broker answers and personal
        notes, which is what a working one looks like, is served from the query it already ran. */
-    if (!Array.isArray(rows) || !rows.some((row) => isExecutionBlockerNote(row?.executionNote))) return rows;
-    const context = await readOutcomeContext(userId).catch(() => null);
-    if (!context) return rows;
+    const list = Array.isArray(rows) ? rows : [];
+    const eligible = list.filter((row) => matchExecutionBlockerNote(row?.executionNote) || matchExecutionBlockerNote(row?.parseError)).length;
+    overlayStats.reads += 1;
+    overlayStats.rows += list.length;
+    overlayStats.eligible += eligible;
+    overlayStats.lastReadAt = new Date().toISOString();
+    overlayTrace('read', null, { userId, rows: list.length, eligible });
+    if (!eligible) return rows;
+    const context = await readOutcomeContext(userId).catch((error) => {
+      overlayTrace('context-failed', null, { userId, message: error?.message || String(error) });
+      return null;
+    });
+    /* The one branch that leaves a stale sentence on the screen on purpose, so it is the loudest thing here:
+       without a context there is nothing to re-decide against, and guessing a workspace's state to replace a
+       stored one is worse than the stale text. If a trader ever reports a contradiction that this line does not
+       explain, it is not this function. */
+    if (!context) {
+      overlayStats.contextFailures += 1;
+      overlayStats.lastSkipReason = 'context-unreadable';
+      // A code first and the sentence after it, because this is the line a log search turns on.
+      overlayTrace('skipped-list', null, { userId, eligible, reason: 'context-unreadable', meaning: 'the workspace state could not be read, so the stored sentences stand' });
+      return rows;
+    }
+    overlayTrace('context', null, { userId, ...context }, { dedupe: `context:${userId}:${JSON.stringify(context)}` });
     return rows.map((row) => overlayLiveBlocker(row, context));
   }
 

@@ -35,7 +35,7 @@ import { createBillingService } from './services/billing-service.js';
 import { createPricingStore, normalizePricingUpdate, normalizeBillingSettings, planChargeDecision, publicPricing } from './services/pricing.js';
 import { createPlanSynchronizer } from './services/plan-sync.js';
 import { planLimitsFor, buildLimitError } from './services/plan-limits.js';
-import { SIGNAL_OUTCOME_CONTEXT_SQL, createSignalOutcomeReader, decideSignalOutcome, overlayLiveBlocker } from './services/signal-outcome.js';
+import { SIGNAL_OUTCOME_CONTEXT_SQL, createSignalOutcomeReader, decideSignalOutcome, overlayLiveBlocker, describeOverlayDiagnostics } from './services/signal-outcome.js';
 import { friendlySignalNote } from './services/signal-wording.js';
 import {
   createInactivityService, daysInactiveSince,
@@ -686,6 +686,11 @@ function disconnectSupportSockets(sessionId) {
 const BOOTED_AT = new Date();
 const healthPayload = () => ({
   status: 'ok',
+  /* Whether the read-path re-decision is running, in counts only: `/health` is not authenticated, so a note's
+     text or a workspace id has no business in it. It is here because a screen that looks wrong and a code path
+     that never ran are indistinguishable from the outside, and this settles which one it is without a log
+     search. The lines themselves - with the reason each row was skipped - go to stdout. */
+  overlay: describeOverlayDiagnostics(),
   timestamp: new Date().toISOString(),
   bootedAt: BOOTED_AT.toISOString(),
   uptimeSeconds: Math.round((Date.now() - BOOTED_AT.getTime()) / 1000),
@@ -964,6 +969,11 @@ app.get('/api/dashboard', authenticate, asyncRoute(async (req, res) => {
     stats: { totalSignals: signalsCount.rows[0].count, activeChannels: channelsCount.rows[0].count, accounts: accountsCount.rows[0].count },
     signals: dashboardSignals.rows,
     signalsScope: dashboardSignals.scope,
+    // The two keys that let the panel say "and here is why the newest message is not one of these" instead of
+    // leaving a filtered list of three to look like a feed that stopped. They come from the service, so the
+    // route cannot report a number it did not read.
+    signalsNewerCaptures: dashboardSignals.newerCaptures,
+    signalsLastCaptureAt: dashboardSignals.lastCaptureAt,
     settings: settings.rows[0] || { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 5, dailyLossLimit: 5, autoTradingEnabled: false },
     subscription: { status: subscription.rows[0]?.status || null, plan: subscription.rows[0]?.plan || null },
     trading: { liveExecutionEnabled: autoTradingRuntimeEnabled, autoTradingEnabled: settings.rows[0]?.autoTradingEnabled === true, message: autoTradingRuntimeEnabled ? 'Auto-Trading starts on for new workspaces; review the live-trading warning and turn it off in Advanced Settings whenever you want.' : 'Automatic execution is unavailable right now. Signals can still be reviewed.' },

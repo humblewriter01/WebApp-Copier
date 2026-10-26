@@ -49,6 +49,32 @@ export function signalRowTime(row) {
  * stale. An id that is already present is replaced in place, so a row whose status moved from `queued` to
  * `executed` does not jump around the screen.
  */
+/** A clock the trader's own machine agrees with: UTC in the row, local on the screen. */
+function captureClock(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+}
+
+/**
+ * The one sentence that tells a reader their feed is alive.
+ *
+ * The Overview is a filtered list - three setups, newest first - and on a channel that also talks, the newest
+ * captured message can sit an hour below the top card. Nothing on the screen says so, and a panel that looks
+ * frozen is reported as broken capture, which it is not. So the server counts the messages it left out and this
+ * says what that number means, in the same one line whether it is 1 or 120.
+ */
+export function dashboardFreshnessNote({ newerCaptures = 0, lastCaptureAt = null } = {}) {
+  const count = Number(newerCaptures);
+  if (!Number.isFinite(count) || count <= 0) return '';
+  const single = count === 1;
+  const when = captureClock(lastCaptureAt);
+  return `${count} newer ${single ? 'message has' : 'messages have'} come through since these setups`
+    + (when ? ` (the newest at ${when})` : '')
+    + `. ${single ? 'It was not one.' : 'They were not setups.'}`;
+}
+
 export function mergeSignalRows(list, incoming, { limit } = {}) {
   const rows = Array.isArray(list) ? list : [];
   if (!incoming || typeof incoming !== 'object' || incoming.id === undefined || incoming.id === null) return rows;

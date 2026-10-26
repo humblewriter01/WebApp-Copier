@@ -8,9 +8,10 @@
  * agrees with the banner" is either true or not.
  */
 import assert from 'node:assert/strict';
+import { format } from 'node:util';
 import test from 'node:test';
 
-import { createSignalOutcomeReader } from '../services/signal-outcome.js';
+import { createSignalOutcomeReader, describeOverlayDiagnostics } from '../services/signal-outcome.js';
 import {
   isExecutionBlockerNote,
   matchExecutionBlockerNote,
@@ -211,4 +212,85 @@ test('the registry matches on words, and on nothing looser', () => {
   assert.equal(matchExecutionBlockerNote(42), null);
   // A paraphrase is not ours to rewrite, however close it reads.
   assert.equal(isExecutionBlockerNote('Auto-Trading is OFF so this signal was saved for review only.'), false);
+});
+
+/* --------------------------------------------------------------------------- *
+ * The instrumentation an operator reads when a card and the truth disagree.
+ * --------------------------------------------------------------------------- */
+
+test('a list whose only stale sentence sits in parse_error still costs a read', async () => {
+  /* The overlay was taught to look in the fallback field, but the short-circuit in front of it decides whether
+     a read happens at all. If that one asks only about `execution_note`, the fix is unreachable from a route -
+     which is the difference between a unit test passing and a trader seeing the truth. */
+  const row = { id: 'sig-parse-held', source: 'telegram', status: 'unparsed', executionNote: null, parseError: AUTO_TRADING_OFF_NOTE };
+  const { reader, queries } = harness({ settingsRow: { autoTrading: true, executionAccountId: 'acct-1', accountState: 'DEPLOYED', subscriptionStatus: 'free' } });
+  const [out] = await reader.withLiveBlockers('user-1', [row]);
+  assert.equal(queries.length, 1, 'the context was read, because the row does carry one of ours');
+  assert.equal(out.executionNote, PLAN_NO_EXECUTION_NOTE);
+  assert.equal(out.parseError, null, 'and the legacy copy is not left to be picked up by the card again');
+});
+
+test('every decision the read path takes is counted, and the lines themselves can be turned off', async () => {
+  const rewrite = { id: 'sig-counted-1', source: 'telegram', status: 'unexecuted', executionNote: AUTO_TRADING_OFF_NOTE };
+  const foreign = { id: 'sig-counted-2', source: 'telegram', status: 'unexecuted', executionNote: 'The broker declined this order.' };
+  const before = describeOverlayDiagnostics();
+  assert.equal(before.registry, 6, 'six sentences are this module to rewrite, and no more');
+
+  const lines = [];
+  const original = console.log;
+  console.log = (...args) => lines.push(format(...args));
+  try {
+    const { reader } = harness({ settingsRow: { autoTrading: true, executionAccountId: 'acct-1', accountState: 'DEPLOYED', subscriptionStatus: 'free' } });
+    await reader.withLiveBlockers('user-counted', [rewrite, foreign]);
+  } finally {
+    console.log = original;
+  }
+  const after = describeOverlayDiagnostics();
+  assert.equal(after.rewrites - before.rewrites, 1, 'one row re-decided');
+  assert.equal(after.skips - before.skips, 1, 'one row left alone, and counted as left alone');
+  assert.equal(after.reads - before.reads, 1, 'one list read');
+  assert.equal(after.rows - before.rows, 2);
+  assert.equal(after.eligible - before.eligible, 1, 'only the row carrying our sentence was eligible');
+  assert.equal(after.lastSkipReason, 'note-not-in-registry');
+  assert.match(after.lastSkippedNote, /broker declined/, 'and the note an operator would want to see is on the record');
+
+  assert.ok(lines.some((line) => line.includes('overlay: read') && line.includes('user-counted')), 'a line per read, with who it was for');
+  assert.ok(lines.some((line) => line.includes('overlay: rewriting') && line.includes('sig-counted-1')), 'the rewrite is announced with the row id');
+  assert.ok(lines.some((line) => line.includes('overlay: skipped') && line.includes('sig-counted-2')), 'so is the skip, with the sentence that caused it');
+
+  // Off is off: the counters keep their meaning, stdout goes quiet.
+  const counted = describeOverlayDiagnostics().rewrites;
+  process.env.SIGNAL_OVERLAY_DEBUG = 'off';
+  const muted = [];
+  console.log = (...args) => muted.push(format(...args));
+  try {
+    const { reader } = harness({ settingsRow: { autoTrading: true, executionAccountId: 'acct-1', accountState: 'DEPLOYED', subscriptionStatus: 'free' } });
+    await reader.withLiveBlockers('user-quiet', [{ ...rewrite, id: 'sig-counted-3' }]);
+  } finally {
+    console.log = original;
+    delete process.env.SIGNAL_OVERLAY_DEBUG;
+  }
+  assert.deepEqual(muted, [], 'not one line while it is silenced');
+  assert.equal(describeOverlayDiagnostics().rewrites, counted + 1, 'still counted, because /health reports it');
+});
+
+test('a read path that cannot see the workspace says so out loud instead of failing quietly', async () => {
+  // This is the branch that leaves a stale sentence on the screen on purpose, so it is the one line an
+  // operator needs first: without it, "the overlay did nothing" and "the overlay could not run" are the same
+  // shape from the outside.
+  const before = describeOverlayDiagnostics();
+  const lines = [];
+  const original = console.log;
+  console.log = (...args) => lines.push(format(...args));
+  try {
+    const { reader } = harness({ failContext: true });
+    const rows = [blockedRow(AUTO_TRADING_OFF_NOTE)];
+    const [out] = await reader.withLiveBlockers('user-broken', rows);
+    assert.equal(out.executionNote, AUTO_TRADING_OFF_NOTE, 'the stored sentence stands');
+  } finally {
+    console.log = original;
+  }
+  const after = describeOverlayDiagnostics();
+  assert.equal(after.contextFailures - before.contextFailures, 1);
+  assert.ok(lines.some((line) => line.includes('overlay: skipped-list') && line.includes('context-unreadable')), 'and the reason is in the log, not only in the code');
 });
