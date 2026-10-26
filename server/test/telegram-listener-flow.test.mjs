@@ -547,6 +547,13 @@ test('an update that arrives late is written down as late, at the moment it arri
   assert.equal(harness.entry().stats.lastDelayMs, 60_000, 'it is still measured, so the trend is visible without reading a log line');
   assert.equal(harness.entry().stats.lastSentAt, '2026-10-23T12:59:00.000Z', 'from the channel clock, not from ours');
 
+  // The lateness rides on the line that proves the row exists, so one entry answers "did we get it" and "how
+  // late was it" together - which is the comparison an operator makes in the log viewer, once, per message.
+  const firstLine = harness.logs.find((entry) => entry.message === 'Telegram message captured');
+  assert.ok(firstLine, 'the capture is still announced the same way');
+  assert.equal(firstLine.meta.delayMs, 60_000);
+  assert.equal(firstLine.meta.sentAt, '2026-10-23T12:59:00.000Z');
+
   // Ten more silent minutes, and the next message out of the fixture carries the same send date: eleven
   // minutes of travel, which is the number the incident report was about.
   harness.advance(10 * 60_000);
