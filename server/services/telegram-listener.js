@@ -231,7 +231,10 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
         ).catch(() => ({ rows: [] }));
         if (known.rows?.length) return { stored: false, reason: 'ALREADY_CAPTURED' };
       }
-      log('info', replayed ? 'Telegram message captured from catch-up' : 'Telegram message captured', { userId, chatId, channel: rows[0].title, chars: text.length, messageId: message?.id ?? null });
+      /* `delayMs` rides on the line that proves the row exists, so one log entry answers "did we get it" and "how
+         late was it" together - the pair an operator actually has to compare, and the only way the difference
+         between a quiet channel and a deaf socket survives past the buffer for a report. */
+      log('info', replayed ? 'Telegram message captured from catch-up' : 'Telegram message captured', { userId, chatId, channel: rows[0].title, chars: text.length, messageId: message?.id ?? null, delayMs: stats.lastDelayMs, sentAt: stats.lastSentAt });
       // The signal is stored whatever the parser makes of it - a message from a monitored channel that
       // reads as prose is still a captured message, and it is shown as such instead of vanishing.
       await saveSignal(userId, text, { source: 'telegram', channelId: rows[0].channelId, title: rows[0].title, telegramMessageId: message?.id ?? null, sentAt, delayMs: stats.lastDelayMs, replayed });
