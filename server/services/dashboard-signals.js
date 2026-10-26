@@ -77,6 +77,22 @@ export function buildDashboardRecentSignalsQuery() {
 }
 
 /**
+ * How many captured messages are newer than the newest row this screen is allowed to show.
+ *
+ * The Overview is a filtered list, and a filtered list of three rows on a busy channel looks like a stalled one:
+ * the newest message a workspace captured can be forty minutes below the top card because everything since was a
+ * bulletin the panel does not print. Counting them is the difference between "it stopped syncing" and "these are
+ * the setups", and it is one bounded aggregate that is only asked when the unfiltered list already proves there
+ * is something to count.
+ */
+export function buildDashboardNewerCapturesQuery() {
+  return {
+    sql: 'SELECT COUNT(*)::int AS count FROM signals WHERE user_id=$1 AND created_at>$2',
+    params: 2,
+  };
+}
+
+/**
  * The either/or, kept in one place so the rule and its wording cannot drift apart.
  *
  * Both queries are issued together - one round trip each, both bounded to three rows, no branch that sends
@@ -112,5 +128,18 @@ export async function readDashboardSignals({ pool, userId, withLiveBlockers } = 
     withLiveBlockers(userId, actionable.rows),
     withLiveBlockers(userId, recent.rows),
   ]);
-  return chooseDashboardSignals({ actionable: actionableLive, recent: recentLive });
+  const chosen = chooseDashboardSignals({ actionable: actionableLive, recent: recentLive });
+  /* The instant the last message was captured, whatever the panel decided to do with it, and how many of them
+     are newer than the top card. `recent` is the unfiltered newest-first list, so its first row *is* the newest
+     capture - which is also the test for whether counting is worth a query at all: when the setups already
+     include the newest message there is nothing newer to explain. */
+  const newestCapture = recent.rows[0]?.createdAt || null;
+  const shownNewest = chosen.rows[0]?.createdAt || null;
+  const behind = chosen.scope === 'actionable' && Number(new Date(newestCapture)) > Number(new Date(shownNewest));
+  let newerCaptures = 0;
+  if (behind) {
+    const { rows } = await pool.query(buildDashboardNewerCapturesQuery().sql, [userId, shownNewest]);
+    newerCaptures = Number(rows[0]?.count || 0);
+  }
+  return { ...chosen, newerCaptures, lastCaptureAt: newestCapture };
 }

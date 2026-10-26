@@ -19,16 +19,7 @@ import { build } from 'esbuild';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
-import {
-  connectSignalFeed,
-  createReconciler,
-  mergeSignalRows,
-  signalRowTime,
-  SIGNAL_ROW_EVENT,
-  FALLBACK_POLL_INTERVAL_MS,
-  LIVE_SWEEP_INTERVAL_MS,
-  RECONCILE_DELAY_MS,
-} from '../src/lib/signal-feed.js';
+import {connectSignalFeed, createReconciler, mergeSignalRows, signalRowTime, SIGNAL_ROW_EVENT, FALLBACK_POLL_INTERVAL_MS, LIVE_SWEEP_INTERVAL_MS, RECONCILE_DELAY_MS, dashboardFreshnessNote} from '../src/lib/signal-feed.js';
 import { autoTradingBannerView } from '../src/lib/platform-view.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -339,3 +330,20 @@ test('the settings page says what the switch is not enough of, in its own words'
   assert.equal(/no trading account is connected/.test(deployed), false, 'and it stops saying it once the account is there');
 });
 
+/* ------------------------------------------------------ the "am I still syncing?" line ------------------------------------------------------ */
+
+test('a filtered Overview says when something newer arrived, and says nothing when nothing did', () => {
+  // The report this exists for: three setups on screen, an hour of traffic under them, and no way to tell a
+  // quiet channel from a dead one. The count comes from the server; the sentence is only ever assembled here.
+  assert.equal(dashboardFreshnessNote({}), '', 'nothing counted, nothing said');
+  assert.equal(dashboardFreshnessNote({ newerCaptures: 0 }), '', 'and the same when nothing is newer');
+  assert.equal(dashboardFreshnessNote({ newerCaptures: 'three' }), '', 'a value that is not a number is not a sentence either');
+  const one = dashboardFreshnessNote({ newerCaptures: 1, lastCaptureAt: '2026-10-26T10:35:49.000Z' });
+  assert.match(one, /^1 newer message has come through since these setups/, 'singular, and it names what it counted');
+  assert.match(one, /the newest at \d\d?:\d\d/, 'the clock the user reads it beside');
+  assert.match(one, /It was not one\.$/, 'and why it is not on the card');
+  const many = dashboardFreshnessNote({ newerCaptures: 12, lastCaptureAt: 'nonsense' });
+  assert.match(many, /^12 newer messages have come through/, 'plural');
+  assert.equal(many.includes('(the newest at'), false, 'a time the server could not give is left out, not guessed');
+  assert.doesNotMatch(many, /undefined|NaN|null/, 'and never printed as a hole in the sentence');
+});

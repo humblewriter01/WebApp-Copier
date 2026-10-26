@@ -127,7 +127,10 @@ function projectedKeys(source, from, to) {
   const end = source.indexOf(to, start);
   assert.notEqual(start, -1, `${from.slice(0, 32)} is found`);
   assert.ok(end > start, `and ${to.slice(0, 32)} closes it`);
-  const list = source.slice(start, end);
+  /* Read the list, not the sentence around it: the declaration and the `SELECT` are noise either side of the
+     first column, and a token of ``= `id`` names nothing - which is how a column every projection in the product
+     selects could still be reported as missing from one. */
+  const list = source.slice(start, end).replace(/^(?:export const \w+ = |SELECT )/i, '').replace(/`/g, '');
   const keys = new Set();
   for (const part of list.split(/\n\s*/).join(',').split(',')) {
     const token = part.trim();

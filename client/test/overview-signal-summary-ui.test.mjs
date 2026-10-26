@@ -7,6 +7,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { dashboardFreshnessNote } from '../src/lib/signal-feed.js';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -91,7 +92,20 @@ test('a fallback list says what it is, in one sentence', () => {
   assert.ok(note, 'the panel carries the explanation next to the heading');
   assert.equal(note.endsWith('.'), true, 'one sentence');
   assert.equal(note.split(' ').length <= 22, true, `and short enough not to become the clutter it replaces (got ${note.split(' ').length} words)`);
-  assert.doesNotMatch(app, /signalsScope === 'actionable'/, 'an actionable list needs no preamble at all');
+  /* An actionable list needs no preamble *about itself* - it does need one sentence when the newest thing the
+     workspace captured is not on it, because three filtered rows under a heading that says LATEST ACTIVITY reads
+     as a feed that stopped, and it was reported as exactly that. The rule is therefore: say it only when the
+     server counted something to say, in the same paragraph and the same length limit as its sibling above. */
+  assert.match(app, /dashboard\?\.signalsScope === 'actionable'/, 'the actionable list speaks only through the guard below');
+  assert.match(app, /dashboardFreshnessNote\(\{ newerCaptures: dashboard\?\.signalsNewerCaptures, lastCaptureAt: dashboard\?\.signalsLastCaptureAt \}\)/,
+    'from the counted rows the server sent, not from anything the client guesses');
+  const freshness = readFileSync(path.join(here, '..', 'src', 'lib', 'signal-feed.js'), 'utf8');
+  const noteFn = freshness.slice(freshness.indexOf('export function dashboardFreshnessNote'));
+  assert.match(noteFn, /return ''/, 'and it says nothing at all when there is nothing newer');
+  const sample = dashboardFreshnessNote({ newerCaptures: 2, lastCaptureAt: '2026-10-26T10:35:49.000Z' });
+  assert.ok(sample.split(' ').length <= 22, `one short sentence (got ${sample.split(' ').length} words)`);
+  assert.equal(sample.endsWith('.'), true);
+  assert.doesNotMatch(sample, /signal|filter|query|db|SQL/i, 'no internals in a sentence a trader reads');
 });
 
 /* --------------------------------------------------------------- the rendered card --------------------------------------------------------------- */

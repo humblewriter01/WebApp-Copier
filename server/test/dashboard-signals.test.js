@@ -18,6 +18,7 @@ import {
   DASHBOARD_SIGNAL_COLUMNS,
   buildDashboardActionableSignalsQuery,
   buildDashboardRecentSignalsQuery,
+  buildDashboardNewerCapturesQuery,
   chooseDashboardSignals,
   readDashboardSignals,
 } from '../services/dashboard-signals.js';
@@ -196,6 +197,67 @@ test('a workspace with nothing to re-decide is not a workspace worth a context r
   const dashboard = await readDashboardSignals({ pool, userId: 'user-1', withLiveBlockers: reader.withLiveBlockers });
   assert.equal(dashboard.rows[0].executionNote, null);
   assert.equal(contextReads, 0, 'nothing was re-decided, so nothing was read to decide it with');
+});
+
+test('a filtered strip counts what it left out, and does not pay for a count when there is nothing to count', async () => {
+  /* Three setups in a window that has received twelve more messages since looks, to the person looking at it,
+     like a feed that stopped. The service therefore reports the newest capture and how much newer traffic it
+     filtered out - but only when the unfiltered list proves there is something, because the Overview is polled
+     and an unconditional aggregate would be a query for the majority of reads. */
+  const setups = [{ id: 'sig-old', source: 'telegram', executionReady: true, status: 'unexecuted', executionNote: null, createdAt: '2026-10-26T09:08:49.000Z' }];
+  const noise = [{ id: 'sig-new', source: 'telegram', executionReady: false, status: 'unparsed', executionNote: null, parseError: 'A BUY or SELL direction was not found.', createdAt: '2026-10-26T10:35:49.000Z' }];
+  const queries = [];
+  const pool = {
+    async query(sql, params) {
+      queries.push({ sql, params });
+      if (sql.includes('COUNT(*)::int AS count FROM signals WHERE user_id=$1 AND created_at>$2')) return { rows: [{ count: 1 }] };
+      if (sql.includes('execution_ready = TRUE')) return { rows: setups };
+      if (sql.includes('FROM signals')) return { rows: [...noise, ...setups] };
+      throw new Error(`unexpected statement: ${sql.slice(0, 40)}`);
+    },
+  };
+  const annotate = async (_userId, rows) => rows;
+  const out = await readDashboardSignals({ pool, userId: 'user-1', withLiveBlockers: annotate });
+  assert.equal(out.scope, 'actionable');
+  assert.equal(out.newerCaptures, 1, 'one message arrived after the newest setup shown');
+  assert.equal(out.lastCaptureAt, '2026-10-26T10:35:49.000Z', 'and the panel can say when the feed last moved');
+  const count = queries.find((entry) => entry.sql.includes('created_at>$2'));
+  assert.deepEqual(count.params, ['user-1', '2026-10-26T09:08:49.000Z'], 'bounded by the newest row actually shown, and scoped to this workspace');
+
+  // The same read with nothing newer must not reach for the counter at all.
+  queries.length = 0;
+  const upToDate = {
+    async query(sql) {
+      if (sql.includes('execution_ready = TRUE')) return { rows: [{ ...setups[0], createdAt: '2026-10-26T10:35:49.000Z' }] };
+      return { rows: [{ ...setups[0], createdAt: '2026-10-26T10:35:49.000Z' }] };
+    },
+  };
+  const quiet = await readDashboardSignals({ pool: upToDate, userId: 'user-1', withLiveBlockers: annotate });
+  assert.equal(quiet.newerCaptures, 0);
+  assert.equal(queries.filter((sql) => String(sql).includes('created_at>$2')).length, 0, 'no count query when the newest capture is on the card');
+  // And a fallback list explains itself elsewhere; counting what it filtered is meaningless because it filtered nothing.
+  const fallback = {
+    async query(sql) {
+      if (sql.includes('execution_ready = TRUE')) return { rows: [] };
+      return { rows: noise };
+    },
+  };
+  const fell = await readDashboardSignals({ pool: fallback, userId: 'user-1', withLiveBlockers: annotate });
+  assert.equal(fell.scope, 'recent');
+  assert.equal(fell.newerCaptures, 0, 'and the count stays zero rather than becoming a second explanation');
+});
+
+test('the counter is a bounded statement with two values and nothing in its prose to bind', () => {
+  const built = buildDashboardNewerCapturesQuery();
+  assert.equal(built.params, 2);
+  assertQueryParameters(built.sql, 2);
+  assert.match(built.sql, /WHERE user_id=\$1 AND created_at>\$2/, 'scoped to the workspace and to what is newer than the top card');
+  assert.equal(built.sql.includes('LIMIT'), false, 'a count is not a list, so it needs no bound of its own');
+});
+
+test('the payload the client reads carries the two new keys', () => {
+  assert.match(routes, /signalsNewerCaptures: dashboardSignals\.newerCaptures/);
+  assert.match(routes, /signalsLastCaptureAt: dashboardSignals\.lastCaptureAt/);
 });
 
 test('the Overview selects the columns the re-decision reads', () => {
