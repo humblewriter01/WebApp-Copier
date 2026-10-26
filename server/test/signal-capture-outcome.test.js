@@ -519,26 +519,54 @@ test('a late capture is stored as late, and the execution guard reads the channe
 
    ------------------------------------------------------------------------------------------------------------------------------------------------------ */
 
-test('the sweep proves each listening session is receiving, and rebuilds the ones that cannot answer', () => {
+test('the sweep asks the channel what it said, and the heartbeat is what asks the socket', () => {
   const watchdog = section(index, 'async function checkTelegramStreams(', '\n/** Re-attach anything in memory');
-  assert.ok(watchdog.length > 400, 'the check exists in the server, next to the re-arm it follows');
-  assert.match(watchdog, /telegramCapture\.streamHealth\(userId\)/, 'it works off the silence clock rather than a boolean');
+  assert.ok(watchdog.length > 400, 'the cross-check exists in the server, next to the re-arm it follows');
+  assert.match(watchdog, /telegramCapture\.streamHealth\(userId\)/, 'it works off the session clock rather than a boolean');
   assert.match(watchdog, /if \(!health\.listening\) continue/, 'a session with no handler is the re-arm\'s business, not a rebuild trigger');
-  assert.match(watchdog, /if \(health\.suspect\) \{/, 'a session that delivered a message a minute ago is not interrogated on every sweep - only the quiet one is asked a question');
-  assert.match(watchdog, /telegramCapture\.probeUpdateStream\(entry\.client\)/, 'a suspect session is asked a bounded question');
-  assert.match(watchdog, /restoreTelegramClient\(userId, \{ reason: 'silent-update-stream' \}\)/, 'a socket that cannot answer is rebuilt, under a reason that names the diagnosis');
-  assert.equal(/probe\.state === 'unknown'[\s\S]{0,400}restoreTelegramClient/.test(watchdog.slice(watchdog.indexOf("if (probe.state === 'unknown')"))), false,
-    'and a probe this build cannot run never, on its own, tears a working listener down');
-  assert.match(watchdog, /if \(health\.catchUpOverdue\) \{[\s\S]{0,160}runCatchUp\(userId\)/, 'and every session is cross-checked against the channel on its own staggered schedule, because a quiet-but-live session and a half-deaf one look identical from the flags');
-  assert.match(watchdog, /Telegram update stream is silent and the socket is not answering; rebuilding the session/, 'the rebuild is logged with the numbers that justify it');
+  assert.match(watchdog, /if \(health\.catchUpOverdue\) \{[\s\S]{0,200}runCatchUp\(userId\)/, 'every listening session is cross-checked against the channel on its own staggered schedule');
+  assert.equal(watchdog.includes('probeUpdateStream'), false, 'the socket question is not asked here any more: a beat every 30 seconds cannot be older than the sweep, and two watchdogs reconnecting the same session is one too many');
+  assert.match(watchdog, /if \(results\.gapChecked\) log\('info', 'Telegram streams checked'/, 'the sweep only speaks when it did something, so a quiet minute is a quiet minute in the logs too');
 
-  // Being a function is not being scheduled: the proof is that it runs in the same 60 second sweep that already
-  // re-arms handlers, after the re-arm, so a rebuild never races the thing that was about to fix the same row.
-  assert.ok(index.includes(".then(() => rearmTelegramListeners())\n      .then(() => checkTelegramStreams({ reason: 'sweep' }))"),
-    'it is chained onto the sweep, after the re-arm, so a rebuild never races the pass that was about to fix the same session');
-  const sweepAt = index.indexOf('const telegramSweep = setInterval(');
-  assert.ok(sweepAt > 0, 'the telegram sweep is a named interval in the server');
-  const sweep = index.slice(sweepAt, sweepAt + 700);
-  assert.match(sweep, /\}, 60 \* 1000\);/, 'and the sweep is a minute, which is what bounds the worst case for every path in here');
-  assert.match(sweep, /\.catch\(\(error\) => log\('warn', 'Telegram listener sweep failed'/, 'a failed check cannot kill the interval that keeps the fleet listening');
+  /* Being a function is not being scheduled. The proof is that the beat runs on its own interval - not inside the
+     sweep, which is a minute, and not off the silence clock, which is ninety seconds of already-lost time. */
+  assert.match(index, /void beatTelegramStreams\(\{ reason: 'boot' \}\);\n\s*const telegramHeartbeat = setInterval\(\(\) => \{\n\s*void beatTelegramStreams\(\{ reason: 'interval' \}\);\n\s*\}, HEARTBEAT_INTERVAL_MS\);\n\s*telegramHeartbeat\.unref\?\.\(\);/,
+    'the interval is the exported constant, is unref\'d so it can never hold a shutting-down process open, and its first cycle runs at boot');
+  assert.match(index, /import \{ HEARTBEAT_INTERVAL_MS, createTelegramListener \} from '\.\/services\/telegram-listener\.js'/,
+    'from the module that owns the beat, so the number cannot drift between the two files');
+  const runner = section(index, 'async function beatTelegramStreams(', '\n/** Re-attach anything in memory');
+  assert.match(runner, /catch \(error\) \{\n\s*log\('warn', 'Telegram heartbeat cycle failed'/,
+    'a cycle that throws once is logged, because an interval callback that rejects would stop the keep-alive permanently and silently - the exact failure this exists to prevent');
+
+  // The rebuild goes through the one function that can do it, and the listener never reaches for it directly.
+  assert.match(index, /onDeadStream: \(userId, reason\) => restoreTelegramClient\(userId, \{ reason \}\)/,
+    'the listener decides when a stream is not a stream; the server owns the reconnect, which also re-attaches and replays');
+
+  /* `/health` is public, so the heartbeat appears there as counts and nothing else. `beats` is the per-session
+     array - user ids, `pts`, timings - and it is destructured away rather than filtered, so the shape that could
+     leak is not merely hidden but absent from the object being serialised. */
+  const healthBlock = section(index, 'function telegramHeartbeatHealth()', '\n/**');
+  assert.match(healthBlock, /const \{ beats, \.\.\.counters \} = telegramCapture\.heartbeatSummary\(\)/, 'the per-session detail is dropped by construction');
+  assert.match(healthBlock, /catch \{[\s\S]{0,120}return null/, 'and a diagnostic that throws cannot take the platform health route down with it');
+  assert.match(index, /telegram: telegramHeartbeatHealth\(\),/, 'the block is on the payload every probe reads');
+});
+
+test('the transport can be moved off the plain port, and the option can never cost capture its signals', () => {
+  const transport = section(index, 'function telegramCaptureTransport()', '\nasync function restoreTelegramClient');
+  assert.match(transport, /process\.env\.TELEGRAM_TRANSPORT \|\| ''\)\.toLowerCase\(\) !== 'wss'/, 'off by default: the beat is the fix, this is a knob');
+  assert.match(transport, /useWSS: true/, 'and when it is on, it is the library\'s own option rather than a hand-rolled socket');
+  assert.match(transport, /return \{ wss: false, options: base \}/, 'the shape tells the caller whether a fallback is even available');
+
+  const restore = section(index, 'async function restoreTelegramClient(', '\n/** How many recent messages');
+  assert.match(restore, /const transport = telegramCaptureTransport\(\);/, 'the capture client is built from it');
+  assert.match(restore, /if \(!transport\.wss\) throw error;/, 'a failure with the option off is the ordinary failure');
+  assert.match(restore, /Telegram WSS transport could not connect; reconnecting over the default transport/, 'and with it on, the fallback is announced');
+  assert.match(restore, /client = new TelegramClient\(new StringSession\(sessionString\), Number\(process\.env\.API_ID\), process\.env\.API_HASH, \{ connectionRetries: 3, autoReconnect: true \}\);\n\s*await client\.connect\(\);/,
+    'retried on the default transport with the same session, so an operator can turn the knob from the dashboard without being able to break login or capture');
+
+  /* The login clients deliberately keep the plain transport: a user waiting for a code is waiting interactively,
+     and an experiment that exists for long-lived idle connections has no business in a one-shot handshake. */
+  const loginSites = index.match(/new TelegramClient\(new StringSession\(''\)[^)]*\)\s*;?/g) || [];
+  assert.ok(loginSites.length >= 1, 'the login clients are constructed in the same file');
+  assert.equal(loginSites.some((site) => site.includes('useWSS')), false, 'and none of them takes the knob');
 });

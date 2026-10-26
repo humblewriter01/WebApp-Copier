@@ -17,7 +17,15 @@
  * 2. ID MATCHING. A channel id has two spellings (`-1002440709664` and `2440709664`) depending on
  *    which accessor produced it, and the database holds whichever one the browser sent. Every
  *    lookup goes through both spellings, on both sides.
- * 3. THE GAP. GramJS in this version defines `catchUp()` as a stub with a `// TODO` in it, and the
+ * 3. THE IDLE SOCKET. `MTProtoSender` in this version has no keep-alive pinger: while a channel is quiet, an
+ *    MTProto connection sends *nothing at all*, and a NAT that evicts idle flows (which is what a host like
+ *    Render does to a free service with no traffic) can leave the socket either half-dead or answered only by
+ *    requests we initiate. Nothing in GramJS notices, because nothing in GramJS asks: `autoReconnect` reacts to
+ *    an error the sender observes, and a black-holed write produces none until a request times out - and no
+ *    request is ever issued. `beatUpdateStreams` is the thing that asks, every 30 seconds, on purpose: an
+ *    outbound byte per session per half-minute is what keeps a flow entry alive, and its answer or absence is
+ *    what decides whether to rebuild the session now rather than at the next sweep.
+ * 4. THE GAP. GramJS in this version defines `catchUp()` as a stub with a `// TODO` in it, and the
  *    update loop only pings: nothing asks Telegram for the messages that arrived while the instance
  *    was disconnected. On a free Render service, which stops between visitors, that means a message
  *    published during sleep is never seen at all - the connection is healthy, the handler is
@@ -44,12 +52,38 @@ export const CATCH_UP_COOLDOWN_MS = 60_000;
  * How long a connected, attached, listening session may go without one event before that is treated as a
  * problem rather than a quiet channel.
  *
- * A scalping signal is dead at two minutes (`MAX_SIGNAL_AGE_MS`), so the bound has to be well under that: this
- * is the interval within which a deaf socket is noticed, probed and rebuilt, instead of at the next deploy.
+ * A scalping signal is dead at two minutes (`MAX_SIGNAL_AGE_MS`), so the bound has to be well under that. It is
+ * now a *reporting* threshold rather than the rescue plan - the heartbeat asks every session a question every 30
+ * seconds regardless of what the last message was - and it is still what decides when an arriving update counts
+ * as late, which is the number a support report is made of.
  */
 export const SILENCE_SUSPECT_MS = 90_000;
 /** A probe that has not answered in this long is a dead socket, because a live one answers in tens of ms. */
 export const STREAM_PROBE_DEADLINE_MS = 5_000;
+/**
+ * How often every connected session is asked an active question, whether or not anything is happening.
+ *
+ * The point is not diagnostics, it is traffic: MTProto connections in this library never speak unless they have
+ * something to say, and an idle flow is exactly what a hosting NAT evicts. One `updates.GetState` per session
+ * per half-minute is a few dozen bytes, well inside anything Telegram calls flooding (it is per account, and the
+ * request is the cheapest one the API serves), and it turns "the socket died at 03:00 and nobody noticed until
+ * the next deploy" into at most thirty seconds of silence and one reconnect. The beat is also the only *proof*
+ * that the stream is delivering: the answer carries the account's own `pts`, and a `pts` that moves while our
+ * handler stays quiet means updates are being produced for us and not reaching the dispatcher - a dead socket
+ * and a dead update loop look identical from `connected`, and these two numbers tell them apart.
+ */
+export const HEARTBEAT_INTERVAL_MS = 30_000;
+/** Consecutive beats of "their `pts` moved, our handler saw nothing" before the session is rebuilt. */
+export const PTS_STALL_BEATS = 2;
+/**
+ * How long one session must wait between watchdog-triggered rebuilds.
+ *
+ * A rebuild is not free: it tears the transport down, reconnects, re-attaches and replays history. Telegram's
+ * clock, a skewed channel date or a session that legitimately has nothing to do must not be able to turn the
+ * watchdog into a reconnect loop, so a second request inside this window is counted and ignored - which is also
+ * why the cooldown is far longer than the beat, and the beat far longer than a request.
+ */
+export const STREAM_REBUILD_COOLDOWN_MS = 2 * 60_000;
 /**
  * How often a session that passes its probe is still cross-checked against the channel.
  *
@@ -79,12 +113,24 @@ export const STREAM_IDLE_MS = 15 * 60 * 1000;
 
 const EMPTY_STATS = () => ({ seen: 0, saved: 0, ignored: 0, lastAt: null, lastChatId: null, lastError: null, catchUpSaved: 0, lastDelayMs: null, lastSentAt: null, lastMessageId: null });
 
-export function createTelegramListener({ clients, pool, log = console, saveSignal, now = () => Date.now(), catchUpLimit = CATCH_UP_LIMIT, catchUpCooldownMs = CATCH_UP_COOLDOWN_MS, catchUpBudgetMs = CATCH_UP_BUDGET_MS, silenceSuspectMs = SILENCE_SUSPECT_MS, probeDeadlineMs = STREAM_PROBE_DEADLINE_MS, gapCatchUpMs = GAP_CATCH_UP_MS } = {}) {
+export function createTelegramListener({ clients, pool, log = console, saveSignal, now = () => Date.now(), catchUpLimit = CATCH_UP_LIMIT, catchUpCooldownMs = CATCH_UP_COOLDOWN_MS, catchUpBudgetMs = CATCH_UP_BUDGET_MS, silenceSuspectMs = SILENCE_SUSPECT_MS, probeDeadlineMs = STREAM_PROBE_DEADLINE_MS, gapCatchUpMs = GAP_CATCH_UP_MS, gapCatchUpSpreadMs = GAP_CATCH_UP_SPREAD_MS, heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS, ptsStallBeats = PTS_STALL_BEATS, rebuildCooldownMs = STREAM_REBUILD_COOLDOWN_MS, onDeadStream = null } = {}) {
   if (!clients || !pool || !saveSignal) throw new Error('createTelegramListener requires clients, pool and saveSignal');
   const startedAt = new Date();
   const catchUpRuns = new Map();
   const catchUpInFlight = new Set();
+  /* One heartbeat per session per cycle, and the memory of the last answer: `pts` is the account's own
+     persistent timestamp, so the delta between two beats against the delta in `stats.seen` is the difference
+     between "Telegram had nothing for us" and "Telegram sent it and our dispatcher never woke up". */
+  const streamBeats = new Map();
+  const rebuildCooldown = new Map();
+  const heartbeat = { cycles: 0, sent: 0, answered: 0, dead: 0, stalled: 0, rebuilt: 0, probing: 0, suppressed: 0, lastCycleAt: null, lastCycleMs: null, lastCycleSessions: 0 };
+  let emptyCycleReported = false;
   let resumedAfterBoot = 0;
+
+  /** A deterministic per-session offset inside `spread`, so a fleet is not asked in the same second. */
+  function staggerFor(key, spread) {
+    return [...String(key)].reduce((total, char) => (total * 31 + char.charCodeAt(0)) % spread, 0);
+  }
 
   const entryFor = (userId) => clients.get(String(userId)) || clients.get(userId);
 
@@ -152,6 +198,167 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
     }
   }
 
+  /**
+   * Ask one session for permission to be rebuilt, and only ask if it has been quiet about it lately.
+   *
+   * Every watchdog in this file ends up here, whichever proof it found - a socket that will not answer, a `pts`
+   * that moved while our handler stayed quiet, a replay that turned up a message posted while we were listening.
+   * The cooldown is the only thing between "the stream is broken" and "reconnect forever", and it is deliberately
+   * a property of the *rebuild* rather than of each detector, so three detectors agreeing still means one
+   * rebuild per window.
+   */
+  function requestStreamRebuild(userId, reason) {
+    const key = String(userId);
+    const last = rebuildCooldown.get(key) || 0;
+    if (now() - last < rebuildCooldownMs) {
+      heartbeat.suppressed += 1;
+      log('info', 'Telegram stream rebuild already cooling down', { userId, reason, sinceMs: Math.round(now() - last) });
+      return false;
+    }
+    rebuildCooldown.set(key, now());
+    if (typeof onDeadStream !== 'function') {
+      log('warn', 'Telegram update stream needs a rebuild but no restorer is wired', { userId, reason });
+      return false;
+    }
+    heartbeat.rebuilt += 1;
+    log('warn', 'Telegram update stream rebuild forced', { userId, reason, cooldownMs: rebuildCooldownMs });
+    // Deliberately not awaited by the caller: a reconnect is a minutes-long affair (handshake, resume, replay)
+    // and a watchdog that blocks on it stops watching everything else. `restoreTelegramClient` re-attaches and
+    // flags its own catch-up, which is the whole recovery; failures are logged rather than thrown so a dead
+    // session cannot become an unhandled rejection inside the interval.
+    Promise.resolve().then(() => onDeadStream(userId, reason)).catch((error) => {
+      log('warn', 'Telegram update stream rebuild failed', { userId, reason, error: `${error?.message || error}`.slice(0, 200) });
+    });
+    return true;
+  }
+
+  /**
+   * One heartbeat cycle: an active request to every connected session, and the decisions its answer allows.
+   *
+   * Three outcomes, all of them cheap. The socket does not answer -> it is not a stream, rebuild now. It answers
+   * and its `pts` moved while our handler saw nothing, twice in a row -> the transport works and the update loop
+   * does not, rebuild now. It answers and `pts` is where it was -> the account genuinely has nothing new, and
+   * the only correct action is to leave the session alone. A quiet channel is not a fault, and a watchdog that
+   * reconnects quiet channels is a self-inflicted outage; this is the line the whole function walks.
+   */
+  async function beatUpdateStreams({ reason = 'heartbeat' } = {}) {
+    const targets = [];
+    for (const [userId, entry] of clients.entries?.() || []) {
+      if (!entry?.client || entry.client.connected !== true) continue;
+      targets.push([userId, entry]);
+    }
+    const cycleStartedAt = now();
+    const results = { reason, sessions: targets.length, sent: 0, answered: 0, dead: 0, stalled: 0, quiet: 0, unknown: 0, worstMs: 0 };
+    if (!targets.length) {
+      heartbeat.cycles += 1;
+      heartbeat.lastCycleAt = new Date(cycleStartedAt).toISOString();
+      if (!emptyCycleReported) {
+        emptyCycleReported = true;
+        log('info', 'Telegram heartbeat has no connected sessions to beat', { reason, intervalMs: heartbeatIntervalMs });
+      }
+      return { ...results, beats: 0 };
+    }
+    emptyCycleReported = false;
+
+    const beatOne = async ([userId, entry]) => {
+      const key = String(userId);
+      const previous = streamBeats.get(key);
+      const stats = entry.stats || EMPTY_STATS();
+      const seenBefore = Number(stats.seen) || 0;
+      results.sent += 1;
+      const probe = await probeUpdateStream(entry.client, { deadlineMs: probeDeadlineMs });
+      if (probe.state === 'unknown') {
+        // A library change that removed `updates.GetState` must not become one log line per session per beat.
+        results.unknown += 1;
+        heartbeat.probing += 1;
+        log('debug', 'Telegram heartbeat could not be answered by this build of the library', { userId });
+        return;
+      }
+      if (!probe.alive) {
+        results.dead += 1;
+        heartbeat.dead += 1;
+        streamBeats.set(key, { ...(previous || {}), at: now(), error: probe.error || 'probe-timeout', stalls: 0 });
+        requestStreamRebuild(userId, 'heartbeat-no-answer');
+        return;
+      }
+      results.answered += 1;
+      results.worstMs = Math.max(results.worstMs, Number(probe.ms) || 0);
+      const pts = Number(probe.pts) || 0;
+      const seenNow = Number(stats.seen) || 0;
+      const ptsAdvanced = Number.isFinite(previous?.pts) && pts > previous.pts;
+      const seenAtLastBeat = Number.isFinite(previous?.seen) ? previous.seen : 0;
+      const handlerKeptUp = seenNow > seenAtLastBeat;
+      /* A rebuild replaces the session's whole `stats` object, so `seen` going *backwards* is not a stalled
+         handler - it is a fresh one, and comparing it against a baseline from the previous lifetime would accuse
+         the new session of the old one's silence. The beat learns the new baseline and says nothing. */
+      const restarted = Number.isFinite(previous?.seen) && seenNow < seenAtLastBeat;
+      let stalls = Number(previous?.stalls) || 0;
+      if (ptsAdvanced && !handlerKeptUp && !restarted) {
+        stalls += 1;
+        if (stalls >= ptsStallBeats) {
+          results.stalled += 1;
+          heartbeat.stalled += 1;
+          requestStreamRebuild(userId, 'update-stream-stalled');
+          stalls = 0;
+        }
+      } else {
+        if (ptsAdvanced) results.quiet += 1;
+        stalls = 0;
+      }
+      streamBeats.set(key, { at: now(), pts, seen: seenNow, ms: Number(probe.ms) || 0, stalls, error: null });
+    };
+
+    // Chunked rather than fired-all-at-once: one session's slow reconnect must not be the reason 200 requests
+    // are opened against the same process tick, and `Promise.allSettled` per chunk keeps one timeout from
+    // rejecting the cycle.
+    const chunkSize = 8;
+    for (let index = 0; index < targets.length; index += chunkSize) {
+      await Promise.allSettled(targets.slice(index, index + chunkSize).map(beatOne));
+    }
+
+    heartbeat.cycles += 1;
+    heartbeat.sent += results.sent;
+    heartbeat.answered += results.answered;
+    heartbeat.lastCycleAt = new Date(now()).toISOString();
+    heartbeat.lastCycleMs = results.worstMs;
+    heartbeat.lastCycleSessions = results.sessions;
+    /* The line the operator greps to prove the watchdog is alive: once per cycle, with every count that decides
+       anything in it, so "it is beating but the streams are dead" is one line rather than a correlation. */
+    log(results.dead || results.stalled ? 'warn' : 'info', 'Telegram heartbeat sent', {
+      ...results,
+      intervalMs: heartbeatIntervalMs,
+      slowestMs: results.worstMs,
+      sinceBootMs: Math.max(0, now() - startedAt.getTime()),
+    });
+    return { ...results, beats: heartbeat.cycles };
+  }
+
+  /** The heartbeat's own counters, for the health panel and for the `/health` payload. */
+  function heartbeatSummary() {
+    const beats = [...streamBeats.entries()].map(([userId, beat]) => ({
+      userId: String(userId),
+      at: beat.at ? new Date(beat.at).toISOString() : null,
+      pts: Number.isFinite(beat.pts) ? beat.pts : null,
+      ms: Number.isFinite(beat.ms) ? beat.ms : null,
+      stalls: Number(beat.stalls) || 0,
+      error: beat.error || null,
+    }));
+    return {
+      ...heartbeat,
+      intervalMs: heartbeatIntervalMs,
+      ptsStallBeats,
+      rebuildCooldownMs,
+      secondsSinceLastCycle: heartbeat.lastCycleAt ? Math.round((now() - Date.parse(heartbeat.lastCycleAt)) / 1000) : null,
+      stale: heartbeat.lastCycleAt ? (now() - Date.parse(heartbeat.lastCycleAt)) > heartbeatIntervalMs * 4 : true,
+      beats,
+    };
+  }
+
+  /** Whether one session's beat says its stream is moving; used by the summary, never by a user-facing route. */
+  function streamBeatFor(userId) {
+    return streamBeats.get(String(userId)) || null;
+  }
+
   /** What one session's stream looks like: when we last saw anything, and whether it is due a cross-check. */
   function streamHealth(userId) {
     const entry = entryFor(userId);
@@ -161,7 +368,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
     const lastRun = catchUpRuns.get(String(userId)) || 0;
     /* Staggered per workspace, deterministically: `gapCatchUpMs + spread` is the outer bound, and a user who
        signed up last is not the one that gets throttled every time the fleet is asked at once. */
-    const spread = [...String(userId)].reduce((total, char) => (total * 31 + char.charCodeAt(0)) % GAP_CATCH_UP_SPREAD_MS, 0);
+    const spread = staggerFor(userId, gapCatchUpSpreadMs);
     return {
       lastEventAt: stats.lastAt || null,
       silenceMs,
@@ -315,6 +522,13 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
 
   async function runCatchUpPass(userId, current, startedAt) {
     let stored = 0;
+    /* A replay that turns up a message posted *after* this handler went on is not a recovery, it is a
+       confession: the channel spoke while we were listening and the push never arrived. That is the one thing
+       the silence clock cannot tell us - a workspace with two monitored channels keeps `lastAt` fresh on the
+       live one and misses the other forever - so it is measured here, against the attach, where both halves of
+       the comparison are already in hand. */
+    const listeningSince = current.attachedAt ? Date.parse(current.attachedAt) : 0;
+    let fresh = 0;
     current.needsCatchUp = false;
     const { rows: channels } = await pool.query(
       'SELECT channel_id AS "channelId",title,username FROM channels WHERE user_id=$1 AND enabled=TRUE ORDER BY created_at DESC',
@@ -325,7 +539,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
       if (now() - startedAt >= catchUpBudgetMs) {
         // Out of budget: the remaining channels keep their claim on the next run.
         current.needsCatchUp = true;
-        return { ran: true, reason: 'BUDGET', stored, partial: true };
+        return { ran: true, reason: 'BUDGET', stored, fresh, partial: true };
       }
       const handles = [];
       if (channel.username) handles.push(channel.username);
@@ -351,15 +565,23 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
         await yieldToEventLoop();
         if (now() - startedAt >= catchUpBudgetMs) {
           current.needsCatchUp = true;
-          if (stored) log('info', 'Telegram catch-up stopped at its budget', { userId, stored });
-          return { ran: true, reason: 'BUDGET', stored, partial: true };
+          if (stored) log('info', 'Telegram catch-up stopped at its budget', { userId, stored, fresh });
+          return { ran: true, reason: 'BUDGET', stored, fresh, partial: true };
         }
         const result = await ingestMessage(userId, message, { message }, { replayed: true });
-        if (result.stored) stored += 1;
+        if (result.stored) {
+          stored += 1;
+          const sentAtMs = Number(message?.date) * 1000;
+          if (listeningSince && Number.isFinite(sentAtMs) && sentAtMs > listeningSince) fresh += 1;
+        }
       }
     }
-    if (stored) log('info', 'Telegram catch-up stored missed messages', { userId, stored });
-    return { ran: true, reason: 'DONE', stored };
+    if (stored) log('info', 'Telegram catch-up stored missed messages', { userId, stored, fresh });
+    if (fresh) {
+      log('warn', 'Telegram replay found messages posted while the handler was attached', { userId, fresh, sinceAttachMs: Math.max(0, now() - listeningSince) });
+      requestStreamRebuild(userId, 'message-missed-while-listening');
+    }
+    return { ran: true, reason: 'DONE', stored, fresh };
   }
 
   /** What every user's session looks like right now, for the admin diagnostics only. */
@@ -371,6 +593,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
     let lastMessageAt = null;
     for (const [userId, entry] of clients.entries?.() || []) {
       const stats = entry.stats || EMPTY_STATS();
+      const beatInfo = streamBeats.get(String(userId));
       const attached = Boolean(entry.handler) && handlerIsLive(entry.client, entry.handler);
       if (attached && entry.client?.connected) listening += 1;
       seen += Number(stats.seen) || 0;
@@ -392,6 +615,14 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
         lastDelayMs: Number.isFinite(stats.lastDelayMs) ? stats.lastDelayMs : null,
         silenceSeconds: stats.lastAt ? Math.round(Math.max(0, now() - Date.parse(stats.lastAt)) / 1000) : null,
         attachedAt: entry.attachedAt || null,
+        /* The beat's own numbers for this session. Together with `silenceSeconds` these are the whole answer to
+           "is it slow, is it dead, or is the channel quiet": a fresh `lastBeatAt` with a moving `beatPts` and no
+           `messagesSeen` growth is a live transport feeding a dead update loop, which is invisible from any flag. */
+        lastBeatAt: beatInfo?.at ? new Date(beatInfo.at).toISOString() : null,
+        beatMs: Number.isFinite(beatInfo?.ms) ? beatInfo.ms : null,
+        beatPts: Number.isFinite(beatInfo?.pts) ? beatInfo.pts : null,
+        beatStalls: Number(beatInfo?.stalls) || 0,
+        beatError: beatInfo?.error || null,
       });
     }
     const instanceStartedAt = startedAt.toISOString();
@@ -418,6 +649,9 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
       medianDelayMs: delays.length ? delays.slice().sort((a, b) => a - b)[Math.floor(delays.length / 2)] : null,
       longestSilenceSeconds: slowestSilence,
       streamIdle: listening > 0 && (idleMs === null || idleMs > Math.max(STREAM_IDLE_MS, silenceSuspectMs)),
+      // The keep-alive watchdog in one object: how many cycles ran, how many sessions could not answer, how
+      // many had to be rebuilt, and whether the last cycle is old enough that the interval itself is suspect.
+      heartbeat: heartbeatSummary(),
       // The state the health panel turns into a sentence: something is expected, nothing is attached.
       nothingAttached: sessions.length > 0 && listening === 0,
       idleSeconds: idleMs === null ? null : Math.round(idleMs / 1000),
@@ -426,5 +660,5 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
 
   function markSessionResumed() { resumedAfterBoot += 1; }
 
-  return { startTelegramListener, handlerIsLive, ingestMessage, runCatchUp, statsFor, telegramFleetSummary, probeUpdateStream, streamHealth, markSessionResumed, EMPTY_STATS };
+  return { startTelegramListener, handlerIsLive, ingestMessage, runCatchUp, statsFor, telegramFleetSummary, probeUpdateStream, streamHealth, beatUpdateStreams, heartbeatSummary, streamBeatFor, requestStreamRebuild, markSessionResumed, EMPTY_STATS };
 }
