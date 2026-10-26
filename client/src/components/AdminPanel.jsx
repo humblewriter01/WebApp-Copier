@@ -394,6 +394,34 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     }
   };
 
+  /*
+   * The manual rebuild of one workspace's Telegram session. It is the operator's override of the watchdog: the
+   * server's own reconnects are throttled so a misread quiet channel cannot become a loop, and a person holding
+   * the evidence is not what that throttle was written against.
+   *
+   * The notice reports what the replay found rather than thanking the clicker, because "it worked" is not
+   * knowable from the response alone - a reconnect that stored nothing is still a working reconnect on a channel
+   * that has not posted, and that distinction is the whole reason anyone presses it.
+   */
+  const reconnectTelegram = async (user) => {
+    setBusyUser(user.id);
+    setError('');
+    setNotice('');
+    try {
+      const result = await request(`/api/admin/users/${user.id}/telegram/reconnect`, token, { method: 'POST', body: { reason: 'admin-panel' }, retryWhenUnanswered: true });
+      const caughtUp = Number(result?.caughtUp) || 0;
+      const fresh = Number(result?.fresh) || 0;
+      setNotice(`${user.name}'s Telegram session is new. ${caughtUp
+        ? `It replayed ${caughtUp} missed message(s)${fresh ? `, ${fresh} of them posted while the old listener was still attached - that is the deaf-stream case, not a backlog.` : '.'}`
+        : 'Nothing was waiting in the channels, which on a quiet channel is the normal answer.'}`);
+      await loadUsers();
+    } catch (reconnectError) {
+      setError(reconnectError.message);
+    } finally {
+      setBusyUser('');
+    }
+  };
+
   const changeRole = (user, role) => {
     if (role === user.role) return;
     void updateUser(user.id, { role }, role === 'admin' ? `${user.name} is now an administrator.` : `${user.name} is now a standard user.`);
@@ -855,6 +883,9 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
                       <strong>{user.name}{isSelf ? ' (you)' : ''}</strong>
                       <small>{user.email}</small>
                       {isSuspended && user.suspensionReason ? <small className="admin-reason">Reason: {user.suspensionReason}</small> : null}
+                      {user.telegramConnected
+                        ? <small className="admin-reason">Telegram linked · {user.monitorCount ? `${user.monitorCount} monitored channel${user.monitorCount === 1 ? '' : 's'}` : 'no channel monitored yet'}</small>
+                        : null}
                     </td>
                     <td data-label="Role">
                       <select
@@ -882,6 +913,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
                           : <button type="button" className="button button-danger button-small" disabled={busy} onClick={() => startSuspension(user)}>Suspend</button>}
                         <button type="button" className="button button-secondary button-small" disabled={busy || isSelf} onClick={() => (supporting ? closeSupportAccessForm() : openSupportAccess(user))}>Impersonate</button>
                         <button type="button" className="button button-secondary button-small" disabled={busy} onClick={() => (adjusting ? cancelAdjustment() : openAdjustment(user))}>Adjust plan</button>
+                        {user.telegramConnected && !isSelf ? <button type="button" className="button button-secondary button-small" disabled={busy} onClick={() => reconnectTelegram(user)} title="Drop the Telegram connection, sign back in with the stored session, and replay what the channels posted while it was down">{busy ? 'Working…' : 'Reconnect Telegram'}</button> : null}
                       </div>
                     </td>
                   </tr>;

@@ -616,7 +616,7 @@ function makeBeatHarness({ pts = () => 100, mode = 'alive', stats = null, ...ove
     log: (level, message, meta) => logs.push({ level, message, meta }),
     saveSignal: async () => ({ id: 'signal-1' }),
     now: () => clock,
-    onDeadStream: async (userId, reason) => { rebuilt.push({ userId, reason }); },
+    onDeadStream: async (userId, reason, { force = false } = {}) => { rebuilt.push({ userId, reason, forced: force === true }); },
     // The production constants, not numbers of the test's own: the cadence and the reconnect cooldown are the
     // two things an operator can legitimately change, and a test that pinned a copy of them would survive the
     // change silently.
@@ -662,7 +662,7 @@ test('a beat that is not answered reconnects immediately, and the beat is what n
   assert.equal(cycle.dead, 1, 'a request that errors is a dead stream, not a slow network');
   assert.ok(harness.logs.some((entry) => entry.message === 'Telegram heartbeat sent' && entry.level === 'warn'), 'the cycle is a warning when it found a corpse');
   await new Promise((resolve) => { setImmediate(resolve); });
-  assert.deepEqual(harness.rebuilt, [{ userId: USER_ID, reason: 'heartbeat-no-answer' }], 'and the reconnect is requested on the spot rather than at the next sweep');
+  assert.deepEqual(harness.rebuilt, [{ userId: USER_ID, reason: 'heartbeat-no-answer', forced: false }], 'and the reconnect is requested on the spot rather than at the next sweep');
 
   // The unresponsive socket - the shape Render's NAT actually leaves behind: writes succeed, nothing returns.
   const hung = makeBeatHarness({ mode: 'hang' });
@@ -685,7 +685,7 @@ test('a moving pts with a quiet handler is a dead update loop, and it is rebuilt
   assert.equal(stalls, 1);
   await harness.cycle();          // and the second one is
   await new Promise((resolve) => { setImmediate(resolve); });
-  assert.deepEqual(harness.rebuilt, [{ userId: USER_ID, reason: 'update-stream-stalled' }], 'two beats of "Telegram produced updates we never saw" is the one proof that a live socket and a dead listener can be told apart');
+  assert.deepEqual(harness.rebuilt, [{ userId: USER_ID, reason: 'update-stream-stalled', forced: false }], 'two beats of "Telegram produced updates we never saw" is the one proof that a live socket and a dead listener can be told apart');
 
   // The same movement, delivered: nothing to fix.
   const healthy = makeBeatHarness({ pts: (index) => 100 + index });
@@ -817,4 +817,54 @@ test('a rebuild is not mistaken for a stalled handler, because the new session s
   await new Promise((resolve) => { setImmediate(resolve); });
   assert.equal(harness.listener.streamBeatFor(USER_ID).stalls, 0, 'a counter going backwards is a new session, not a deaf one');
   assert.equal(harness.rebuilt.length, 0, 'and no rebuild is requested for it');
+});
+
+test('the cooldown protects Telegram from the watchdog, and never from a person', async () => {
+  const harness = makeBeatHarness({ mode: 'error' });
+  await harness.cycle();
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(harness.rebuilt.length, 1, 'the first failure reconnects');
+  assert.deepEqual(harness.rebuilt[0], { userId: USER_ID, reason: 'heartbeat-no-answer', forced: false }, 'and the automatic path says plainly that it is not forcing anything');
+
+  await harness.cycle();
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(harness.rebuilt.length, 1, 'the same session inside the window is left to the rebuild already in progress');
+
+  // The manual route's call, one level up in index.js: `force: true`, and nothing else about the beat changes.
+  assert.equal(harness.listener.requestStreamRebuild(USER_ID, 'manual-reconnect', { force: true }), true,
+    'an operator who has read the counters is not refused by a throttle designed for a machine that might be wrong');
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.deepEqual(harness.rebuilt[1], { userId: USER_ID, reason: 'manual-reconnect', forced: true });
+  assert.equal(harness.listener.heartbeatSummary().suppressed, 1, 'the suppressed attempt is counted, so "the button worked but the watchdog was already shouting" is one number');
+});
+
+test('a session that was just rebuilt starts its own clock, and its throttle with it', async () => {
+  const harness = makeBeatHarness({ pts: (index) => 101 + index });
+  harness.entry().stats.seen = 4;
+  await harness.cycle();                                   // first beat: pts 102, seen 4 -> the baseline
+  assert.equal(harness.listener.streamBeatFor(USER_ID).pts, 102, 'the beat keeps what it will compare the next answer against');
+
+  // What `restoreTelegramClient` now does on every rebuild, automatic or forced: new entry, empty stats, and
+  // `resetStreamBaseline`, which drops both the comparison baseline and the rebuild throttle the old session
+  // earned. The first is defence against accusing a new session of its predecessor's silence; the second is why
+  // an operator pressing the button is not told to wait two minutes, twice.
+  harness.entry().stats = harness.listener.EMPTY_STATS();
+  assert.deepEqual(harness.listener.resetStreamBaseline(USER_ID), { cleared: 1 });
+  assert.equal(harness.listener.streamBeatFor(USER_ID), null, 'the old lifetime is not compared with the new one');
+
+  await harness.cycle();                                   // pts moved, `seen` legitimately back to zero
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(harness.rebuilt.length, 0, 'and a single beat after a rebuild is not a verdict');
+  assert.ok(harness.listener.streamBeatFor(USER_ID).stalls <= 1, 'at most one suspicion, retaken from the new baseline');
+
+  // The throttle half, which is the part a person feels.
+  const throttled = makeBeatHarness({ mode: 'error' });
+  await throttled.cycle();
+  await new Promise((resolve) => { setImmediate(resolve); });
+  await throttled.cycle();
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(throttled.rebuilt.length, 1, 'the watchdog is throttled inside the window, as designed');
+  throttled.listener.resetStreamBaseline(USER_ID);
+  assert.equal(throttled.listener.requestStreamRebuild(USER_ID, 'manual-reconnect'), true,
+    'and a rebuild that was asked for by hand clears that window, because the operator is not the risk the cooldown was written against');
 });

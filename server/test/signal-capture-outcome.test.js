@@ -539,8 +539,11 @@ test('the sweep asks the channel what it said, and the heartbeat is what asks th
     'a cycle that throws once is logged, because an interval callback that rejects would stop the keep-alive permanently and silently - the exact failure this exists to prevent');
 
   // The rebuild goes through the one function that can do it, and the listener never reaches for it directly.
-  assert.match(index, /onDeadStream: \(userId, reason\) => restoreTelegramClient\(userId, \{ reason \}\)/,
+  assert.match(index, /onDeadStream: \(userId, reason, \{ force = false \} = \{\}\) => restoreTelegramClient\(userId, \{ reason, force \}\)/,
     'the listener decides when a stream is not a stream; the server owns the reconnect, which also re-attaches and replays');
+  assert.equal((index.match(/force: true/g) || []).length, 1, 'exactly one caller in the server may bypass the rebuild cooldown, and it is the manual reconnect route');
+  assert.match(index, /telegramClients\.set\(userId, \{ client, handler: null, stats: telegramCapture\.EMPTY_STATS\(\) \}\);\n\s*telegramCapture\.resetStreamBaseline\(userId\);/,
+    'a rebuilt session has its beat baseline retaken, because `seen` restarting at zero would otherwise read as a stalled stream and the watchdog would reconnect every session it had ever fixed');
 
   /* `/health` is public, so the heartbeat appears there as counts and nothing else. `beats` is the per-session
      array - user ids, `pts`, timings - and it is destructured away rather than filtered, so the shape that could
@@ -569,4 +572,42 @@ test('the transport can be moved off the plain port, and the option can never co
   const loginSites = index.match(/new TelegramClient\(new StringSession\(''\)[^)]*\)\s*;?/g) || [];
   assert.ok(loginSites.length >= 1, 'the login clients are constructed in the same file');
   assert.equal(loginSites.some((site) => site.includes('useWSS')), false, 'and none of them takes the knob');
+});
+
+test('an operator can rebuild a deaf session by hand, and that is the one path allowed to ignore the cooldown', () => {
+  const route = section(index, "app.post('/api/admin/users/:id/telegram/reconnect'", '\napp.post');
+  assert.match(route, /authenticate, requireAdmin, adminRoute\('Reconnecting a Telegram session by hand'/,
+    'admin-only, and inside the wrapper that knows a write already landed, so a later failure is reported as "it happened" rather than as a clean refusal');
+  assert.match(route, /markApplied\(req\);/, 'the user lookup is not the mutation, but the reconnect is');
+  assert.match(route, /SELECT id, email FROM users WHERE id=\$1/, 'the target has to exist before anything is tried');
+  assert.match(route, /fail\(res, 404, 'No workspace has that id/, 'and a bad id is a 404 about the id, not a 500 about the socket');
+  assert.match(route, /fail\(res, 409, `\$\{error\.message\} The phone number has to sign in again/, 'no stored session is a conflict with the next step for the human');
+  assert.match(route, /fail\(res, 502, `\$\{error\.message\} Try again in a minute/, 'and a refused handshake says what to do, in minutes, not in stack frames');
+
+  const helper = section(index, 'async function forceTelegramReconnect(', '\n/** Re-attach anything in memory');
+  assert.match(helper, /restoreTelegramClient\(userId, \{ reason, force: true \}\)/, 'the bypass is one call deep and named');
+  assert.match(helper, /action: 'telegram\.reconnectForced'/, 'the audit trail gets its own action, because "who rebuilt this" is the first question after a rebuild that fixed something');
+  assert.match(helper, /actorId,\n\s*actorEmail,/, 'both halves of the actor are recorded');
+  assert.match(helper, /const caughtUp = Number\(outcome\?\.stored\) \|\| 0;\n\s*const fresh = Number\(outcome\?\.fresh\) \|\| 0;/,
+    'the numbers are read out once');
+  assert.match(helper, /metadata: \{ reason, caughtUp, fresh, heartbeatCycles: capture\.cycles, deadBeats: capture\.dead, stalledBeats: capture\.stalled \}/,
+    'and the audit row and the response are built from that one pair, never from two computations that can disagree');
+  assert.match(helper, /Reconnected a workspace's Telegram session by hand and replayed its channels: \$\{caughtUp\} missed message\(s\) stored, \$\{fresh\} of them posted while the old handler was already attached\./,
+    'the summary says what was found and what it means, so the audit row can be read without the logs');
+  assert.match(helper, /Telegram session reconnected by hand/, 'and the stdout line is searchable, with the same numbers');
+  assert.match(helper, /await auditLog\.record\(\{[\s\S]{0,700}\}\)\.catch\(\(error\) => log\('warn', 'Telegram forced reconnect could not be audited'/,
+    'a failure to write the audit row is logged rather than allowed to fail the action the operator took');
+
+  // The helper must not go and rebuild the whole fleet as a side effect of one button press.
+  assert.equal(helper.includes('resetStreamBaseline()'), false, 'the baseline is retaken per session, by the restore itself');
+
+  /* The button is rendered from a field on the row, so the field has to be in the list the row is built from -
+     and quoted, because Postgres folds a bare camelCase alias to lowercase and the client then reads
+     `undefined` and states something false. This is the exact bug that put "Auto-Trading is off" on every row
+     once, and a conditional control is the most dangerous place to repeat it: the button would simply vanish. */
+  const columns = section(index, 'const adminUserColumns = `', '`;');
+  assert.match(columns, /u\.telegram_connected AS "telegramConnected"/, 'the linked fact is on every admin read of an account, from one list');
+  assert.match(columns, /\(SELECT COUNT\(\*\)::int FROM channels c WHERE c\.user_id=u\.id AND c\.enabled=TRUE\) AS "monitorCount"/,
+    'and so is how many channels that session is supposed to be hearing, which is what distinguishes a deaf stream from a workspace that never picked a channel');
+  assert.equal(/AS [a-z][a-zA-Z]*(?![\w"])/.test(columns), false, 'no camelCase alias in that list is left unquoted');
 });

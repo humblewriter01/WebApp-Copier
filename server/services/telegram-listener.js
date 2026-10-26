@@ -206,11 +206,15 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
    * The cooldown is the only thing between "the stream is broken" and "reconnect forever", and it is deliberately
    * a property of the *rebuild* rather than of each detector, so three detectors agreeing still means one
    * rebuild per window.
+   *
+   * `force: true` steps around that window, and is only ever passed by a human being on the other side of an
+   * admin route. The throttle exists to protect Telegram from a watchdog that has misread a quiet channel; it
+   * has no argument with an operator who is looking at the evidence and wants a new session now.
    */
-  function requestStreamRebuild(userId, reason) {
+  function requestStreamRebuild(userId, reason, { force = false } = {}) {
     const key = String(userId);
     const last = rebuildCooldown.get(key) || 0;
-    if (now() - last < rebuildCooldownMs) {
+    if (!force && now() - last < rebuildCooldownMs) {
       heartbeat.suppressed += 1;
       log('info', 'Telegram stream rebuild already cooling down', { userId, reason, sinceMs: Math.round(now() - last) });
       return false;
@@ -226,7 +230,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
     // and a watchdog that blocks on it stops watching everything else. `restoreTelegramClient` re-attaches and
     // flags its own catch-up, which is the whole recovery; failures are logged rather than thrown so a dead
     // session cannot become an unhandled rejection inside the interval.
-    Promise.resolve().then(() => onDeadStream(userId, reason)).catch((error) => {
+    Promise.resolve().then(() => onDeadStream(userId, reason, { force: force === true })).catch((error) => {
       log('warn', 'Telegram update stream rebuild failed', { userId, reason, error: `${error?.message || error}`.slice(0, 200) });
     });
     return true;
@@ -357,6 +361,27 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
   /** Whether one session's beat says its stream is moving; used by the summary, never by a user-facing route. */
   function streamBeatFor(userId) {
     return streamBeats.get(String(userId)) || null;
+  }
+
+  /**
+   * Forget what the last beat compared, for one session or for all of them.
+   *
+   * Call it whenever a session is replaced by hand: the new client's `stats.seen` starts at zero, and a
+   * comparison against a baseline taken from the session it replaced reads that as a stalled stream - which is
+   * how a watchdog ends up reconnecting every session it has ever rebuilt, forever. The beat retakes the
+   * baseline on its next cycle, so what this removes is only the accusation.
+   */
+  function resetStreamBaseline(userId = null) {
+    if (userId === null || userId === undefined) {
+      const cleared = streamBeats.size;
+      streamBeats.clear();
+      rebuildCooldown.clear();
+      return { cleared };
+    }
+    const key = String(userId);
+    const had = streamBeats.delete(key);
+    rebuildCooldown.delete(key);
+    return { cleared: had ? 1 : 0 };
   }
 
   /** What one session's stream looks like: when we last saw anything, and whether it is due a cross-check. */
@@ -660,5 +685,5 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
 
   function markSessionResumed() { resumedAfterBoot += 1; }
 
-  return { startTelegramListener, handlerIsLive, ingestMessage, runCatchUp, statsFor, telegramFleetSummary, probeUpdateStream, streamHealth, beatUpdateStreams, heartbeatSummary, streamBeatFor, requestStreamRebuild, markSessionResumed, EMPTY_STATS };
+  return { startTelegramListener, handlerIsLive, ingestMessage, runCatchUp, statsFor, telegramFleetSummary, probeUpdateStream, streamHealth, beatUpdateStreams, heartbeatSummary, streamBeatFor, resetStreamBaseline, requestStreamRebuild, markSessionResumed, EMPTY_STATS };
 }
