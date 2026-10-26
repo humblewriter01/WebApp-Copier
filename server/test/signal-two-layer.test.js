@@ -26,6 +26,7 @@ import { llmConfig, needsLayer2, extractJsonObject, validateExtraction, numbersI
 import { CAPTURE_PARSE_BUDGET_MS, parseSignalTwoLayer, mergeGaps } from '../services/signal-parse-pipeline.js';
 import { captureSafety, applySafetyNets, pipSizeFor } from '../services/signal-safety.js';
 import { createExecutionEngine } from '../services/execution-engine.js';
+import { FRIENDLY_NOTES } from '../services/signal-wording.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const indexSource = readFileSync(path.join(here, '..', 'index.js'), 'utf8');
@@ -246,18 +247,95 @@ test('a model that answers in prose still gets read, and a model that does not a
   assert.equal(http.status, 429, 'the status is kept, because 429 and 401 want different answers from an operator');
 });
 
-test('an endpoint that does not know response_format is asked again without it', async () => {
+test('no response envelope is sent at all, because the provider\u0027s objection to it is not answerable', async () => {
   const bodies = [];
   const fetchImpl = async (_url, init) => {
     const body = JSON.parse(init.body);
     bodies.push(body);
-    if ('response_format' in body) return { ok: false, status: 400, text: async () => 'Unknown parameter: response_format' };
+    if ('response_format' in body) return { ok: false, status: 400, text: async () => 'Failed to validate JSON' };
     return llmReply({ symbol: 'EURUSD', side: 'buy', entry: 1.085, stop_loss: 1.08, take_profit: 1.095, confidence: 0.95 })();
   };
   const result = await llmParseSignal('BUY EURUSD Entry 1.0850 TP 1.0950 - stop should be 1.0800', { config: CONFIG, fetchImpl });
-  assert.equal(result.ok, true, 'the request is retried once, without the parameter the server objected to');
-  assert.equal(bodies.length, 2);
-  assert.ok('response_format' in bodies[0] && !('response_format' in bodies[1]));
+  assert.equal(result.ok, true, 'the reading succeeds on the first request, because there is no parameter for the endpoint to refuse');
+  assert.equal(bodies.length, 1, 'and there is exactly one request: the retry that used to follow a 400 was a second payment for an envelope that was never needed');
+  assert.equal('response_format' in bodies[0], false, 'the body carries the four documented keys and nothing else');
+  assert.deepEqual(Object.keys(bodies[0]).sort(), ['max_tokens', 'messages', 'model', 'temperature']);
+  assert.equal(bodies[0].temperature, 0, 'still transcription, not composition');
+});
+
+test('a provider that fails for a real reason is still reported as one, and not as an unreadable message', async () => {
+  const result = await llmParseSignal('BUY EURUSD Entry 1.0850 TP 1.0950', {
+    config: CONFIG,
+    fetchImpl: async () => ({ ok: false, status: 429, text: async () => JSON.stringify({ error: { message: 'rate limit reached for model llama-3.1-8b-instant' } }) }),
+  });
+  assert.equal(result.code, 'http-error');
+  assert.equal(result.status, 429);
+  assert.match(result.technical, /rate limit reached/, 'the provider\u0027s own words reach the admin panel');
+  assert.equal(result.reason, FRIENDLY_NOTES.readerUnavailable, 'and the row keeps the one honest sentence, because a rate limit is not something a trader can fix');
+});
+
+/* ------------------------------------------------------------------ the model\u0027s framing ---------------------------------------------------------
+
+   Without a provider-enforced envelope, the reply is text, and text is where a chat model puts its manners:
+   fences, a preface, a trailing aside. The parser has to be tolerant of the frame and strict about the contents,
+   because the failure mode it is protecting against is symmetrical - refuse on a fence and a correct reading is
+   thrown away, repair a value and an invented price is accepted. Every case below is a shape that has been seen
+   from a real endpoint; the last one is what is *not* forgiven.
+   ------------------------------------------------------------------------------------------------------------------------------------------------------------- */
+
+test('a fenced, prefaced, or padded reply is read as the object it contains', async () => {
+  const object = '{"symbol":"XAUUSD","side":"buy","entry":null,"stop_loss":4010,"take_profit":null,"confidence":1}';
+  const cases = [
+    ['\`\`\`json fenced', `\`\`\`json\n${object}\n\`\`\``],
+    ['bare fence', `\`\`\`\n${object}\n\`\`\``],
+    ['prefaced and fenced', `Sure! Here is the extracted signal:\n\`\`\`json\n${object}\n\`\`\`\nLet me know if you need anything else.`],
+    ['no fence, sentences either side', `The message states a direction and a stop. ${object} I could not find an entry price.`],
+    ['an example object before the answer', `Format: {"symbol": null} ${object}`],
+    ['a stray brace in the closing sentence', `${object} (send it now})`],
+    ['byte-order mark and trailing whitespace', `\uFEFF${object}\n\n  `],
+    ['a trailing comma, which is a syntax slip and not a value', '{"symbol":"XAUUSD","side":"buy","entry":null,"stop_loss":4010,"confidence":1,}'],
+    ['the fenced block is the answer, and an aside after it is not', '```json\n' + object + '\n```\nP.S. if the channel meant silver it would be {"symbol":"XAGUSD","confidence":1}'],
+  ];
+  for (const [label, content] of cases) {
+    const json = extractJsonObject(content);
+    assert.ok(json, `${label}: the object is found`);
+    assert.equal(json.symbol, 'XAUUSD', `${label}: the symbol survived`);
+    assert.equal(json.stop_loss, 4010, `${label}: the number survived untouched`);
+    assert.equal(json.entry, null, `${label}: a null stays null rather than becoming a guess`);
+  }
+
+  const truncated = await llmParseSignal('GOLD long, SL 4010', {
+    config: CONFIG,
+    // An opening fence with nothing to close it is a cut-off answer, and a cut-off answer is where a field went
+    // missing. The last case above repairs a comma; this one refuses, which is the line between the two.
+    fetchImpl: async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ choices: [{ message: { content: `\`\`\`json\n{"symbol":"XAUUSD","side":"buy","stop_loss":401` } }] }) }),
+  });
+  assert.equal(truncated.ok, false, 'a reply that cannot be read is a refusal');
+  assert.equal(truncated.code, 'malformed', 'reported as the model not answering, not as the message being unclear');
+});
+
+test('the prompt tells the model the frame matters as much as the numbers', () => {
+  const [system] = buildMessages('GOLD long, stop 4010', CONFIG);
+  assert.ok(system.content.includes('its first character is "{", its last is "}"'), 'the shape is stated as a rule, at the top, where a short model obeys it');
+  assert.match(system.content, /Never wrap it in a markdown code fence/, 'and the specific failure - the fence - is named rather than left to "no markdown"');
+  assert.match(system.content, /one JSON object, unquoted, unescaped, unfenced, on its own\./, 'restated at the end, because recency is what a small model obeys');
+  assert.equal(/```/.test(buildMessages('x', CONFIG)[1].content), false, 'the user turn quotes the message in triple quotes, which is the one thing that must not look like a fence instruction');
+});
+
+test('a garbled message the model can read is no longer described as unreadable', async () => {
+  // The report verbatim: a long on gold with a stop and no entry. The model reads it; the row is honest that an
+  // entry is missing; and nothing in it says the platform could not read the message, because it could.
+  const message = 'I am looking to go long on Gold here, stop loss at 4010';
+  const fenced = '\`\`\`json\n{"symbol":"XAUUSD","side":"buy","entry":null,"stop_loss":4010,"take_profit":null,"confidence":1}\n\`\`\`';
+  const { parsed, review, provenance } = await read(message, { fetchImpl: async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ choices: [{ message: { content: fenced } }] }) }) });
+  assert.equal(provenance.llmUsed, true, 'the fallback layer was consulted and answered, which is the whole of what it is for');
+  assert.equal(provenance.parsedBy, 'regex', 'while the row is still credited to the reader that actually produced it');
+  assert.equal(parsed.symbol, 'XAUUSD');
+  assert.equal(parsed.side, 'buy');
+  assert.equal(parsed.stopLoss, 4010, 'the stop the channel stated is on the row');
+  assert.equal(parsed.entryPrice, null, 'and the entry it did not state is still absent - "here" is a market order, not a price');
+  assert.equal(review.required, false, 'so the row is not flagged at all: nothing about this message was unreadable');
+  assert.equal(review.reason, null, 'no sentence about the reader, because the reader did its job');
 });
 
 /* --------------------------------------------------------------------- degradation --------------------------------------------------------------------- */
