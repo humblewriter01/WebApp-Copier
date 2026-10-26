@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+
+import { AUTO_TRADING_OFF_NOTE, PLAN_NO_EXECUTION_NOTE, overlayLiveBlocker } from '../services/signal-outcome.js';
 import { fileURLToPath } from 'node:url';
 
 /*
@@ -70,9 +72,12 @@ test('a row is pushed to the socket only once the database has finished deciding
   assert.notEqual(emit, -1, 'then the row is announced on the socket');
   assert.ok(insert < update && update < emit, 'in that order: a client must never render a row whose status is still the INSERT default');
   assert.ok(queue < emit, 'and the queued job it schedules is already in `execution_jobs`, so the refresh a push triggers finds it');
+  assert.ok(update < queue, 'and the annotation is on the row before the job exists at all, because the engine mirrors an order outcome onto these same columns and must never arrive first, only to have `queued` written back over `executed`');
   // The one thing the ordering cannot do on its own: the pushed object must be the row that was written, not
-  // the parsed result from before the UPDATE.
-  assert.match(body, /if \(recorded\[0\]\) Object\.assign\(signal, recorded\[0\]\);[\s\S]{0,80}emit\('signal:received', signal\)/, 'the pushed payload carries the recorded status and note');
+  // the parsed result from before the UPDATE - and nothing may touch it again on the way out.
+  const afterTheMerge = body.slice(body.indexOf('Object.assign(signal, recorded[0])'), emit);
+  assert.match(afterTheMerge.slice(0, 60), /Object\.assign\(signal, recorded\[0\]\);\s*\n\s*\}/, 'the recorded row is merged in the block that read it');
+  assert.equal(/signal\.\w+\s*=|(?:^|[^.\w])signal\s*=/.test(afterTheMerge), false, 'and nothing between the merge and the emit edits the pushed object, so what a client renders is what the database holds');
 });
 
 test('a push can only reach the workspace that owns the row', () => {
@@ -110,4 +115,79 @@ test('the read that refreshes the workspace also answers what the plan allows', 
   // a free workspace and a workspace with no account end up described by the same sentence.
   assert.match(index, /pool\.query\('SELECT subscription_status AS status,subscription_plan AS plan FROM users WHERE id=\$1', \[req\.userId\]\)/);
   assert.match(index, /subscription: \{ status: subscription\.rows\[0\]\?\.status \|\| null, plan: subscription\.rows\[0\]\?\.plan \|\| null \}/);
+});
+
+/* The contract between the overlay and the queries it is applied to. It exists because the re-decision was once
+   silently disarmed by a guard reading `signal.telegramMessageId`, a column no list query selects: the check
+   passed in every test that hand-built a row and failed on every row that came from Postgres. */
+
+/** The keys a projection actually returns - aliases where there is one, column name where there is not. */
+function projectedKeys(source, from, to) {
+  const start = source.indexOf(from);
+  const end = source.indexOf(to, start);
+  assert.notEqual(start, -1, `${from.slice(0, 32)} is found`);
+  assert.ok(end > start, `and ${to.slice(0, 32)} closes it`);
+  const list = source.slice(start, end);
+  const keys = new Set();
+  for (const part of list.split(/\n\s*/).join(',').split(',')) {
+    const token = part.trim();
+    if (!token || /\$\d|\bFROM\b/i.test(token)) continue;
+    const aliased = /^(.+?)\s+AS\s+"([^"]+)"$/i.exec(token);
+    if (aliased) keys.add(aliased[2]);
+    else if (/^[a-z_]+$/i.test(token)) keys.add(token);
+  }
+  return keys;
+}
+
+test('every column the live-blocker overlay reads is a column the list queries return', () => {
+  const overlay = readFileSync(new URL('../services/signal-outcome.js', import.meta.url), 'utf8');
+  const body = overlay.slice(overlay.indexOf('export function overlayLiveBlocker'), overlay.indexOf('/**', overlay.indexOf('export function overlayLiveBlocker') + 10));
+  const reads = [...new Set([...body.matchAll(/signal\.([A-Za-z_][A-Za-z0-9_]*)/g)].map((match) => match[1]))];
+  assert.ok(reads.length >= 3, `the overlay reads a handful of fields, and the test reads ${reads.length}`);
+  const dashboard = readFileSync(new URL('../services/dashboard-signals.js', import.meta.url), 'utf8');
+  const dashboardKeys = projectedKeys(dashboard, 'export const DASHBOARD_SIGNAL_COLUMNS = `', '`;');
+  const signalsKeys = projectedKeys(index, 'SELECT id,channel_title', ' FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2');
+  for (const key of reads) {
+    assert.ok(dashboardKeys.has(key), `the Overview projection selects what the overlay needs: ${key}`);
+    assert.ok(signalsKeys.has(key), `and so does the Signals page: ${key}`);
+  }
+});
+
+test('a row shaped like the dashboard projection is re-decided, not passed through', () => {
+  const row = { id: 7, source: 'telegram', executionReady: true, status: 'received', executionNote: AUTO_TRADING_OFF_NOTE };
+  const context = { autoTradingEnabled: true, runtimeEnabled: true, paused: false, subscriptionStatus: 'free', accountSelected: false, accountState: null };
+  const overlaid = overlayLiveBlocker(row, context);
+  assert.equal(overlaid.executionNote, PLAN_NO_EXECUTION_NOTE, 'a Free workspace sees the plan sentence, which is the sentence its banner already shows');
+  assert.equal(overlaid.status, 'received', 'and only the sentence moved, never the status');
+  const upgraded = overlayLiveBlocker(row, { ...context, subscriptionStatus: 'active', accountSelected: true, accountState: 'DEPLOYED' });
+  assert.equal(upgraded.executionNote, null, 'a workspace that has since done everything is left with no warning at all');
+  const handWritten = overlayLiveBlocker({ ...row, source: 'manual' }, context);
+  assert.equal(handWritten.executionNote, AUTO_TRADING_OFF_NOTE, 'while a note a person wrote is never spoken for');
+});
+
+/* ------------------------------------------------------------------ the file no test can execute
+
+   `saveSignal` lives in `index.js`, which boots the server, connects to Postgres and starts timers, so nothing
+   here can call it - and a change to its body is therefore only checked as text. That is how an edit which moved
+   the outcome decision below the INSERT while leaving `status` reading `outcome.status` in the INSERT's own
+   parameter list passed every pin in this repository: a temporal-dead-zone reference is not a syntax error, and
+   it throws on the first captured message rather than on the first test run. This is the cheapest thing that
+   catches the class. */
+
+test('no name in the capture function is read before the line that declares it', () => {
+  const body = index.slice(index.indexOf('async function saveSignal('), index.indexOf('\n}\n\n/*', index.indexOf('async function saveSignal(')));
+  assert.ok(body.length > 2000, 'the whole function is in view, not a fragment');
+  const stripped = body
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/\/\/[^\n]*/g, ' ')
+    .replace(/`(?:[\\\S\\s])*?`/g, ' `` ')
+    .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+    .replace(/"(?:[^"\\]|\\.)*"/g, '""');
+  const offenders = [];
+  for (const declaration of stripped.matchAll(/\b(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=/g)) {
+    const name = declaration[1];
+    const use = stripped.search(new RegExp(`(^|[^\\w$.])${name}\\b`));
+    if (use !== -1 && use < declaration.index) offenders.push(name);
+  }
+  assert.deepEqual(offenders, [], 'every value the statements hand to a query is declared by the line above them');
 });

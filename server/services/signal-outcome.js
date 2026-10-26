@@ -142,7 +142,13 @@ export const SIGNAL_OUTCOME_CONTEXT_SQL = `SELECT s.auto_trading_enabled AS auto
  */
 export function overlayLiveBlocker(signal, context = {}) {
   if (!signal || typeof signal !== 'object' || signal.executionReady !== true) return signal;
-  if (String(signal.source || '') !== 'telegram' || signal.telegramMessageId == null) return signal;
+  /* `source` is what says "a channel wrote this, a person did not", and it is the only fact needed. Reading a
+     second field - the Telegram message id - looked like belt and braces and was instead a switch that turned
+     this whole function off: the id is not a column either list query selects, so every row that reached a
+     trader failed the test and kept the sentence its workspace had outgrown. A re-decision is allowed to depend
+     on exactly the fields the projections it is applied to promise, and `test/signal-capture-outcome.test.js`
+     now holds both halves of that: this list, and the column lists that have to carry it. */
+  if (String(signal.source || '') !== 'telegram') return signal;
   const stored = typeof signal.executionNote === 'string' ? signal.executionNote.trim() : '';
   // Only a row that already carries one of these sentences is re-decided. A row with no sentence had nothing to
   // report about its execution - a hand-written note, or a signal that went straight to the queue - and the
@@ -160,6 +166,53 @@ export function overlayLiveBlocker(signal, context = {}) {
   });
   if ((decision.note || '') === stored) return signal;
   return { ...signal, executionNote: decision.note || null };
+}
+
+/**
+ * The read behind that re-decision, as a factory, so the exact sequence a list route performs can be driven
+ * from a test: which statements are issued, what happens when one of them fails, and which rows are left
+ * exactly as stored because they never carried a blocker sentence.
+ *
+ * `runtimeEnabled` is a function rather than a value because the flag is turned over by an administrator while
+ * this process is running: read once at start-up, every row in the product would keep the sentence the boot
+ * environment deserved.
+ */
+export function createSignalOutcomeReader({ pool, platformControls, runtimeEnabled = () => false } = {}) {
+  if (!pool?.query) throw new TypeError('The outcome reader needs a pool to read from');
+
+  /** The live answer to "could this workspace trade right now", or null when it cannot be answered. */
+  async function readOutcomeContext(userId) {
+    const [context, pause] = await Promise.all([
+      pool.query(SIGNAL_OUTCOME_CONTEXT_SQL, [userId]),
+      Promise.resolve(platformControls?.read?.() ?? null).catch(() => null),
+    ]);
+    const row = context.rows[0];
+    // An unreadable kill switch is not a reason to describe a workspace as paused, and an unreadable settings
+    // row is not a reason to describe it as blocked by anything. No context, no re-decision.
+    if (!row || !pause) return null;
+    return {
+      autoTradingEnabled: row.autoTrading === true,
+      runtimeEnabled: runtimeEnabled() === true,
+      paused: pause.state !== 'live',
+      subscriptionStatus: row.subscriptionStatus,
+      accountSelected: Boolean(row.executionAccountId),
+      accountState: row.accountState,
+    };
+  }
+
+  /** Re-derives the blocker sentence on the rows that carry one, for a route that is about to show them. */
+  async function withLiveBlockers(userId, rows) {
+    /* Asked against the registry rather than against "is there any note at all", because the two are the same
+       question to this function - a note it does not own is a note it will not touch - and the answer decides
+       whether a list read costs a database round trip. A workspace whose rows carry broker answers and personal
+       notes, which is what a working one looks like, is served from the query it already ran. */
+    if (!Array.isArray(rows) || !rows.some((row) => isExecutionBlockerNote(row?.executionNote))) return rows;
+    const context = await readOutcomeContext(userId).catch(() => null);
+    if (!context) return rows;
+    return rows.map((row) => overlayLiveBlocker(row, context));
+  }
+
+  return { readOutcomeContext, withLiveBlockers };
 }
 
 /**

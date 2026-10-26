@@ -13,6 +13,7 @@
  * would otherwise attempt (`getMe`) is pre-seeded, because it is a network call and not part of what
  * is under test; nothing else is stubbed out.
  */
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Api, TelegramClient } from 'telegram';
@@ -64,6 +65,9 @@ function makeHarness(options = {}) {
     log: (level, message, meta) => logs.push({ level, message, meta }),
     saveSignal: async (userId, message, channel) => {
       if (options.failSave) throw new Error('column "fallback_stop_loss_points" does not exist');
+      // A test that wants to hold the replay mid-write - to see what a live update does while the loop is
+      // busy with a row - parks here, before the row is recorded as stored.
+      if (options.onSave) await options.onSave(channel);
       saved.push({ userId, message, channel });
       return { id: `signal-${saved.length}` };
     },
@@ -372,4 +376,49 @@ test('a live message is stored while a replay is still reading history', async (
 
   release();
   assert.equal((await replay).ran, true, 'the replay finishes afterwards');
+});
+
+test('a live message is stored between two replayed ones, not after the whole window', async () => {
+  /* The hazard this pins is not the history read - that is a network call, and its awaits yield by
+     themselves - but the ingest loop: 25 messages per channel, each a database write and sometimes a
+     model request, chained through nothing but promises. A microtask chain like that never returns to the
+     event loop, so a signal that arrived while the replay was running would be served after another row of
+     the replay, which is exactly the delay this path exists to remove. One turn of the loop per message is
+     what keeps the worst case at "one row behind", and the source assertion below is what keeps that from
+     being optimised away as a redundant line. */
+  let releaseFirst;
+  const firstHeld = new Promise((resolve) => { releaseFirst = resolve; });
+  let seen = 0;
+  const harness = makeHarness({
+    onSave: async (channel) => {
+      seen += 1;
+      if (channel.replayed === true && seen === 1) await firstHeld;
+    },
+  });
+  await harness.listener.startTelegramListener(USER_ID, harness.client);
+  // Entity resolution is a network call in GramJS, and `getMessages` is only reached once it succeeds, so
+  // both halves of the history read are stood in for here.
+  harness.client.getEntity = async () => ({ id: 1 });
+  harness.client.getMessages = async () => [9, 8, 7].map((id) => channelMessage({ id }));
+
+  const replay = harness.listener.runCatchUp(USER_ID);
+  for (let index = 0; index < 5; index += 1) await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(harness.saved.length, 0, 'the replay is parked inside the save of its first row');
+
+  await dispatch(harness, new Api.UpdateNewChannelMessage({ message: channelMessage({ id: 500 }), pts: 60, seq: 0 }));
+  assert.deepEqual(harness.saved.map((entry) => entry.channel.telegramMessageId), [500], 'the live row lands while the replay is mid-write');
+
+  releaseFirst();
+  const result = await replay;
+  assert.equal(result.ran, true, 'and the replay finishes what it started');
+  assert.deepEqual(harness.saved.map((entry) => entry.channel.telegramMessageId), [500, 7, 8, 9],
+    'the live update is first, ahead of the replayed rows that had not begun yet, and the window still lands oldest first');
+});
+
+test('the replay gives the loop back once per message, and says why in the line that does it', () => {
+  const listenerSource = readFileSync(new URL('../services/telegram-listener.js', import.meta.url), 'utf8');
+  const loop = listenerSource.slice(listenerSource.indexOf('for (const message of [...messages].reverse())'));
+  assert.ok(loop.length > 80, 'the replay loop is where the yield has to be');
+  assert.match(loop.slice(0, 900), /await yieldToEventLoop\(\);/, 'one turn of the event loop between messages');
+  assert.match(listenerSource, /const yieldToEventLoop = \(\) => new Promise\(\(resolve\) => setImmediate\(resolve\)\);/, 'queued in the check phase, which is where an update from Telegram lands - a microtask would cut in front of it');
 });

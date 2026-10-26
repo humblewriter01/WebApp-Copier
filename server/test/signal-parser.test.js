@@ -284,3 +284,42 @@ test('a headline cannot be finished into an order by a workspace fallback distan
   assert.equal(safety.problems.length, 0, 'and it is not reported as a missing leg on top of being news');
   assert.equal(safety.parseError, 'This message is market news rather than a trade instruction, so nothing was taken from it.');
 });
+
+/* Two things a screenshot asked to be verified, pinned with the message text it was written from: which bound of
+   a published zone a row is credited with, and how long the order is allowed to live once the channel has
+   labelled the setup a scalp. */
+
+const SCREENSHOT_SIGNAL = 'SELL GOLD\nZone: 4016.70-4023.70\nSL: 4027.00\nTP 1: 4014.70\nTP 2: 4008.00\nSCALPING';
+
+test('the message as the channel wrote it: the zone low is the entry, TP 1 is the target, and the label is read', () => {
+  const parsed = parseSignal(SCREENSHOT_SIGNAL);
+  assert.equal(parsed.symbol, 'XAUUSD', 'GOLD resolves to the broker symbol the way it always has');
+  assert.equal(parsed.side, 'sell');
+  assert.deepEqual(parsed.entryRange, { low: 4016.7, high: 4023.7 }, 'the zone is kept as published, both bounds');
+  assert.equal(parsed.entryPrice, 4016.7, 'and the row is credited at the bottom of it - the worst fill inside the zone for a short, not the best');
+  assert.equal(parsed.takeProfit, 4014.7, 'TP 1 is the target the row carries');
+  assert.deepEqual(parsed.takeProfitLevels, [4014.7, 4008], 'both numbered targets survive as the scale-out ladder, in the order the channel listed them');
+  assert.equal(parsed.isScalping, true, 'SCALPING standing on its own line is the channel labelling the setup, which is what the 2-minute window is keyed to');
+  assert.equal(parsed.executionReady, true);
+  /* A zone with no instruction word is routed as a resting order at the bound the row is credited with - the
+     product's own policy, not the channel's request, which is why the two flags are read apart on the card.
+     `pendingOrderPlan` then decides per quote: inside the zone the market is taken now, above it the order
+     waits at the bound, below it the message is refused because the price ran through the whole zone. */
+  assert.equal(parsed.orderType, 'limit', 'the zone is read as an order resting at its bound');
+  assert.equal(parsed.orderTypeStated, false, 'and the card says this was inferred, because the channel never wrote LIMIT');
+});
+
+test('a scalp word is read where a channel puts it, and not where a person explains themselves', () => {
+  const bare = 'SELL GOLD 4016.70 SL 4027.00 TP 4014.70\nSCALPING';
+  const decorated = 'SELL GOLD 4016.70 SL 4027.00 TP 4014.70\n🔥 SCALPING 🔥\nTP2: 4008';
+  const inline = 'SELL GOLD SCALPING 4016.70 SL 4027.00 TP 4014.70';
+  for (const text of [bare, decorated, inline]) {
+    assert.equal(parseSignal(text).isScalping, true, `${JSON.stringify(text.split('\n')[1] || text)} is a label, wherever it stands`);
+  }
+  // The opposite case is why this cannot simply become "the word anywhere in the message": a channel that
+  // tells people what a setup is *not* must not have its order forgotten about two minutes later.
+  const prose = 'SELL GOLD 4016.70 SL 4027.00 TP 4014.70\nNote: this is not a scalping setup, hold for hours';
+  assert.equal(parseSignal(prose).isScalping, false, 'a sentence about scalping is prose, and prose does not set a deadline');
+  const nothing = 'SELL GOLD 4016.70 SL 4027.00 TP 4014.70\nTP 2: 4008.00';
+  assert.equal(parseSignal(nothing).isScalping, false, 'and no word, no window');
+});

@@ -443,3 +443,26 @@ test('a skip the engine decides for itself is already written for a trader, and 
   assert.equal(mirror.params[2], null, 'and nothing is hidden away, because there was nothing technical to hide');
   assert.equal(orderCalls(trading).length, 0, 'and the account that is not deployed was never asked');
 });
+
+test('a scalp carries its own two-minute deadline onto both rows, and an unlabelled market order carries none', async () => {
+  const before = Date.now();
+  const pool = fakePool({ item: { isScalping: true } });
+  const trading = fakeTrading();
+  const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true });
+  const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.equal(result.status, 'executed', 'the order was sent, so a deadline was computed on the way');
+  const inserted = pool.calls.find(({ sql }) => sql.includes('INSERT INTO trades'));
+  const stamp = new Date(inserted.params[12]);
+  const seconds = (stamp.getTime() - before) / 1000;
+  assert.ok(seconds > 110 && seconds <= 125, `a market order from a scalp gets the 2-minute window the channel asked for, not the workspace's 30 (${Math.round(seconds)}s)`);
+  const mirrored = pool.calls.find(({ sql }) => sql.includes('UPDATE signals SET expiry_timestamp'));
+  assert.ok(mirrored, 'and the deadline is on the signal row too, because that is the row a reader looks at');
+  assert.equal(new Date(mirrored.params[1]).getTime(), stamp.getTime(), 'both rows hold the same instant, not two computations');
+
+  const plain = fakePool({});
+  const plainEngine = createExecutionEngine({ pool: plain, trading: fakeTrading(), resolveToken: async () => 'fake-token', runtimeEnabled: true });
+  await plainEngine.processJob({ id: 'job-1', user_id: 'user-1' });
+  const plainInsert = plain.calls.find(({ sql }) => sql.includes('INSERT INTO trades'));
+  assert.equal(plainInsert.params[12], null, 'a market order with no scalp label stores no deadline of its own - the job window bounds it, and saying otherwise would invent a promise the channel did not make');
+  assert.equal(plain.calls.some(({ sql }) => sql.includes('UPDATE signals SET expiry_timestamp')), false, 'nor on the row');
+});

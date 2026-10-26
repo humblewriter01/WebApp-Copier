@@ -481,9 +481,20 @@ export function detectOrderType(text, { entryPrice = null } = {}) {
   return { orderType: 'market', stated: false };
 }
 
+/**
+ * A line that carries the keyword and nothing else - `SCALPING`, `🔥 SCALPING 🔥`, `[scalp]`.
+ *
+ * Channels label a post the way a form has a field, so the word that decides how long the order is allowed to
+ * live sits on its own line above or below the setup, where the clause scope the order type is read from cannot
+ * see it. Requiring the line to hold no other word is what keeps this from reaching into prose: "this is not a
+ * scalping setup, hold for hours" is a sentence about the trade, and it stays a sentence about the trade.
+ */
+const SCALP_LABEL_LINE = /^[^\w]*\bSCALP(?:ING|ED|ER|S)?\b[^\w]*$/im;
+
 export function detectScalping(text) {
   const { scope, hasInstructionLine } = orderTypeClause(text);
   if (SCALP_WORDS.test(scope)) return true;
+  if (SCALP_LABEL_LINE.test(String(text || ''))) return true;
   return hasInstructionLine && SCALP_PHRASE.test(scope);
 }
 
