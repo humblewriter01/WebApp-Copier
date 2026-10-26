@@ -324,3 +324,40 @@ test('the Limit badge explains a zone differently from an inferred price', () =>
   assert.match(inferred.title, /It published 4026 without asking to be filled at the market/);
   assert.equal(/zone/.test(inferred.title), false, 'a single price keeps the sentence it has always had');
 });
+
+/* ---------------------------------------------------------------- the row a management update leaves behind */
+
+/** The row `saveSignal` writes for `HIT TP 1 ✅ +50 PIPS`: every trading field empty, one reason attached. */
+function updateRow(over = {}) {
+  return {
+    id: 'update-1', source: 'telegram', channelTitle: 'Adrielle Traders Circle', message: 'HIT TP 1 ✅ +50 PIPS',
+    symbol: null, side: null, entryPrice: null, stopLoss: null, takeProfit: null,
+    stopLossPips: null, takeProfitPips: null, takeProfitLevels: [], entryRange: null,
+    orderType: 'market', orderTypeStated: false, isScalping: false, directionInferred: false,
+    needsReview: false, executionReady: false, parsedBy: 'regex', parseConfidence: null, llmUsed: false,
+    status: 'unparsed', parseError: 'This message manages a trade that is already open - a target hit, a stop moved to break even, or an instruction to close - rather than giving a new entry, so nothing was taken from it.',
+    executionNote: null, createdAt: '2026-10-25T09:00:00.000Z', ...over,
+  };
+}
+
+test('a management update reads as no clear signal, with its reason, and no badges invented from it', () => {
+  const markup = renderRow(updateRow());
+  assert.match(markup, /No clear signal/, 'the label the brief asked for');
+  assert.match(markup, /manages a trade that is already open/, 'and the sentence that says why, which used to sit unread in `parse_error`');
+  assert.equal(/>Market</.test(markup), false, 'no MARKET badge - the message never asked to be filled at the market');
+  assert.equal(/Missing SL|Missing TP/.test(markup), false, 'and no missing-leg advice about a message that gave no legs');
+  // The message body still contains the words "TP 1", so the assertion is about the meta line's markup and not
+  // about the letters appearing anywhere on the row.
+  const meta = /<div class="signal-meta">([\s\S]*?)<\/div>/.exec(markup);
+  assert.ok(meta, 'the row keeps its meta line');
+  assert.equal(/<span/.test(meta[1]), false, 'while it holds no price at all, because nothing was stored');
+  assert.match(meta[1], /<time>/, 'and only the captured time is shown beside it');
+});
+
+test('an outcome note still speaks ahead of a parse error, and a real signal keeps its badges', () => {
+  const outcome = signalOutcomeView(updateRow({ status: 'unexecuted', executionNote: 'Auto-Trading is off, so this signal was saved for review only.' }));
+  assert.equal(outcome.note, 'Auto-Trading is off, so this signal was saved for review only.', 'the decision about the row outranks why it was hard to read');
+  const readable = signalOutcomeView({ status: 'unparsed', symbol: 'EURUSD', side: 'buy', entryPrice: 1.08, executionNote: null, parseError: 'The signal needs an entry price.' });
+  assert.equal(readable.note, 'The signal needs an entry price.', 'a legible row with a hole in it quotes its own reason');
+  assert.equal(readable.label, 'Needs review', 'without becoming "no clear signal"');
+});

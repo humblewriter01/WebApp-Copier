@@ -99,3 +99,85 @@ export function supportBannerCopy(session, remaining) {
       : '',
   };
 }
+
+/* ---------------------------------------------------------------- the workspace's own trading readiness ---------------------------------------------------------------- */
+
+/** The states MetaAPI reports for an account this product can actually place an order on. */
+export const EXECUTABLE_ACCOUNT_STATES = Object.freeze(['DEPLOYED', 'CONNECTED']);
+
+/**
+ * One sentence for the banner at the top of the workspace, in the order the reader can act on it.
+ *
+ * The banner used to answer only "is the switch on", which is the one question the app can already see the
+ * answer to - and it was the answer the user got when the switch was on, an account was missing, and nothing
+ * would ever trade. Auto-Trading being enabled is not the same thing as being able to execute, so each state
+ * says which half is missing. `no-account` is phrased to cover both reasons it happens (nothing linked, and a
+ * free workspace that is not allowed to link anything), because the reader's next action is the same either
+ * way: go to Trading Accounts, and if that page says upgrade, upgrade.
+ *
+ * The order mirrors the server's own precedence in `decideSignalOutcome` - the service, then the platform
+ * switch, then the account - so the banner and the note under a signal row cannot blame two different things.
+ */
+export function autoTradingBannerView({ autoTradingEnabled = false, runtimeEnabled = true, platformPause = null, linkedAccounts = [], executionAccountId = '' } = {}) {
+  if (autoTradingEnabled !== true) {
+    return {
+      state: 'off',
+      tone: 'muted',
+      headline: 'Auto-Trading is off',
+      message: 'Signals are saved for review only. Turn Auto-Trading on in Advanced Settings to submit new eligible signals to your broker.',
+      metricNote: 'Off until you enable it',
+      action: null,
+    };
+  }
+  if (runtimeEnabled === false) {
+    return {
+      state: 'unavailable',
+      tone: 'warn',
+      headline: 'Auto-Trading is on',
+      message: 'Automatic execution is unavailable on this service right now, so nothing is sent to your broker. Signals are still captured and saved.',
+      metricNote: 'Unavailable on this service',
+      action: null,
+    };
+  }
+  if (platformPause?.paused === true) {
+    const reason = typeof platformPause.reason === 'string' && platformPause.reason.trim() ? ` Reason given: ${platformPause.reason.trim()}.` : '';
+    return {
+      state: 'paused',
+      tone: 'warn',
+      headline: 'Auto-Trading is on',
+      message: `Signal Desk has paused automatic execution for every workspace, so nothing is sent to your broker.${reason}`,
+      metricNote: 'Paused by Signal Desk',
+      action: null,
+    };
+  }
+  const accounts = Array.isArray(linkedAccounts) ? linkedAccounts.filter((account) => account && typeof account === 'object') : [];
+  const selected = accounts.find((account) => String(account.metaApiAccountId || '') === String(executionAccountId || '')) || null;
+  if (!accounts.length || !selected) {
+    return {
+      state: 'no-account',
+      tone: 'warn',
+      headline: 'Auto-Trading is on',
+      message: 'Auto-Trading is ON, but no trading account is connected. Connect your account or upgrade your plan to execute signals.',
+      metricNote: 'Waiting for a trading account',
+      action: { label: 'Open Trading Accounts', tab: 'metaapi' },
+    };
+  }
+  if (!EXECUTABLE_ACCOUNT_STATES.includes(String(selected.state || '').toUpperCase())) {
+    return {
+      state: 'not-deployed',
+      tone: 'warn',
+      headline: 'Auto-Trading is on',
+      message: `Auto-Trading is ON, but the trading account you selected is not connected yet (${String(selected.state || 'unknown').toLowerCase().replace(/_/g, ' ')}). Deploy it before signals can be executed.`,
+      metricNote: 'Waiting for the account to deploy',
+      action: { label: 'Open Trading Accounts', tab: 'metaapi' },
+    };
+  }
+  return {
+    state: 'ready',
+    tone: 'good',
+    headline: 'Auto-Trading is on',
+    message: 'New eligible Telegram signals may place live orders on your selected account. You can turn this off in Advanced Settings.',
+    metricNote: 'Eligible signals may place orders',
+    action: null,
+  };
+}

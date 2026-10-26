@@ -22,6 +22,8 @@ test('parses a strict BUY signal with an entry, stop loss, and one target', () =
     // Not news: the message is an instruction, so nothing about the bulletin rule applies to it.
     newsOnly: false,
     newsMarkers: [],
+    managementUpdate: false,
+    managementMarkers: [],
     // The message publishes a price and never says `NOW`, so it is read as a level to be filled *at*. Not
     // because the channel asked for a pending order - it did not - but because a price that was written down
     // is a price the trader meant to get, and `orderTypeStated: false` is what keeps the two apart on screen.

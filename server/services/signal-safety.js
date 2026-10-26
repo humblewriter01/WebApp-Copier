@@ -155,9 +155,10 @@ export function captureSafety({ parsed, source = 'telegram', settings = {}, revi
      distance in a settings panel may turn it into one: `BUY GOLD` with a 500-point fallback would be an
      order placed on a sentiment. The legs stay missing, the nets stay furled, and the row says why. */
   const priceless = governed && parsed?.hasPriceLevel === false;
-  /* A message read as market news carries its own reason already, and it is not "a direction with no price":
-     it stated no direction either, so no policy problem belongs on top of a message that asked for nothing. */
-  if (priceless && parsed?.newsOnly !== true && (codes.has('stop-loss-missing') || parsed?.missing?.takeProfit === true)) {
+  /* A message read as market news or as trade management carries its own reason already, and it is not "a
+     direction with no price": it stated no direction either, so no policy problem belongs on top of a message
+     that asked for nothing. */
+  if (priceless && parsed?.newsOnly !== true && parsed?.managementUpdate !== true && (codes.has('stop-loss-missing') || parsed?.missing?.takeProfit === true)) {
     problems.push({ code: 'no-price-level', message: 'The signal states a direction but no price, so the fallback distances were not applied and nothing was executed.' });
   }
 

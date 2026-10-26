@@ -270,3 +270,64 @@ test('a health panel with no switch wired up still refuses to claim trading is l
     assert.match(snapshot.checks[0].detail, /not wired up/);
   });
 });
+
+/* ---------------------------------------------------------------- what the panel says about the AI reader ---------------------------------------------------------------- */
+
+test('the health panel names the model this process was started with', () => {
+  /* The report this answers is "I set LLM_MODEL_NAME and I cannot tell whether it took". The answer is a
+     database read away rather than a log scroll, and it can only be shown here because the configuration is
+     reported rather than assumed. */
+  const checks = buildHealthChecks({
+    killSwitch: { state: 'live', paused: false, reason: null },
+    runtimeEnabled: true,
+    queue: { queuedJobs: 0, processingJobs: 0, overdueJobs: 0 },
+    counts: { available: true, windowHours: 24 },
+    llm: { enabled: true, model: 'openai/gpt-oss-20b', host: 'api.groq.com', maxConcurrent: 2, active: 1, waiting: { realtime: 2, replay: 4 }, gated: 0 },
+  });
+  const reader = checks.find((check) => check.key === 'ai_reader');
+  assert.ok(reader, 'the check exists when the reader is wired');
+  assert.equal(reader.headline, 'openai/gpt-oss-20b', 'the headline is the model name, which is the thing being asked');
+  assert.equal(reader.state, 'ok');
+  assert.match(reader.detail, /api\.groq\.com/);
+  assert.match(reader.detail, /1 in flight, 6 waiting/, 'and the queue depth is on the same line');
+  assert.equal(JSON.stringify(checks).includes('gsk_'), false, 'the key is never in the payload');
+});
+
+test('an unconfigured reader is reported as off, with the reason, not as healthy', () => {
+  const checks = buildHealthChecks({
+    killSwitch: { state: 'live', paused: false, reason: null },
+    runtimeEnabled: true,
+    queue: { queuedJobs: 0, processingJobs: 0, overdueJobs: 0 },
+    counts: { available: true, windowHours: 24 },
+    llm: { enabled: false, model: 'llama-3.1-8b-instant', host: 'api.groq.com', disabledReason: 'no API key' },
+  });
+  const reader = checks.find((check) => check.key === 'ai_reader');
+  assert.equal(reader.state, 'unavailable');
+  assert.equal(reader.headline, 'Off');
+  assert.match(reader.detail, /no API key/);
+  assert.match(reader.detail, /saved for review/, 'the sentence says what that means for a message the built-in reader cannot finish');
+});
+
+test('a reader that is refusing replays shows as watched, not as fine', () => {
+  const checks = buildHealthChecks({
+    killSwitch: { state: 'live', paused: false, reason: null },
+    runtimeEnabled: true,
+    queue: { queuedJobs: 0, processingJobs: 0, overdueJobs: 0 },
+    counts: { available: true, windowHours: 24 },
+    llm: { enabled: true, model: 'm', host: 'h', maxConcurrent: 2, active: 0, waiting: { realtime: 0, replay: 0 }, gated: 3 },
+  });
+  const reader = checks.find((check) => check.key === 'ai_reader');
+  assert.equal(reader.state, 'watch');
+  assert.match(reader.detail, /3 replayed messages left for review/);
+});
+
+test('a deployment with no reader wired at all gets no line about one', () => {
+  const checks = buildHealthChecks({
+    killSwitch: { state: 'live', paused: false, reason: null },
+    runtimeEnabled: true,
+    queue: { queuedJobs: 0, processingJobs: 0, overdueJobs: 0 },
+    counts: { available: true, windowHours: 24 },
+  });
+  assert.equal(checks.some((check) => check.key === 'ai_reader'), false, 'no section is an absent read, not a broken one');
+});
+

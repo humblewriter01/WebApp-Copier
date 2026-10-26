@@ -133,7 +133,9 @@ test('a real GramJS channel update is matched and stored through the real dispat
   assert.equal(channels[0].params[0], USER_ID, 'only this workspace rows are consulted');
 
   assert.equal(harness.saved.length, 1, 'the message reached storage');
-  assert.deepEqual(harness.saved[0].channel, { source: 'telegram', channelId: STORED_CHANNEL_ID, title: CHANNEL_TITLE, telegramMessageId: 77 });
+  /* `replayed: false` is not decoration: it is what tells the AI reader queue that this message is live and
+     must be served before a reconnect's replay, so the flag is pinned on the live path as well as the replay. */
+  assert.deepEqual(harness.saved[0].channel, { source: 'telegram', channelId: STORED_CHANNEL_ID, title: CHANNEL_TITLE, telegramMessageId: 77, replayed: false });
   assert.equal(harness.saved[0].message, SIGNAL_TEXT);
   const captured = harness.logs.find((entry) => entry.message === 'Telegram message captured');
   assert.ok(captured, 'the capture is written down, so a report can quote it');
@@ -242,6 +244,7 @@ test('catch-up after a wake stores what the workspace missed, oldest first, and 
   const first = await listener.runCatchUp(USER_ID);
   assert.equal(first.stored, 1, 'the message already captured is not stored again');
   assert.deepEqual(saved.map((entry) => entry.channel.telegramMessageId), [12], 'and the replay runs oldest first');
+  assert.deepEqual(saved.map((entry) => entry.channel.replayed), [true], 'a replay says so, so the model queue can put it last');
   assert.equal(clients.get(USER_ID).stats.catchUpSaved, 1);
 
   const second = await listener.runCatchUp(USER_ID);
@@ -283,4 +286,90 @@ test('the reader finds a body in every field this library puts one in', () => {
   assert.equal(telegramMessageText({ media: { caption: 'SELL GBPUSD' } }), 'SELL GBPUSD', 'a caption under a photo');
   assert.equal(telegramMessageText({ message: '   ' }), null, 'blank is genuinely blank');
   assert.equal(telegramMessageText(null), null);
+});
+
+/*
+ * Catch-up is the part of capture that runs *next to* live traffic rather than instead of it. These three
+ * tests are the contract the reconnect path has to keep: one replay per user, a bounded run that resumes,
+ * and a live message that is never made to wait behind a replay of older ones.
+ */
+function makeReplayHarness({ messages, catchUpBudgetMs, onStored, getMessages } = {}) {
+  const pool = makePool();
+  const clients = new Map();
+  const saved = [];
+  let clock = Date.parse('2026-10-23T13:00:00.000Z');
+  const listener = createTelegramListener({
+    clients,
+    pool,
+    log: () => {},
+    saveSignal: async (userId, message, channel) => {
+      saved.push({ message, channel });
+      pool.known.add(String(channel.telegramMessageId));
+      onStored?.(clock);
+      return { id: `signal-${saved.length}` };
+    },
+    now: () => clock,
+    catchUpBudgetMs,
+    catchUpCooldownMs: 0,
+  });
+  const client = {
+    connected: true,
+    getEntity: async () => ({ id: 1 }),
+    getMessages: getMessages || (async () => messages.map((id) => channelMessage({ id, decorated: false }))),
+  };
+  clients.set(USER_ID, { client, handler: () => {}, stats: listener.EMPTY_STATS() });
+  return { pool, clients, listener, saved, entry: () => clients.get(USER_ID), advance: (ms) => { clock += ms; } };
+}
+
+test('a catch-up that runs out of its budget stops, keeps its claim, and finishes on the next pass', async () => {
+  // The first stored message spends the whole budget of five milliseconds, so the replay is interrupted after
+  // one row and the rest must survive rather than be silently walked past.
+  const harness = makeReplayHarness({
+    // Newest first, because that is the order Telegram hands history over; the replay is what reverses it.
+    messages: [33, 32, 31],
+    catchUpBudgetMs: 5,
+    onStored: () => { if (!harness.spent) { harness.spent = true; harness.advance(10); } },
+  });
+  const first = await harness.listener.runCatchUp(USER_ID);
+  assert.equal(first.stored, 1, 'the run stores what fits in its budget');
+  assert.equal(first.reason, 'BUDGET', 'and says that it stopped rather than claiming it finished');
+  assert.equal(harness.entry().needsCatchUp, true, 'a stopped replay leaves the session flagged for the next sweep');
+
+  const second = await harness.listener.runCatchUp(USER_ID);
+  assert.equal(second.reason, 'DONE');
+  assert.deepEqual(second.stored, 2, 'the remaining messages are picked up where the first pass stopped');
+  assert.equal(harness.entry().needsCatchUp, false, 'and the flag is cleared only once the list was finished');
+  assert.deepEqual(harness.saved.map((entry) => entry.channel.telegramMessageId), [31, 32, 33], 'oldest first, with nothing lost or repeated');
+});
+
+test('one catch-up per user: a second call gives up instead of reading the same window twice', async () => {
+  let release;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  const harness = makeReplayHarness({ getMessages: async () => { await blocked; return []; } });
+  const running = harness.listener.runCatchUp(USER_ID);
+  const overlapping = await harness.listener.runCatchUp(USER_ID);
+  assert.deepEqual({ ran: overlapping.ran, reason: overlapping.reason, stored: overlapping.stored }, { ran: false, reason: 'IN_FLIGHT', stored: 0 });
+  release();
+  assert.equal((await running).ran, true, 'the run that got there first is unaffected');
+  const after = await harness.listener.runCatchUp(USER_ID);
+  assert.equal(after.ran, true, 'and once it finishes, a new run is allowed');
+});
+
+test('a live message is stored while a replay is still reading history', async () => {
+  let release;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  const harness = makeHarness();
+  await harness.listener.startTelegramListener(USER_ID, harness.client);
+  // The reconnect's history read is in flight - a real flood wait, or a slow `getEntity`, looks just like this.
+  harness.client.getEntity = async () => { await blocked; return { id: 1 }; };
+  const replay = harness.listener.runCatchUp(USER_ID);
+
+  await dispatch(harness, new Api.UpdateNewChannelMessage({ message: channelMessage({ id: 400 }), pts: 30, seq: 0 }));
+
+  assert.deepEqual(harness.saved.map((entry) => entry.channel?.telegramMessageId), [400], 'the pushed update is stored while the replay waits');
+  assert.equal(harness.saved[0].channel.replayed, false, 'and it is stored as live traffic, which is what puts it first in the AI reader queue');
+  assert.equal(harness.logs.some((entry) => entry.message === 'Telegram message captured'), true);
+
+  release();
+  assert.equal((await replay).ran, true, 'the replay finishes afterwards');
 });

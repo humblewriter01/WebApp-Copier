@@ -97,9 +97,14 @@ export function entryZoneView(signal) {
  */
 export function signalOutcomeView(signal) {
   const status = String(signal?.status || 'received');
-  const note = typeof signal?.executionNote === 'string' && signal.executionNote.trim()
-    ? signal.executionNote.trim()
-    : '';
+  /* Two sentences can be attached to a row, and they answer different questions: `executionNote` is what the
+     platform decided to do about the signal, `parseError` is why there was no signal to do anything about. The
+     decision wins when both exist. Falling back to the second is what stopped a cleared row - market news, a
+     trade-management update - from showing a bare "No clear signal" with the explanation sitting one API call
+     away and unread: the server wrote the reason, the row is the place to see it, and nothing here adds one. */
+  const note = [signal?.executionNote, signal?.parseError]
+    .map((value) => (typeof value === 'string' ? value.trim() : ''))
+    .find((value) => value.length > 0) || '';
   const known = OUTCOMES[status];
   // "No clear signal" is a claim about the message, not about the parser's mood, so it is only made
   // when nothing usable came out of it. A readable note that is missing a piece says "Needs review"

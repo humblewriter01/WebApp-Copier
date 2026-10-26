@@ -225,6 +225,33 @@ test('a signal for a user without a paid plan is never sent to the broker', asyn
   }
 });
 
+test('Auto-Trading is read again for every job, so a toggle takes effect on the next signal', async () => {
+  /* The report this pins is "the toggle is on but the engine used an old value". The engine has no copy of the
+     setting to be old: `auto_trading_enabled` comes from the settings row joined into the job read, so the
+     value can move between two jobs - or between the queue and the submit, which the test above covers - and
+     the next job sees the table. The same pool object is used for all three jobs below, and only its rows move.
+     */
+  const live = { auto_trading_enabled: false };
+  const pool = fakePool({ item: live });
+  const trading = fakeTrading();
+  const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true });
+
+  const off = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.equal(off.status, 'skipped');
+  assert.match(off.message, /Auto-Trading is off/i, 'the row says the switch, because the switch is why');
+  assert.equal(trading.calls.filter((call) => typeof call === 'object').length, 0, 'nothing reached the broker');
+
+  live.auto_trading_enabled = true;
+  const on = await engine.processJob({ id: 'job-2', user_id: 'user-1' });
+  assert.equal(on.status, 'executed', 'the next signal runs, with no restart and no waiting for a cache to expire');
+  assert.equal(trading.calls.filter((call) => typeof call === 'object').length, 1);
+
+  live.auto_trading_enabled = false;
+  const offAgain = await engine.processJob({ id: 'job-3', user_id: 'user-1' });
+  assert.equal(offAgain.status, 'skipped', 'and turning it off works just as fast');
+  assert.equal(trading.calls.filter((call) => typeof call === 'object').length, 1, 'while no further order is sent');
+});
+
 test('a newly turned-off setting blocks queued work before any MetaAPI order call', async () => {
   const pool = fakePool({ disableBeforeSubmit: true });
   const trading = fakeTrading();

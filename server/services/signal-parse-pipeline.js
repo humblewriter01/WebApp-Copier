@@ -63,14 +63,15 @@ function layer1Authority(parsed) {
  * handed a price from here. The same protection covers the entry: a range the channel gave is kept rather
  * than replaced by a single price, because the bound is the conservative half of the instruction.
  */
-function mergeGaps(layer1, fields, { pipValues }) {
+/** Exported for the tests: this is the boundary a model's answer has to cross, so it is worth pinning. */
+export function mergeGaps(layer1, fields, { pipValues }) {
   const merged = { ...layer1 };
   const filled = [];
   const dropped = [];
   /* A message Layer 1 read as market news has no gaps, because it has no signal in it. Filling `symbol` or
      `side` here is precisely how a headline ends up on screen as a direction nobody asked for, so a news row
      is closed to the model from both ends: the caller refuses to ask, and this refuses to write. */
-  if (layer1.newsOnly === true) return { merged, filled, dropped };
+  if (layer1.newsOnly === true || layer1.managementUpdate === true) return { merged, filled, dropped };
   /* News wording that stopped short of a full bulletin - a headline that quotes levels, a report with a
      target in it - still may not be completed with a direction. A price the message wrote down is verifiable
      against the text; "buy" or "sell" is not, and it is the half of a signal a headline can never state. */
@@ -116,7 +117,7 @@ function mergeGaps(layer1, fields, { pipValues }) {
  * authority, and for a signal-shaped message when the model is switched off - because in that case the
  * channel did write a signal and nobody read it, which is worth a look rather than a shrug.
  */
-export async function parseSignalTwoLayer(message, { source = 'telegram', config, fetchImpl, logger } = {}) {
+export async function parseSignalTwoLayer(message, { source = 'telegram', config, fetchImpl, logger, gate = null, priority = 'realtime' } = {}) {
   const layer1 = parseSignal(message);
   const base = {
     parsed: layer1,
@@ -143,7 +144,10 @@ export async function parseSignalTwoLayer(message, { source = 'telegram', config
     };
   }
 
-  const result = await llmParseSignal(message, { config: settings, fetchImpl, logger });
+  /* One request per message, and the queue decides which message asks first: a capture that arrived just now
+     outranks a row catch-up is replaying, and a replay that cannot get a slot is left for review rather than
+     made to wait behind other replays. Nothing here changes what Layer 1 already read. */
+  const result = await llmParseSignal(message, { config: settings, fetchImpl, logger, gate, priority });
   const provenance = { llmUsed: true, parsedBy: 'regex', confidence: null, filled: [], dropped: [] };
   if (!result.ok) {
     return {

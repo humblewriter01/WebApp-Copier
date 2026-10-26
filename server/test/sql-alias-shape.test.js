@@ -128,3 +128,17 @@ test('the dashboard signal queries read declared columns', () => {
     }
   }
 });
+
+test('the two signal lists the workspace reads are ordered newest first, in SQL', () => {
+  /* "The newest signal is not at the top" cannot be a sorting bug in the browser, because the client never
+     sorts: it renders the rows in the order the query returned them, and the live feed merges a pushed row into
+     that same order. So the order is a property of these two statements, and both of them have to keep it -
+     the Signals tab and the Overview would otherwise be able to disagree about which message is the latest. */
+  assert.match(indexSource, /FROM signals WHERE user_id=\$1 ORDER BY created_at DESC LIMIT \$2/, 'the signals page is one bounded query, newest first, that the client can render as-is');
+  const dashboard = readFileSync(new URL('../services/dashboard-signals.js', import.meta.url), 'utf8');
+  const ordered = dashboard.match(/ORDER BY created_at DESC LIMIT \$?\{?[A-Z_]+\}?/g) || [];
+  assert.equal(ordered.length, 2, 'both dashboard queries - the actionable list and the recent one - carry the same ordering');
+  assert.equal(/ORDER BY created_at ASC|ORDER BY created_at\b(?! DESC)/.test(dashboard), false, 'and neither quietly flips to oldest first');
+  assert.equal(/signals\.sort\(|\.sort\(\(a, b\) => a\.createdAt/.test(readFileSync(path.join(here, '..', '..', 'client', 'src', 'App.jsx'), 'utf8')), false, 'the client renders this order rather than inventing its own');
+});
+
