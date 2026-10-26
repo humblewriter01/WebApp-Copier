@@ -23,7 +23,7 @@ import { fileURLToPath } from 'node:url';
 
 import { parseSignal } from '../services/signal-parser.js';
 import { llmConfig, needsLayer2, extractJsonObject, validateExtraction, numbersInText, llmParseSignal, buildMessages, DEFAULT_MIN_CONFIDENCE } from '../services/signal-llm.js';
-import { parseSignalTwoLayer } from '../services/signal-parse-pipeline.js';
+import { parseSignalTwoLayer, mergeGaps } from '../services/signal-parse-pipeline.js';
 import { captureSafety, applySafetyNets, pipSizeFor } from '../services/signal-safety.js';
 import { createExecutionEngine } from '../services/execution-engine.js';
 
@@ -524,4 +524,78 @@ test('the prompt says out loud that a headline has no direction in it', () => {
   assert.match(system.content, /return null for the direction/i);
   assert.match(system.content, /falls under/i, 'naming the wording that was actually misread');
   assert.match(system.content, /dumping/i);
+});
+
+/* --------------------------------------------------------------------- a trade update is not a signal to ask about either --------------------------------------------------------------------- */
+
+/** The management posts from the brief, in the shapes channels actually send them. */
+const MANAGEMENT_TEXTS = [
+  'HIT TP 1 ✅ +50 PIPS',
+  '✅ HIT TP1 +50 pips, well done. Set BE now',
+  'TP1 HIT ✅ +50 PIPS - close half and move SL to BE',
+  '✅ TP 1 HIT for GOLD BUY 4016. Close now at market',
+];
+
+for (const text of MANAGEMENT_TEXTS) {
+  test(`a management update is never asked about: ${text.slice(0, 34)}`, async () => {
+    /* A model told to find a trade in "GOLD BUY 4016. Close now at market" finds one - a BUY at 4016 - and
+       that is how an exit becomes an entry. Nothing here depends on the model being careful: the request is
+       never made, so there is no answer to merge. */
+    const fetch = countingFetch(llmReply({ symbol: 'XAUUSD', side: 'buy', entry: 4016, stop_loss: 4010, take_profit: 4050, confidence: 1 }));
+    const outcome = await parseSignalTwoLayer(text, { source: 'telegram', config: CONFIG, fetchImpl: fetch.fetchImpl });
+    assert.equal(fetch.calls.length, 0, 'refused before it costs a request');
+    assert.equal(outcome.parsed.managementUpdate, true);
+    assert.deepEqual([outcome.parsed.symbol, outcome.parsed.side, outcome.parsed.entryPrice, outcome.parsed.stopLoss, outcome.parsed.takeProfit],
+      [null, null, null, null, null], 'and nothing at all is taken from it');
+    assert.equal(outcome.parsed.orderTypeStated, false, 'while a message that says "at market" about an exit does not state an entry type');
+    assert.equal(outcome.provenance.llmUsed, false);
+    assert.equal(outcome.review.required, false, 'a row with no signal in it is not a row awaiting a human');
+  });
+}
+
+test('the row written for a management update stores no trade and carries the update sentence', async () => {
+  const fetch = countingFetch(llmReply({ symbol: 'XAUUSD', side: 'buy', entry: 4016, confidence: 1 }));
+  const outcome = await parseSignalTwoLayer('GOLD BUY HIT TP 1 ✅ +50 PIPS set BE', { source: 'telegram', config: CONFIG, fetchImpl: fetch.fetchImpl });
+  const safety = captureSafety({ parsed: outcome.parsed, source: 'telegram', settings: NETS, review: outcome.review });
+  assert.equal(fetch.calls.length, 0);
+  assert.equal(safety.executionReady, false, 'nothing is queued');
+  // The complaint the report was about: a row that read as a signal missing a stop loss.
+  assert.equal(safety.problems.some((problem) => problem.code === 'stop-loss-required'), false, 'no missing-leg advice on a message that gave no legs');
+  assert.equal(safety.problems.some((problem) => problem.code === 'no-price-level'), false, 'and not even the generic one, which is news and updates alike');
+  assert.equal(safety.parseError, 'This message manages a trade that is already open - a target hit, a stop moved to break even, or an instruction to close - rather than giving a new entry, so nothing was taken from it.');
+});
+
+test('a signal published alongside a management note is still read as a signal', async () => {
+  /* The other direction, and the one that decides whether this classifier is safe to have: a channel that
+     reports TP1 and then posts the next setup must not lose the next setup. A message that names where to get
+     in *and* what protects the trade has an instruction in it whatever else it is talking about. */
+  const text = '✅ TP 1 HIT +50 pips, well done. BUY GOLD 4016 SL 4010 TP 4050';
+  const fetch = countingFetch(llmReply({ symbol: 'XAUUSD', side: 'buy', entry: 4016, stop_loss: 4010, take_profit: 4050, confidence: 1 }));
+  const outcome = await parseSignalTwoLayer(text, { source: 'telegram', config: CONFIG, fetchImpl: fetch.fetchImpl });
+  assert.equal(outcome.parsed.managementUpdate, false);
+  assert.deepEqual([outcome.parsed.symbol, outcome.parsed.side, outcome.parsed.entryPrice, outcome.parsed.stopLoss, outcome.parsed.takeProfit],
+    ['XAUUSD', 'buy', 4016, 4010, 4050]);
+  assert.equal(outcome.parsed.executionReady, true, 'and it is eligible, exactly as it was before the classifier existed');
+});
+
+test('the fallback layer is not entered by a management row that looks half-readable', () => {
+  const layer1 = { ...parseSignal('GOLD BUY 4016'), managementUpdate: true, hasPriceLevel: true, symbol: 'XAUUSD' };
+  assert.equal(needsLayer2(layer1), false);
+  assert.equal(needsLayer2({ ...layer1, managementUpdate: false }), true, 'while the same message without the update reading is still worth a request');
+});
+
+test('the merge will not write a direction onto a management row either', () => {
+  // Belt and braces: even a caller that asks anyway gets nothing written.
+  const layer1 = { ...parseSignal('GOLD BUY HIT TP 1'), managementUpdate: true, side: null, symbol: null };
+  const merged = mergeGaps(layer1, { side: 'buy', entry: 4016, confidence: 1 }, { pipValues: new Set() });
+  assert.equal(merged.merged.side, null);
+  assert.equal(merged.merged.entryPrice, null);
+  assert.deepEqual(merged.filled, []);
+});
+
+test('the prompt says out loud that an open position is not an entry instruction', () => {
+  const [system] = buildMessages('anything at all', CONFIG);
+  assert.match(system.content, /already open is not an entry instruction/i);
+  assert.match(system.content, /never turn an instruction to close into a direction to open/i);
+  assert.match(system.content, /"TP 1", "TP2 ✅"|A numbered target/i, 'and it names the numbered-target shape that was being read as a price');
 });

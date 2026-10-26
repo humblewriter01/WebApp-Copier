@@ -206,7 +206,7 @@ function stateFor(count, { failAt = 0, warnAt = 1 } = {}) {
  * the browser so the panel can never invent a reassuring sentence, and an unreadable section is
  * reported as `unknown` - never as "fine".
  */
-export function buildHealthChecks({ killSwitch, runtimeEnabled, queue, counts, thresholds = {}, capture = null } = {}) {
+export function buildHealthChecks({ killSwitch, runtimeEnabled, queue, counts, thresholds = {}, capture = null, llm = null } = {}) {
   const checks = [];
   const switchState = killSwitch?.state;
   checks.push({
@@ -267,6 +267,24 @@ export function buildHealthChecks({ killSwitch, runtimeEnabled, queue, counts, t
   if (capture) {
     checks.push({ key: 'capture', label: 'Telegram message capture', state: capture.state, headline: capture.headline, detail: capture.detail });
   }
+  /* The fallback layer is the one part of capture whose behaviour is set by an environment variable, which
+     makes it the part most often believed to be on when it is not. So the panel says which model this process
+     read at boot, and the queue in front of it, instead of leaving an operator to infer it from a log line. */
+  if (llm) {
+    const waiting = Number(llm.waiting?.realtime || 0) + Number(llm.waiting?.replay || 0);
+    const gated = Number(llm.gated || 0);
+    checks.push({
+      key: 'ai_reader',
+      label: 'AI reading assistant',
+      state: llm.enabled === true ? (gated > 0 ? 'watch' : 'ok') : 'unavailable',
+      headline: llm.enabled === true ? (llm.model || 'configured') : 'Off',
+      detail: llm.enabled === true
+        ? `Layer 2 asks ${llm.model || 'the configured model'} at ${llm.host || 'the configured endpoint'} when the built-in reader cannot finish a signal.`
+          + ` ${Number(llm.maxConcurrent || 0)} request${Number(llm.maxConcurrent || 1) === 1 ? '' : 's'} at a time, ${Number(llm.active || 0)} in flight, ${waiting} waiting.`
+          + (gated > 0 ? ` ${gated} replayed message${gated === 1 ? '' : 's'} left for review because the queue was full.` : '')
+        : `The fallback layer is switched off (${llm.disabledReason || 'no LLM_API_KEY set'}), so every message is read by the built-in parser alone and anything it cannot finish is saved for review.`,
+    });
+  }
   return checks;
 }
 
@@ -291,7 +309,7 @@ export function mapCaptureState(row = {}) {
   };
 }
 
-export function createSystemHealthService({ pool, controls, runtimeEnabled = false, logger = console, now = () => new Date(), capture = null } = {}) {
+export function createSystemHealthService({ pool, controls, runtimeEnabled = false, logger = console, now = () => new Date(), capture = null, llm = null } = {}) {
   if (!pool?.query) throw new TypeError('System health needs a database pool.');
   const log = (level, message, extra = {}) => logger?.[level]?.(message, extra);
 
@@ -348,6 +366,14 @@ export function createSystemHealthService({ pool, controls, runtimeEnabled = fal
       ? null
       : buildCaptureHealth({ live: liveCapture, stored: storedCapture, now: now() });
 
+    /* What the AI reader is doing is process state rather than a row, so it is read from the process: the
+       configuration this instance was started with and the queue in front of the endpoint. A reader that
+       cannot answer is reported as no section at all, never as a healthy one. */
+    let llmHealth = null;
+    if (typeof llm === 'function') {
+      try { llmHealth = llm() || null; } catch { llmHealth = null; }
+    }
+
     // One object feeds both the payload and the checks, so the sentence next to the toggle can
     // never disagree with the state the toggle reports.
     const switchState = killSwitch
@@ -361,9 +387,10 @@ export function createSystemHealthService({ pool, controls, runtimeEnabled = fal
       runtimeEnabled: runtimeEnabled === true,
       queue,
       counts,
-      checks: buildHealthChecks({ killSwitch: switchState, runtimeEnabled: runtimeEnabled === true, queue, counts, capture: captureHealth }),
+      checks: buildHealthChecks({ killSwitch: switchState, runtimeEnabled: runtimeEnabled === true, queue, counts, capture: captureHealth, llm: llmHealth }),
       // Admin-only: what this process and the database each say about message capture, including how
       // long the instance has been up, because "is my fix even deployed" has to be answerable here.
+      aiReader: llmHealth,
       capture: captureHealth
         ? {
           ...captureHealth.facts,

@@ -16,7 +16,8 @@ import { withDeadline } from './services/schema-sql.js';
 import { createMetaApiConfigurationLink, metaApiRequest, toSafeMetaApiAccount } from './services/metaapi.js';
 import { getTelegramErrorCode, isTelegramPasswordNeeded, shouldDiscardTelegramLogin, telegramAuthErrorPayload } from './services/telegram-auth.js';
 import { parseSignalTwoLayer } from './services/signal-parse-pipeline.js';
-import { llmConfig } from './services/signal-llm.js';
+import { llmConfig, describeLlmConfig } from './services/signal-llm.js';
+import { createLlmGate } from './services/llm-gate.js';
 import { TARGET_MODES } from './services/scale-out.js';
 import { captureSafety, readFallbackPoints } from './services/signal-safety.js';
 import { entryRangeBounds, readExpirySetting, readSlippageSetting, ORDER_TYPES } from './services/order-routing.js';
@@ -92,6 +93,11 @@ const adminAccess = createAdminAccess();
    capture. `disabledReason` is what the startup log below quotes, and it is the only place an operator finds
    out that the AI reading assistant is switched off. */
 const parserConfig = llmConfig(process.env);
+/* The queue in front of the AI reader, shared by every user in this process: it exists so that a reconnect
+   replaying 25 messages cannot make a live signal wait for somebody else's model request. The number is small
+   on purpose - a Groq key is rate limited per model, so more concurrent requests buy queueing at the provider,
+   not throughput. */
+const llmGate = createLlmGate({ maxConcurrent: Number(process.env.LLM_MAX_CONCURRENT) || undefined });
 
 const accountCleanup = createAccountCleanup({ logger: { warn: (message, extra = {}) => log('warn', message, extra) } });
 const paystackConfig = billingConfig();
@@ -261,7 +267,7 @@ async function resolveExecutionToken(userId, accountId, managedByApp) {
  */
 const platformControls = createPlatformControls({ pool, logger: console });
 const auditLog = createAuditLogger({ pool, logger: console });
-const systemHealth = createSystemHealthService({ pool, controls: platformControls, runtimeEnabled: autoTradingRuntimeEnabled, logger: console, capture: () => ({ ...telegramCapture.telegramFleetSummary(), gitCommit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || null, startup: { ...boot } }) });
+const systemHealth = createSystemHealthService({ pool, controls: platformControls, runtimeEnabled: autoTradingRuntimeEnabled, logger: console, capture: () => ({ ...telegramCapture.telegramFleetSummary(), gitCommit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || null, startup: { ...boot } }), llm: () => ({ ...describeLlmConfig(parserConfig), ...llmGate.summary() }) });
 const announcementService = createAnnouncementService({ pool, logger: console });
 const supportSessions = createSupportSessionService({ pool, logger: console });
 
@@ -342,6 +348,9 @@ function scaleOutLadder(parsed) {
 
 async function saveSignal(userId, message, channel = {}) {
   const source = channel.source === 'manual' ? 'manual' : 'telegram';
+  /* Which end of the AI reader's queue this message stands in. A message pushed by Telegram is live; a
+     message catch-up is replaying is already late, and must not be served first. */
+  const llmPriority = channel.replayed === true ? 'replay' : 'realtime';
   const telegramMessageId = source === 'telegram' && channel.telegramMessageId != null ? String(channel.telegramMessageId) : null;
   const savedText = String(message || '').slice(0, 5000);
   /* The one thing that has to be known before the row is written is how strict this workspace wants
@@ -356,7 +365,7 @@ async function saveSignal(userId, message, channel = {}) {
      anything, and it is deliberately before the insert: the row a reader sees later is the row that was
      written, provenance and all, rather than a row that got upgraded after the fact by whatever the fallback
      layer managed to read while the dashboard was already showing it. */
-  const { parsed, review, provenance } = await parseSignalTwoLayer(savedText, { source, config: parserConfig, logger: serviceLogger });
+  const { parsed, review, provenance } = await parseSignalTwoLayer(savedText, { source, config: parserConfig, logger: serviceLogger, gate: llmGate, priority: llmPriority });
   /* Which refusals this workspace's own safety rules can answer: a fallback distance may complete a leg
      the channel forgot, an override may send the order without it, and neither is true when the block is
      up and no net is set. A direction inferred from the prices never becomes eligible at all - reading a
@@ -565,29 +574,68 @@ async function resumeTelegramSessions({ reason = 'restore' } = {}) {
 /** Re-attach anything in memory that has lost its handler, and run the catch-up it flagged. */
 async function rearmTelegramListeners() {
   let rearmed = 0;
+  const catchUps = [];
   for (const [userId, entry] of telegramClients.entries()) {
     if (entry.client?.connected === true && (!entry.handler || !telegramCapture.handlerIsLive(entry.client, entry.handler))) {
       await startTelegramListener(userId, entry.client);
       rearmed += 1;
     }
+    /* Replays are started together and never awaited here. A catch-up is a run of Telegram API calls on a
+       connection that may be throttled, and awaiting it per user meant the twelfth workspace's missed messages
+       waited behind the first workspace's flood wait - while every one of those workspaces was still receiving
+       live updates on their own clients. Nothing in this loop needs another user's result, so nothing in it
+       may wait for one. */
     if (entry.needsCatchUp && entry.client?.connected === true) {
-      await telegramCapture.runCatchUp(userId).catch((error) => log('warn', 'Telegram catch-up failed', { userId, error: error.message }));
+      catchUps.push(telegramCapture.runCatchUp(userId).catch((error) => log('warn', 'Telegram catch-up failed', { userId, error: error.message })));
     }
   }
+  if (catchUps.length) await Promise.allSettled(catchUps);
   return rearmed;
 }
 
 io.use((socket, next) => {
+  let payload;
   try {
-    const payload = jwt.verify(socket.handshake.auth?.token, process.env.JWT_SECRET);
-    socket.userId = payload.sub;
-    next();
-  } catch { next(new Error('Authentication required')); }
+    payload = jwt.verify(socket.handshake.auth?.token, process.env.JWT_SECRET);
+  } catch { return next(new Error('Authentication required')); }
+  socket.userId = payload.sub;
+  /*
+   * One rule from `authenticate` has to be repeated here, because the socket is now a second door into the same
+   * rows: an impersonation token is only valid while the support session behind it is. Verified once at the
+   * handshake, and remembered on the socket, so closing the session can also stop the stream - which the REST
+   * half of the same guarantee already implied and this door did not, until the live signal feed opened it.
+   */
+  if (String(payload.purpose || '') !== 'impersonation') return next();
+  Promise.resolve()
+    .then(() => supportSessions.redeem(payload.jti))
+    .then((session) => {
+      if (!session || String(session.userId) !== String(payload.sub)) return next(new Error('Authentication required'));
+      socket.data.supportSessionId = session.id;
+      return next();
+    })
+    .catch(() => next(new Error('Authentication required')));
 });
 io.on('connection', (socket) => {
   socket.join(`user:${socket.userId}`);
   socket.emit('connected', { ok: true });
 });
+
+/**
+ * Ends the sockets a closed support session left open. The room it joined belongs to the workspace it was
+ * looking at, so the real owner's sockets share it and are untouched: only sockets tagged with this session id
+ * are dropped.
+ */
+function disconnectSupportSockets(sessionId) {
+  if (!io || !sessionId) return 0;
+  let dropped = 0;
+  for (const socket of io.sockets.sockets.values()) {
+    if (socket.data && socket.data.supportSessionId === sessionId) {
+      dropped += 1;
+      socket.disconnect(true);
+    }
+  }
+  return dropped;
+}
 
 /*
  * The answer to a question this workspace has had to guess at repeatedly: is the code I just merged
@@ -870,7 +918,7 @@ app.get('/api/dashboard', authenticate, asyncRoute(async (req, res) => {
     pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled" FROM settings WHERE user_id=$1', [req.userId]),
   ]);
   const dashboardSignals = chooseDashboardSignals({ actionable: actionableSignals.rows, recent: recentSignals.rows });
-  res.json({
+  res.set('Cache-Control', 'no-store').json({
     stats: { totalSignals: signalsCount.rows[0].count, activeChannels: channelsCount.rows[0].count, accounts: accountsCount.rows[0].count },
     signals: dashboardSignals.rows,
     signalsScope: dashboardSignals.scope,
@@ -881,7 +929,7 @@ app.get('/api/dashboard', authenticate, asyncRoute(async (req, res) => {
 
 app.get('/api/channels', authenticate, asyncRoute(async (req, res) => {
   const { rows } = await pool.query('SELECT id,channel_id AS "channelId",title,username,enabled,created_at AS "createdAt" FROM channels WHERE user_id=$1 ORDER BY created_at DESC', [req.userId]);
-  res.json({ channels: rows });
+  res.set('Cache-Control', 'no-store').json({ channels: rows });
 }));
 app.post('/api/channels', authenticate, asyncRoute(async (req, res) => {
   const channelId = String(req.body.channelId || '').trim();
@@ -915,7 +963,7 @@ app.delete('/api/channels/:id', authenticate, asyncRoute(async (req, res) => {
 app.get('/api/signals', authenticate, asyncRoute(async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
   const { rows } = await pool.query(`SELECT id,channel_title AS "channelTitle",source,message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",direction_inferred AS "directionInferred",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",take_profit_levels AS "takeProfitLevels",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",needs_review AS "needsReview",order_type AS "orderType",order_type_stated AS "orderTypeStated",is_scalping AS "isScalping",entry_range AS "entryRange",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2`, [req.userId, limit]);
-  res.json({ signals: rows });
+  res.set('Cache-Control', 'no-store').json({ signals: rows });
 }));
 app.post('/api/signals', authenticate, asyncRoute(async (req, res) => {
   const message = String(req.body.message || '').trim().slice(0, 5000);
@@ -951,7 +999,7 @@ app.delete('/api/signals', authenticate, asyncRoute(async (req, res) => {
 
 app.get('/api/accounts', authenticate, asyncRoute(async (req, res) => {
   const { rows } = await pool.query('SELECT id,label,broker,platform,account_reference AS "accountReference",created_at AS "createdAt" FROM accounts WHERE user_id=$1 ORDER BY created_at DESC', [req.userId]);
-  res.json({ accounts: rows });
+  res.set('Cache-Control', 'no-store').json({ accounts: rows });
 }));
 app.post('/api/accounts', authenticate, asyncRoute(async (req, res) => {
   const label = String(req.body.label || '').trim().slice(0, 100);
@@ -1015,7 +1063,7 @@ app.get('/api/metaapi/linked-accounts', authenticate, asyncRoute(async (req, res
     [req.userId],
   );
   const activity = await inactivityService.statusFor(req.userId);
-  res.json({
+  res.set('Cache-Control', 'no-store').json({
     accounts: rows.map((account) => ({
       ...account,
       daysInactive: account.managedByApp ? daysInactiveSince(account.lastActiveAt) : null,
@@ -2288,6 +2336,7 @@ app.post('/api/admin/support/stop', authenticate, requireAdmin, asyncRoute(async
   const sessionId = String(req.body?.sessionId || '').trim();
   if (!UUID_PATTERN.test(sessionId)) return fail(res, 400, 'Choose a support session to close.');
   const result = await supportSessions.stop({ sessionId, adminId: req.userId });
+  disconnectSupportSockets(sessionId);
   if (!result.revoked) return fail(res, 404, 'That support session is already closed.');
   await auditLog.record({
     actorId: req.userId,
@@ -2309,6 +2358,7 @@ app.post('/api/admin/support/stop', authenticate, requireAdmin, asyncRoute(async
 app.post('/api/auth/support/exit', authenticate, asyncRoute(async (req, res) => {
   if (!req.supportSessionId) return fail(res, 400, 'This is not a support session.');
   const result = await supportSessions.stop({ sessionId: req.supportSessionId, adminId: req.impersonatedBy });
+  disconnectSupportSockets(req.supportSessionId);
   res.set('Cache-Control', 'no-store').json({ ok: true, revoked: result.revoked });
 }));
 

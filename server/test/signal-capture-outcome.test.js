@@ -37,6 +37,25 @@ const eligible = {
   accountState: 'DEPLOYED',
 };
 
+test('the capture path asks the database for the switch on every message, and remembers nothing between them', () => {
+  /* "Auto-Trading is toggled on but the signal was saved for review" is a staleness accusation, and the only
+     answer that closes it is where the number comes from. The read lives inside `saveSignal`, below the INSERT
+     and above the decision, so it happens once per captured message - and the decision is built from that
+     row, not from anything held in a variable between calls. A cache here would be defensible design (a
+     setting that changes mid-signal is its own hazard), but it does not exist, and this pin is what keeps
+     somebody from adding one quietly. */
+  const readAt = saveSignalBody.indexOf('SELECT s.auto_trading_enabled AS autoTrading');
+  assert.ok(readAt > 0, 'the workspace switch is read from `settings` inside saveSignal');
+  assert.ok(readAt < saveSignalBody.indexOf('decideSignalOutcome({'), 'after the row is stored, before the outcome is decided');
+  assert.match(saveSignalBody, /autoTradingEnabled: context\.autoTrading === true/, 'and the decision is built from that read');
+  assert.match(saveSignalBody, /accountSelected: Boolean\(context\.executionAccountId\)/, 'as is whether an account is selected at all');
+  assert.equal(/let (cached)?autoTrading\b/.test(index), false, 'no module-level copy of the switch exists to go stale');
+  /* The one auto-trading value that IS read once, at boot, is the deployment's runtime flag - and it is used
+     as itself, never as the user\'s switch. Conflating the two is how "it is on but nothing trades" starts. */
+  assert.match(saveSignalBody, /runtimeEnabled: autoTradingRuntimeEnabled/, 'the runtime flag is passed separately');
+  assert.equal(/runtimeEnabled: settings\.autoTrading|autoTradingEnabled: autoTradingRuntimeEnabled/.test(index), false);
+});
+
 test('a free workspace with no trading account is an unexecuted signal, never a missing one', () => {
   const outcome = decideSignalOutcome({
     executionReady: true,

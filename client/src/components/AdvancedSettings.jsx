@@ -1,6 +1,7 @@
 import React from 'react';
 import RiskWarningModal, { needsRiskAcknowledgement, RISK_REMINDER, RISK_WARNING_COPY } from './RiskWarningModal.jsx';
 import SettingsSection from './SettingsSection.jsx';
+import { autoTradingBannerView } from '../lib/platform-view.js';
 
 /**
  * Kept as the full sentence the warning used to be, for surfaces that need to quote it in one line.
@@ -128,7 +129,7 @@ export function platformPauseNotice(platformPause) {
     : `Automatic execution is paused by Signal Desk for every workspace. Your own settings are untouched, and new signals are saved for review until the pause is lifted.${reason}`;
 }
 
-export default function AdvancedSettings({ settings, accounts = [], trades = [], runtimeAvailable = false, platformPause = null, onChange, onSubmit, onToggle, onOpenRiskSettings = () => {}, saving = false }) {
+export default function AdvancedSettings({ settings, accounts = [], trades = [], runtimeAvailable = false, platformPause = null, onChange, onSubmit, onToggle, onOpenRiskSettings = () => {}, onOpenTradingAccounts = () => {}, saving = false }) {
   const [riskWarningOpen, setRiskWarningOpen] = React.useState(false);
   const pauseNotice = platformPauseNotice(platformPause);
   // Turning the switch on is the only action here that spends money, so it is the only one that
@@ -192,6 +193,24 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
             <input id="auto-trading-enabled" type="checkbox" checked={Boolean(settings.autoTradingEnabled)} disabled={saving || (!settings.autoTradingEnabled && !runtimeAvailable)} onChange={(event) => requestAutoTrading(event.target.checked)} />
             <span><strong>Auto-Trading {settings.autoTradingEnabled ? 'ON' : 'OFF'}</strong><small>This toggle saves immediately. Turn it off whenever no new orders should be submitted.</small></span>
           </label>
+          {/* The switch is not the whole instruction. A workspace with the switch on and nothing behind it read
+              this page as "ON" and nothing more, then wondered why signals were only ever saved for review - so
+              the sentence the Overview banner shows is repeated here, where the switch is, from the same
+              helper, so the two can never disagree about what is missing. */}
+          {(() => {
+            const readiness = autoTradingBannerView({
+              autoTradingEnabled: settings.autoTradingEnabled,
+              runtimeEnabled: runtimeAvailable,
+              platformPause,
+              linkedAccounts: accounts,
+              executionAccountId: settings.executionAccountId,
+            });
+            if (readiness.state !== 'no-account' && readiness.state !== 'not-deployed') return null;
+            return <p className="field-help auto-trading-readiness-prompt" data-state={readiness.state}>
+              <span>{readiness.message}</span>
+              {readiness.action ? <button type="button" className="text-button" onClick={onOpenTradingAccounts}>{readiness.action.label}</button> : null}
+            </p>;
+          })()}
           <p className="risk-reminder">
             <span>{RISK_REMINDER}</span>
             <details className="risk-reminder-details">

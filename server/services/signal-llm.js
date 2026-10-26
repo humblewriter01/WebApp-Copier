@@ -48,6 +48,7 @@ const SYSTEM_PROMPT = [
   '- side is "buy" for BUY, LONG or CALL and "sell" for SELL, SHORT or PUT. A message that says both is contradictory: return null for every field and confidence 0.',
   '- If the text is a news headline or market commentary rather than a trade instruction, return null for the direction. "JUST IN", "breaking", "report", "headline", "news", a market "dumping" or a price that "falls under" or "rises above" a level are reporting what happened, not telling anyone what to do: return null for side, and null for any other field the message does not state as an instruction. A direction must never be chosen from the tone of a headline.',
   '- An entry of "now", "market" or "current price" means entry null. That is not a missing value; do not fill it in.',
+  '- A message about a position that is already open is not an entry instruction. "TP 1 HIT", "close now", "close half", "set BE", "SL to entry" and "+50 PIPS" describe how a trade finished or how it is being managed: return null for side, and never turn an instruction to close into a direction to open. A numbered target ("TP 1", "TP2 ✅") is the index of a level, not a price.',
   '- A target or stop given in pips or points is a distance, not a price: return null for that field.',
   '- confidence is how sure you are that this message is a trade instruction and that you read it correctly: 1 only when every value you returned is written in the message in plain form.',
   'Do not add commentary, markdown, or any text outside the JSON object.',
@@ -86,6 +87,26 @@ export function llmConfig(env = process.env, defaults = {}) {
 }
 
 /**
+ * What may be said out loud about this configuration: which model, which endpoint host, no secret.
+ *
+ * The admin health panel needs to answer "is my `LLM_MODEL_NAME` actually the thing being asked" without
+ * anybody reading a Render log line or, worse, printing a key. The model name and the host are not secrets -
+ * the endpoint is public - and the key never leaves `llmConfig`.
+ */
+export function describeLlmConfig(config = llmConfig()) {
+  let host = null;
+  try { host = new URL(config?.url || '').host || null; } catch { host = null; }
+  return {
+    enabled: config?.enabled === true,
+    model: config?.model || null,
+    host,
+    timeoutMs: config?.timeoutMs ?? null,
+    minConfidence: config?.minConfidence ?? null,
+    disabledReason: config?.disabledReason || null,
+  };
+}
+
+/**
  * Whether this message is worth a request.
  *
  * Only signal-shaped text is: something in it looked like a trade instruction (a direction, a symbol, a
@@ -100,7 +121,7 @@ export function needsLayer2(parsed) {
   /* A message Layer 1 classified as market news is not an unfinished signal, and asking a model about it is
      how a headline ends up with a direction attached: the model is paid to find a trade, it will find one.
      Refusing the request outright is cheaper and surer than hoping the answer is cautious. */
-  if (parsed.newsOnly === true) return false;
+  if (parsed.newsOnly === true || parsed.managementUpdate === true) return false;
   const complete = parsed.executionReady === true && parsed.missing
     && parsed.missing.stopLoss === false && parsed.missing.takeProfit === false && parsed.missing.entryPrice === false;
   if (complete) return false;
@@ -222,8 +243,27 @@ export function validateExtraction(json, { rawMessage, config = {} } = {}) {
  * it does not understand the parameter - a request that would otherwise 400 forever and leave the layer
  * silently switched off.
  */
-export async function llmParseSignal(message, { config, fetchImpl = globalThis.fetch, logger } = {}) {
+/**
+ * Ask the model about one message, and come back with either its fields or a refusal.
+ *
+ * `gate` is the queue in `llm-gate.js`: when one is supplied the request is made through it, so a burst of
+ * catch-up work cannot hold the endpoint away from a live capture. Without a gate (the manual save path, every
+ * test that has no interest in queueing) the request is simply made. A gate that refuses is not an error: it
+ * returns the same `{ ok: false }` shape as a timeout, which is what makes "the reader was busy" land on the
+ * row as a review flag rather than as a failed capture.
+ */
+export async function llmParseSignal(message, { config, fetchImpl = globalThis.fetch, logger, gate = null, priority = 'realtime' } = {}) {
   if (!config?.enabled) return { ok: false, code: 'disabled', reason: config?.disabledReason || 'not configured' };
+  const request = () => llmRequest(message, { config, fetchImpl, logger });
+  if (!gate) return request();
+  const slot = await gate.run(request, { priority });
+  if (slot?.ok !== true) {
+    return { ok: false, code: slot?.code || 'gated', reason: slot?.reason || 'The AI reader was busy, so this signal was saved for review.' };
+  }
+  return slot.value;
+}
+
+async function llmRequest(message, { config, fetchImpl = globalThis.fetch, logger } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
   const body = (withFormat) => JSON.stringify({

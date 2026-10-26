@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import Sidebar from './components/Sidebar.jsx';
 import SignalTable from './components/SignalTable.jsx';
 import ConfirmModal from './components/ConfirmModal.jsx';
@@ -20,8 +20,13 @@ import BillingPage from './components/BillingPage.jsx';
 import BillingCallbackPage from './components/BillingCallbackPage.jsx';
 import UpdatePasswordPage from './components/UpdatePasswordPage.jsx';
 import { navigationItemsForRole } from './navigation.js';
-import { request } from './lib/api.js';
+import { API_URL, request } from './lib/api.js';
+import { connectSignalFeed, createReconciler, mergeSignalRows, FALLBACK_POLL_INTERVAL_MS, LIVE_SWEEP_INTERVAL_MS } from './lib/signal-feed.js';
+import { autoTradingBannerView } from './lib/platform-view.js';
 import { supabaseReady } from './lib/supabase.js';
+
+/** How many captured rows the workspace keeps on screen, and the cap a pushed row is merged into. */
+export const SIGNALS_PAGE_LIMIT = 50;
 
 function AuthScreen({ onAuthenticated, installPrompt, onInstall }) {
   const [mode, setMode] = useState('login');
@@ -111,6 +116,11 @@ function App() {
   // The platform's own switch, read with the settings so the panel can explain a pause instead
   // of letting a user hunt for a toggle that is already on.
   const [executionPaused, setExecutionPaused] = useState(null);
+  // Whether the pushed feed is open right now. It decides how often the dashboard polls, and nothing else:
+  // a closed feed is a slower page, never a broken one.
+  const [feedLive, setFeedLive] = useState(false);
+  const signalsRef = useRef(null);
+  const reconcilerRef = useRef(null);
   const [loading, setLoading] = useState(true);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [error, setError] = useState('');
@@ -208,9 +218,15 @@ function App() {
     if (!authToken) return;
     try {
       const [me, dash, channelsData, accountsData, signalsData, settingsData, tradingAccountsData, tradesData] = await Promise.all([
-        request('/api/auth/me', authToken), request('/api/dashboard', authToken), request('/api/channels', authToken), request('/api/accounts', authToken), request('/api/signals?limit=50', authToken), request('/api/settings', authToken), request('/api/metaapi/linked-accounts', authToken), request('/api/trades', authToken),
+        request('/api/auth/me', authToken), request('/api/dashboard', authToken), request('/api/channels', authToken), request('/api/accounts', authToken), request(`/api/signals?limit=${SIGNALS_PAGE_LIMIT}`, authToken), request('/api/settings', authToken), request('/api/metaapi/linked-accounts', authToken), request('/api/trades', authToken),
       ]);
-      setUser(me.user); setDashboard(dash); setChannels(channelsData.channels); setAccounts(accountsData.accounts); setSignals(signalsData.signals); setSettings((current) => ({ ...current, ...settingsData.settings })); setExecutionRuntimeEnabled(Boolean(settingsData.runtimeEnabled)); setExecutionPaused(settingsData.executionPaused || null); setLinkedAccounts(tradingAccountsData.accounts || []); setTrades(tradesData.trades || []);
+      setUser(me.user); setDashboard(dash); setChannels(channelsData.channels); setAccounts(accountsData.accounts); setSignals(signalsData.signals); signalsRef.current = signalsData.signals;
+      /* The dashboard payload carries the workspace's own `auto_trading_enabled` straight out of the database,
+         so it is applied first and the settings request on the same tick fills in the rest. Reading the switch
+         from the row rather than from whatever a previous poll left in state is what keeps the banner from
+         contradicting the engine: a signal is queued against the value in the table, and this is the same
+         value, from the same read, at the same moment. */
+      setSettings((current) => ({ ...current, ...(dash.settings || {}), ...settingsData.settings })); setExecutionRuntimeEnabled(Boolean(settingsData.runtimeEnabled)); setExecutionPaused(settingsData.executionPaused || null); setLinkedAccounts(tradingAccountsData.accounts || []); setTrades(tradesData.trades || []);
       setError('');
     } catch (e) {
       // A support session that just ran out must not sign the administrator out of their own work.
@@ -219,7 +235,51 @@ function App() {
     }
     finally { setLoading(false); }
   }, [authToken, logout, exitSupport]);
-  useEffect(() => { if (!authToken) { setLoading(false); return; } refresh(); const timer = setInterval(refresh, 20_000); return () => clearInterval(timer); }, [authToken, refresh]);
+  // `refresh` changes identity when the support session or the sign-out handler changes; the feed must not
+  // reconnect for that reason, so it reaches the current function through a ref.
+  const refreshRef = useRef(refresh);
+  useEffect(() => { refreshRef.current = refresh; }, [refresh]);
+
+  /* A captured signal is applied the moment the server emits it, then one debounced refresh reconciles the
+     parts of the page the event does not carry (the outcome the worker writes a second later, the trade list,
+     the counters). Merging the row rather than re-reading the page is what makes the difference visible on a
+     phone: no spinner, no scroll jumping back to the top, no flash of the empty state. */
+  const applyIncomingSignal = useCallback((incoming) => {
+    if (!incoming || incoming.id === undefined || incoming.id === null) return;
+    setSignals((current) => mergeSignalRows(current, incoming, { limit: SIGNALS_PAGE_LIMIT }));
+    setDashboard((current) => (current ? { ...current, signals: mergeSignalRows(current.signals || [], incoming) } : current));
+    reconcilerRef.current?.schedule();
+  }, []);
+
+  useEffect(() => {
+    if (!authToken) { setFeedLive(false); return undefined; }
+    reconcilerRef.current = createReconciler(() => refreshRef.current());
+    const feed = connectSignalFeed({ url: API_URL, token: authToken, onSignal: applyIncomingSignal, onStatus: (state) => setFeedLive(state === 'open') });
+    return () => { feed.close(); reconcilerRef.current?.cancel(); reconcilerRef.current = null; setFeedLive(false); };
+  }, [authToken, applyIncomingSignal]);
+
+  useEffect(() => {
+    if (!authToken) { setLoading(false); return undefined; }
+    refresh();
+    // The poll is the safety net, not the mechanism: while the feed is open a slower sweep is enough, and the
+    // instant one comes back the moment it is not.
+    const timer = setInterval(() => { void refreshRef.current(); }, feedLive ? LIVE_SWEEP_INTERVAL_MS : FALLBACK_POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [authToken, feedLive, refresh]);
+
+  // Coming back to a tab is when "did anything arrive while I was away?" is actually asked, and it is also
+  // when a feed killed by a sleeping laptop needs re-reading. Cheap, and it removes the worst case of a
+  // reconnect: the first event after the wake can be seconds away, and the interval may be minutes.
+  useEffect(() => {
+    if (!authToken) return undefined;
+    const onVisible = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      void refreshRef.current();
+    };
+    window.addEventListener('focus', onVisible);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => { window.removeEventListener('focus', onVisible); document.removeEventListener('visibilitychange', onVisible); };
+  }, [authToken]);
 
   const beginSupportSession = useCallback((data) => {
     if (!writeSupportSession(data)) {
@@ -295,6 +355,13 @@ function App() {
     finally { setSettingsSaving(false); }
   };
 
+  const autoTradingBanner = autoTradingBannerView({
+    autoTradingEnabled: settings.autoTradingEnabled,
+    runtimeEnabled: executionRuntimeEnabled,
+    platformPause: executionPaused,
+    linkedAccounts,
+    executionAccountId: settings.executionAccountId,
+  });
   const isAdmin = user?.role === 'admin';
   const tabs = navigationItemsForRole(user?.role).map(({ key, label }) => [key, label]);
 
@@ -317,9 +384,9 @@ function App() {
       <div className="content-area">
         {tab === 'overview' && <>
           <section className="welcome-row"><div><h2>Good to see you, {user?.name?.split(' ')[0] || 'trader'}.</h2><p>Monitor Telegram signals and keep your setup organized.</p></div><LiveLabel channelCount={channels.length} /></section>
-          <div className="metrics-grid"><Metric label="Signals captured" value={dashboard?.stats?.totalSignals ?? 0} note="Across your workspace" /><Metric label="Active sources" value={dashboard?.stats?.activeChannels ?? 0} note="Telegram channels" /><Metric label="Account Notes" value={dashboard?.stats?.accounts ?? 0} note="Labels and references" /><Metric label="Auto-Trading" value={settings.autoTradingEnabled ? 'On' : 'Off'} note={settings.autoTradingEnabled ? 'Eligible signals may place orders' : 'Off until you enable it'} /></div>
+          <div className="metrics-grid"><Metric label="Signals captured" value={dashboard?.stats?.totalSignals ?? 0} note="Across your workspace" /><Metric label="Active sources" value={dashboard?.stats?.activeChannels ?? 0} note="Telegram channels" /><Metric label="Account Notes" value={dashboard?.stats?.accounts ?? 0} note="Labels and references" /><Metric label="Auto-Trading" value={settings.autoTradingEnabled ? 'On' : 'Off'} note={autoTradingBanner.metricNote} /></div>
           {settings.autoTradingEnabled && <p className="risk-reminder risk-reminder-compact"><span>{RISK_REMINDER} Use a demo account while you are testing, and turn this off in Advanced Settings whenever you want no new orders.</span></p>}
-          <div className="notice-banner"><strong>{settings.autoTradingEnabled ? 'Auto-Trading is on' : 'Auto-Trading is off'}</strong><span>{settings.autoTradingEnabled ? 'New eligible Telegram signals may place live orders on your selected account. You can turn this off in Advanced Settings.' : 'Signals are saved for review only. Turn Auto-Trading on in Advanced Settings to submit new eligible signals to your broker.'}</span></div>
+          <div className={`notice-banner${autoTradingBanner.state === 'ready' ? '' : autoTradingBanner.state === 'off' ? '' : ' notice-banner-warn'}`} data-state={autoTradingBanner.state}><strong>{autoTradingBanner.headline}</strong><span>{autoTradingBanner.message}</span>{autoTradingBanner.action ? <button type="button" className="text-button notice-banner-action" onClick={() => navigateToTab(autoTradingBanner.action.tab)}>{autoTradingBanner.action.label}</button> : null}</div>
           <section className="panel"><div className="panel-heading"><div><p className="eyebrow">LATEST ACTIVITY</p><h2>Recent signals</h2></div><button className="text-button" onClick={() => setTab('signals')}>View all</button></div>{dashboard?.signalsScope === 'recent' && dashboard?.signals?.length ? <p className="dashboard-signals-note">No setup has come through your channels yet, so this is your most recent captured traffic.</p> : null}<SignalTable signals={dashboard?.signals || []} compact channelCount={channels.length} onOpenTelegram={() => navigateToTab('telegram')} onUpgrade={() => navigateToTab('billing')} /></section>
         </>}
         {tab === 'telegram' && <TelegramConnect token={authToken} channels={channels} onRefresh={refresh} />}
@@ -350,7 +417,7 @@ function App() {
             the whole row as the server last returned it, so a save on Risk Settings can never blank what
             is set on Advanced Settings. `PUT /api/settings` is unchanged by the split. */}
         {tab === 'settings' && <RiskSettings settings={settings} onChange={setSettings} onSubmit={saveSettings} onOpenAdvanced={() => navigateToTab('advanced')} saving={settingsSaving} />}
-        {tab === 'advanced' && <AdvancedSettings settings={settings} accounts={linkedAccounts} trades={trades} runtimeAvailable={executionRuntimeEnabled} platformPause={executionPaused} onChange={setSettings} onSubmit={saveSettings} onToggle={toggleAutoTrading} onOpenRiskSettings={() => navigateToTab('settings')} saving={settingsSaving} />}
+        {tab === 'advanced' && <AdvancedSettings settings={settings} accounts={linkedAccounts} trades={trades} runtimeAvailable={executionRuntimeEnabled} platformPause={executionPaused} onChange={setSettings} onSubmit={saveSettings} onToggle={toggleAutoTrading} onOpenRiskSettings={() => navigateToTab('settings')} onOpenTradingAccounts={() => navigateToTab('metaapi')} saving={settingsSaving} />}
         {tab === 'profile' && <ProfileSettings user={user} token={authToken} onDeleted={logout} readOnly={readOnlySupport} />}
       </div>
       <footer className="footer">Not financial advice. Use at your own risk.</footer>

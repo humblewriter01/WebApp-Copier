@@ -223,9 +223,13 @@ test('both settings pages save through the one handler, and the profile page nev
 
 test('the copy that pointed a reader at a page they were already on points at the right one now', () => {
   // Auto-Trading left this page, so every sentence telling somebody to change it "in Risk settings"
-  // would be sending them to a page that no longer has the switch.
-  assert.equal(/turn this off in Risk settings|Turn Auto-Trading on in Risk Settings/i.test(appSource), false);
-  assert.match(appSource, /turn this off in Advanced Settings/);
-  assert.match(appSource, /Turn Auto-Trading on in Advanced Settings/);
+  // would be sending them to a page that no longer has the switch. The sentences themselves now live in
+  // `lib/platform-view.js`, where the banner and the metric share one reading of the workspace state - so the
+  // guard follows them there, and the shell is pinned to the helper rather than to its own copy.
+  const bannerSource = readSource('lib', 'platform-view.js');
+  assert.equal(/turn this off in Risk settings|Turn Auto-Trading on in Risk Settings/i.test(`${appSource}\n${bannerSource}`), false);
+  assert.match(bannerSource, /turn this off in Advanced Settings/);
+  assert.match(bannerSource, /Turn Auto-Trading on in Advanced Settings/);
+  assert.match(appSource, /autoTradingBannerView\(/, 'the banner is the helper\'s answer, not a ternary the shell invented');
   assert.equal(readSource('components', 'AdvancedSettings.jsx').includes('Auto-Trading is currently unavailable'), false, 'the runtime note says what is unavailable, not where the switch lives');
 });

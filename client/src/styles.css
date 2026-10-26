@@ -580,3 +580,10 @@ button,input,textarea,select{touch-action:manipulation}
   .settings-section-state{grid-area:state;margin-left:0;justify-self:end;line-height:1.45;white-space:normal}
 }
 .execution-scale-out-summary{margin:0;font-size:11px;color:#3d5c52;background:#f2faf6;border-left:3px solid #2f7d63;border-radius:0 6px 6px 0;padding:5px 8px;line-height:1.5}
+
+/* The banner has three jobs on a trading screen: say the switch state, say what is missing, and get out of
+   the way. Only the "something is missing" states get the accent - a green banner about Auto-Trading being
+   ready is a banner that trains the eye to skip the one that matters. */
+.notice-banner-warn{border-left:3px solid #d9a13b;background:#fff7e6}
+.notice-banner-action{margin-left:auto;white-space:nowrap;font-weight:600;font-size:11px}
+@media (max-width:700px){.notice-banner-action{margin-left:0;align-self:flex-start}}

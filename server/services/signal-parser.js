@@ -262,6 +262,14 @@ const PENDING_LIMIT = (symbol) => String.raw`(?:BUY|SELL|LONG|SHORT)\s+${symbol}
 const PENDING_STOP = (symbol) => String.raw`(?:BUY|SELL|LONG|SHORT)\s+${symbol}STOP\s*(?:ORDER\s+|ENTRY\s+)?(?:ABOVE|BELOW|AT|@|:|=)?\s*(?<stop>${NUMBER})`;
 const PENDING_SYMBOL = String.raw`(?:[A-Za-z][A-Za-z0-9._-]{1,9}\s+)?`;
 const LABELLED_STOP = /\b(?:SL|STOP[- ]?LOSS|STOPLOSS|INVALIDATION)\b\s*[:=@-]?\s*\d/i;
+/* An instruction to get *out* of a trade, and nothing this file may read as an instruction to get into one.
+   `Close now` is the trap: `IMMEDIATE_IN_CLAUSE` looks for a direction word within twenty characters of `NOW`,
+   and `GOLD BUY 4016. Close now at market` has one - the `BUY` of the trade being *closed*. That is how a
+   management update came back wearing a stated MARKET order type. The verb and the exit words that belong to
+   it are blanked out of the order-type scope (blanked, not removed, so every other rule still reads the same
+   offsets), and only they are blanked: the run stops at the first word that is not part of an exit clause, so
+   `CLOSE ALL, then BUY GOLD 4016 NOW` keeps its `NOW`. */
+const EXIT_CLAUSE = /\b(?:CLOSE|CLOSES|CLOSED|CLOSING|EXIT|EXITS|EXITING|LIQUIDATE|LIQUIDATED|SCALE\s*OUT|PARTIAL\s*CLOSE)\b(?:\s+(?:ALL|EVERYTHING|HALF|MY|THE|A|AN|POSITION|POSITIONS|TRADE|TRADES|IT|NOW|IMMEDIATELY|AT|IN|MARKET|PROFIT|LOSS|EARLY|PARTIAL|ANYWAY|PLEASE|BE|BELOW|ABOVE))*(?!\s*\d)/gi;
 
 function pendingLevelPattern(text) {
   const stopAllowsSymbol = LABELLED_STOP.test(String(text || ''));
@@ -310,12 +318,20 @@ const ENTRY_SEPARATORS = '[:=@–—-]';
    looking like a measure. A number that has a digit after it was never the whole number. */
 const BARE_ENTRY_GUARD = '(?!\\d)(?!\\s*(?:lots?|units?|deals?|%|pips?|pts?|points?|USD|EUR|digits?|minutes?|hours?|days?|traders?))';
 
+/* The number the bare scan reaches over has to be reachable: if a protective-leg label sits between the
+   symbol and the digits, the digits belong to that leg. `GOLD BUY HIT TP 1` is a channel naming target one of
+   a trade it is reporting on, and taking `1` as the entry price made a management update look like a signal
+   with a one-dollar entry - a price so far from the market that every fallback distance in the product would
+   happily trade it. */
+const LEG_WORD = /\b(?:TP\d*|TAKE\s*PROFIT|SL|STOP(?:\s*LOSS|\s*OUT)?|TARGET|GOAL|INVALIDATION|BREAK\s*EVEN)\b/i;
+
 function parseBareEntry(text, names, taken) {
   const pattern = (names || []).filter(Boolean).map((name) => String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
   if (!pattern.length) return null;
   const regex = new RegExp(`\\b(?:${pattern.join('|')})\\b[^\\d\\n]{0,12}${NUMBER}${BARE_ENTRY_GUARD}`, 'gi');
   const found = [];
   for (const match of text.matchAll(regex)) {
+    if (LEG_WORD.test(match[0])) continue;
     const value = parseNumber(match[1]);
     if (value === null || taken.includes(value)) continue;
     found.push(value);
@@ -436,7 +452,8 @@ function orderTypeClause(text) {
   const scope = (lines.length ? lines.join('\n') : String(text || ''))
     .replace(LEG_WITH_VALUE, ' ')
     .replace(PROSE_LIMIT, ' ')
-    .replace(PROSE_STOP, ' ');
+    .replace(PROSE_STOP, ' ')
+    .replace(EXIT_CLAUSE, ' ');
   // A message with no instruction line cannot be attributed to an entry at all, so only the phrases that
   // could not possibly mean anything else are allowed to speak for it.
   return { scope, hasInstructionLine: lines.length > 0 };
@@ -509,6 +526,69 @@ const CASHTAG_LIST_MIN = 3;
 export const NEWS_BLOCKER_CODE = 'news-commentary';
 export const NEWS_BLOCKER_MESSAGE = 'This message is market news rather than a trade instruction, so nothing was taken from it.';
 
+/*
+ * Trade management, in the words channels actually use.
+ *
+ * A channel that is watching an open position writes about targets being hit, stops moved to break even,
+ * halves closed and trades running - and every one of those sentences contains the vocabulary of an order
+ * (`TP`, `SL`, `CLOSE`, `+50 PIPS`) without containing an order. This family is nastier than market news, which
+ * is why it needs its own classifier rather than a wider news rule: a management update *does* name the
+ * direction and the instrument, because it is reporting on the trade it took in them, so the test the news
+ * uses ("did the message state a direction?") answers "yes" here every time.
+ */
+/** A leg of the plan completed, which is a fact about a finished trade. */
+const MANAGEMENT_HIT = /\b(?:TP|TAKE\s*PROFIT|TARGET|SL|STOP\s*LOSS)\s*\d*\s*(?:HIT|REACHED|TOUCHED|DONE|COMPLETED|FIRED)\b|\b(?:HIT|REACHED|TOUCHED|CLOSED\s+AT)\s+(?:ALL\s+)?(?:THE\s+)?(?:TP|TAKE\s*PROFIT|TARGET|SL|STOP)\s*\d*\b|\b(?:TP\s*\d+|TARGET\s*\d+)\s*(?:✅|✔|✅✅)\s*\b/gi;
+/** An instruction about the exit of a position, which is never an instruction about an entry. */
+const MANAGEMENT_EXIT = /\b(?:CLOSE|CLOSES|CLOSED|CLOSING|EXIT|EXITS|EXITING|LIQUIDATE|SCALE\s*OUT|PARTIAL\s*CLOSE)\b\s*(?:ALL|EVERYTHING|HALF|MY|THE|A|POSITION|POSITIONS|TRADE|TRADES|NOW|IT|EARLY|PARTIAL|AT\s+MARKET)?\b/gi;
+/** Moving a stop to the entry price - management of an open trade, in every channel that writes it. */
+const MANAGEMENT_BREAK_EVEN = /\b(?:SET|MOVE|MOVED|SHIFT|ADJUST|SLIDE|CHANGE)\s+(?:THE\s+|MY\s+|YOUR\s+)?(?:SL|STOP|STOP\s*LOSS)?\s*(?:TO|AT|AT\s+THE)?\s*(?:BE|B\/E|BREAK\s*EVEN|ENTRY)\b|\b(?:SL|STOP)\s*(?:TO|ON|AT)\s*(?:BE|BREAK\s*EVEN|ENTRY)\b|\bSET\s*(?:BE|BREAK\s*EVEN)\b|\bBREAK\s*EVEN\s+(?:SET|DONE|ACTIVATED?)\b|\b(?:IN\s+)?BREAK\s*EVEN\b/gi;
+/** The result of a closed trade: a signed distance, or the words that go with one. */
+const MANAGEMENT_RESULT = /(?:^|[\s(,|:])[-+] ?\d+(?:[.,]\d+)? ?(?:PIPS?|POINTS?|PTS)\b|\b(?:WITH|MAKING|UP|DOWN|IN|FOR)\s+(?:A\s+)?(?:PROFIT|LOSS)\b|\b(?:PROFIT|LOSS)\s+(?:OF|IS|:)?\s*\d|\b(?:GOOD\s+TRADE|WELL\s+DONE|CONGRATS|CONGRATULATIONS|GG)\b/gi;
+/** The trade is still being described, not ordered. */
+const MANAGEMENT_RUNNING = /\b(?:TRADE|POSITION|SETUP)\s+(?:IS\s+)?(?:STILL\s+)?(?:RUNNING|LIVE|OPEN|ACTIVE)\b|\b(?:LET\s+IT\s+RUN|RUN\s+IT|HOLD\s+(?:THE|YOUR|IT)?\s*(?:POSITION|TRADE|WINNERS?)|TP\s*\d+\s+(?:PENDING|OPEN|RUNNING))\b/gi;
+
+/** The blocker code and the sentence that go on a row classified as a trade update. */
+export const MANAGEMENT_BLOCKER_CODE = 'trade-management-update';
+export const MANAGEMENT_BLOCKER_MESSAGE = 'This message manages a trade that is already open - a target hit, a stop moved to break even, or an instruction to close - rather than giving a new entry, so nothing was taken from it.';
+
+/**
+ * Which management wording this message carries.
+ *
+ * Every one of these is `g`-flagged and used with `test`, which makes a regex's `lastIndex` a live variable
+ * shared by every caller - so each is reset first. Reading the same text twice and getting a different answer
+ * the second time is a worse bug than the one being fixed, and it is invisible in a single test.
+ */
+export function findManagementMarkers(text) {
+  const value = String(text ?? '');
+  const markers = [];
+  for (const [name, pattern] of [['target-hit', MANAGEMENT_HIT], ['close-instruction', MANAGEMENT_EXIT], ['break-even', MANAGEMENT_BREAK_EVEN], ['pips-result', MANAGEMENT_RESULT], ['trade-running', MANAGEMENT_RUNNING]]) {
+    pattern.lastIndex = 0;
+    if (pattern.test(value)) markers.push(name);
+  }
+  return markers;
+}
+
+/**
+ * Whether management wording makes this message something other than an entry instruction.
+ *
+ * The wording alone is not enough, because a channel that publishes a fresh signal often mentions the trade
+ * it is replacing. What decides it is whether the message can stand as an order on its own: a level to get in
+ * at (a price, a zone, or an explicit "now"/"CMP"), *and* a protective leg. A message with both is a signal
+ * that happens to talk about its predecessor, and clearing it would lose a trade. A message with management
+ * wording and no complete instruction of its own is a report, and reading it as an order is how a
+ * "CLOSE NOW" ends up opening a position.
+ */
+function readsAsTradeUpdate({ markers, entry, entryPrice, entryPips, order, stopMatches, targetPriceMatches }) {
+  if (!markers.length) return false;
+  /* `entryPrice`, not `entry.value`: the level a channel writes next to the symbol with no label at all
+     (`GOLD BUY 4011`) is resolved after the labelled scan, and an instruction that named its entry that way is
+     still an instruction with a price to be filled at. */
+  const levelStated = entryPrice !== null || entry.range !== null || entryPips === true || order?.stated === true;
+  const protectedStated = stopMatches.length > 0 || targetPriceMatches.length > 0;
+  if (levelStated && protectedStated) return false;
+  return true;
+}
+
 /**
  * Which news tells a message this is. Every marker is reported, never counted blindly: a single journalism
  * noun is not enough (a real signal says "no trading during the news" too), while a bulletin lead or a price
@@ -573,7 +653,16 @@ export function parseSignal(message) {
   const distinctPrices = (matches) => [...new Set(matches.map((match) => match.value).filter((value) => value !== null))];
   const stopPriceMatches = stopMatches.filter((match) => !match.pips);
   const stopDistanceMatches = stopMatches.filter((match) => match.pips);
-  const targetPriceMatches = takeProfitMatches.filter((match) => !match.pips);
+  /* A target label followed by one small bare integer is the channel numbering its ladder, not a level:
+     `HIT TP 1 ✅ +50 PIPS` names target one, and `TP 1` is not a price of one. The index clause in
+     `findMarkedValues` already skips `TP 1: 4050` and `TP 1 4050`, where a price follows; what it could not
+     see was the index with *nothing* after it, and reading that as a price of 1 did two kinds of damage: the
+     row claimed a take-profit the message never stated, and `directionInferred` then compared 1 against the
+     entry and "worked out" a direction from it. A genuine one-digit price level is not a thing in any market
+     this product trades (and dropping one only costs a target: the take-profit block then refuses to trade,
+     which is the safe direction). */
+  const isTargetIndex = (match) => /^\d$/.test(String(match.match?.[1] ?? '').trim());
+  const targetPriceMatches = takeProfitMatches.filter((match) => !match.pips && !isTargetIndex(match));
   const targetDistanceMatches = takeProfitMatches.filter((match) => match.pips);
   const stopPrices = distinctPrices(stopPriceMatches);
   const stopPips = [...distinctPrices(stopDistanceMatches), ...findPipDistances(legText, 'SL|STOP(?:\\s*LOSS)?|INVALIDATION')];
@@ -679,6 +768,18 @@ export function parseSignal(message) {
     stopMatches,
     takeProfitMatches,
   });
+  /* Trade management is decided next to news and by a different test, for the reason above: a management update
+     names its direction and its instrument, so "did it state a direction" cannot be the discriminator here. */
+  const managementMarkers = findManagementMarkers(text);
+  const managementUpdate = readsAsTradeUpdate({
+    markers: managementMarkers,
+    entry,
+    entryPrice,
+    entryPips,
+    order,
+    stopMatches,
+    targetPriceMatches,
+  });
 
   const parsed = {
     symbol,
@@ -704,6 +805,10 @@ export function parseSignal(message) {
        reader should be able to tell a "needs review" row apart from a "not a signal" row by, and it is what
        keeps the fallback layer from being consulted about a headline. */
     newsOnly,
+    /* Whether this message was read as an update on an open trade. Same purpose as `newsOnly`, different rule:
+       it is what stops a "HIT TP 1 +50 PIPS" being stored as an order that is missing a stop loss. */
+    managementUpdate,
+    managementMarkers,
     /* Which news wording the message carries, kept even on a row that stays a signal. A headline that quotes
        levels is still a headline, and this is what stops a direction being taken from one. */
     newsMarkers,
@@ -716,10 +821,11 @@ export function parseSignal(message) {
     blockers,
   };
 
-  if (!newsOnly) return parsed;
-  /* Nothing at all is taken from a news message: not the symbol it named, and above all not a direction read
-     out of a price falling. The legs are null because the text never stated them, and `missing` stays
-     all-true so no workspace fallback distance can finish a headline into an order. */
+  if (!newsOnly && !managementUpdate) return parsed;
+  /* Nothing at all is taken from a news message or a management update: not the symbol it named, and above all
+     not a direction read out of a price falling, or an entry read out of a trade being closed. The legs are null
+     because the text never stated them, and `missing` stays all-true so no workspace fallback distance can
+     finish a headline - or a `CLOSE NOW` - into an order. */
   return {
     ...parsed,
     symbol: null,
@@ -740,11 +846,16 @@ export function parseSignal(message) {
     hasTradingData: false,
     hasPriceLevel: false,
     missing: { entryPrice: true, stopLoss: true, takeProfit: true },
-    newsOnly: true,
+    newsOnly,
     newsMarkers,
+    managementUpdate,
+    managementMarkers,
     executionReady: false,
-    parseError: NEWS_BLOCKER_MESSAGE,
-    blockers: [{ code: NEWS_BLOCKER_CODE, message: NEWS_BLOCKER_MESSAGE }],
+    parseError: newsOnly ? NEWS_BLOCKER_MESSAGE : MANAGEMENT_BLOCKER_MESSAGE,
+    blockers: [{
+      code: newsOnly ? NEWS_BLOCKER_CODE : MANAGEMENT_BLOCKER_CODE,
+      message: newsOnly ? NEWS_BLOCKER_MESSAGE : MANAGEMENT_BLOCKER_MESSAGE,
+    }],
   };
 }
 

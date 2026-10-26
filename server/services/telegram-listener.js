@@ -32,15 +32,29 @@ import { isTelegramServiceMessage, resolveTelegramChatId, telegramMessageText, t
 export const CATCH_UP_LIMIT = 25;
 /** Never poll Telegram for history more often than this, per user. */
 export const CATCH_UP_COOLDOWN_MS = 5 * 60 * 1000;
+/**
+ * How long one catch-up run may spend before it stops and leaves the rest for the next one.
+ *
+ * A replay is 25 messages times however many channels a workspace monitors, each of them a database write and
+ * sometimes a model request. Given no bound, a reconnect could sit in this loop for minutes - not because the
+ * event loop was blocked, but because the queue of work it keeps appending to is the same queue live captures
+ * are served from. The budget is what makes "catch up on what we missed" finish; a run that stops early leaves
+ * the session flagged, so the next sweep resumes it, and messages already stored are never stored twice.
+ */
+export const CATCH_UP_BUDGET_MS = 20_000;
+
+/** One turn of the event loop, so a replay never runs two messages back to back. */
+const yieldToEventLoop = () => new Promise((resolve) => setImmediate(resolve));
 /** Connected, listening, and nothing through the handler for this long is worth saying out loud. */
 export const STREAM_IDLE_MS = 15 * 60 * 1000;
 
 const EMPTY_STATS = () => ({ seen: 0, saved: 0, ignored: 0, lastAt: null, lastChatId: null, lastError: null, catchUpSaved: 0 });
 
-export function createTelegramListener({ clients, pool, log = console, saveSignal, now = () => Date.now(), catchUpLimit = CATCH_UP_LIMIT, catchUpCooldownMs = CATCH_UP_COOLDOWN_MS } = {}) {
+export function createTelegramListener({ clients, pool, log = console, saveSignal, now = () => Date.now(), catchUpLimit = CATCH_UP_LIMIT, catchUpCooldownMs = CATCH_UP_COOLDOWN_MS, catchUpBudgetMs = CATCH_UP_BUDGET_MS } = {}) {
   if (!clients || !pool || !saveSignal) throw new Error('createTelegramListener requires clients, pool and saveSignal');
   const startedAt = new Date();
   const catchUpRuns = new Map();
+  const catchUpInFlight = new Set();
   let resumedAfterBoot = 0;
 
   const entryFor = (userId) => clients.get(String(userId)) || clients.get(userId);
@@ -116,7 +130,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
       log('info', replayed ? 'Telegram message captured from catch-up' : 'Telegram message captured', { userId, chatId, channel: rows[0].title, chars: text.length, messageId: message?.id ?? null });
       // The signal is stored whatever the parser makes of it - a message from a monitored channel that
       // reads as prose is still a captured message, and it is shown as such instead of vanishing.
-      await saveSignal(userId, text, { source: 'telegram', channelId: rows[0].channelId, title: rows[0].title, telegramMessageId: message?.id ?? null });
+      await saveSignal(userId, text, { source: 'telegram', channelId: rows[0].channelId, title: rows[0].title, telegramMessageId: message?.id ?? null, replayed });
       stats.saved += 1;
       if (replayed) stats.catchUpSaved = (stats.catchUpSaved || 0) + 1;
       return { stored: true };
@@ -169,17 +183,39 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
   async function runCatchUp(userId) {
     const current = clients.get(String(userId)) || clients.get(userId);
     if (!current?.client || current.client.connected !== true) return { ran: false, reason: 'NO_CLIENT', stored: 0 };
+    /* Two runs for one user would read the same 25 messages twice and race each other on the dedupe check,
+       and the two ways a catch-up starts - the reconnect itself and the periodic re-arm sweep - are not
+       coordinated with each other. Whichever arrives second gives up immediately; the flag stays set, so the
+       work is not lost, only deferred. */
+    if (catchUpInFlight.has(String(userId))) return { ran: false, reason: 'IN_FLIGHT', stored: 0 };
     const lastRun = catchUpRuns.get(String(userId)) || 0;
     if (now() - lastRun < catchUpCooldownMs) return { ran: false, reason: 'COOLDOWN', stored: 0 };
+    catchUpInFlight.add(String(userId));
+    // The cooldown starts here, not when the pass finishes: a run that is interrupted still costs a pause.
     catchUpRuns.set(String(userId), now());
+    // Cleared only when a run finishes the whole list; see the budget check below.
+    const startedAt = now();
+    try {
+      return await runCatchUpPass(userId, current, startedAt);
+    } finally {
+      catchUpInFlight.delete(String(userId));
+    }
+  }
+
+  async function runCatchUpPass(userId, current, startedAt) {
+    let stored = 0;
     current.needsCatchUp = false;
     const { rows: channels } = await pool.query(
       'SELECT channel_id AS "channelId",title,username FROM channels WHERE user_id=$1 AND enabled=TRUE ORDER BY created_at DESC',
       [userId],
     );
     if (!channels.length) return { ran: true, reason: 'NO_CHANNELS', stored: 0 };
-    let stored = 0;
     for (const channel of channels) {
+      if (now() - startedAt >= catchUpBudgetMs) {
+        // Out of budget: the remaining channels keep their claim on the next run.
+        current.needsCatchUp = true;
+        return { ran: true, reason: 'BUDGET', stored, partial: true };
+      }
       const handles = [];
       if (channel.username) handles.push(channel.username);
       const numeric = String(channel.channelId || '').replace(/^-100/, '');
@@ -197,6 +233,16 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
       if (!messages.length) continue;
       // Oldest first, so the rows land in the order the channel wrote them.
       for (const message of [...messages].reverse()) {
+        /* One event-loop turn per message. Without this the replay is a chain of 25 promises that never
+           yields, and every live update that arrives during it is served after another row of the replay -
+           which is exactly the latency this whole path is meant to remove. `setImmediate` puts the next
+           message at the back of the check queue instead of the front of the microtask one. */
+        await yieldToEventLoop();
+        if (now() - startedAt >= catchUpBudgetMs) {
+          current.needsCatchUp = true;
+          if (stored) log('info', 'Telegram catch-up stopped at its budget', { userId, stored });
+          return { ran: true, reason: 'BUDGET', stored, partial: true };
+        }
         const result = await ingestMessage(userId, message, { message }, { replayed: true });
         if (result.stored) stored += 1;
       }
