@@ -40,7 +40,9 @@ const FIELDS = ['symbol', 'side', 'entry', 'stop_loss', 'take_profit'];
 
 const SYSTEM_PROMPT = [
   'You read Telegram trading signals and report only what the message states.',
-  'Reply with a single JSON object and nothing else, with exactly these keys:',
+  'Your reply is the raw JSON object and nothing else: its first character is "{", its last is "}".',
+  'Never wrap it in a markdown code fence (no ``` and no ```json), never prefix it with "Here is", never add a sentence after it. Any character outside the braces can discard a trade.',
+  'Answer with exactly these keys:',
   '{"symbol": string|null, "side": "buy"|"sell"|null, "entry": number|null, "stop_loss": number|null, "take_profit": number|null, "confidence": number}',
   'Rules, in order of importance:',
   '- Copy numbers exactly as the message writes them and return them as plain decimals (1085.50, not "1,085.50", not "$1085.50"). Never convert, estimate, average, extend or infer a number that is not written in the message.',
@@ -52,7 +54,7 @@ const SYSTEM_PROMPT = [
   '- A message about a position that is already open is not an entry instruction. "TP 1 HIT", "close now", "close half", "set BE", "SL to entry" and "+50 PIPS" describe how a trade finished or how it is being managed: return null for side, and never turn an instruction to close into a direction to open. A numbered target ("TP 1", "TP2 ✅") is the index of a level, not a price.',
   '- A target or stop given in pips or points is a distance, not a price: return null for that field.',
   '- confidence is how sure you are that this message is a trade instruction and that you read it correctly: 1 only when every value you returned is written in the message in plain form.',
-  'Do not add commentary, markdown, or any text outside the JSON object.',
+  'Output format, restated because it is the only part of this brief with no second chance: one JSON object, unquoted, unescaped, unfenced, on its own.',
 ].join('\n');
 
 function numberValue(value) {
@@ -148,24 +150,98 @@ export function buildMessages(message, config = {}) {
 }
 
 /**
+ * Remove a markdown code fence, and the BOM, from a reply that was meant to be JSON.
+ *
+ * The fence is the model being polite: chat models are trained on answers that put code in a block, and the
+ * object inside is exactly what was asked for. Anything outside the block is the model's own framing and is
+ * discarded, because a sentence is never a price. A reply with an *opening* fence and no closing one is not
+ * repaired - that is a truncated answer, and truncation is where a field goes missing.
+ *
+ * Taking the block rather than letting it be found by the brace walk below is the point: `extractJsonObject`
+ * prefers the last object in a reply, so without this step an example the model waved at *after* its answer
+ * would outrank the answer. Inside the fence is what the model meant to send.
+ */
+function stripJsonFence(text) {
+  const trimmed = String(text ?? '').trim().replace(/^\uFEFF/, '');
+  if (!trimmed.includes('`')) return trimmed;
+  const closed = trimmed.match(/```[ \t]*(?:json|JSON|javascript|js)?[ \t]*\r?\n([\s\S]*?)\r?\n?[ \t]*```/);
+  if (closed) return closed[1].trim();
+  const opened = trimmed.match(/```[ \t]*(?:json|JSON|javascript|js)?[ \t]*\r?\n?([\s\S]*)$/);
+  if (opened && !/```/.test(opened[1])) return opened[1].trim();
+  return trimmed;
+}
+
+/**
+ * Every top-level `{...}` in the text, in order, with strings and escapes respected.
+ *
+ * Scanning by brace depth rather than "first brace to last brace" - which is what this used to do - is what
+ * makes the two shapes a chatty model produces readable: an example object shown before the answer, and a
+ * stray brace in the closing sentence. A depth walk finds the objects and ignores the manners, and a reply
+ * whose last object never closes is returned as the broken slice it is, so the caller can refuse it rather
+ * than parse half a trade.
+ */
+function topLevelObjects(text) {
+  const found = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === '{') {
+      if (depth === 0) start = index;
+      depth += 1;
+    } else if (char === '}') {
+      if (depth === 0) continue;
+      depth -= 1;
+      if (depth === 0 && start !== -1) {
+        found.push(text.slice(start, index + 1));
+        start = -1;
+      }
+    }
+  }
+  if (depth > 0 && start !== -1) found.push(text.slice(start));
+  return found;
+}
+
+const tryParseObject = (text) => {
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch { return null; }
+};
+
+/**
  * The JSON object inside whatever came back.
  *
- * Models wrap JSON in fences, prefix it with "Here is the object:", or trail it with a disclaimer, and a
- * strict `JSON.parse` on that is a refusal that looks like a model failure. So the outermost braces are
- * located and parsed, which is tolerant of the frame and still strict about the contents.
+ * A strict `JSON.parse` on a model reply is a refusal that looks like a model failure, and a refusal on this
+ * path costs somebody a trade they described correctly. So the frame comes off first - fence, byte-order
+ * mark, the sentence before the braces, the sentence after - and the contents are then parsed strictly. The
+ * answer is taken as the *last* object in the reply rather than the first, because a model that shows an
+ * example writes the answer after it. The one tolerance inside the braces is a trailing comma before `}` or
+ * `]`, which is a syntax slip that cannot change a number; nothing else is repaired, because the next step
+ * after being helpful about syntax is being helpful about prices, and that is the line this layer exists to
+ * hold.
  */
 export function extractJsonObject(content) {
-  const text = String(content ?? '').trim();
+  const text = stripJsonFence(content);
   if (!text) return null;
-  const direct = (() => { try { return JSON.parse(text); } catch { return null; } })();
-  if (direct && typeof direct === 'object') return direct;
-  const start = text.indexOf('{');
-  const end = text.lastIndexOf('}');
-  if (start === -1 || end <= start) return null;
-  try {
-    const parsed = JSON.parse(text.slice(start, end + 1));
-    return parsed && typeof parsed === 'object' ? parsed : null;
-  } catch { return null; }
+  const direct = tryParseObject(text);
+  if (direct) return direct;
+  const candidates = topLevelObjects(text);
+  for (let index = candidates.length - 1; index >= 0; index -= 1) {
+    const parsed = tryParseObject(candidates[index]) ?? tryParseObject(candidates[index].replace(/,\s*([}\]])/g, '$1'));
+    if (parsed) return parsed;
+  }
+  return null;
 }
 
 /** Every number the message itself states, after the same normalisation Layer 1 reads. */
@@ -237,15 +313,10 @@ export function validateExtraction(json, { rawMessage, config = {} } = {}) {
 }
 
 /**
- * One request, one answer, no exceptions thrown.
- *
- * `temperature: 0` because this is transcription, not composition. `response_format: json_object` is sent
- * because endpoints that support it stop writing prose, and dropped on a single retry when the provider says
- * it does not understand the parameter - a request that would otherwise 400 forever and leave the layer
- * silently switched off.
- */
-/**
  * Ask the model about one message, and come back with either its fields or a refusal.
+ *
+ * `temperature: 0` because this is transcription, not composition, and the request body is the same four keys
+ * the endpoint documents - no `response_format`, whose absence is explained at `llmRequest`.
  *
  * `gate` is the queue in `llm-gate.js`: when one is supplied the request is made through it, so a burst of
  * catch-up work cannot hold the endpoint away from a live capture. Without a gate (the manual save path, every
@@ -315,7 +386,7 @@ export async function llmParseSignal(message, input = {}) {
   return result;
 }
 
-async function readSignalWithModel(message, { config, fetchImpl = globalThis.fetch, logger, gate = null, priority = 'realtime' } = {}) {
+async function readSignalWithModel(message, { config, fetchImpl = globalThis.fetch, gate = null, priority = 'realtime' } = {}) {
   // `disabledReason` names variables and endpoints, which is admin-facing information; it is kept on
   // `technical` and never put on a sentence the trader reads.
   if (!config?.enabled) {
@@ -326,7 +397,10 @@ async function readSignalWithModel(message, { config, fetchImpl = globalThis.fet
       technical: describeTechnicalNote(config?.disabledReason || 'the AI reading assistant is not configured'),
     };
   }
-  const request = () => llmRequest(message, { config, fetchImpl, logger });
+  // No logger here on purpose: the one line per failure is written by `llmParseSignal` through
+  // `logReaderFailure`, which is also where the record the admin card reads is kept. A second copy in the
+  // request would only double the noise when the provider is down.
+  const request = () => llmRequest(message, { config, fetchImpl });
   if (!gate) return request();
   const slot = await gate.run(request, { priority });
   if (slot?.ok !== true) {
@@ -337,21 +411,37 @@ async function readSignalWithModel(message, { config, fetchImpl = globalThis.fet
   return slot.value;
 }
 
-async function llmRequest(message, { config, fetchImpl = globalThis.fetch, logger } = {}) {
+/**
+ * The call itself.
+ *
+ * There is deliberately no `response_format` in this body, and that is a fix rather than a simplification. The
+ * parameter asks the endpoint to enforce JSON for us, which sounds free until a model does not implement it:
+ * Groq answers that request with `HTTP 400 - Failed to validate JSON`, and the previous version of this file
+ * recovered from that by retrying without the parameter *when the error text named it*. Groq's text does not -
+ * it complains about the JSON, not about the key - so the retry never fired, every Layer 2 read in the fleet
+ * returned `http-error`, and every message the regex could not finish was written as "The platform could not
+ * fully read it" while the provider had in fact refused the envelope, not the reading. A format this code
+ * cannot predict the error text for is a format that fails silently and permanently.
+ *
+ * So the contract is the prompt plus the parser, and it is one-sided on purpose: we ask for an object, and we
+ * accept one wherever it is buried (`extractJsonObject` strips fences, prose and the model's own hedging).
+ * Nothing here can be rejected by a provider's idea of a valid request, which is the only guarantee worth
+ * having on a path where a refusal costs someone an entry.
+ */
+async function llmRequest(message, { config, fetchImpl = globalThis.fetch } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
-  const body = (withFormat) => JSON.stringify({
+  const payload = JSON.stringify({
     model: config.model,
     temperature: 0,
     max_tokens: 300,
-    ...(withFormat ? { response_format: { type: 'json_object' } } : {}),
     messages: buildMessages(message, config),
   });
-  const send = async (withFormat) => {
+  const send = async () => {
     const response = await fetchImpl(config.url, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${config.apiKey}` },
-      body: body(withFormat),
+      body: payload,
       signal: controller.signal,
     });
     const text = await response.text().catch(() => '');
@@ -359,11 +449,7 @@ async function llmRequest(message, { config, fetchImpl = globalThis.fetch, logge
   };
 
   try {
-    let result = await send(true);
-    if (!result.ok && result.status === 400 && /response_format/i.test(result.text)) {
-      logger?.warn?.(JSON.stringify({ level: 'warn', message: '[Parser] The AI endpoint rejected the JSON response format; retrying without it.' }));
-      result = await send(false);
-    }
+    const result = await send();
     if (!result.ok) {
       /* The status code and the provider's body are the only things that make this debuggable, and they are
          not things a trader can act on: the sentence says what happened to their signal, the detail goes to
