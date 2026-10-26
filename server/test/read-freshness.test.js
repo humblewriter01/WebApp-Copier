@@ -103,3 +103,11 @@ test('a closed support session stops streaming, not just stops reading', () => {
   assert.ok(index.includes('disconnectSupportSockets(sessionId);'), 'the admin route that ends a session drops its sockets');
   assert.ok(index.includes('disconnectSupportSockets(req.supportSessionId);'), 'and so does the exit a support session can perform on itself');
 });
+
+test('the read that refreshes the workspace also answers what the plan allows', () => {
+  // The banner and the note under a signal are two renderings of one question - can this trade right now - and
+  // the answer needs the plan. Without this the client would have to guess from the account list, which is how
+  // a free workspace and a workspace with no account end up described by the same sentence.
+  assert.match(index, /pool\.query\('SELECT subscription_status AS status,subscription_plan AS plan FROM users WHERE id=\$1', \[req\.userId\]\)/);
+  assert.match(index, /subscription: \{ status: subscription\.rows\[0\]\?\.status \|\| null, plan: subscription\.rows\[0\]\?\.plan \|\| null \}/);
+});

@@ -407,3 +407,39 @@ test('a market that has already run past the zone is refused, and the sentence s
   assert.match(result.message, /allows no drift at all/);
   assert.equal(orderCalls(trading).length, 0, 'nothing reaches the broker on the wrong side of the zone');
 });
+
+/* ------------------------------------------------- what a broker's answer looks like on the signal row */
+
+test('a rejection the broker explains in code becomes one sentence a trader can read, with the code kept beside it', async () => {
+  const pool = fakePool();
+  const trading = fakeTrading();
+  trading.createMarketOrder = async () => {
+    throw Object.assign(new Error('MetaAPI returned HTTP 502 (ECONNRESET) while the order was in flight: {"error":{"code":"upstream_reject","retcode":10006}}'), { status: 502 });
+  };
+  const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true });
+  const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.notEqual(result.status, 'executed', 'the order did not go out');
+
+  const mirror = pool.calls.find(({ sql }) => sql.includes('UPDATE signals SET status=$1,execution_note=$2,technical_note=COALESCE($3,technical_note)'));
+  assert.ok(mirror, 'the signal row is written through the mirror that keeps both halves');
+  const [, note, technical] = mirror.params;
+  assert.equal(note, 'The broker declined this order. Check your account and try again.', 'the card says what happened and what to do');
+  assert.equal(/HTTP|api\.groq|gpt-oss|stack|ECONN|retcode|\{|502/i.test(String(note)), false, 'and carries none of the machinery');
+  assert.match(String(technical), /HTTP 502|retcode|10006/, 'the provider\'s own answer is on the row, in the column only the admin panel reads');
+  assert.equal(/gsk_|sk-|Bearer [A-Za-z0-9]/.test(String(technical)), false, 'while a credential never is');
+
+  const settled = pool.calls.find(({ sql }) => sql.includes('UPDATE execution_jobs SET status=$1,error_message=$2'));
+  assert.match(String(settled.params[1]), /HTTP 502|retcode/, 'the job row keeps the raw reason too, which is where the admin history reads it from');
+});
+
+test('a skip the engine decides for itself is already written for a trader, and passes through untouched', async () => {
+  const pool = fakePool({ item: { account_state: 'STOPPED' } });
+  const trading = fakeTrading();
+  const engine = createExecutionEngine({ pool, trading, resolveToken: async () => 'fake-token', runtimeEnabled: true });
+  const result = await engine.processJob({ id: 'job-1', user_id: 'user-1' });
+  assert.equal(result.status, 'skipped');
+  const mirror = pool.calls.find(({ sql }) => sql.includes('UPDATE signals SET status=$1,execution_note=$2,technical_note=COALESCE($3,technical_note)'));
+  assert.equal(mirror.params[1], 'The selected MetaAPI account is not deployed.', 'the sentence the writer chose is kept word for word');
+  assert.equal(mirror.params[2], null, 'and nothing is hidden away, because there was nothing technical to hide');
+  assert.equal(orderCalls(trading).length, 0, 'and the account that is not deployed was never asked');
+});

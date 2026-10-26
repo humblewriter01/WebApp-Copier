@@ -13,6 +13,7 @@ import { interpretCancelResponse, marketSlippage, pendingOrderOutcome, pendingOr
 import { planScaleOutLevels, resolveCloseVolume, selectTarget, targetReached } from './scale-out.js';
 import { isPaidSubscriber, PAID_STATUSES } from './plan-limits.js';
 import { signalStatusForJobStatus } from './signal-outcome.js';
+import { FRIENDLY_NOTES, friendlySignalNote } from './signal-wording.js';
 
 const MAX_SIGNAL_AGE_MS = 120_000;
 const UTC_DAY_MS = 24 * 60 * 60 * 1000;
@@ -443,7 +444,10 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
      life because a timestamp outlived its status is the worst kind of bug to discover on a live account. */
   const JOB_SETTLE_SQL = `UPDATE execution_jobs SET status=$1,error_message=$2,locked_at=NULL,next_attempt_at=NULL,updated_at=NOW() WHERE id=$3 AND user_id=$4`;
   const JOB_DEFER_SQL = `UPDATE execution_jobs SET status='queued',error_message=$2,locked_at=NULL,next_attempt_at=NOW()+($3::text || ' milliseconds')::interval,updated_at=NOW() WHERE id=$1 AND user_id=$4`;
-  const SIGNAL_MIRROR_SQL = `UPDATE signals SET status=$1,execution_note=$2 WHERE id=(SELECT signal_id FROM execution_jobs WHERE id=$3 AND user_id=$4)`;
+  /* The signal row is what a user reads and the job row is what the admin history reads, so the mirror carries
+     two sentences: one a trader can act on, and the provider's own words in a column no user-facing SELECT
+     reads. A broker response is written for whoever has to debug it, which is why it cannot be shown as-is. */
+  const SIGNAL_MIRROR_SQL = `UPDATE signals SET status=$1,execution_note=$2,technical_note=COALESCE($3,technical_note) WHERE id=(SELECT signal_id FROM execution_jobs WHERE id=$4 AND user_id=$5)`;
   /* The note an account carries when it cannot trade at all. It lives on the account and not on the
      signal because the fault is not the signal's: every workspace row would otherwise repeat the same
      sentence, and the one place a user goes to look at a trading account is where the answer belongs. */
@@ -455,9 +459,17 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
     // The job table and the signal table describe one event in different words: a skipped job is a
     // signal the workspace reads as unexecuted, and the reason travels with it so the panel never
     // has to guess why nothing reached the broker.
+    /* Which endings put a sentence on the row. `rejected` is in the list because a declined order is the one
+       outcome a reader absolutely has to be told about, and the provider's words for it - a retcode, a numeric
+       code, an HTTP status when the trading server was behind a proxy - are exactly what the filter below
+       exists to turn into "the broker declined this order". */
+    const rawNote = note ? safeText(note) : (['skipped', 'expired', 'unknown', 'failed', 'rejected'].includes(status) ? safeText(errorMessage) || null : null);
+    // An ending with nothing to say stays blank: a signal that reached the broker must not inherit the fallback
+    // sentence as though something had gone wrong with reading it.
+    const shown = rawNote ? friendlySignalNote(rawNote, { fallback: FRIENDLY_NOTES.generic }) : { text: null, original: null };
     await pool.query(
       SIGNAL_MIRROR_SQL,
-      [signalStatusForJobStatus(status), note ? safeText(note) : (['skipped', 'expired', 'unknown', 'failed'].includes(status) ? safeText(errorMessage) || null : null), jobId, userId],
+      [signalStatusForJobStatus(status), shown.text || null, shown.original, jobId, userId],
     );
   }
 
@@ -469,7 +481,7 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
   async function deferJob(job, { delayMs, message }) {
     const delay = String(Math.max(0, Math.round(Number(delayMs) || 0)));
     await pool.query(JOB_DEFER_SQL, [job.id, safeText(message), delay, job.user_id]);
-    await pool.query(SIGNAL_MIRROR_SQL, [signalStatusForJobStatus('queued'), null, job.id, job.user_id]);
+    await pool.query(SIGNAL_MIRROR_SQL, [signalStatusForJobStatus('queued'), null, null, job.id, job.user_id]);
   }
 
   /**
@@ -1728,7 +1740,8 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
     // told, best-effort and in that order: a signal whose row moved while the job did not is a stale status,
     // which is a smaller wrong than a trade written as expired that the user's own row still calls pending.
     if (trade.signal_id) {
-      await pool.query('UPDATE signals SET status=COALESCE($2,status),execution_note=COALESCE($3,execution_note) WHERE id=$1', [trade.signal_id, signalStatus, message]).catch(() => {});
+      const shown = message ? friendlySignalNote(message, { fallback: FRIENDLY_NOTES.generic }) : { text: null, original: null };
+      await pool.query('UPDATE signals SET status=COALESCE($2,status),execution_note=COALESCE($3,execution_note),technical_note=COALESCE($4,technical_note) WHERE id=$1', [trade.signal_id, signalStatus, shown.text || null, shown.original || message]).catch(() => {});
     }
     if (trade.execution_job_id) {
       await pool.query('UPDATE execution_jobs SET status=$2,error_message=COALESCE($3,error_message),updated_at=NOW() WHERE id=$1 AND status=$4', [trade.execution_job_id, status, message, 'pending']).catch(() => {});

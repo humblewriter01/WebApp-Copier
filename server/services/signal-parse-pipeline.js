@@ -22,6 +22,7 @@
 
 import { parseSignal } from './signal-parser.js';
 import { llmConfig, needsLayer2, llmParseSignal } from './signal-llm.js';
+import { describeTechnicalNote, friendlySignalNote } from './signal-wording.js';
 
 /** The legs a model may supply, and where each one lands on the row. */
 const GAPS = [
@@ -117,12 +118,23 @@ export function mergeGaps(layer1, fields, { pipValues }) {
  * authority, and for a signal-shaped message when the model is switched off - because in that case the
  * channel did write a signal and nobody read it, which is worth a look rather than a shrug.
  */
+/**
+ * Every sentence the pipeline can put on a row goes through here, so "user-facing" is a property of the write
+ * path rather than a hope about what each writer said. Clean copy is kept word for word; copy that carries a
+ * status code, a payload, a model name or a stack frame is replaced by the friendly sentence for its family,
+ * and what it actually said is returned beside it for `signals.technical_note`.
+ */
+function reviewSentence(reason, technical = null) {
+  const note = friendlySignalNote(reason, { fallback: 'This signal was saved for review and is not eligible for automatic execution.' });
+  return { reason: note.text, technical: describeTechnicalNote(note.replaced ? note.original : (note.original || technical)) };
+}
+
 export async function parseSignalTwoLayer(message, { source = 'telegram', config, fetchImpl, logger, gate = null, priority = 'realtime' } = {}) {
   const layer1 = parseSignal(message);
   const base = {
     parsed: layer1,
     provenance: { llmUsed: false, parsedBy: 'regex', confidence: null, filled: [], dropped: [] },
-    review: { required: false, reason: null, code: null },
+    review: { required: false, reason: null, code: null, technical: null },
     llm: null,
   };
   // A note the user typed for their own review is not a channel instruction, and sending it to a model would
@@ -138,8 +150,8 @@ export async function parseSignalTwoLayer(message, { source = 'telegram', config
       review: {
         required: true,
         code: 'llm-disabled',
-        reason: layer1.parseError
-          || 'Part of this signal was written in a form the built-in reader could not finish, and the AI reading assistant is switched off.',
+        ...reviewSentence(layer1.parseError
+          || 'Part of this signal was written in a form the built-in reader could not finish, and the AI reading assistant is switched off.'),
       },
     };
   }
@@ -156,7 +168,7 @@ export async function parseSignalTwoLayer(message, { source = 'telegram', config
       review: {
         required: true,
         code: result.code || 'refused',
-        reason: result.reason || 'The AI reader could not finish this signal, so it was saved for review.',
+        ...reviewSentence(result.reason || 'The AI reader could not finish this signal, so it was saved for review.', result.technical),
       },
       llm: result,
     };
@@ -169,16 +181,16 @@ export async function parseSignalTwoLayer(message, { source = 'telegram', config
   const outcome = {
     parsed: merged,
     provenance: { ...provenance, parsedBy: filled.length ? 'llm' : 'regex', confidence: result.confidence ?? null, filled, dropped },
-    review: { required: false, reason: null, code: null },
+    review: { required: false, reason: null, code: null, technical: null },
     llm: result,
   };
   if (!authority.has) {
     outcome.review = {
       required: true,
       code: 'llm-only-reading',
-      reason: filled.length
+      ...reviewSentence(filled.length
         ? 'Only the AI reading assistant could make sense of this message, so it was saved for review and will not be traded automatically.'
-        : (result.reason || layer1.parseError || 'The AI reader could not add anything usable to this message, so it was saved for review.'),
+        : (result.reason || layer1.parseError || 'The AI reader could not add anything usable to this message, so it was saved for review.'), result.technical),
     };
   } else if (dropped.length) {
     // The model produced something we refused to use, on a leg that is therefore still incomplete. Saying so
@@ -186,10 +198,10 @@ export async function parseSignalTwoLayer(message, { source = 'telegram', config
     outcome.review = {
       required: true,
       code: 'llm-discarded',
-      reason: `The AI reader's answer was not usable (${dropped[0].because}), so this signal was saved for review.`,
+      ...reviewSentence(`The AI reader's answer was not usable (${dropped[0].because}), so this signal was saved for review.`),
     };
   } else if (!complete && merged.blockers?.length) {
-    outcome.review = { required: true, code: 'still-incomplete', reason: merged.parseError };
+    outcome.review = { required: true, code: 'still-incomplete', ...reviewSentence(merged.parseError) };
   }
   return outcome;
 }

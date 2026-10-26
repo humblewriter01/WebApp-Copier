@@ -4,6 +4,12 @@ import { readFileSync } from 'node:fs';
 import {
   decideSignalOutcome,
   signalStatusForJobStatus,
+  overlayLiveBlocker,
+  EXECUTION_BLOCKER_NOTES,
+  AUTO_TRADING_OFF_NOTE,
+  PLAN_NO_EXECUTION_NOTE,
+  NO_ACCOUNT_NOTE,
+  ACCOUNT_NOT_READY_NOTE,
   SIGNAL_STATUSES,
   UPGRADE_REQUIRED_NOTE,
 } from '../services/signal-outcome.js';
@@ -44,16 +50,74 @@ test('the capture path asks the database for the switch on every message, and re
      row, not from anything held in a variable between calls. A cache here would be defensible design (a
      setting that changes mid-signal is its own hazard), but it does not exist, and this pin is what keeps
      somebody from adding one quietly. */
-  const readAt = saveSignalBody.indexOf('SELECT s.auto_trading_enabled AS autoTrading');
-  assert.ok(readAt > 0, 'the workspace switch is read from `settings` inside saveSignal');
+  const readAt = saveSignalBody.indexOf('await pool.query(SIGNAL_OUTCOME_CONTEXT_SQL, [userId])');
+  assert.ok(readAt > 0, 'the workspace switch is read from `settings` inside saveSignal, through the one statement built for it');
   assert.ok(readAt < saveSignalBody.indexOf('decideSignalOutcome({'), 'after the row is stored, before the outcome is decided');
   assert.match(saveSignalBody, /autoTradingEnabled: context\.autoTrading === true/, 'and the decision is built from that read');
   assert.match(saveSignalBody, /accountSelected: Boolean\(context\.executionAccountId\)/, 'as is whether an account is selected at all');
   assert.equal(/let (cached)?autoTrading\b/.test(index), false, 'no module-level copy of the switch exists to go stale');
+  // The statement itself lives beside the decision it feeds, and the routes that *display* signals read the
+  // same one: a banner and a row that disagree about the account are only possible if they ask separately.
+  const outcomeService = readFileSync(new URL('../services/signal-outcome.js', import.meta.url), 'utf8');
+  assert.match(outcomeService, /export const SIGNAL_OUTCOME_CONTEXT_SQL = `SELECT s\.auto_trading_enabled AS autoTrading/);
+  assert.equal((index.match(/pool\.query\(SIGNAL_OUTCOME_CONTEXT_SQL/g) || []).length, 2, 'queried twice: the capture, and the read helper every list route goes through');
   /* The one auto-trading value that IS read once, at boot, is the deployment's runtime flag - and it is used
      as itself, never as the user\'s switch. Conflating the two is how "it is on but nothing trades" starts. */
   assert.match(saveSignalBody, /runtimeEnabled: autoTradingRuntimeEnabled/, 'the runtime flag is passed separately');
   assert.equal(/runtimeEnabled: settings\.autoTrading|autoTradingEnabled: autoTradingRuntimeEnabled/.test(index), false);
+});
+
+test('the four states of the workspace produce exactly the four sentences, in this order', () => {
+  /* A switch that is on is not a promise that anything will trade, and the row has to say which of the four
+     states it is in. Each sentence is pinned verbatim: these are the words a trader reads on a phone, and the
+     one thing that must never happen is a row explaining a condition that is not the one in front of them. */
+  const cases = [
+    {
+      name: 'Auto-Trading actually off',
+      input: { autoTradingEnabled: false },
+      note: 'Auto-Trading is off, so this signal was saved for review only.',
+      status: SIGNAL_STATUSES.received,
+    },
+    {
+      name: 'Free plan, no paid execution',
+      input: { autoTradingEnabled: true, subscriptionStatus: 'free' },
+      note: 'Auto-Trading is on, but your plan does not include automatic execution. Upgrade to execute signals.',
+      status: SIGNAL_STATUSES.unexecuted,
+    },
+    {
+      name: 'Paid plan, no trading account connected',
+      input: { autoTradingEnabled: true, subscriptionStatus: 'active', accountSelected: false, accountState: undefined },
+      note: 'Auto-Trading is on, but no trading account is connected. Connect one to execute signals.',
+      status: SIGNAL_STATUSES.unexecuted,
+    },
+    {
+      name: 'Everything set',
+      input: { autoTradingEnabled: true, subscriptionStatus: 'active', accountSelected: true, accountState: 'DEPLOYED' },
+      note: null,
+      status: SIGNAL_STATUSES.queued,
+    },
+  ];
+  for (const entry of cases) {
+    const outcome = decideSignalOutcome({ executionReady: true, runtimeEnabled: true, paused: false, ...entry.input });
+    assert.equal(outcome.note, entry.note, `${entry.name} says exactly its own sentence`);
+    assert.equal(outcome.status, entry.status, `${entry.name} is recorded as ${entry.status}`);
+    assert.equal(outcome.queue, entry.status === SIGNAL_STATUSES.queued, `${entry.name} queues only when nothing blocks it`);
+  }
+});
+
+test('the account and plan sentences win over the switch sentence, because that is what is actually blocking', () => {
+  // The bug this pins: a row that read "Auto-Trading is off" beside a banner reading "Auto-Trading is ON, but
+  // no trading account is connected". `Auto-Trading is off` is only ever the sentence for a switch that is off;
+  // with the switch on, the row must name the plan or the account.
+  const on = { executionReady: true, autoTradingEnabled: true, runtimeEnabled: true, paused: false };
+  assert.equal(decideSignalOutcome({ ...on, subscriptionStatus: 'free', accountSelected: false }).note, PLAN_NO_EXECUTION_NOTE,
+    'an unpaid workspace is told to upgrade before it is told to connect an account, because paying is the step that makes an account possible');
+  assert.equal(decideSignalOutcome({ ...on, subscriptionStatus: 'active', accountSelected: false }).note, NO_ACCOUNT_NOTE);
+  assert.equal(decideSignalOutcome({ ...on, subscriptionStatus: 'active', accountSelected: true, accountState: 'STOPPED' }).note, ACCOUNT_NOT_READY_NOTE);
+  assert.equal(/Auto-Trading is off/.test(decideSignalOutcome({ ...on, accountSelected: false }).note), false,
+    'and the switch sentence never appears for a switch that is on');
+  assert.equal(decideSignalOutcome({ ...on, autoTradingEnabled: undefined }).note, AUTO_TRADING_OFF_NOTE,
+    'a workspace with no settings row at all is treated as off, which is what the column default says');
 });
 
 test('a free workspace with no trading account is an unexecuted signal, never a missing one', () => {
@@ -71,14 +135,14 @@ test('a free workspace with no trading account is an unexecuted signal, never a 
   assert.equal(outcome.upgradeRequired, true);
   assert.equal(outcome.note, UPGRADE_REQUIRED_NOTE);
   // The sentence has to name the action the user can take, not just refuse them.
-  assert.match(outcome.note, /Upgrade to Starter or higher/);
-  assert.match(outcome.note, /saved for review/);
+  assert.match(outcome.note, /Upgrade to execute signals/);
+  assert.match(outcome.note, /Auto-Trading is on/, 'and it says so from a switch that is on, so it cannot be misread as a disabled toggle');
 });
 
 test('every condition that stops execution explains itself in the note', () => {
   const cases = [
-    [{ accountSelected: false }, /No trading account is selected/],
-    [{ accountState: 'STOPPED' }, /not deployed/],
+    [{ accountSelected: false }, /no trading account is connected/],
+    [{ accountState: 'STOPPED' }, /not connected yet/],
     [{ runtimeEnabled: false }, /unavailable on this service/],
     [{ paused: true }, /paused by Signal Desk/],
     [{ autoTradingEnabled: false }, /Auto-Trading is off/],
@@ -89,6 +153,26 @@ test('every condition that stops execution explains itself in the note', () => {
     assert.equal(outcome.queue, false);
     assert.match(outcome.note, pattern);
   }
+});
+
+test('a blocked row is re-read live when it is displayed, and a note from anywhere else is left alone', () => {
+  const blocked = {
+    source: 'telegram', telegramMessageId: '41', executionReady: true,
+    status: SIGNAL_STATUSES.unexecuted, executionNote: AUTO_TRADING_OFF_NOTE,
+  };
+  const nowReady = { autoTradingEnabled: true, runtimeEnabled: true, paused: false, subscriptionStatus: 'active', accountSelected: true, accountState: 'DEPLOYED' };
+  assert.equal(overlayLiveBlocker(blocked, nowReady).executionNote, null, 'the row stops accusing a switch that is on once nothing blocks it');
+  assert.equal(overlayLiveBlocker(blocked, nowReady).status, SIGNAL_STATUSES.unexecuted, 'and only the sentence changes: whether an order went out is a fact about the past');
+  assert.equal(overlayLiveBlocker(blocked, { ...nowReady, accountSelected: false }).executionNote, NO_ACCOUNT_NOTE, 'with an account still missing it says so instead');
+  const mirrored = { ...blocked, executionNote: 'The broker declined this order. Check your account and try again.' };
+  assert.equal(overlayLiveBlocker(mirrored, { ...nowReady, accountSelected: false }), mirrored, 'a note the engine wrote about a real order is nobody else\'s to rewrite');
+  const unready = { source: 'telegram', telegramMessageId: '42', executionReady: false, status: SIGNAL_STATUSES.unparsed, executionNote: null };
+  assert.equal(overlayLiveBlocker(unready, nowReady), unready, 'a row nothing could be executed from has no execution state to report');
+  const handWritten = { source: 'manual', executionReady: true, status: SIGNAL_STATUSES.received, executionNote: null };
+  assert.equal(overlayLiveBlocker(handWritten, nowReady), handWritten, 'and a note a person typed for themselves is never annotated');
+  assert.deepEqual(overlayLiveBlocker({ ...blocked, executionNote: null }, { ...nowReady, accountSelected: false }), { ...blocked, executionNote: null },
+    'a row that was never given a blocker sentence is not given one on the way past the reader either');
+  assert.ok(EXECUTION_BLOCKER_NOTES.every((note) => typeof note === 'string' && note.length > 20), 'the registry the overlay keys on is made of sentences, not codes');
 });
 
 test('only a fully eligible Telegram signal is queued, and a hand-written note never is', () => {
@@ -183,7 +267,26 @@ test('the safety nets are read before the row is written, and the decision is no
 test('the outcome is read back by every surface that lists signals', () => {
   assert.equal((index.match(/execution_note AS "executionNote"/g) || []).length >= 3, true, 'signals list, dashboard and the save path all carry the note');
   assert.match(index, /const queued = outcome\.queue === true|if \(outcome\.queue\) \{/);
-  assert.match(index, /UPDATE signals SET status=\$2,execution_note=\$3 WHERE id=\$1 RETURNING status,execution_note AS "executionNote"/);
+  assert.match(index, /UPDATE signals SET status=\$2,execution_note=\$3,technical_note=COALESCE\(\$4,technical_note\) WHERE id=\$1 RETURNING status,execution_note AS "executionNote"/);
+});
+
+test('the technical half of a row is written for the admin panel and read by nobody else', () => {
+  /* `signals.technical_note` exists so that a status code, a provider body or a stack frame can be kept without
+     ever being the sentence a trader reads. That is only true while no user-facing SELECT picks it up, so the
+     boundary is a test rather than a habit: the admin column list has it, the capture statements write it, and
+     the routes a browser polls - plus the payload pushed over the socket - do not read it. */
+  assert.ok(index.includes('s.technical_note AS "technicalNote"'), 'the admin signal list reads it, which is the point of the column');
+  assert.match(index, /entry_range,technical_note\)\n\s+VALUES\(\$1,\$2,\$3,\$4,\$5,\$6,\$7,\$8,\$9,\$10,\$11,\$12,\$13,\$14,\$15,\$16::jsonb,\$17,\$18,\$19,\$20,\$21,\$22,\$23,\$24,\$25,\$26::jsonb,\$27\)/, 'the capture writes it');
+  const userReads = ["app.get('/api/signals'", "app.get('/api/dashboard'", "const dashboardColumns"];
+  for (const marker of userReads) {
+    const at = index.indexOf(marker);
+    if (at === -1) continue;
+    const block = index.slice(at, index.indexOf("res.set('Cache-Control'", at));
+    assert.equal(block.includes('technical_note'), false, `${marker} never selects the technical half`);
+  }
+  assert.equal((index.match(/technical_note AS "technicalNote"/g) || []).length, 1, 'one SELECT in the whole server reads it back, and it is the admin one');
+  assert.match(index, /io\.to\(`user:\$\{userId\}`\)\.emit\('signal:received', signal\);/, 'the socket pushes the object the capture RETURNING produced');
+  assert.equal(/RETURNING[^']*technical_note/.test(index), false, 'and no RETURNING list of a capture statement carries it, so nothing pushed or POSTed can contain it');
 });
 
 test('a skipped job is an unexecuted signal, and a trade clears the stale reason', () => {
@@ -192,7 +295,8 @@ test('a skipped job is an unexecuted signal, and a trade clears the stale reason
   assert.equal(signalStatusForJobStatus('unknown'), SIGNAL_STATUSES.unknown);
   assert.equal(signalStatusForJobStatus('executed'), 'executed');
   assert.equal(signalStatusForJobStatus(undefined), SIGNAL_STATUSES.received);
-  assert.match(engineSource, /UPDATE signals SET status=\$1,execution_note=\$2 WHERE id=\(SELECT signal_id FROM execution_jobs WHERE id=\$3 AND user_id=\$4\)/);
+  assert.match(engineSource, /UPDATE signals SET status=\$1,execution_note=\$2,technical_note=COALESCE\(\$3,technical_note\) WHERE id=\(SELECT signal_id FROM execution_jobs WHERE id=\$4 AND user_id=\$5\)/,
+    'and the mirror that moves the status carries both halves of the reason');
 });
 
 const baseItem = {
@@ -282,9 +386,9 @@ test('the zone a message published is stored beside the bound the row was credit
      has run through the range, and the row that has to show what was offered - and both read the stored value
      rather than re-parsing the message. So the write is pinned here: a row that lost its zone would quietly
      go back to trading a dead setup as a bargain. */
-  assert.match(saveSignalBody, /is_scalping,entry_range\)/, 'the INSERT carries the column');
-  assert.match(saveSignalBody, /\$26::jsonb/, 'as jsonb, like the target ladder beside it');
-  assert.match(saveSignalBody, /entryRangeValue\(parsed\)\]/, 'from the parse, not from a re-read of the message');
+  assert.match(saveSignalBody, /is_scalping,entry_range,technical_note\)/, 'the INSERT carries the column');
+  assert.match(saveSignalBody, /\$26::jsonb,\$27/, 'as jsonb, like the target ladder beside it, with the admin-only half last');
+  assert.match(saveSignalBody, /entryRangeValue\(parsed\),/, 'from the parse, not from a re-read of the message');
   assert.match(saveSignalBody, /entry_range AS "entryRange"/, 'and the row read back has it, so the client sees the row that was written');
 
   const helper = section(index, 'function entryRangeValue(parsed) {', '\nasync function saveSignal(');

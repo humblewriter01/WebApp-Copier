@@ -63,7 +63,11 @@ export const RECENT_ERRORS_CTE = `recent AS (
   WHERE m.status IN ('failed','unknown') AND m.error_message IS NOT NULL AND m.error_message <> ''
     AND m.created_at >= NOW() - ($1::int * INTERVAL '1 hour')
   UNION ALL
-  SELECT 'telegram_parse',s.created_at,s.status,s.parse_error,s.symbol,s.side,NULL,s.user_id,u.email,u.name
+  -- The list is the operator's, so it leads with what the row was actually told: technical_note holds the status
+  -- code or provider sentence the card is not allowed to carry, and the friendly sentence is the fallback for a
+  -- row with no technical half. The condition stays parse_error, which is what a row the parser filed means, and
+  -- is also what "Clear parsing errors" clears.
+  SELECT 'telegram_parse',s.created_at,s.status,COALESCE(NULLIF(s.technical_note,''),s.parse_error),s.symbol,s.side,NULL,s.user_id,u.email,u.name
   FROM signals s JOIN users u ON u.id=s.user_id
   WHERE s.parse_error IS NOT NULL AND s.parse_error <> ''
     AND s.created_at >= NOW() - ($1::int * INTERVAL '1 hour')
@@ -92,7 +96,9 @@ FROM recent GROUP BY kind`;
  * captured message itself is never deleted either, so the parse can be re-run from the original text.
  */
 export function buildParseErrorClear() {
-  return { sql: "UPDATE signals SET parse_error=NULL WHERE parse_error IS NOT NULL AND parse_error <> ''", params: [] };
+  // The raw half goes with the sentence it explains: clearing one and leaving the other would keep a
+  // status code on a row the panel has already been told to stop complaining about.
+  return { sql: "UPDATE signals SET parse_error=NULL,technical_note=NULL WHERE parse_error IS NOT NULL AND parse_error <> ''", params: [] };
 }
 
 export const EXECUTION_STATE_SELECT = `SELECT
@@ -282,6 +288,10 @@ export function buildHealthChecks({ killSwitch, runtimeEnabled, queue, counts, t
         ? `Layer 2 asks ${llm.model || 'the configured model'} at ${llm.host || 'the configured endpoint'} when the built-in reader cannot finish a signal.`
           + ` ${Number(llm.maxConcurrent || 0)} request${Number(llm.maxConcurrent || 1) === 1 ? '' : 's'} at a time, ${Number(llm.active || 0)} in flight, ${waiting} waiting.`
           + (gated > 0 ? ` ${gated} replayed message${gated === 1 ? '' : 's'} left for review because the queue was full.` : '')
+          // The sentence a trader was not shown, kept here instead: same incident, right audience.
+          + (llm.lastFailure?.technical
+            ? ` Last failure${llm.lastFailure.code ? ` (${llm.lastFailure.code})` : ''} at ${llm.lastFailure.at || 'an unknown time'}: ${llm.lastFailure.technical}`
+            : '')
         : `The fallback layer is switched off (${llm.disabledReason || 'no LLM_API_KEY set'}), so every message is read by the built-in parser alone and anything it cannot finish is saved for review.`,
     });
   }
@@ -371,7 +381,9 @@ export function createSystemHealthService({ pool, controls, runtimeEnabled = fal
        cannot answer is reported as no section at all, never as a healthy one. */
     let llmHealth = null;
     if (typeof llm === 'function') {
-      try { llmHealth = llm() || null; } catch { llmHealth = null; }
+      /* Awaited through a resolved promise so a provider that has to look something up - the last failure this
+         process recorded, for instance - is as simple to write as one that returns a constant. */
+      try { llmHealth = (await Promise.resolve(llm())) || null; } catch { llmHealth = null; }
     }
 
     // One object feeds both the payload and the checks, so the sentence next to the toggle can

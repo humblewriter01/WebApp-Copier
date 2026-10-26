@@ -158,7 +158,10 @@ test('a slot is released when a request throws, so one bad call cannot wedge the
   const failed = await gate.run(async () => { throw new Error('socket hang up'); });
   assert.equal(failed.ok, false, 'the failure comes back as a refusal rather than a rejection');
   assert.equal(failed.code, 'reader-failed');
-  assert.match(failed.reason, /socket hang up/, 'with the words the pipeline writes onto the row');
+  assert.equal(failed.reason, 'This signal was saved for review. The platform could not fully read it.',
+    'with the sentence the row may show - a thrown exception is an error name and a file path, and that is not a thing a trader can read off a signal card');
+  assert.match(failed.technical, /socket hang up/, 'and the exception text travels on the admin-only half, so nothing is lost');
+  assert.equal(/HTTP|socket hang|\{|at .*:\d+:\d+/.test(failed.reason), false, 'the user-facing sentence carries no internals');
   assert.equal(failed.error instanceof Error, true, 'and the error itself travels with it, for the log');
   const next = await gate.run(async () => 'ran');
   assert.equal(next.value, 'ran', 'and the next message is still served');
