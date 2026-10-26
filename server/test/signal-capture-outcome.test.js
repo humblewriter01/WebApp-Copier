@@ -346,7 +346,8 @@ test('the technical half of a row is written for the admin panel and read by nob
      boundary is a test rather than a habit: the admin column list has it, the capture statements write it, and
      the routes a browser polls - plus the payload pushed over the socket - do not read it. */
   assert.ok(index.includes('s.technical_note AS "technicalNote"'), 'the admin signal list reads it, which is the point of the column');
-  assert.match(index, /entry_range,technical_note\)\n\s+VALUES\(\$1,\$2,\$3,\$4,\$5,\$6,\$7,\$8,\$9,\$10,\$11,\$12,\$13,\$14,\$15,\$16::jsonb,\$17,\$18,\$19,\$20,\$21,\$22,\$23,\$24,\$25,\$26::jsonb,\$27\)/, 'the capture writes it');
+  assert.match(index, /entry_range,technical_note,sent_at\)\n\s+VALUES\(\$1,\$2,\$3,\$4,\$5,\$6,\$7,\$8,\$9,\$10,\$11,\$12,\$13,\$14,\$15,\$16::jsonb,\$17,\$18,\$19,\$20,\$21,\$22,\$23,\$24,\$25,\$26::jsonb,\$27,\$28::timestamptz\)/, 'the capture writes it, and the channel clock rides along in the same statement');
+  assert.match(index, /channel\.sentAt \? new Date\(channel\.sentAt\) : null\],/, 'the bound value is the time the channel posted, and a source without one stores NULL rather than "just now"');
   const userReads = ["app.get('/api/signals'", "app.get('/api/dashboard'", "const dashboardColumns"];
   for (const marker of userReads) {
     const at = index.indexOf(marker);
@@ -456,7 +457,7 @@ test('the zone a message published is stored beside the bound the row was credit
      has run through the range, and the row that has to show what was offered - and both read the stored value
      rather than re-parsing the message. So the write is pinned here: a row that lost its zone would quietly
      go back to trading a dead setup as a bargain. */
-  assert.match(saveSignalBody, /is_scalping,entry_range,technical_note\)/, 'the INSERT carries the column');
+  assert.match(saveSignalBody, /is_scalping,entry_range,technical_note,sent_at\)/, 'the INSERT carries the column');
   assert.match(saveSignalBody, /\$26::jsonb,\$27/, 'as jsonb, like the target ladder beside it, with the admin-only half last');
   assert.match(saveSignalBody, /entryRangeValue\(parsed\),/, 'from the parse, not from a re-read of the message');
   assert.match(saveSignalBody, /entry_range AS "entryRange"/, 'and the row read back has it, so the client sees the row that was written');
@@ -465,4 +466,79 @@ test('the zone a message published is stored beside the bound the row was credit
   assert.match(helper, /entryRangeBounds\(parsed\?\.entryRange\)/, 'normalised through the same reader the execution engine uses');
   assert.match(helper, /JSON\.stringify\(bounds\)/, 'stored as the two bounds');
   assert.match(helper, /return bounds \? JSON\.stringify\(bounds\) : null/, 'and NULL for a message that named a single price');
+});
+
+/* ------------------------------------------------------------------- the channel's own clock ------------------------------------------------------
+
+   `signals.created_at` is the moment we wrote the row, and nothing else. As long as that was the only
+   timestamp, two very different failures looked identical in the database and identical in the logs - a
+   channel that had simply not posted, and a session that was connected, "listening", and deaf - and the
+   second one was invisible until someone watched a dashboard. Storing the Telegram send time is what makes
+   the difference measurable after the fact; ageing the execution guard off it is what stops a five-minute-late
+   entry being traded as though it had just been posted.
+
+   ------------------------------------------------------------------------------------------------------------------------------------------ */
+
+test('a late capture is stored as late, and the execution guard reads the channel clock rather than ours', () => {
+  const schema = readFileSync(new URL('../db.js', import.meta.url), 'utf8');
+  assert.match(schema, /ALTER TABLE signals ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ;/,
+    'the column is added idempotently, so an existing workspace gains it on the next boot without a migration step');
+  assert.equal(/ALTER TABLE signals ADD COLUMN IF NOT EXISTS sent_at[^;]*;[^;]*ALTER TABLE signals ADD COLUMN IF NOT EXISTS sent_at/.test(schema), false,
+    'once, in one statement');
+
+  assert.match(saveSignalBody, /sent_at\)/, 'the capture writes it');
+  assert.match(saveSignalBody, /channel\.sentAt \? new Date\(channel\.sentAt\) : null/,
+    'from the update, or NULL when the source has no send time - never from the wall clock, which would defeat the column');
+
+  // The bound that decides whether a signal is still tradable is the one place this changes behaviour, and it
+  // changes it in the direction of refusing: a row written just now about a price from six minutes ago is stale.
+  assert.match(engineSource, /COALESCE\(s\.sent_at, s\.created_at\) AS signal_created_at/,
+    'the claim query hands the engine the posting time, falling back to the write time for rows written before the column existed');
+  assert.match(engineSource, /now\(\) - createdAt > MAX_SIGNAL_AGE_MS/,
+    'and that is the value the age guard is measured against');
+  const ageGuardAt = engineSource.indexOf('const createdAt = new Date(item.signal_created_at).getTime();');
+  assert.ok(ageGuardAt > 0, 'the guard is where the engine reads the claimed row');
+  const ageGuard = engineSource.slice(ageGuardAt, ageGuardAt + 420);
+  assert.match(ageGuard, /now\(\) - createdAt > MAX_SIGNAL_AGE_MS/,
+    'the guard consumes exactly that column, so a rebuild of either half without the other breaks a test');
+
+  // And the listener is what computes it, on every path - live push and replay alike - so a catch-up cannot
+  // smuggle an old message in wearing a fresh timestamp.
+  assert.match(listenerSource, /const sentAtMs = Number\(message\?\.date\) \* 1000/, 'the Telegram date is read in seconds and converted once');
+  assert.match(listenerSource, /saveSignal\(userId, text, \{/, 'through the single storage path both routes share');
+  assert.match(listenerSource, /sentAt, delayMs/, 'with the send time and the measured lateness riding along together');
+});
+
+/* ------------------------------------------------------------- the watchdog that proves the socket ------------------------------------------------
+
+   `connected === true` and a handler in GramJS's own list are both facts about objects in memory. They were the
+   only facts the product had, which meant a session that stayed open and stopped receiving looked identical to a
+   quiet channel - for as long as it took someone to notice that the signals had stopped. The sweep below is what
+   makes the difference an event rather than an observation: it asks each silent session a bounded question,
+   rebuilds the ones that cannot answer it, and asks the channel directly about the ones that can.
+
+   ------------------------------------------------------------------------------------------------------------------------------------------------------ */
+
+test('the sweep proves each listening session is receiving, and rebuilds the ones that cannot answer', () => {
+  const watchdog = section(index, 'async function checkTelegramStreams(', '\n/** Re-attach anything in memory');
+  assert.ok(watchdog.length > 400, 'the check exists in the server, next to the re-arm it follows');
+  assert.match(watchdog, /telegramCapture\.streamHealth\(userId\)/, 'it works off the silence clock rather than a boolean');
+  assert.match(watchdog, /if \(!health\.listening\) continue/, 'a session with no handler is the re-arm\'s business, not a rebuild trigger');
+  assert.match(watchdog, /if \(health\.suspect\) \{/, 'a session that delivered a message a minute ago is not interrogated on every sweep - only the quiet one is asked a question');
+  assert.match(watchdog, /telegramCapture\.probeUpdateStream\(entry\.client\)/, 'a suspect session is asked a bounded question');
+  assert.match(watchdog, /restoreTelegramClient\(userId, \{ reason: 'silent-update-stream' \}\)/, 'a socket that cannot answer is rebuilt, under a reason that names the diagnosis');
+  assert.equal(/probe\.state === 'unknown'[\s\S]{0,400}restoreTelegramClient/.test(watchdog.slice(watchdog.indexOf("if (probe.state === 'unknown')"))), false,
+    'and a probe this build cannot run never, on its own, tears a working listener down');
+  assert.match(watchdog, /if \(health\.catchUpOverdue\) \{[\s\S]{0,160}runCatchUp\(userId\)/, 'and every session is cross-checked against the channel on its own staggered schedule, because a quiet-but-live session and a half-deaf one look identical from the flags');
+  assert.match(watchdog, /Telegram update stream is silent and the socket is not answering; rebuilding the session/, 'the rebuild is logged with the numbers that justify it');
+
+  // Being a function is not being scheduled: the proof is that it runs in the same 60 second sweep that already
+  // re-arms handlers, after the re-arm, so a rebuild never races the thing that was about to fix the same row.
+  assert.ok(index.includes(".then(() => rearmTelegramListeners())\n      .then(() => checkTelegramStreams({ reason: 'sweep' }))"),
+    'it is chained onto the sweep, after the re-arm, so a rebuild never races the pass that was about to fix the same session');
+  const sweepAt = index.indexOf('const telegramSweep = setInterval(');
+  assert.ok(sweepAt > 0, 'the telegram sweep is a named interval in the server');
+  const sweep = index.slice(sweepAt, sweepAt + 700);
+  assert.match(sweep, /\}, 60 \* 1000\);/, 'and the sweep is a minute, which is what bounds the worst case for every path in here');
+  assert.match(sweep, /\.catch\(\(error\) => log\('warn', 'Telegram listener sweep failed'/, 'a failed check cannot kill the interval that keeps the fleet listening');
 });

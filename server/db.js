@@ -598,6 +598,7 @@ const SCHEMA_SQL = `
     -- What actually failed, kept off the sentence a trader reads: a status code, a provider body, a model name.
     -- Selected only by the admin panel, never by a route a workspace reads.
     ALTER TABLE signals ADD COLUMN IF NOT EXISTS technical_note TEXT;
+    ALTER TABLE signals ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ;
     ALTER TABLE trades ADD COLUMN IF NOT EXISTS order_type TEXT NOT NULL DEFAULT 'market';
     ALTER TABLE trades ADD COLUMN IF NOT EXISTS expiry_timestamp TIMESTAMPTZ;
     ALTER TABLE trades ADD COLUMN IF NOT EXISTS drift_points NUMERIC;

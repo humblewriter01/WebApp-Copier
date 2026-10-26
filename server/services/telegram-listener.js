@@ -30,8 +30,37 @@ import { isTelegramServiceMessage, resolveTelegramChatId, telegramMessageText, t
 
 /** How many recent messages one channel is asked for when a session comes back. */
 export const CATCH_UP_LIMIT = 25;
-/** Never poll Telegram for history more often than this, per user. */
-export const CATCH_UP_COOLDOWN_MS = 5 * 60 * 1000;
+/**
+ * Never poll Telegram for history more often than this, per user.
+ *
+ * This used to be five minutes, and five minutes is what a trader waited for a signal their channel had posted
+ * already: `connected === true` is not proof that updates are arriving (see `probeUpdateStream`), so a session
+ * that went deaf mid-life was only ever rescued by a catch-up, and the cooldown decided *when*. A launch-blocking
+ * delay was hiding in a throttle constant. One minute is still polite to Telegram - one `getHistory` per channel
+ * per user per minute at worst, inside `CATCH_UP_BUDGET_MS` - and it bounds the damage of every recovery path.
+ */
+export const CATCH_UP_COOLDOWN_MS = 60_000;
+/**
+ * How long a connected, attached, listening session may go without one event before that is treated as a
+ * problem rather than a quiet channel.
+ *
+ * A scalping signal is dead at two minutes (`MAX_SIGNAL_AGE_MS`), so the bound has to be well under that: this
+ * is the interval within which a deaf socket is noticed, probed and rebuilt, instead of at the next deploy.
+ */
+export const SILENCE_SUSPECT_MS = 90_000;
+/** A probe that has not answered in this long is a dead socket, because a live one answers in tens of ms. */
+export const STREAM_PROBE_DEADLINE_MS = 5_000;
+/**
+ * How often a session that passes its probe is still cross-checked against the channel.
+ *
+ * `pts` desync, a Telegram-side update drop, a builder that filtered something we cared about: every one of
+ * those looks healthy from the inside. Asking the channel on a schedule is what turns "the bot missed it" into
+ * "the bot caught it a few minutes later", and it is staggered per user so two hundred workspaces do not all
+ * arrive in the same second.
+ */
+export const GAP_CATCH_UP_MS = 3 * 60_000;
+/** Spread for that schedule, per workspace, so the sweep does not become a thundering herd. */
+export const GAP_CATCH_UP_SPREAD_MS = 90_000;
 /**
  * How long one catch-up run may spend before it stops and leaves the rest for the next one.
  *
@@ -48,9 +77,9 @@ const yieldToEventLoop = () => new Promise((resolve) => setImmediate(resolve));
 /** Connected, listening, and nothing through the handler for this long is worth saying out loud. */
 export const STREAM_IDLE_MS = 15 * 60 * 1000;
 
-const EMPTY_STATS = () => ({ seen: 0, saved: 0, ignored: 0, lastAt: null, lastChatId: null, lastError: null, catchUpSaved: 0 });
+const EMPTY_STATS = () => ({ seen: 0, saved: 0, ignored: 0, lastAt: null, lastChatId: null, lastError: null, catchUpSaved: 0, lastDelayMs: null, lastSentAt: null, lastMessageId: null });
 
-export function createTelegramListener({ clients, pool, log = console, saveSignal, now = () => Date.now(), catchUpLimit = CATCH_UP_LIMIT, catchUpCooldownMs = CATCH_UP_COOLDOWN_MS, catchUpBudgetMs = CATCH_UP_BUDGET_MS } = {}) {
+export function createTelegramListener({ clients, pool, log = console, saveSignal, now = () => Date.now(), catchUpLimit = CATCH_UP_LIMIT, catchUpCooldownMs = CATCH_UP_COOLDOWN_MS, catchUpBudgetMs = CATCH_UP_BUDGET_MS, silenceSuspectMs = SILENCE_SUSPECT_MS, probeDeadlineMs = STREAM_PROBE_DEADLINE_MS, gapCatchUpMs = GAP_CATCH_UP_MS } = {}) {
   if (!clients || !pool || !saveSignal) throw new Error('createTelegramListener requires clients, pool and saveSignal');
   const startedAt = new Date();
   const catchUpRuns = new Map();
@@ -82,6 +111,67 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
     return builders.some((pair) => Array.isArray(pair) && pair[1] === handler);
   }
 
+  /**
+   * Ask the socket whether it is still answering, rather than trusting a boolean.
+   *
+   * `client.connected` is GramJS's own flag about a TCP socket, and a socket can be open, registered and
+   * entirely deaf: Telegram stops pushing after a `pts` gap it cannot close, an idle connection is severed by
+   * the host's NAT and quietly re-established on the other side, a reconnect leaves the update manager detached
+   * from the event builders. All of those keep `connected === true` and every handler in place, and all of them
+   * look like a channel that has nothing to say. `updates.GetState` is the cheapest request Telegram answers -
+   * it returns the current `pts`, which is also the number that tells us whether the stream moved - and a
+   * socket that cannot answer it inside a few seconds is not a stream.
+   *
+   * A probe this code cannot build (a library change, an unexpected export) answers `unknown`, and `unknown`
+   * never tears a session down: it is worse to drop a working listener than to keep one that needs a minute to
+   * be caught by the gap sweep anyway.
+   */
+  async function probeUpdateStream(client, { deadlineMs = probeDeadlineMs } = {}) {
+    if (!client || client.connected !== true) return { alive: false, state: 'no-socket' };
+    if (typeof client.invoke !== 'function') return { alive: true, state: 'unknown' };
+    let request = null;
+    try {
+      const { Api } = await import('telegram');
+      if (Api?.updates?.GetState) request = new Api.updates.GetState();
+    } catch {
+      return { alive: true, state: 'unknown' };
+    }
+    if (!request) return { alive: true, state: 'unknown' };
+    const startedAt = now();
+    let timer = null;
+    try {
+      const state = await Promise.race([
+        Promise.resolve().then(() => client.invoke(request)),
+        new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('probe-timeout')), deadlineMs); timer.unref?.(); }),
+      ]);
+      return { alive: true, state: 'alive', pts: Number(state?.pts ?? 0) || null, ms: Math.max(0, now() - startedAt) };
+    } catch (error) {
+      return { alive: false, state: 'dead', error: `${error?.message || error}`.slice(0, 160), ms: Math.max(0, now() - startedAt) };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** What one session's stream looks like: when we last saw anything, and whether it is due a cross-check. */
+  function streamHealth(userId) {
+    const entry = entryFor(userId);
+    const stats = entry?.stats || EMPTY_STATS();
+    const lastAt = stats.lastAt ? Date.parse(stats.lastAt) : 0;
+    const silenceMs = lastAt ? Math.max(0, now() - lastAt) : null;
+    const lastRun = catchUpRuns.get(String(userId)) || 0;
+    /* Staggered per workspace, deterministically: `gapCatchUpMs + spread` is the outer bound, and a user who
+       signed up last is not the one that gets throttled every time the fleet is asked at once. */
+    const spread = [...String(userId)].reduce((total, char) => (total * 31 + char.charCodeAt(0)) % GAP_CATCH_UP_SPREAD_MS, 0);
+    return {
+      lastEventAt: stats.lastAt || null,
+      silenceMs,
+      lastDelayMs: Number.isFinite(stats.lastDelayMs) ? stats.lastDelayMs : null,
+      suspect: silenceMs !== null && silenceMs >= silenceSuspectMs,
+      catchUpOverdue: now() - lastRun >= gapCatchUpMs + spread,
+      listening: Boolean(entry?.handler) && handlerIsLive(entry.client, entry.handler) && entry.client?.connected === true,
+    };
+  }
+
   /* The one place a message becomes a row. Both the pushed-update path and the catch-up path call
      it, so "it was captured" means the same thing in production and in the replay. */
   async function ingestMessage(userId, message, event, { replayed = false } = {}) {
@@ -91,8 +181,22 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
     try {
       if (!replayed) stats.seen += 1;
       const chatId = resolveTelegramChatId(message, event);
-      stats.lastAt = new Date(now()).toISOString();
+      const arrivedAt = now();
+      stats.lastAt = new Date(arrivedAt).toISOString();
       stats.lastChatId = chatId || null;
+      stats.lastMessageId = message?.id ?? null;
+      /* When the *channel* sent it, not when we got it: without this number the whole question "is the listener
+         lagging" is unanswerable after the fact, because `signals.created_at` is only ever the write time. GramJS
+         gives the Telegram date in epoch seconds, so the delay is one subtraction, and it is recorded on every
+         update - including the ones this workspace does not trade - because a quiet handler and a deaf one are
+         the same shape from the outside. */
+      const sentAtMs = Number(message?.date) * 1000;
+      const sentAt = Number.isFinite(sentAtMs) && sentAtMs > 0 ? new Date(sentAtMs).toISOString() : null;
+      stats.lastSentAt = sentAt;
+      stats.lastDelayMs = sentAt ? Math.max(0, Math.round(arrivedAt - sentAtMs)) : null;
+      if (stats.lastDelayMs !== null && stats.lastDelayMs >= silenceSuspectMs) {
+        log('warn', 'Telegram update arrived late', { userId, messageId: message?.id ?? null, delayMs: stats.lastDelayMs, replayed: replayed === true });
+      }
       const text = telegramMessageText(message);
       if (!chatId) {
         stats.ignored += 1;
@@ -130,7 +234,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
       log('info', replayed ? 'Telegram message captured from catch-up' : 'Telegram message captured', { userId, chatId, channel: rows[0].title, chars: text.length, messageId: message?.id ?? null });
       // The signal is stored whatever the parser makes of it - a message from a monitored channel that
       // reads as prose is still a captured message, and it is shown as such instead of vanishing.
-      await saveSignal(userId, text, { source: 'telegram', channelId: rows[0].channelId, title: rows[0].title, telegramMessageId: message?.id ?? null, replayed });
+      await saveSignal(userId, text, { source: 'telegram', channelId: rows[0].channelId, title: rows[0].title, telegramMessageId: message?.id ?? null, sentAt, delayMs: stats.lastDelayMs, replayed });
       stats.saved += 1;
       if (replayed) stats.catchUpSaved = (stats.catchUpSaved || 0) + 1;
       return { stored: true };
@@ -164,11 +268,15 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
     target.addEventHandler(handler, new NewMessage({}));
     current.handler = handler;
     if (!current.stats) current.stats = EMPTY_STATS();
-    // A session that has just been rebuilt knows nothing about the messages that arrived while the
-    // instance was down, so it is marked for the catch-up pull instead of waiting for a push that
-    // will never come.
-    if (!current.stats.lastAt) current.needsCatchUp = true;
-    log('info', 'Telegram capture handler attached', { userId, reattach: true });
+    /* Every re-attach asks what was missed, whatever the statistics say. This used to be conditioned on
+       "we have never seen a message on this session", which is the only case where the flag was obviously
+       needed and the only case where a lost handler is *not* the explanation: a session that ran for an hour,
+       went deaf, and had its handler re-attached had seen messages, so nothing was fetched, and the gap the
+       re-attach existed to close stayed open forever. A push that will never come is a push that will never
+       come whether or not we have had one before. */
+    current.needsCatchUp = true;
+    current.attachedAt = new Date(now()).toISOString();
+    log('info', 'Telegram capture handler attached', { userId, reattach: true, silenceMs: current.stats.lastAt ? Math.max(0, now() - Date.parse(current.stats.lastAt)) : null });
     return current;
   }
 
@@ -276,10 +384,17 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
         catchUpSaved: Number(stats.catchUpSaved) || 0,
         lastMessageAt: stats.lastAt || null,
         lastError: stats.lastError || null,
+        // What the operator needs to answer "is it slow" without a log search: how long the last update took
+        // to reach us from the channel, and how long it has been since the handler fired at all.
+        lastDelayMs: Number.isFinite(stats.lastDelayMs) ? stats.lastDelayMs : null,
+        silenceSeconds: stats.lastAt ? Math.round(Math.max(0, now() - Date.parse(stats.lastAt)) / 1000) : null,
+        attachedAt: entry.attachedAt || null,
       });
     }
     const instanceStartedAt = startedAt.toISOString();
     const idleMs = lastMessageAt ? Math.max(0, now() - Date.parse(lastMessageAt)) : null;
+    const delays = sessions.map((session) => session.lastDelayMs).filter((value) => Number.isFinite(value));
+    const slowestSilence = sessions.reduce((worst, session) => (session.silenceSeconds != null && (worst === null || session.silenceSeconds > worst) ? session.silenceSeconds : worst), null);
     return {
       sessions,
       sessionsInMemory: sessions.length,
@@ -294,7 +409,12 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
       // The one sentence this whole block exists to make possible: the session is connected and
       // nothing has passed through the handler, which on a sleeping host means the instance was
       // not running when the channel posted.
-      streamIdle: listening > 0 && (idleMs === null || idleMs > STREAM_IDLE_MS),
+      // The numbers this whole path is judged on, in the health panel and nowhere else: the worst
+      // channel-to-database delay any session reported, and the longest silence across the fleet.
+      maxDelayMs: delays.length ? Math.max(...delays) : null,
+      medianDelayMs: delays.length ? delays.slice().sort((a, b) => a - b)[Math.floor(delays.length / 2)] : null,
+      longestSilenceSeconds: slowestSilence,
+      streamIdle: listening > 0 && (idleMs === null || idleMs > Math.max(STREAM_IDLE_MS, silenceSuspectMs)),
       // The state the health panel turns into a sentence: something is expected, nothing is attached.
       nothingAttached: sessions.length > 0 && listening === 0,
       idleSeconds: idleMs === null ? null : Math.round(idleMs / 1000),
@@ -303,5 +423,5 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
 
   function markSessionResumed() { resumedAfterBoot += 1; }
 
-  return { startTelegramListener, handlerIsLive, ingestMessage, runCatchUp, statsFor, telegramFleetSummary, markSessionResumed, EMPTY_STATS };
+  return { startTelegramListener, handlerIsLive, ingestMessage, runCatchUp, statsFor, telegramFleetSummary, probeUpdateStream, streamHealth, markSessionResumed, EMPTY_STATS };
 }

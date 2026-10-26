@@ -19,7 +19,8 @@ import assert from 'node:assert/strict';
 import { Api, TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { _handleUpdate } from 'telegram/client/updates.js';
-import { createTelegramListener } from '../services/telegram-listener.js';
+import { NewMessage } from 'telegram/events/index.js';
+import { CATCH_UP_COOLDOWN_MS, GAP_CATCH_UP_MS, GAP_CATCH_UP_SPREAD_MS, SILENCE_SUSPECT_MS, createTelegramListener } from '../services/telegram-listener.js';
 import { telegramPeerIdVariants, telegramMessageText } from '../services/telegram-peer.js';
 
 const USER_ID = '5036a3d3-0671-4cbf-9728-e5e3bf1eea9b';
@@ -139,7 +140,11 @@ test('a real GramJS channel update is matched and stored through the real dispat
   assert.equal(harness.saved.length, 1, 'the message reached storage');
   /* `replayed: false` is not decoration: it is what tells the AI reader queue that this message is live and
      must be served before a reconnect's replay, so the flag is pinned on the live path as well as the replay. */
-  assert.deepEqual(harness.saved[0].channel, { source: 'telegram', channelId: STORED_CHANNEL_ID, title: CHANNEL_TITLE, telegramMessageId: 77, replayed: false });
+  /* `sentAt`/`delayMs` are pinned here because they are the whole difference between "the channel was quiet" and
+   * "we were deaf", and they are the only evidence of it that outlives the log buffer: the fixture posts at
+   * 12:59:00 and the harness clock says 13:00:00, so a minute of lateness has to be carried into storage rather
+   * than flattened into `created_at`, which would describe a five-minute-late entry as a fresh one. */
+  assert.deepEqual(harness.saved[0].channel, { source: 'telegram', channelId: STORED_CHANNEL_ID, title: CHANNEL_TITLE, telegramMessageId: 77, replayed: false, sentAt: '2026-10-23T12:59:00.000Z', delayMs: 60_000 });
   assert.equal(harness.saved[0].message, SIGNAL_TEXT);
   const captured = harness.logs.find((entry) => entry.message === 'Telegram message captured');
   assert.ok(captured, 'the capture is written down, so a report can quote it');
@@ -297,7 +302,7 @@ test('the reader finds a body in every field this library puts one in', () => {
  * tests are the contract the reconnect path has to keep: one replay per user, a bounded run that resumes,
  * and a live message that is never made to wait behind a replay of older ones.
  */
-function makeReplayHarness({ messages, catchUpBudgetMs, onStored, getMessages } = {}) {
+function makeReplayHarness({ messages, catchUpBudgetMs, onStored, getMessages, catchUpCooldownMs = 0 } = {}) {
   const pool = makePool();
   const clients = new Map();
   const saved = [];
@@ -314,7 +319,7 @@ function makeReplayHarness({ messages, catchUpBudgetMs, onStored, getMessages } 
     },
     now: () => clock,
     catchUpBudgetMs,
-    catchUpCooldownMs: 0,
+    catchUpCooldownMs,
   });
   const client = {
     connected: true,
@@ -421,4 +426,160 @@ test('the replay gives the loop back once per message, and says why in the line 
   assert.ok(loop.length > 80, 'the replay loop is where the yield has to be');
   assert.match(loop.slice(0, 900), /await yieldToEventLoop\(\);/, 'one turn of the event loop between messages');
   assert.match(listenerSource, /const yieldToEventLoop = \(\) => new Promise\(\(resolve\) => setImmediate\(resolve\)\);/, 'queued in the check phase, which is where an update from Telegram lands - a microtask would cut in front of it');
+});
+
+/* --------------------------------------------------------------------------- *
+ * Half-deaf sockets.
+ *
+ * `connected === true` and a handler sitting in GramJS's own list are both statements about objects in memory,
+ * and neither is a statement about the transport. A session can be open and receive nothing at all: a `pts` gap
+ * Telegram stopped filling, an idle connection reaped by the host's NAT, a reconnect that left the update
+ * manager attached to the previous transport. Every one of those was reported healthy, because the only rescue
+ * was a catch-up that ran once every five minutes and was flagged only when the session had never seen a single
+ * message - so a stream that went deaf mid-session stayed deaf until the next deploy. The three pieces below are
+ * what close that hole: the bounded probe that asks the socket a question, the silence clock that decides when to
+ * ask it, and the rule that any handler put back on a client has to look at the channel afterwards.
+ * --------------------------------------------------------------------------- */
+
+test('the probe tells a quiet channel from a deaf socket, and never condemns a client it cannot ask', async () => {
+  const harness = makeHarness();
+  const answering = { connected: true, invoke: async () => ({ pts: 900 }) };
+  const live = await harness.listener.probeUpdateStream(answering);
+  assert.equal(live.alive, true, 'a socket that replies is a socket that can push');
+  assert.equal(live.state, 'alive');
+  assert.equal(live.pts, 900, 'and the reply carries the counter whose movement is the whole proof');
+
+  // A request that never returns is the actual production failure: the socket accepts writes and answers nothing.
+  const deaf = { connected: true, invoke: () => { harness.advance(4_000); return new Promise(() => {}); } };
+  // The probe's own deadline timer is unref'd - deliberately, because a watchdog must never be the reason a
+  // process cannot exit - so a test that waits on it has to hold the loop open itself.
+  const holdTheLoopOpen = setTimeout(() => {}, 120);
+  const stalled = await harness.listener.probeUpdateStream(deaf, { deadlineMs: 20 });
+  clearTimeout(holdTheLoopOpen);
+  assert.deepEqual({ alive: stalled.alive, state: stalled.state }, { alive: false, state: 'dead' }, 'a probe that times out is a dead stream, and the bound is what makes it safe to ask');
+  assert.equal(stalled.ms, 4_000, 'the wait it spent is reported on the session clock, so a log line can say how long the socket took to fail to answer');
+
+  const rejected = { connected: true, invoke: async () => { throw new Error('Cannot send requests while disconnected'); } };
+  assert.equal((await harness.listener.probeUpdateStream(rejected)).state, 'dead', 'a socket that answers with an error is exactly as deaf as one that answers with nothing');
+
+  assert.equal((await harness.listener.probeUpdateStream({ connected: false })).state, 'no-socket', 'a session with no transport is not a mystery, it is a reconnect');
+  const unaskable = { connected: true };
+  const unknown = await harness.listener.probeUpdateStream(unaskable);
+  assert.equal(unknown.state, 'unknown');
+  assert.equal(unknown.alive, true, 'a library this build cannot interrogate is never a reason to tear a working listener down');
+});
+
+test('a session is suspect on silence alone, and only on silence', async () => {
+  const harness = makeHarness();
+  // No traffic and no attach: there is nothing to conclude, and a watchdog that acts on that would tear down
+  // every session between the connect and the first message.
+  harness.clients.set('never-listened', { client: harness.client, handler: () => {}, stats: harness.listener.EMPTY_STATS() });
+  const cold = harness.listener.streamHealth('never-listened');
+  assert.equal(cold.silenceMs, null, 'a session that has never received anything has no silence to measure');
+  assert.equal(cold.suspect, false);
+
+  await harness.listener.startTelegramListener(USER_ID, harness.client);
+  await dispatch(harness, new Api.UpdateNewChannelMessage({ message: channelMessage({ id: 500 }), pts: 20, seq: 0 }));
+
+  let health = harness.listener.streamHealth(USER_ID);
+  assert.equal(health.listening, true, 'connected, attached, handler in GramJS own list: the state that used to be the whole answer');
+  assert.equal(health.silenceMs, 0, 'silence is measured from when the last update reached us; how stale that update was is the separate number below');
+  assert.equal(health.lastDelayMs, 60_000, 'and the lag between the channel posting and us hearing about it is kept beside it, because that pair is the whole diagnosis');
+  assert.equal(health.suspect, false, 'a minute of nothing on a scalping channel is a quiet channel, and it is not probed on every sweep');
+
+  harness.advance(20 * 60_000);
+  health = harness.listener.streamHealth(USER_ID);
+  assert.equal(health.suspect, true, 'twenty silent minutes while everything claims to be listening is the half-deaf state, and it now has to be asked out loud instead of shown in a panel fifteen minutes later');
+  assert.ok(health.catchUpOverdue, 'a session this quiet is also due for the channel to be asked what it has');
+
+  // A message arriving is the cure: the suspicion is a clock, not a latch.
+  await dispatch(harness, new Api.UpdateNewChannelMessage({ message: channelMessage({ id: 501 }), pts: 21, seq: 0 }));
+  const healed = harness.listener.streamHealth(USER_ID);
+  assert.equal(healed.suspect, false, 'and it clears the moment the stream speaks again');
+  assert.equal(healed.silenceMs, 0);
+});
+
+test('the periodic cross-check is bounded on both sides and does not fire the fleet in one second', async () => {
+  const harness = makeReplayHarness({ messages: [], catchUpCooldownMs: 60_000 });
+  const client = harness.clients.get(USER_ID).client;
+  // Chosen because its per-workspace offset is 55 s from USER_ID's, which is what the assertion below needs.
+  const OTHER = '2036a3d3-0671-4cbf-9728-e5e3bf1eea9b';
+  harness.clients.set(OTHER, { client, handler: () => {}, stats: harness.listener.EMPTY_STATS() });
+  assert.equal((await harness.listener.runCatchUp(USER_ID)).ran, true, 'both workspaces looked at the channel in the same second');
+  assert.equal((await harness.listener.runCatchUp(OTHER)).ran, true);
+
+  const firstDue = new Map();
+  for (let step = 0; step < 60 && firstDue.size < 2; step += 1) {
+    harness.advance(5_000);
+    for (const userId of [USER_ID, OTHER]) {
+      if (!firstDue.has(userId) && harness.listener.streamHealth(userId).catchUpOverdue) firstDue.set(userId, (step + 1) * 5_000);
+    }
+  }
+
+  assert.equal(firstDue.size, 2, 'a quiet-but-healthy session is cross-checked eventually, on a schedule, for every workspace');
+  for (const [userId, due] of firstDue) {
+    assert.ok(due >= GAP_CATCH_UP_MS, `${userId} was cross-checked before the gap had elapsed, which is how a replay becomes polling`);
+    assert.ok(due <= GAP_CATCH_UP_MS + GAP_CATCH_UP_SPREAD_MS + 5_000, `${userId} went longer than the gap plus its stagger without being asked, which is how a missed message stays missed`);
+  }
+  assert.notEqual(firstDue.get(USER_ID), firstDue.get(OTHER), 'two workspaces that caught up in the same second do not ask the channel in the same second: the spread is what keeps a fleet-wide sweep from being one request storm');
+});
+
+test('the catch-up window is a minute, not five, so a missed message is replayed inside the trade rather than after it', async () => {
+  // The harness is driven with the production constant rather than a number of its own, so that changing the
+  // window in the service is a test failure here and not a quiet divergence.
+  assert.equal(CATCH_UP_COOLDOWN_MS, 60_000, 'one minute: five was chosen when a replay was a courtesy to a busy API, and it became the length of a signal delay');
+  const harness = makeReplayHarness({ messages: [12], catchUpCooldownMs: CATCH_UP_COOLDOWN_MS });
+  const first = await harness.listener.runCatchUp(USER_ID);
+  assert.deepEqual({ ran: first.ran, stored: first.stored }, { ran: true, stored: 1 });
+  const blocked = await harness.listener.runCatchUp(USER_ID);
+  assert.deepEqual({ ran: blocked.ran, reason: blocked.reason }, { ran: false, reason: 'COOLDOWN' }, 'back-to-back recoveries are still rate limited, so a rebuild cannot hammer Telegram');
+  harness.advance(70_000);
+  const again = await harness.listener.runCatchUp(USER_ID);
+  assert.equal(again.ran, true, 'and the wait is one minute: a five-minute throttle in front of a two-minute signal is the difference between a trade and a miss');
+});
+
+test('an update that arrives late is written down as late, at the moment it arrives', async () => {
+  const harness = makeHarness();
+  await harness.listener.startTelegramListener(USER_ID, harness.client);
+  await dispatch(harness, new Api.UpdateNewChannelMessage({ message: channelMessage({ id: 501 }), pts: 21, seq: 0 }));
+  assert.equal(harness.logs.some((entry) => entry.message === 'Telegram update arrived late'), false,
+    'a minute of travel on a signal that is dead at two is normal delivery, and crying about it would bury the alarms that matter');
+  assert.equal(harness.entry().stats.lastDelayMs, 60_000, 'it is still measured, so the trend is visible without reading a log line');
+  assert.equal(harness.entry().stats.lastSentAt, '2026-10-23T12:59:00.000Z', 'from the channel clock, not from ours');
+
+  // Ten more silent minutes, and the next message out of the fixture carries the same send date: eleven
+  // minutes of travel, which is the number the incident report was about.
+  harness.advance(10 * 60_000);
+  await dispatch(harness, new Api.UpdateNewChannelMessage({ message: channelMessage({ id: 502 }), pts: 22, seq: 0 }));
+  const late = harness.logs.find((entry) => entry.message === 'Telegram update arrived late');
+  assert.ok(late, 'this is the line that turns "the bot feels slow" into an interval an operator can be held to');
+  assert.equal(late.level, 'warn', 'and it is a warning, because a late signal is a signal nobody traded');
+  assert.equal(late.meta.userId, USER_ID);
+  assert.equal(late.meta.delayMs, 11 * 60_000);
+  assert.equal(harness.entry().stats.lastDelayMs, 11 * 60_000);
+
+  const summary = harness.listener.telegramFleetSummary();
+  const session = summary.sessions.find((item) => item.userId === USER_ID);
+  assert.equal(session.lastDelayMs, 11 * 60_000, 'the panel shows the worst lag in the fleet, not only the count of messages');
+  assert.equal(summary.maxDelayMs, 11 * 60_000);
+});
+
+test('a handler that had to be put back asks the channel what it missed, even after a session that was already talking', async () => {
+  const harness = makeHarness();
+  await harness.listener.startTelegramListener(USER_ID, harness.client);
+  await dispatch(harness, new Api.UpdateNewChannelMessage({ message: channelMessage({ id: 503 }), pts: 23, seq: 0 }));
+  // The state a session reaches once its boot replay has finished: caught up, and full of history.
+  harness.entry().needsCatchUp = false;
+
+  // The detach itself, done the way the library does it: the callback leaves `_eventBuilders`, and our own
+  // bookkeeping is what is left pointing at a function nothing will ever call.
+  harness.client.removeEventHandler(harness.entry().handler, new NewMessage({}));
+  assert.equal(harness.listener.handlerIsLive(harness.client, harness.entry().handler), false, 'the handler is off the socket, which is the entire failure');
+  assert.ok(harness.entry().stats.lastAt, 'the session had already seen a message - the case the old flag rule excluded');
+  await harness.listener.startTelegramListener(USER_ID, harness.client);
+  assert.equal(harness.entry().needsCatchUp, true,
+    'so a re-attach is still a recovery: a handler that was off the socket for any length of time has to ask what happened while it was off');
+  assert.ok(Number.isFinite(Date.parse(harness.entry().attachedAt)), 'and the moment it went back on is recorded, so the summary can say how long a listener has really been up');
+  assert.ok(harness.logs.some((entry) => entry.message === 'Telegram capture handler attached'),
+    'the attach itself is logged, which is what a report is quoted from when someone asks whether the listener was ever there');
 });

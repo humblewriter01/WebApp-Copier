@@ -23,7 +23,7 @@ import { fileURLToPath } from 'node:url';
 
 import { parseSignal } from '../services/signal-parser.js';
 import { llmConfig, needsLayer2, extractJsonObject, validateExtraction, numbersInText, llmParseSignal, buildMessages, DEFAULT_MIN_CONFIDENCE } from '../services/signal-llm.js';
-import { parseSignalTwoLayer, mergeGaps } from '../services/signal-parse-pipeline.js';
+import { CAPTURE_PARSE_BUDGET_MS, parseSignalTwoLayer, mergeGaps } from '../services/signal-parse-pipeline.js';
 import { captureSafety, applySafetyNets, pipSizeFor } from '../services/signal-safety.js';
 import { createExecutionEngine } from '../services/execution-engine.js';
 
@@ -623,4 +623,37 @@ test('the prompt says out loud that an open position is not an entry instruction
   assert.match(system.content, /already open is not an entry instruction/i);
   assert.match(system.content, /never turn an instruction to close into a direction to open/i);
   assert.match(system.content, /"TP 1", "TP2 ✅"|A numbered target/i, 'and it names the numbered-target shape that was being read as a price');
+});
+
+/* ------------------------------------------------------------------ the capture's patience ------------------------------------------------------
+
+   A row a trader is waiting on is not worth waiting on a model for. This is the property that turns
+   "the AI reader is having a slow afternoon" from a five-minute signal delay into one sentence on a row
+   that arrived on time, and it is also the guard rail for the launch promise that a capture is on screen
+   in under two seconds.
+   ------------------------------------------------------------------------------------------------------------------------------------------ */
+
+test('a capture that outlives its patience writes the row from Layer 1 and says so', async () => {
+  const hanging = async () => new Promise(() => {});
+  const result = await parseSignalTwoLayer('GBPUSD buy now, sl 1.0910, tp 1.1100', {
+    source: 'telegram', config: CONFIG, fetchImpl: hanging, logger: { warn() {}, info() {} }, captureBudgetMs: 25,
+  });
+  assert.equal(result.parsed.symbol, 'GBPUSD', 'the message is not lost while the model is unreachable');
+  assert.equal(result.parsed.takeProfit, 1.11, 'and the prices the regex read are the prices stored');
+  assert.equal(result.provenance.llmUsed, false, 'the row says it was not read by a model, because it was not');
+  assert.equal(result.review.required, true, 'an unfinished read is a review row, never a guess');
+  assert.equal(result.review.code, 'llm-deadline', 'with its own code, so the panel can count how often this happens');
+  assert.equal(/AI|model|timeout|latency|Layer|token/i.test(result.review.reason), false, 'the sentence names what a reader should do, not what the infrastructure did');
+
+  // The same message with a model that answers inside the budget is unaffected: the deadline is a ceiling,
+  // not a switch that quietly turns Layer 2 off for every capture.
+  const quick = countingFetch(llmReply({ symbol: 'GBPUSD', side: 'buy', entry: 1.0910, stop_loss: 1.0910, take_profit: 1.1100, confidence: 0.9 }));
+  const answered = await parseSignalTwoLayer('GBPUSD buy now, sl 1.0910, tp 1.1100', {
+    source: 'telegram', config: CONFIG, fetchImpl: quick.fetchImpl, logger: { warn() {}, info() {} }, captureBudgetMs: 5_000,
+  });
+  assert.equal(answered.provenance.llmUsed, true, 'a model that replies in time is still asked, still used, and still credited on the row');
+  assert.equal(quick.calls.length, 1, 'exactly one request, whether or not we waited for it');
+
+  assert.ok(CAPTURE_PARSE_BUDGET_MS > 0 && CAPTURE_PARSE_BUDGET_MS < 2_000, 'the whole budget is inside the two seconds a capture is allowed to take');
+  assert.match(indexSource, /captureBudgetMs: CAPTURE_PARSE_BUDGET_MS/, 'and the capture path is the one that passes it - the admin preview and the re-read backfill keep their patience, because nobody is waiting on them live');
 });
