@@ -536,7 +536,7 @@ const telegramCapture = createTelegramListener({
      `force` is the human override - the cooldown protects Telegram from a watchdog that misread a quiet channel,
      and it has no argument with an operator reading the evidence - and a restore retakes the beat's baseline,
      because a session that starts from zero counters would otherwise be accused of its own first minute. */
-  onDeadStream: (userId, reason, { force = false } = {}) => restoreTelegramClient(userId, { reason, force }),
+  onDeadStream: (userId, reason, { force = false, escalate = false } = {}) => restoreTelegramClient(userId, { reason, force, escalate }),
 });
 const startTelegramListener = (userId, client) => telegramCapture.startTelegramListener(userId, client);
 
@@ -595,20 +595,33 @@ function telegramCaptureTransport() {
   return { wss: true, options: { ...base, useWSS: true } };
 }
 
-async function restoreTelegramClient(userId, { reason = 'restore', force = false } = {}) {
+async function restoreTelegramClient(userId, { reason = 'restore', force = false, escalate = false } = {}) {
   const current = telegramClients.get(userId);
-  if (current?.client?.connected === true && current.handler && telegramCapture.handlerIsLive(current.client, current.handler)) return current.client;
+  /* Two reasons to step past the "already listening" shortcut, and they are different asks. `escalate` is the
+     watchdog's: the socket is up and the handler is attached, and the stream is still deaf, so the session itself
+     has to go and the update state has to be reconciled before anything else is trusted. `force` is the operator's
+     - the same rebuild, without waiting for the cooldown. Before this, both flags reached a function that ignored
+     them and returned the connected client, which is why a "forced" reconnect of a deaf session changed nothing
+     but the timestamp on the audit row. */
+  const mustRebuild = force === true || escalate === true;
+  if (!mustRebuild && current?.client?.connected === true && current.handler && telegramCapture.handlerIsLive(current.client, current.handler)) return current.client;
   if (current?.client && current.client.connected !== true) {
     try { await current.client.connect(); } catch (error) { log('warn', 'Telegram reconnect deferred', { userId, error: error.message }); }
     if (current.client.connected === true) {
+      /* A socket that came back is a socket whose update state may not have: Telegram stops pushing to a session
+         that never reconciled the updates it missed, and GramJS never reconciles one. Asking now - two cheap
+         requests, `updates.GetState` and, only if the account moved while we were out, `updates.GetDifference` -
+         is what turns "reconnected" into "listening again". */
+      await telegramCapture.resyncUpdateState(current.client, { userId, reason: `${reason}:reconnected` });
       await startTelegramListener(userId, current.client);
       void telegramCapture.runCatchUp(userId).catch(() => {});
       return current.client;
     }
   }
   // Whatever half-connected object was here is dropped before a new one replaces it, so a wake does
-  // not leave a second authorized session polling with the same StringSession.
-  if (current?.client && current.client.connected !== true) await current.client.disconnect().catch(() => {});
+  // not leave a second authorized session polling with the same StringSession - and so an escalated rebuild of a
+  // session that still looks fine does not leave the deaf one attached and receiving.
+  if (current?.client && (current.client.connected !== true || mustRebuild)) await current.client.disconnect().catch(() => {});
   const { rows } = await pool.query('SELECT telegram_session FROM users WHERE id=$1', [userId]);
   if (!rows[0]?.telegram_session) {
     if (current) telegramClients.delete(userId);
@@ -635,12 +648,18 @@ async function restoreTelegramClient(userId, { reason = 'restore', force = false
     log('warn', 'Telegram session is no longer authorized', { userId, reason });
     return null;
   }
+  /* Before the handler, before the catch-up, and only after `checkAuthorization` has answered: a new client from
+     a stored StringSession inherits the *account's* stream, and unless somebody tells Telegram where this session
+     stands it keeps believing we are behind. `resyncUpdateState` is that sentence - it seeds the cached `pts` on a
+     session that has none, and closes a real gap with a difference request instead of waiting for a push that will
+     never come. */
+  await telegramCapture.resyncUpdateState(client, { userId, reason: `${reason}:new-session`, force: mustRebuild });
   telegramClients.set(userId, { client, handler: null, stats: telegramCapture.EMPTY_STATS() });
   telegramCapture.resetStreamBaseline(userId);
   await startTelegramListener(userId, client);
   await pool.query('UPDATE users SET telegram_connected=TRUE WHERE id=$1', [userId]);
   telegramCapture.markSessionResumed();
-  log('info', 'Telegram session restored for capture', { userId, reason, transport: transport.wss ? '443' : 'default' });
+  log('info', 'Telegram session restored for capture', { userId, reason, transport: transport.wss ? '443' : 'default', forced: force === true, escalated: escalate === true });
   // The messages this session missed while nothing was running are pulled back in the background,
   // so a workspace that was asleep during a channel's signal does not have to wait for the next one.
   void telegramCapture.runCatchUp(userId).catch((error) => log('warn', 'Telegram catch-up failed', { userId, error: error.message }));
