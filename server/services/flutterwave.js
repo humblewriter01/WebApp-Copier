@@ -54,6 +54,41 @@ export const INTERVAL_MAP = Object.freeze({
   yearly: 'yearly',
 });
 
+/**
+ * How a checkout is *presented*, per currency - which country the provider renders and which rails it offers.
+ *
+ * Flutterwave decides what a payer sees from the country it believes the payment is happening in, and when a
+ * request says nothing it infers that from the payer's IP. A trader in Lagos paying a dollar price is therefore
+ * shown the Nigerian page: bank transfer, ussd, and a naira amount field, none of which can settle a card
+ * charge in USD. The currency in the request was correct; the page was still wrong, which is the whole reason
+ * these two fields exist rather than being left to inference.
+ *
+ * They are keyed on the currency, because the currency is the only thing that decides which methods can settle
+ * at all: naira has local rails, dollars have cards. `card` on its own is not a limitation to work around - it
+ * is what makes "Pay with USD" a possible action on the page instead of a price you cannot pay.
+ */
+export const CURRENCY_CHECKOUT_PRESENTATION = Object.freeze({
+  NGN: Object.freeze({ country: 'NG', paymentOptions: 'card,banktransfer,ussd' }),
+  USD: Object.freeze({ country: 'US', paymentOptions: 'card' }),
+});
+
+/** A plan-bound charge is settled by the provider, by card, every interval - so the local rails are not offered. */
+export const PLAN_BOUND_PAYMENT_OPTIONS = 'card';
+
+/**
+ * The two fields for a currency, with the plan-bound exception already applied.
+ *
+ * A currency this workspace has no rule for sends neither field: it is better for the provider to render what
+ * it thinks is right for an unexpected currency than to be told a country that does not charge in it.
+ */
+export function checkoutPresentation(currency, { planBound = false } = {}) {
+  const rule = CURRENCY_CHECKOUT_PRESENTATION[String(currency || '').toUpperCase().trim()] || null;
+  return Object.freeze({
+    country: rule ? rule.country : null,
+    paymentOptions: planBound ? PLAN_BOUND_PAYMENT_OPTIONS : (rule ? rule.paymentOptions : null),
+  });
+}
+
 function networkError(cause) {
   const error = new Error('Flutterwave could not be reached. Please try again shortly.');
   error.status = 502;
@@ -319,7 +354,7 @@ export function createFlutterwaveClient({ config, fetchImpl } = {}) {
    * `amount` is the major unit - the whole reason this migration is careful about units - and the reference is
    * ours, which is what makes verification immune to anything the browser sends back.
    */
-  async function initializeTransaction({ email, name, amountMinor, currency, reference, redirectUrl, planId, metadata, payloadHashValue, paymentOptions, title }) {
+  async function initializeTransaction({ email, name, amountMinor, currency, reference, redirectUrl, planId, metadata, payloadHashValue, paymentOptions, country, title }) {
     const amount = amountString(amountMinor);
     if (!amount) {
       const error = new Error('The amount to charge could not be determined.');
@@ -336,9 +371,16 @@ export function createFlutterwaveClient({ config, fetchImpl } = {}) {
       customer: { email, ...(name ? { name: String(name).slice(0, 80) } : {}) },
       customizations: { title: String(title || 'Signal Desk subscription').slice(0, 80) },
     };
+    /* What the payer is shown, decided here rather than inferred from their IP. A caller that already worked the
+       rule out (the billing service does, because its response has to carry the same values to the browser)
+       passes them in; anyone who does not still gets the correct page for the currency in the request. */
+    const presentation = checkoutPresentation(body.currency, { planBound: Boolean(planId) });
+    const settledCountry = String(country || presentation.country || '').trim().slice(0, 2).toUpperCase();
+    const settledOptions = String(paymentOptions || presentation.paymentOptions || '').trim();
     if (metadata) body.meta = metadata;
     if (planId) body.payment_plan = planId;
-    if (paymentOptions) body.payment_options = paymentOptions;
+    if (settledCountry) body.country = settledCountry;
+    if (settledOptions) body.payment_options = settledOptions;
     const hash = payloadHashValue ?? payloadHash({ amountMinor, currency: body.currency, email, txRef: reference, secretKey: settings.secretKey });
     if (hash) body.payload_hash = hash;
 
@@ -355,6 +397,8 @@ export function createFlutterwaveClient({ config, fetchImpl } = {}) {
       link,
       reference: String(payload?.data?.tx_ref || reference),
       accessCode: payload?.data?.access_code ? String(payload.data.access_code) : null,
+      country: settledCountry || null,
+      paymentOptions: settledOptions || null,
     };
   }
 

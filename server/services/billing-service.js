@@ -11,7 +11,7 @@ import {
   billingIntervalMs,
   FREE_PLAN,
 } from './billing.js';
-import { toSafeTransaction, toSafeSubscriptionEvent, toSafeRenewal, payloadHash } from './flutterwave.js';
+import { toSafeTransaction, toSafeSubscriptionEvent, toSafeRenewal, payloadHash, checkoutPresentation } from './flutterwave.js';
 import { mergePlanPricing, planChargeDecision } from './pricing.js';
 
 /**
@@ -252,6 +252,13 @@ export function createBillingService({
       log('warn', 'Checkout falling back to a one-time charge', { planKey: priced.plan, currency: priced.currency, reason: decision.reason });
     }
 
+    /* Which country Flutterwave renders and which methods it offers, decided from the currency and from whether
+       this charge is bound to a payment plan - and returned to the browser alongside the amount, because the
+       inline modal is configured by the browser and the hosted page by this request. If the two ever disagreed,
+       a trader could be shown a payment method the server did not intend, which is how a dollar price ends up
+       offering a naira bank transfer. */
+    const presentation = checkoutPresentation(priced.currency, { planBound: Boolean(planId) });
+
     const redirectUrl = `${base}/billing/callback`;
 
     // Reuse a recent pending checkout only when it was raised the same way, so a reused Flutterwave page can
@@ -265,6 +272,9 @@ export function createBillingService({
     );
     const reusable = pending.rows[0];
     if (reusable?.authorization_url) {
+      /* Safe to reuse the presentation computed above: the query only returns a row whose currency, amount and
+         plan code are identical to this checkout's, so the page being re-presented is the same shape by
+         construction. A row that had drifted would have been a new checkout, not a reuse. */
       return {
         reference: reusable.reference,
         link: reusable.authorization_url,
@@ -274,6 +284,8 @@ export function createBillingService({
         providerAmount: toProviderAmount(reusable.amount_minor),
         discountMinor: priced.discountMinor,
         currency: reusable.currency,
+        country: presentation.country,
+        paymentOptions: presentation.paymentOptions,
         plan: priced.plan,
         planName: priced.planName,
         promoCode: priced.promoCode,
@@ -307,6 +319,8 @@ export function createBillingService({
       redirectUrl,
       planId,
       payloadHashValue: finalHash,
+      country: presentation.country,
+      paymentOptions: presentation.paymentOptions,
       title: `Signal Desk ${priced.planName}`,
       metadata: {
         user_id: user.id,
@@ -347,6 +361,8 @@ export function createBillingService({
       amountMinor: priced.amountMinor,
       providerAmount: priced.providerAmount,
       billingMode: planId ? 'subscription' : 'one-time',
+      country: presentation.country,
+      paymentOptions: presentation.paymentOptions,
     });
     return {
       reference: transaction.reference,
@@ -358,6 +374,9 @@ export function createBillingService({
       providerAmount: priced.providerAmount,
       discountMinor: priced.discountMinor,
       currency: priced.currency,
+      // What the modal must be configured with, so the browser never re-derives a payment rule of its own.
+      country: presentation.country,
+      paymentOptions: presentation.paymentOptions,
       plan: priced.plan,
       planName: priced.planName,
       promoCode: priced.promoCode,
