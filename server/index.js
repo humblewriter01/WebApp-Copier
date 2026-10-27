@@ -125,8 +125,22 @@ const billingService = createBillingService({
   logger: serviceLogger,
 });
 
+/**
+ * The one log line this process writes, and the last place anything can be redacted before it reaches stdout.
+ *
+ * `safe` is a copy rather than the caller's object, and every key that names a credential is deleted from the
+ * copy: a provider token, a Telegram session string, a phone number and a password all arrive here as part of
+ * the facts a route attaches to a line, and the log is the one surface in this deployment that is read by
+ * anyone who has not authenticated. The list is a string-match away from silent rot, so `
+ * test/log-redaction.test.js` pins the six names, pins that the line is built from the redacted copy and not
+ * from `extra`, and pins that no second writer of structured logs exists beside this one.
+ *
+ * @param {LogLevel} level
+ * @param {string} message
+ * @param {LogExtra} [extra]
+ */
 const log = (level, message, extra = {}) => {
-  const safe = { ...extra };
+  const safe = /** @type {Record<string, any>} */ ({ ...extra });
   delete safe.phoneNumber; delete safe.token; delete safe.apiToken; delete safe.metaApiToken; delete safe.session; delete safe.password;
   console[level]?.(JSON.stringify({ at: new Date().toISOString(), level, message, ...safe }));
 };
@@ -388,6 +402,13 @@ async function saveSignal(userId, message, channel = {}) {
      answered from the state at the moment the row is annotated rather than the moment it arrived. Failures are
      captured rather than thrown so a rejection cannot become unhandled while the parse is still running; the
      await below is where any of them surfaces. */
+  /**
+   * The capture prelude, settled rather than resolved: a parse that rejects has to surface at the `await`
+   * below and not as an unhandled rejection while the insert is still running, which is why both arms are
+   * objects and why each half is optional rather than one of them being absent by construction.
+   *
+   * @type {Promise<{ value?: [any, Record<string, any>], error?: any }>}
+   */
   const prelude = Promise.all([
     pool.query(guardSql, [userId]),
     parseSignalTwoLayer(savedText, { source, config: parserConfig, logger: serviceLogger, gate: llmGate, priority: llmPriority, captureBudgetMs: CAPTURE_PARSE_BUDGET_MS }),
@@ -865,7 +886,7 @@ async function rearmTelegramListeners() {
   return rearmed;
 }
 
-io.use((socket, next) => {
+io.use((/** @type {DeskSocket} */ socket, next) => {
   let payload;
   try {
     payload = jwt.verify(socket.handshake.auth?.token, process.env.JWT_SECRET);
@@ -887,7 +908,7 @@ io.use((socket, next) => {
     })
     .catch(() => next(new Error('Authentication required')));
 });
-io.on('connection', (socket) => {
+io.on('connection', (/** @type {DeskSocket} */ socket) => {
   socket.join(`user:${socket.userId}`);
   socket.emit('connected', { ok: true });
 });
@@ -3209,12 +3230,31 @@ app.use((error, req, res, _next) => {
     metaApiNetworkDiagnostic: error.metaApiNetworkDiagnostic,
   });
   if (res.headersSent) return;
-  const payload = {
+  /**
+   * The error body every route answers with.
+   *
+   * Written as a type because which fields may leave this process is the point of it: `error` is the only text a
+   * trader is shown, `userMessage` is the only text a service is allowed to choose for that slot, and the four
+   * `metaApi*` keys exist so a support ticket can be answered without reading a log - each added only when the
+   * error actually carries it, and never a provider sentence forwarded verbatim.
+   *
+   * @typedef {Object} ErrorResponseBody
+   * @property {string} error
+   * @property {string} code
+   * @property {string} requestId
+   * @property {boolean} [upgradeRequired]
+   * @property {string} [userMessage]
+   * @property {number} [metaApiStatus]
+   * @property {string} [metaApiErrorCode]
+   * @property {string} [metaApiErrorType]
+   * @property {string} [metaApiNetworkDiagnostic]
+   */
+  const payload = /** @type {ErrorResponseBody} */ ({
     error: error.status ? (typeof error.userMessage === 'string' ? error.userMessage : error.message) : 'Something went wrong. Please try again in a moment.',
     ...(error.code ? { code: error.code } : { code: 'UNEXPECTED' }),
     requestId,
     ...(error.upgradeRequired ? { upgradeRequired: true } : {}),
-  };
+  });
   if (typeof error.userMessage === 'string') payload.userMessage = error.userMessage;
   if (Number.isInteger(error.metaApiStatus)) payload.metaApiStatus = error.metaApiStatus;
   if (typeof error.metaApiErrorCode === 'string') payload.metaApiErrorCode = error.metaApiErrorCode;

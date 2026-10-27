@@ -103,8 +103,12 @@ export function sanitizeAuditMetadata(input) {
  * Normalises one audit row. Deliberately forgiving about the actor (a missing email falls back
  * to a placeholder and is reported through `onWarning`) because losing an audit entry to a
  * validation throw at the end of a successful admin mutation would be the worse failure.
+ *
+ * @typedef {Object} BuildAuditEntryInput
+ * @property {() => Date} [now]
+ * @property {(message: string, extra?: LogExtra) => void} [onWarning]
  */
-export function buildAuditEntry(input = {}, { now = () => new Date(), onWarning } = {}) {
+export function buildAuditEntry(input = {}, /** @type {BuildAuditEntryInput} */ { now = () => new Date(), onWarning } = {}) {
   const action = cleanText(input.action, 60);
   if (!action) throw validationError('An audit entry needs the action that was performed.');
   if (!Object.hasOwn(AUDIT_ACTIONS, action)) throw validationError(`Unknown audit action "${action}".`);
@@ -175,7 +179,14 @@ export function buildAuditLogClear() {
   return { sql: 'DELETE FROM admin_audit_logs', params: [] };
 }
 
-export function createAuditLogger({ pool, logger = console, now = () => new Date() } = {}) {
+/**
+ *
+ * @typedef {Object} AuditLoggerDeps
+ * @property {PoolLike} [pool]
+ * @property {LoggerMethods} [logger]
+ * @property {() => Date} [now] - forwarded to `buildAuditEntry`, which stamps the row with it
+ */
+export function createAuditLogger(/** @type {AuditLoggerDeps} */ { pool, logger = console, now = () => new Date() } = {}) {
   if (!pool?.query) throw new TypeError('The audit logger needs a database pool.');
   const log = (level, message, extra = {}) => logger?.[level]?.(message, extra);
 

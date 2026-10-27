@@ -90,7 +90,18 @@ function currencyForRenewal(renewal, snapshot) {
   return normalizeCurrency(snapshot?.currency);
 }
 
-export function createBillingService({
+/**
+ *
+ * @typedef {Object} BillingServiceDeps
+ * @property {PoolLike} [pool]
+ * @property {Record<string, any>} [flutterwave]
+ * @property {Record<string, any>} [config]
+ * @property {Record<string, any>} [pricing]
+ * @property {LoggerMethods} [logger]
+ * @property {Function} [now]
+ * @property {Function} [random]
+ */
+export function createBillingService(/** @type {BillingServiceDeps} */ {
   pool,
   flutterwave,
   config = billingConfig(),
@@ -179,8 +190,14 @@ export function createBillingService({
    * `currency` is validated rather than defaulted here, because an unsupported code is a bug in the caller or
    * an attack, and "we quietly charged you naira for a dollar price" is the failure this whole layer exists to
    * make impossible.
-   */
-  async function quote({ planKey, promoCode, currency = null, snapshot } = {}) {
+ *
+ * @typedef {Object} QuoteInput
+ * @property {string} [planKey]
+ * @property {string|null} [promoCode]
+ * @property {string|null} [currency]
+ * @property {Record<string, any>|null} [snapshot]
+ */
+async function quote(/** @type {QuoteInput} */ { planKey, promoCode, currency = null, snapshot } = {}) {
     const requested = currency === null || currency === undefined || currency === ''
       ? normalizeCurrency(config.currency)
       : String(currency).trim().toUpperCase();
@@ -636,7 +653,15 @@ export function createBillingService({
     return planPriceMinor(planFromSnapshot(snapshot, planKey), currency || config.currency);
   }
 
-  async function updateSubscriptionForEvent({ data, apply, reason }) {
+/**
+ *
+ * @typedef {Object} UpdateSubscriptionForEventInput
+ * a webhook or a verification, already reduced to the two things the writer needs: what the provider said, and how to apply it inside one transaction
+ * @property {Record<string, any>} [data]
+ * @property {({ subscription }: any) => Promise<any>} [apply]
+ * @property {string|null} [reason]
+ */
+  async function updateSubscriptionForEvent(/** @type {UpdateSubscriptionForEventInput} */ { data, apply, reason }) {
     const email = data?.email || data?.customer?.email || null;
     const userId = await findUserIdByEmail(email);
     if (!userId) return { handled: false, reason: reason || 'unmapped-customer' };

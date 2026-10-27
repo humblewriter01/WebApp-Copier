@@ -74,8 +74,16 @@ function quoteIsFresh(price, now = Date.now(), maxAgeMs = MAX_QUOTE_AGE_MS) {
  * (`{ connectedToBroker, synchronized }`). Only a clear `false` is a verdict of "stale": a snapshot that
  * says nothing keeps trading, exactly as it did before this guard existed, because a missing field is a
  * gap in what we can see and not evidence of a broken feed.
+ *
+ * @typedef {Object} GuardQuoteInput
+ * @property {{ bid?: string|number|null, ask?: string|number|null }|null} [price] - a market quote, and the
+ *   prices in it are NUMERIC-shaped: text out of a broker or a database row, coerced below rather than trusted
+ * @property {{ connectedToBroker?: boolean, synchronized?: boolean }|null} [link] - the account's own report of
+ *   whether it is attached to the broker, which is a different question from whether a quote is fresh
+ * @property {number} [now] - milliseconds, not a function: the default is `Date.now()` already evaluated
+ * @property {number} [maxAgeMs]
  */
-export function guardQuote({ price, link = null, now = Date.now(), maxAgeMs = MAX_QUOTE_AGE_MS } = {}) {
+export function guardQuote(/** @type {GuardQuoteInput} */ { price, link = null, now = Date.now(), maxAgeMs = MAX_QUOTE_AGE_MS } = {}) {
   if (link && (link.connectedToBroker === false || link.synchronized === false)) {
     return { ok: false, kind: 'stale-connection', message: STALE_CONNECTION_MESSAGE };
   }
@@ -101,8 +109,12 @@ export const MAX_DAILY_TRADES_MESSAGE = 'Execution skipped: Maximum daily trades
  * How much of the day's starting equity has gone, as a percentage. `null` means the comparison cannot be
  * made (no baseline, a zero or negative baseline, a non-numeric equity) rather than "no loss", so a caller
  * that treats `null` as 0 % would be trading through a missing safety measurement.
+ *
+ * @typedef {Object} DailyLossPercentInput
+ * @property {number|null} [baselineEquity]
+ * @property {number|null} [equity]
  */
-export function dailyLossPercent({ baselineEquity, equity } = {}) {
+export function dailyLossPercent(/** @type {DailyLossPercentInput} */ { baselineEquity, equity } = {}) {
   const baseline = Number(baselineEquity);
   const current = Number(equity);
   if (!Number.isFinite(baseline) || baseline <= 0 || !Number.isFinite(current)) return null;
@@ -117,8 +129,18 @@ export function dailyLossPercent({ baselineEquity, equity } = {}) {
  * daily loss limit works the same way on the day's drawdown. Values that are not numbers are treated as
  * "no verdict from this cap", because both settings are bounded to real numbers by the settings route
  * (`1..50` and `0.1..100`) and a guard that invented its own limit would be a rule nobody chose.
+ *
+ * @typedef {Object} GuardExposureInput
+ * @property {number|null} [openTrades] - a *count* of positions and resting orders, despite the plural name:
+ *   the engine passes `countPositionsAndOrders(...)`, and the guard coerces it rather than measuring it
+ * @property {number} [maxOpenPositions]
+ * @property {number} [dailyTrades]
+ * @property {number} [maxDailyTrades]
+ * @property {number|null} [equity]
+ * @property {number|null} [baselineEquity]
+ * @property {number|null} [dailyLossLimit]
  */
-export function guardExposure({ openTrades, maxOpenPositions, dailyTrades, maxDailyTrades, equity, baselineEquity, dailyLossLimit } = {}) {
+export function guardExposure(/** @type {GuardExposureInput} */ { openTrades, maxOpenPositions, dailyTrades, maxDailyTrades, equity, baselineEquity, dailyLossLimit } = {}) {
   const cap = Number(maxOpenPositions);
   const held = Number(openTrades);
   if (Number.isFinite(cap) && Number.isFinite(held) && held >= cap) {
@@ -245,9 +267,10 @@ function accountFaultNote(haystack) {
 /**
  * Classify one broker failure.
  *
- * @param input.result     a `MetatraderTradeResponse`-shaped answer the broker returned
- * @param input.error      an exception thrown while preparing or sending the request
- * @param input.submitted  whether the order had already been handed to the broker when it failed
+ * @typedef {Object} ClassifyBrokerFailureInput
+ * @property {Record<string, any>|null} [result] - a `MetatraderTradeResponse`-shaped answer the broker returned
+ * @property {Error|null} [error] - an exception thrown while preparing or sending the request
+ * @property {boolean} [submitted] - whether the order had already been handed to the broker when it failed
  *
  * `delivered` is the load-bearing answer: `'answered'` (a server replied, and a failing code means it
  * opened nothing), `'no'` (proved never delivered), `'unknown'` (the request may have become an order).
@@ -259,7 +282,7 @@ function accountFaultNote(haystack) {
  * credentials), then the codes whose own documentation settles delivery, then the code-vs-no-code split,
  * and only then the fallback for an error with nothing to go on.
  */
-export function classifyBrokerFailure({ result = null, error = null, submitted = false } = {}) {
+export function classifyBrokerFailure(/** @type {ClassifyBrokerFailureInput} */ { result = null, error = null, submitted = false } = {}) {
   const source = error || result || {};
   const { numeric, code, haystack, name, message, status } = codesOf(source);
   const rawMessage = message || String(error?.message || '') || 'The broker refused the order.';
@@ -336,8 +359,14 @@ export const RETRY_MAX_DELAY_MS = 15_000;
  * Deterministic on purpose. A jittered delay would be better engineering for a thousand workers hammering
  * one broker and worse testing for the one worker this service runs, and a retry whose timing can be
  * asserted is a retry whose timing can be trusted.
+ *
+ * @typedef {Object} RetryDelayMsInput
+ * @property {number} [attempt]
+ * @property {number} [baseMs]
+ * @property {number} [maxMs]
+ * @property {number} [factor]
  */
-export function retryDelayMs({ attempt, baseMs = RETRY_BASE_DELAY_MS, maxMs = RETRY_MAX_DELAY_MS, factor = 2 } = {}) {
+export function retryDelayMs(/** @type {RetryDelayMsInput} */ { attempt, baseMs = RETRY_BASE_DELAY_MS, maxMs = RETRY_MAX_DELAY_MS, factor = 2 } = {}) {
   const n = Number(attempt);
   if (!Number.isFinite(n) || n < 1) return null;
   const growth = Number.isFinite(Number(baseMs)) && Number(baseMs) > 0 ? Number(baseMs) : RETRY_BASE_DELAY_MS;
@@ -408,8 +437,12 @@ function normalizeSymbolPart(symbol) {
 
 /**
  * The total order-comment budget: `comment` + `clientId`, as MetaAPI stores them in one field.
+ *
+ * @typedef {Object} ClientIdFitsInput
+ * @property {string|null} [clientId]
+ * @property {string} [comment]
  */
-export function clientIdFits({ clientId, comment = CLIENT_ID_COMMENT } = {}) {
+export function clientIdFits(/** @type {ClientIdFitsInput} */ { clientId, comment = CLIENT_ID_COMMENT } = {}) {
   const id = String(clientId || '');
   const note = String(comment || '');
   if (!id) return { ok: false, reason: 'A client id is required for every order sent to the broker.' };
@@ -423,7 +456,13 @@ export function clientIdFits({ clientId, comment = CLIENT_ID_COMMENT } = {}) {
   return { ok: true, total };
 }
 
-export function buildClientId({ jobId, symbol = null } = {}) {
+/**
+ *
+ * @typedef {Object} BuildClientIdInput
+ * @property {string|null} [jobId]
+ * @property {string|null} [symbol]
+ */
+export function buildClientId(/** @type {BuildClientIdInput} */ { jobId, symbol = null } = {}) {
   const seed = String(jobId || '');
   if (!seed) throw new Error('A durable job id is required to build a broker client id.');
   const digest = crypto.createHash('sha256').update(seed).digest('hex');

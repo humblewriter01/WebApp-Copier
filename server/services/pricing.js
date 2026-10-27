@@ -184,8 +184,15 @@ export function emptyProviderMirror() {
  *
  * The database wins wherever it holds a usable number for that currency, so the site always charges and
  * displays what an administrator last saved - per currency, and never by averaging the two.
+ *
+ * @typedef {Object} MergePlanPricingInput
+ * the three sources of a price, deliberately kept apart: what the app was told, what the app saved, and what the provider says it charges. The answer merges them and never averages them, so a currency that only one of them has is an answer, not an error.
+ * @property {Record<string, any>} [config] - the app's own billing config, `plans` included
+ * @property {Record<string, any>} [planRows] - rows of `plans` keyed by plan key, each holding the per-currency minor amounts
+ * @property {Record<string, any>} [providerPlans] - what Flutterwave says it charges, keyed by plan then currency
+ * @property {Record<string, any>} [billingSettings] - the JSONB settings blob, including whether renewals are enabled at all
  */
-export function mergePlanPricing({ config, planRows = {}, providerPlans = {}, billingSettings = {} } = {}) {
+export function mergePlanPricing(/** @type {MergePlanPricingInput} */ { config, planRows = {}, providerPlans = {}, billingSettings = {} } = {}) {
   const currency = normalizeCurrency(config?.currency);
   const interval = config?.interval || 'monthly';
   const recurringEnabled = billingSettings.recurringEnabled !== false;
@@ -249,8 +256,16 @@ export function mergePlanPricing({ config, planRows = {}, providerPlans = {}, bi
  * a plan is single-currency and a USD customer pointed at an NGN plan is a customer charged the wrong thing in
  * a language they cannot read. A discount cannot sit on top of a plan price, so discounted checkouts stay
  * one-time.
+ *
+ * @typedef {Object} PlanChargeDecisionInput
+ * the question the checkout asks: what to charge, and whether to subscribe them. Every field is optional because the caller has already decided what it knows - a plan with no saved price for this currency is a normal state, not a missing argument.
+ * @property {Record<string, any>} [plan] - the app's plan definition, not the provider's
+ * @property {string|null} [currency]
+ * @property {number|null} [amountMinor] - a minor-unit integer for one currency; NUMERIC in the database, so text out of the driver and a number by the time it is here
+ * @property {boolean} [recurringEnabled]
+ * @property {boolean} [hasDiscount]
  */
-export function planChargeDecision({ plan, currency = null, amountMinor = null, recurringEnabled = true, hasDiscount = false } = {}) {
+export function planChargeDecision(/** @type {PlanChargeDecisionInput} */ { plan, currency = null, amountMinor = null, recurringEnabled = true, hasDiscount = false } = {}) {
   if (!plan) return { usePlan: false, reason: 'plan-unavailable' };
   if (!recurringEnabled) return { usePlan: false, reason: 'recurring-disabled' };
   if (hasDiscount) return { usePlan: false, reason: 'discounted-checkout' };
@@ -316,8 +331,14 @@ function normalizeFlag(value) {
  * A currency the request does not mention is left alone, which is what lets the panel save one field at a
  * time; `null` clears a price back to its deployed default. Every touched (plan, currency) pair needs a
  * provider re-sync, because the amount a renewal charges changed either way.
+ * @param {Record<string, any>} request.input - the administrator's body exactly as it arrived: validating it is this function's whole job, so nothing may assume a field here
+ *
+ * @typedef {Object} NormalizePricingUpdateInput
+ * @property {Record<string, any>} [input] - the administrator's body exactly as it arrived - validating it is this function's whole job, so nothing below may assume a field is present
+ * @property {Record<string, any>} [config]
+ * @property {boolean} [allowEmpty] - an empty body is a save that changed nothing, which is only an error on the first save
  */
-export function normalizePricingUpdate({ input, config, allowEmpty = false } = {}) {
+export function normalizePricingUpdate(/** @type {NormalizePricingUpdateInput} */ { input, config, allowEmpty = false } = {}) {
   const plans = input?.plans && typeof input.plans === 'object' && !Array.isArray(input.plans) ? input.plans : {};
   const known = new Set((config.plans || []).map((plan) => plan.key));
   for (const key of Object.keys(plans)) {
@@ -416,8 +437,15 @@ const SYNC_SELECT = `
  * Every failure degrades to the environment price, because billing must keep working even when a setting is
  * unreadable: a pricing table that cannot be read is a reason to log loudly, not a reason a trader cannot
  * start their month.
+ * @param {PoolLike} deps.pool
+ *
+ * @typedef {Object} PricingStoreDeps
+ * `pool` and `config` are checked in the body rather than by the signature: the store is built at module scope, where a missing dependency has to name itself in a thrown sentence instead of failing as an undefined-property error two hundred lines later.
+ * @property {PoolLike} [pool]
+ * @property {Record<string, any>} [config]
+ * @property {LoggerMethods} [logger] - any subset of levels - the server hands this store a `warn`-only view of its own log, and a type that demanded a whole `Console` would say that caller is broken
  */
-export function createPricingStore({ pool, config, logger = console } = {}) {
+export function createPricingStore(/** @type {PricingStoreDeps} */ { pool, config, logger = console } = {}) {
   const log = (level, message, extra = {}) => logger?.[level]?.(message, extra);
 
   async function loadRows(sql, label) {
@@ -465,6 +493,13 @@ export function createPricingStore({ pool, config, logger = console } = {}) {
     return out;
   }
 
+/**
+ * Returns the billing settings blob. Open-ended on purpose: it is a JSONB document that accumulates keys
+ * (`updatedAt` is one, an operator's note would be another), so the type says "a record" rather than freezing
+ * a list that the write path is not allowed to close.
+ * 
+ * @returns {Promise<Record<string, any>>}
+ */
   async function loadBillingSettings() {
     try {
       const { rows } = await pool.query('SELECT setting_value FROM admin_settings WHERE setting_key=$1 LIMIT 1', [BILLING_SETTINGS_KEY]);
@@ -500,8 +535,18 @@ export function createPricingStore({ pool, config, logger = console } = {}) {
    * `amounts` states the value per currency and `written` states which currencies this call is allowed to
    * change, which is what stops a save of the naira price from quietly zeroing the dollar one. The history
    * entry is appended here rather than by a trigger, because the row it describes is being assembled anyway.
-   */
-  async function savePlanPrices({ planKey, amounts = {}, written = {}, actorId = null, actorEmail = null, note = null, interval = null } = {}) {
+ * @param {string} request.planKey
+ *
+ * @typedef {Object} SavePlanPricesInput
+ * @property {string} [planKey]
+ * @property {Record<string, any>} [amounts] - minor amounts keyed by currency code
+ * @property {Record<string, any>} [written] - the amounts actually persisted, same keys
+ * @property {string|null} [actorId] - the administrator's row id, as text: a UUID, never a number
+ * @property {string|null} [actorEmail]
+ * @property {string|null} [note]
+ * @property {string|null} [interval]
+ */
+async function savePlanPrices(/** @type {SavePlanPricesInput} */ { planKey, amounts = {}, written = {}, actorId = null, actorEmail = null, note = null, interval = null } = {}) {
     const definition = (config.plans || []).find((plan) => plan.key === normalizeKey(planKey));
     if (!definition) throw pricingError('That plan is not available for pricing.');
     const currencies = SUPPORTED_CURRENCIES.filter((code) => Object.hasOwn(written, code) || Object.hasOwn(amounts, code));
@@ -563,8 +608,16 @@ export function createPricingStore({ pool, config, logger = console } = {}) {
     };
   }
 
-  /** Persists the outcome of a Flutterwave payment-plan synchronisation for one plan and currency. */
-  async function recordPlanSync({ planKey, currency, sync = {}, actorId = null } = {}) {
+  /** Persists the outcome of a Flutterwave payment-plan synchronisation for one plan and currency.
+ * @param {string} request.planKey
+ *
+ * @typedef {Object} RecordPlanSyncInput
+ * @property {string} [planKey]
+ * @property {string|null} [currency]
+ * @property {Record<string, any>} [sync] - whatever the synchroniser returned, read field by field below with the guards a provider answer needs - an absent plan id has to stay absent, because `Number(null)` is 0 and 0 looks like an id
+ * @property {string|null} [actorId]
+ */
+async function recordPlanSync(/** @type {RecordPlanSyncInput} */ { planKey, currency, sync = {}, actorId = null } = {}) {
     const definition = (config.plans || []).find((plan) => plan.key === normalizeKey(planKey));
     if (!definition) return null;
     const code = normalizeCurrency(currency || config.currency);

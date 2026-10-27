@@ -82,7 +82,13 @@ function safeParse(text) {
   }
 }
 
-export function createPlatformControls({ pool, logger = console } = {}) {
+/**
+ *
+ * @typedef {Object} PlatformControlsDeps
+ * @property {PoolLike} [pool]
+ * @property {LoggerMethods} [logger]
+ */
+export function createPlatformControls(/** @type {PlatformControlsDeps} */ { pool, logger = console } = {}) {
   if (!pool?.query) throw new TypeError('Platform controls need a database pool.');
   const log = (level, message, extra = {}) => logger?.[level]?.(message, extra);
 

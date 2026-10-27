@@ -114,8 +114,13 @@ export function chooseDashboardSignals({ actionable = [], recent = [] } = {}) {
  *
  * `withLiveBlockers` is required rather than optional. Without it this function returns sentences the
  * workspace has outgrown, and every caller in the product is a trader looking at one.
+ *
+ * @typedef {Object} ReadDashboardSignalsInput
+ * @property {PoolLike} [pool]
+ * @property {string} [userId]
+ * @property {(userId: string, rows: any[]) => Promise<any[]>} [withLiveBlockers]
  */
-export async function readDashboardSignals({ pool, userId, withLiveBlockers } = {}) {
+export async function readDashboardSignals(/** @type {ReadDashboardSignalsInput} */ { pool, userId, withLiveBlockers } = {}) {
   if (!pool?.query) throw new TypeError('The dashboard signal read needs a pool to read from');
   if (typeof withLiveBlockers !== 'function') {
     throw new TypeError('The dashboard signal read needs the live-blocker reader, or its notes are history');

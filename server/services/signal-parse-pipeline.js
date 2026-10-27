@@ -140,7 +140,18 @@ function reviewSentence(reason, technical = null) {
  */
 export const CAPTURE_PARSE_BUDGET_MS = 1_500;
 
-export async function parseSignalTwoLayer(message, { source = 'telegram', config, fetchImpl, logger, gate = null, priority = 'realtime', captureBudgetMs = null } = {}) {
+/**
+ *
+ * @typedef {Object} ParseSignalTwoLayerInput
+ * @property {string} [source]
+ * @property {Record<string, any>|null} [config]
+ * @property {any} [fetchImpl]
+ * @property {LoggerMethods|null} [logger]
+ * @property {any} [gate]
+ * @property {string} [priority]
+ * @property {any} [captureBudgetMs]
+ */
+export async function parseSignalTwoLayer(message, /** @type {ParseSignalTwoLayerInput} */ { source = 'telegram', config, fetchImpl, logger, gate = null, priority = 'realtime', captureBudgetMs = null } = {}) {
   const layer1 = parseSignal(message);
   const base = {
     parsed: layer1,

@@ -39,6 +39,7 @@ A deployable React/Vite and Express app for capturing Telegram channel messages,
 - Persistence: Supabase PostgreSQL (or another PostgreSQL 13+ database)
 - Telegram client: GramJS (`telegram` npm package)
 - MetaAPI access: HTTPS REST API via Node's built-in `fetch`
+- Type checking: TypeScript 5.9 running over the JavaScript sources (`allowJs` + `checkJs`), with no build step and no renamed files
 
 ## Local development
 
@@ -64,6 +65,25 @@ A deployable React/Vite and Express app for capturing Telegram channel messages,
 6. Open the Vite URL printed by the client. The API health endpoint is `http://localhost:5000/health`.
 
 The app creates its PostgreSQL tables and indexes on backend startup. The new `metaapi_credentials` and `metaapi_accounts` tables have row-level security enabled; the backend uses its private database role.
+
+### Tests, and what the type checker is for
+
+`npm test` in `server/` runs the type check first and then the suite - 799 tests, 12 of which exist to keep the
+check itself honest. `npm run typecheck` runs the checker on its own, and `render.yaml` runs that same command in
+the build, which is where a type error stops a deploy rather than joining a backlog.
+
+Nothing was renamed to TypeScript. `server/tsconfig.json` turns on `allowJs` and `checkJs` with `strict` off, so
+every application source is checked as it is written, and `server/types/app.d.ts` declares the four things an
+inference over JavaScript cannot see: what a service is allowed to put on an `Error`, what the logging seam looks
+like, what a database handle accepts, and what a row of `users`, `channels`, `signals`, `trades`, `settings` or
+`promo_codes` contains. The last of those matters more than it looks: `pg` returns `NUMERIC` as a **string**, so a
+price is `string | null` in the types and every arithmetic use of it is written `Number(row.entry_price)`. That is
+why the service contains four hundred `Number(` calls, and it is the reason `row.entry_price > 0` - a comparison
+with no coercion - is now a compile error instead of a rule of thumb.
+
+Two deliberate gaps, both recorded in `TODO.md`: the tests are excluded, because their fixtures are duck-typed
+shapes that are meant to be wrong in instructive ways; and `pg` is left untyped, so the query sites still read
+`rows` as `any` until the row typedefs are attached to them directory by directory.
 
 ## Telegram connection state in the UI
 

@@ -42,7 +42,16 @@ function accountInfoOf(connection) {
   return info;
 }
 
-export function createMetaApiTradingAdapter({ MetaApiClass = MetaApi, now = () => Date.now(), quoteTimeoutMs = DEFAULT_QUOTE_TIMEOUT_MS } = {}) {
+/**
+ *
+ * @typedef {Object} MetaApiTradingAdapterDeps
+ * @property {new (...args: any[]) => any} [MetaApiClass] - the SDK class, injected rather than imported because this
+ *   file may not know the library exists (see `test/telegram-adapter.test.js` for the same rule on the other
+ *   provider): a constructor type, because it is used with `new`, and `Function` would not permit that
+ * @property {Function} [now]
+ * @property {number} [quoteTimeoutMs]
+ */
+export function createMetaApiTradingAdapter(/** @type {MetaApiTradingAdapterDeps} */ { MetaApiClass = MetaApi, now = () => Date.now(), quoteTimeoutMs = DEFAULT_QUOTE_TIMEOUT_MS } = {}) {
   const clients = new Map();
   const connections = new Map();
 
@@ -194,8 +203,13 @@ export function createMetaApiTradingAdapter({ MetaApiClass = MetaApi, now = () =
    *
    * A refusal is returned, not thrown: "the order is no longer there" is the outcome the sweeper was aiming
    * at, and it has to be told apart from "the broker will not let me cancel" without unwinding a stack.
-   */
-  async function cancelOrder({ token, accountId, orderId } = {}) {
+ *
+ * @typedef {Object} CancelOrderInput
+ * @property {string} [token]
+ * @property {string} [accountId]
+ * @property {string} [orderId]
+ */
+async function cancelOrder(/** @type {CancelOrderInput} */ { token, accountId, orderId } = {}) {
     const id = String(orderId ?? '').trim();
     if (!id) throw new Error('A broker order id is required to cancel an order.');
     const { connection } = await getConnection(token, accountId);
@@ -243,8 +257,14 @@ export function createMetaApiTradingAdapter({ MetaApiClass = MetaApi, now = () =
    * positions and pending orders answer first, because that is where an order accepted a moment ago is;
    * the day's deals are searched as well so a position opened and closed inside the retry window is still
    * found. A missing history store is not an error here: it narrows the search, it does not clear it.
-   */
-  async function findOrderByClientId({ token, accountId, clientId, fromTime } = {}) {
+ *
+ * @typedef {Object} FindOrderByClientIdInput
+ * @property {string} [token]
+ * @property {string} [accountId]
+ * @property {string} [clientId]
+ * @property {string|Date|null} [fromTime]
+ */
+async function findOrderByClientId(/** @type {FindOrderByClientIdInput} */ { token, accountId, clientId, fromTime } = {}) {
     const id = assertClientId(clientId);
     const { connection } = await getConnection(token, accountId);
     const terminal = connection.terminalState;

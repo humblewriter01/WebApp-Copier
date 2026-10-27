@@ -11,9 +11,23 @@ import { deleteMetaApiAccount } from './metaapi.js';
  *
  * Failures never block deletion: the user can always remove their workspace,
  * and each failure is logged with safe diagnostics so it can be retried.
+ *
+ * @typedef {Object} AccountCleanupDeps
+ * @property {(apiToken: string, accountId: string) => Promise<{ alreadyMissing?: boolean }>} [removeAccount] -
+ *   token first, then the account it controls, because the token is resolved per account just above the call and
+ *   two accounts on one workspace can sit on different ones; the default is `deleteMetaApiAccount`, which is why
+ *   the server can build this service with nothing but a logger
+ * @property {LoggerMethods} [logger]
  */
-export function createAccountCleanup({ removeAccount = deleteMetaApiAccount, logger = console } = {}) {
-  async function removeProviderAccounts({ accounts = [], resolveToken, includeUserManaged = false } = {}) {
+export function createAccountCleanup(/** @type {AccountCleanupDeps} */ { removeAccount = deleteMetaApiAccount, logger = console } = {}) {
+/**
+ *
+ * @typedef {Object} RemoveProviderAccountsInput
+ * @property {any[]} [accounts]
+ * @property {(account: Record<string, any>) => Promise<string>|string|null} [resolveToken] - asked per account, because two accounts on one workspace can live on different tokens
+ * @property {boolean} [includeUserManaged]
+ */
+  async function removeProviderAccounts(/** @type {RemoveProviderAccountsInput} */ { accounts = [], resolveToken, includeUserManaged = false } = {}) {
     const summary = {
       total: accounts.length,
       attempted: 0,

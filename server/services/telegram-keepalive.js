@@ -80,8 +80,14 @@ export function isProviderKeepAliveTimeout(error) {
  * `attach` is called on a client that has just been constructed and not yet connected, because the update loop
  * starts inside `connect()` - a guard installed afterwards would miss exactly the first flap, which is the one
  * that happens while the session is being rebuilt.
+ *
+ * @typedef {Object} TelegramKeepAliveGuardDeps
+ * @property {Function} [log]
+ * @property {Function} [now]
+ * @property {any} [summaryEveryMs]
+ * @property {number} [markTtlMs]
  */
-export function createTelegramKeepAliveGuard({ log = () => {}, now = () => Date.now(), summaryEveryMs = KEEP_ALIVE_SUMMARY_MS, markTtlMs = KEEP_ALIVE_MARK_TTL_MS } = {}) {
+export function createTelegramKeepAliveGuard(/** @type {TelegramKeepAliveGuardDeps} */ { log = () => {}, now = () => Date.now(), summaryEveryMs = KEEP_ALIVE_SUMMARY_MS, markTtlMs = KEEP_ALIVE_MARK_TTL_MS } = {}) {
   const states = new Set();
   const byClient = new WeakMap();
   // Everything the process-level handler recognises lands here: there is no client to attribute it to, but there

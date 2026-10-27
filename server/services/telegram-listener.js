@@ -246,7 +246,56 @@ export function isValidWorkspaceId(value) {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-export function createTelegramListener({ clients, pool, log = console, saveSignal, now = () => Date.now(), catchUpLimit = CATCH_UP_LIMIT, catchUpCooldownMs = CATCH_UP_COOLDOWN_MS, catchUpBudgetMs = CATCH_UP_BUDGET_MS, silenceSuspectMs = SILENCE_SUSPECT_MS, probeDeadlineMs = STREAM_PROBE_DEADLINE_MS, gapCatchUpMs = GAP_CATCH_UP_MS, gapCatchUpSpreadMs = GAP_CATCH_UP_SPREAD_MS, heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS, ptsStallBeats = PTS_STALL_BEATS, rebuildCooldownMs = STREAM_REBUILD_COOLDOWN_MS,
+/**
+ * Everything the capture loop is allowed to need from the outside, in one bag.
+ *
+ * Documented as a type because the alternative was a compiler that could not see the seam at all: the checker
+ * inferred this parameter from its `= {}` default and from the defaults of its members, which produced two
+ * claims that were both wrong and both load-bearing. It believed `log` was `console` - an object, not a
+ * function - so the twenty-six `log('warn', ...)` calls in this file were "calling a non-callable", and it
+ * believed `clients` and `pool` did not exist, because a member with no default contributes nothing to an
+ * inferred shape.
+ *
+ * The first of those was not only a compiler complaint. `log = console` below is a genuine trap: this function
+ * is called with a `log` by the server and by every test, so the default never ran, but a caller who omitted it
+ * would have got `TypeError: log is not a function` from inside the heartbeat - inside a `catch` that logs with
+ * the same missing function. The default is now a no-op shaped like the seam, which is what "silence is
+ * allowed, logging is not required" should have meant here.
+ *
+ * @typedef {Object} TelegramListenerDeps
+ * @property {Map<string, any>} clients - the live clients, keyed by the workspace id as text; the map is the
+ *   server's, so a session that never gets a listener is still visible to the HTTP routes that report on it
+ * @property {PoolLike} pool - reads the enabled channels and writes what the capture decided
+ * @property {(userId: string, message: any, channel: any) => Promise<any>} saveSignal - the only write this
+ *   file performs through anything other than `pool`, and the reason capture does not know what a signal row is
+ * @property {ServiceLogger} [log] - `log(level, sentence, facts)`; absent means silent, not `console`
+ * @property {() => number} [now] - milliseconds, injected so a test can move the clock instead of waiting on it
+ * @property {number} [catchUpLimit] - how many recent messages a replay is allowed to read
+ * @property {number} [catchUpCooldownMs] - how long before the same session is replayed again
+ * @property {number} [catchUpBudgetMs] - how long one replay may take before it is left for the next cycle
+ * @property {number} [silenceSuspectMs] - how long a listening session may be silent before it is worth asking about
+ * @property {number} [probeDeadlineMs] - how long a stream probe waits for the answer that decides deaf or not
+ * @property {number} [gapCatchUpMs] - the gap that turns a reconciliation into a replay
+ * @property {number} [gapCatchUpSpreadMs] - how far apart two workspaces' gap checks are pushed
+ * @property {number} [heartbeatIntervalMs] - the beat, exported so the server's interval and this file cannot disagree
+ * @property {number} [ptsStallBeats] - beats of an unchanged pts before the stream is called stalled
+ * @property {number} [rebuildCooldownMs] - how often one session may be rebuilt
+ * @property {number} [differenceMaxSteps] - how many slices a single reconciliation may walk
+ * @property {number} [differenceBudgetMs] - and for how long
+ * @property {number} [floodWaitMs] - the default wait when the provider asks for one without saying how long
+ * @property {number} [ptsGapStrikes] - beats of an unclosable gap before the workspace is asked to sign in
+ * @property {number} [gapReauthWindowMs] - the window those strikes have to fall inside
+ * @property {(client: any) => any} [transportFlap] - what the provider's own ping loop last did to this client
+ * @property {number} [keepAliveFlapGraceMs] - how recent a flap has to be to excuse one failed beat
+ * @property {(userId: string, reason: string, options?: { force?: boolean, escalate?: boolean }) => any} [onDeadStream] -
+ *   the rebuild, which only the server can perform
+ * @property {(userId: string, reason: string, details?: any) => any} [onSessionUnrecoverable] -
+ *   the verdict that no rebuild is coming, which only the server can record
+ */
+/* `Partial`, because the whole bag defaults to `{}` and the first line of the body is the check that decides
+   whether the three required members arrived: the type says "anything you do pass has to be shaped right", and
+   the `throw` says "and these three you may not leave out". */
+export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>} */ { clients, pool, log = () => {}, saveSignal, now = () => Date.now(), catchUpLimit = CATCH_UP_LIMIT, catchUpCooldownMs = CATCH_UP_COOLDOWN_MS, catchUpBudgetMs = CATCH_UP_BUDGET_MS, silenceSuspectMs = SILENCE_SUSPECT_MS, probeDeadlineMs = STREAM_PROBE_DEADLINE_MS, gapCatchUpMs = GAP_CATCH_UP_MS, gapCatchUpSpreadMs = GAP_CATCH_UP_SPREAD_MS, heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS, ptsStallBeats = PTS_STALL_BEATS, rebuildCooldownMs = STREAM_REBUILD_COOLDOWN_MS,
   differenceMaxSteps = DIFFERENCE_MAX_STEPS, differenceBudgetMs = DIFFERENCE_BUDGET_MS, floodWaitMs = FLOOD_BACKOFF_MS,
   ptsGapStrikes = PTS_GAP_STRIKES, gapReauthWindowMs = PTS_GAP_REAUTH_WINDOW_MS, transportFlap = null, keepAliveFlapGraceMs = KEEP_ALIVE_FLAP_GRACE_MS, onDeadStream = null, onSessionUnrecoverable = null } = {}) {
   if (!clients || !pool || !saveSignal) throw new Error('createTelegramListener requires clients, pool and saveSignal');
@@ -1272,7 +1321,9 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
     const instanceStartedAt = startedAt.toISOString();
     const idleMs = lastMessageAt ? Math.max(0, now() - Date.parse(lastMessageAt)) : null;
     const delays = sessions.map((session) => session.lastDelayMs).filter((value) => Number.isFinite(value));
-    const slowestSilence = sessions.reduce((worst, session) => (session.silenceSeconds != null && (worst === null || session.silenceSeconds > worst) ? session.silenceSeconds : worst), null);
+    /* The accumulator is not a session, which is what `reduce`'s inference concluded from a `null` seed; the
+       annotation is the shortest way to say what the loop actually carries. */
+    const slowestSilence = sessions.reduce((/** @type {number|null} */ worst, session) => (session.silenceSeconds != null && (worst === null || session.silenceSeconds > worst) ? session.silenceSeconds : worst), null);
     return {
       sessions,
       sessionsInMemory: sessions.length,

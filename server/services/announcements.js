@@ -47,7 +47,13 @@ function clean(value, max) {
     .slice(0, max);
 }
 
-function parseTime(value, label, { now, mustBeFuture = false } = {}) {
+/**
+ *
+ * @typedef {Object} ParseTimeInput
+ * @property {Date|null} [now] - a moment to measure against, already evaluated: the caller passes `new Date()`, it does not pass a clock
+ * @property {boolean} [mustBeFuture]
+ */
+function parseTime(value, label, /** @type {ParseTimeInput} */ { now, mustBeFuture = false } = {}) {
   if (value === undefined || value === null || value === '') return null;
   const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) throw validationError(`That ${label} is not a readable date and time.`);
@@ -151,7 +157,14 @@ export function buildRetiredAnnouncementClear() {
   return { sql: 'DELETE FROM announcements WHERE active = FALSE OR ends_at <= NOW()', params: [] };
 }
 
-export function createAnnouncementService({ pool, logger = console, now = () => new Date() } = {}) {
+/**
+ *
+ * @typedef {Object} AnnouncementServiceDeps
+ * @property {PoolLike} [pool]
+ * @property {LoggerMethods} [logger]
+ * @property {() => Date} [now] - the clock, this one a function, because the service answers "is anything live right now" on demand
+ */
+export function createAnnouncementService(/** @type {AnnouncementServiceDeps} */ { pool, logger = console, now = () => new Date() } = {}) {
   if (!pool?.query) throw new TypeError('Announcements need a database pool.');
   const log = (level, message, extra = {}) => logger?.[level]?.(message, extra);
 

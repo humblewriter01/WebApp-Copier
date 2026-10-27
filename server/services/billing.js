@@ -159,7 +159,10 @@ export function planPriceMinor(plan, currency) {
 
 /** Every price of a plan, keyed by currency, in the shape the API and the billing page read. */
 export function planPrices(plan, { interval = DEFAULT_INTERVAL } = {}) {
-  const out = {};
+  /* Keyed by currency code, and open-ended on purpose: a second supported currency is a constant change in
+     `SUPPORTED_CURRENCIES`, not a type change here, and the whole point of the freeze below is that a caller
+     cannot invent a third entry. */
+  const out = /** @type {Record<string, any>} */ ({});
   for (const code of SUPPORTED_CURRENCIES) {
     const amountMinor = planPriceMinor(plan, code);
     if (amountMinor === null) continue;
@@ -227,8 +230,27 @@ function roundMoney(value) {
  * Neither may take the price below that currency's minimum Flutterwave charge: a ₦50 or $0.40 payment is not
  * refused by a policy here, it is refused by the provider after the customer has already been sent to a
  * checkout page, which is the worse place to discover it.
+ *
+ * @typedef {Object} PromoDescriptor
+ * @property {string|null} [id] - the `promo_codes` row id, a UUID as text
+ * @property {string} [code]
+ * @property {'percentage'|'fixed'} [discountType]
+ * @property {string|number|null} [discountValue] - NUMERIC in the database, so text until it is coerced below,
+ *   where a value that will not coerce is refused rather than read as zero
+ * @property {number|null} [maxUses] - null or absent means unlimited
+ * @property {number} [currentUses]
+ * @property {boolean} [active]
+ * @property {string|Date|null} [expiresAt]
  */
-export function applyPromoCode({ amountMinor, promoCode, currency = DEFAULT_CURRENCY } = {}) {
+/**
+ * @typedef {Object} ApplyPromoCodeInput
+ * @property {number|null} [amountMinor]
+ * @property {PromoDescriptor|null} [promoCode] - the row already normalised for this function, camelCase and all:
+ *   a raw `promo_codes` row has snake_case keys and `applyPromoCode` would read `undefined` off it, which is a
+ *   discount of zero and a 200 where the answer should have been 409
+ * @property {string|null} [currency]
+ */
+export function applyPromoCode(/** @type {ApplyPromoCodeInput} */ { amountMinor, promoCode, currency = DEFAULT_CURRENCY } = {}) {
   if (!promoCode) return { amountMinor, discountMinor: 0, promoCode: null };
   if (promoCode.active !== true) throw promoError('This promo code is no longer active.', 409, 'PROMO_INACTIVE');
   if (promoCode.expiresAt && new Date(promoCode.expiresAt).getTime() <= Date.now()) {

@@ -379,7 +379,26 @@ export function classifyBreakEvenFailure(error) {
   return { status: 'failed', retry: true, message: message || 'The broker rejected the stop-loss change.' };
 }
 
-export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnabled = false, isTradingPaused = async () => false, now = () => Date.now(), breakEvenIntervalMs = 5_000, takeProfitSweepIntervalMs = 5_000, breakEvenMaxAttempts = BREAK_EVEN_MAX_ATTEMPTS, quoteMaxAgeMs = MAX_QUOTE_AGE_MS, expirySweepIntervalMs = 60_000, maxOrderAttempts = MAX_ORDER_ATTEMPTS, retryBaseMs = RETRY_BASE_DELAY_MS, retryMaxMs = RETRY_MAX_DELAY_MS, logger = console } = {}) {
+/**
+ *
+ * @typedef {Object} ExecutionEngineDeps
+ * @property {PoolLike} [pool]
+ * @property {Record<string, any>} [trading]
+ * @property {Function} [resolveToken]
+ * @property {boolean} [runtimeEnabled]
+ * @property {Function} [isTradingPaused]
+ * @property {Function} [now]
+ * @property {number} [breakEvenIntervalMs]
+ * @property {number} [takeProfitSweepIntervalMs]
+ * @property {number} [breakEvenMaxAttempts]
+ * @property {number} [quoteMaxAgeMs]
+ * @property {number} [expirySweepIntervalMs]
+ * @property {number} [maxOrderAttempts]
+ * @property {number} [retryBaseMs]
+ * @property {number} [retryMaxMs]
+ * @property {LoggerMethods} [logger]
+ */
+export function createExecutionEngine(/** @type {ExecutionEngineDeps} */ { pool, trading, resolveToken, runtimeEnabled = false, isTradingPaused = async () => false, now = () => Date.now(), breakEvenIntervalMs = 5_000, takeProfitSweepIntervalMs = 5_000, breakEvenMaxAttempts = BREAK_EVEN_MAX_ATTEMPTS, quoteMaxAgeMs = MAX_QUOTE_AGE_MS, expirySweepIntervalMs = 60_000, maxOrderAttempts = MAX_ORDER_ATTEMPTS, retryBaseMs = RETRY_BASE_DELAY_MS, retryMaxMs = RETRY_MAX_DELAY_MS, logger = console } = {}) {
   if (!pool?.query || !trading?.getAccountState || !trading?.createMarketOrder || typeof resolveToken !== 'function') {
     throw new TypeError('Execution engine dependencies are incomplete.');
   }
@@ -833,7 +852,7 @@ export function createExecutionEngine({ pool, trading, resolveToken, runtimeEnab
          becomes a plan. Both are decided from the stored level list rather than by re-reading the
          message, so a parser change can never move the target of a signal somebody had already reviewed. */
       const target = selectTarget({ mode: item.multipleTargetHandling, takeProfit, levels: item.takeProfitLevels });
-      let scaleOut = { eligible: false, reason: resting ? 'pending-order' : 'mode' };
+      let scaleOut = /** @type {ScaleOutPlan} */ ({ eligible: false, reason: resting ? 'pending-order' : 'mode' });
       /* Scale-out starts from the first target and only moves the exit out once the plan is known to be
          tradeable, because the plan needs the volume the sizing just produced. That order matters: if the
          position is too small to split, a workspace that asked to scale out is left holding the *earlier*

@@ -17,8 +17,16 @@ function safeWorkerError(error) {
  * bounded by `followUpLimit`, so a burst of signals is drained in consecutive round trips instead of one per
  * interval; the bound is what keeps a busy channel from starving the break-even and scale-out sweeps that the
  * same loop carries for positions already open.
+ *
+ * @typedef {Object} ExecutionWorkerDeps
+ * @property {PoolLike} [pool]
+ * @property {Record<string, any>} [engine]
+ * @property {number} [pollIntervalMs]
+ * @property {number} [staleLockMs]
+ * @property {LoggerMethods} [logger]
+ * @property {number} [followUpLimit]
  */
-export function createExecutionWorker({ pool, engine, pollIntervalMs = 1200, staleLockMs = 5 * 60_000, logger = console, followUpLimit = 8 } = {}) {
+export function createExecutionWorker(/** @type {ExecutionWorkerDeps} */ { pool, engine, pollIntervalMs = 1200, staleLockMs = 5 * 60_000, logger = console, followUpLimit = 8 } = {}) {
   if (!pool?.connect || !pool?.query || typeof engine?.processJob !== 'function') throw new TypeError('Execution worker dependencies are incomplete.');
   let stopped = true;
   let timer = null;

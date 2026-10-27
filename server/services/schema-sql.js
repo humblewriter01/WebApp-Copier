@@ -117,8 +117,11 @@ export function sqlPreview(sql, max = 180) {
  * the socket opens, the startup packet goes out, nothing comes back, and `pg` waits because waiting is
  * what a driver does. The caller therefore races the work against a deadline, and `onLate` gets the value
  * if it arrives afterwards, so an abandoned connection checkout is released instead of leaking a slot.
+ *
+ * @typedef {Object} WithDeadlineInput
+ * @property {(value: any) => void} [onLate] - called with the result, when the work finished after the deadline had already answered
  */
-export async function withDeadline(work, timeoutMs, label, { onLate } = {}) {
+export async function withDeadline(work, timeoutMs, label, /** @type {WithDeadlineInput} */ { onLate } = {}) {
   const limit = Math.max(1, Math.round(Number(timeoutMs) || 0)) || 1;
   let expired = false;
   let timer = null;

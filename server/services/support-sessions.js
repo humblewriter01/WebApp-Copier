@@ -58,7 +58,16 @@ export function buildSupportClaims({ sessionId, jti, adminId, adminEmail, userId
   };
 }
 
-export function createSupportSessionService({
+/**
+ *
+ * @typedef {Object} SupportSessionServiceDeps
+ * @property {PoolLike} [pool]
+ * @property {number} [hours]
+ * @property {LoggerMethods} [logger]
+ * @property {Function} [now]
+ * @property {Function} [randomId]
+ */
+export function createSupportSessionService(/** @type {SupportSessionServiceDeps} */ {
   pool,
   hours = SUPPORT_SESSION_HOURS,
   logger = console,
