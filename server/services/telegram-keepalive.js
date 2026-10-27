@@ -88,7 +88,9 @@ export function createTelegramKeepAliveGuard({ log = () => {}, now = () => Date.
   const GUARD_FLAG = '_sdbKeepAliveGuard';
 
   function makeState(userId = null) {
-    return { userId, count: 0, firstAt: null, lastAt: null, windowAt: 0, pending: null };
+    // `count` is everything since boot; `windowCount` is everything since the last summary was said. Only the
+    // second one can express a rate, and a rate is what "starting to spike" means.
+    return { userId, count: 0, windowCount: 0, firstAt: null, lastAt: null, windowAt: 0, pending: null };
   }
 
   function report(state, at) {
@@ -98,14 +100,31 @@ export function createTelegramKeepAliveGuard({ log = () => {}, now = () => Date.
     // nobody reads before the deploy is rolled back.
     if (state.windowAt && at - state.windowAt < summaryEveryMs) return;
     state.windowAt = at;
+    /* Who else is timing out in this same window, because that is the number that tells a bad workspace apart
+       from a bad data center - and it only exists on this line, since a reader looking at 60 separate lines
+       cannot see that they are the same event. The library's own cadence is the yardstick: `PING_INTERVAL` is 9
+       seconds, so `windowCount` near `windowMs / 9000` means every single ping failed, and a third of it means a
+       hiccup. No threshold is asserted here on purpose - that judgement belongs to whoever is on call, and an
+       invented "spike" number is a lie that gets believed. */
+    const windowStart = at - summaryEveryMs;
+    let affectedClients = 0;
+    for (const other of states) {
+      if (other.lastAt !== null && other.lastAt >= windowStart) affectedClients += 1;
+    }
     log('warn', 'Telegram keep-alive timeouts suppressed', {
       userId: state.userId,
       count: state.count,
+      windowCount: state.windowCount,
+      windowMs: summaryEveryMs,
+      pingCyclesPerWindow: Math.max(1, Math.round(summaryEveryMs / 9_000)),
+      affectedClients,
+      guardedClients: states.size,
+      suppressedTotal: stats().count,
       firstAt: state.firstAt === null ? null : new Date(state.firstAt).toISOString(),
       lastAt: new Date(state.lastAt).toISOString(),
-      windowMs: summaryEveryMs,
       source: 'telegram/client/updates.js (_updateLoop ping)',
     });
+    state.windowCount = 0;
   }
 
   function note(error, state) {
@@ -116,6 +135,7 @@ export function createTelegramKeepAliveGuard({ log = () => {}, now = () => Date.
     state.pending = noise ? at : null;
     if (!noise) return false;
     state.count += 1;
+    state.windowCount += 1;
     if (state.firstAt === null) state.firstAt = at;
     state.lastAt = at;
     report(state, at);

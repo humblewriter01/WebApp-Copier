@@ -141,6 +141,37 @@ test('a hundred timeouts a minute become one line, and every one of them is stil
   assert.equal(guard.stats().count, 400);
 });
 
+test('the line carries a rate and a fleet dimension, not just a number since boot', () => {
+  let clock = 0;
+  const logs = [];
+  const guard = createTelegramKeepAliveGuard({ log: (level, message, meta) => logs.push({ level, message, meta }), now: () => clock, summaryEveryMs: 300_000 });
+  const a = guard.attach({ _log: { canSend: () => true } }, { userId: 1 });
+  const b = guard.attach({ _log: { canSend: () => true } }, { userId: 2 });
+  const quiet = guard.attach({ _log: { canSend: () => true } }, { userId: 3 });
+
+  // The quiet client flapped once, an hour before the window being examined here.
+  guard.note(keepAliveTimeout(), quiet);
+  // Then this workspace started failing every ping, and a second one failed once, inside the same window.
+  clock = 300_000;
+  guard.note(keepAliveTimeout(), a);                       // a's first line: the window opens, its counter resets
+  for (let i = 1; i < 5; i += 1) { clock += 60_000; guard.note(keepAliveTimeout(), a); }
+  guard.note(keepAliveTimeout(), b);
+  clock = 600_000;
+  guard.note(keepAliveTimeout(), a);                       // the window has closed, so a is allowed to speak again
+  const line = logs[logs.length - 1].meta;
+  assert.deepEqual(
+    { count: line.count, windowCount: line.windowCount, affectedClients: line.affectedClients, guardedClients: line.guardedClients, suppressedTotal: line.suppressedTotal },
+    { count: 6, windowCount: 5, affectedClients: 2, guardedClients: 3, suppressedTotal: 8 },
+    'the window number is what a spike looks like, `affectedClients` is what a fleet event looks like, and the client whose only failure was an hour ago is not counted as affected now');
+  assert.equal(line.pingCyclesPerWindow, 33, 'the yardstick is the library’s own: a 5-minute window holds ~33 pings, so a `windowCount` of 33 means every one of them failed');
+  assert.equal(logs.filter((entry) => entry.meta.userId === 3).length, 1, 'a client is allowed its first line and then goes quiet for the window');
+
+  clock += 300_000;
+  guard.note(keepAliveTimeout(), a);
+  assert.deepEqual({ count: logs[logs.length - 1].meta.count, windowCount: logs[logs.length - 1].meta.windowCount }, { count: 7, windowCount: 1 },
+    'the lifetime total keeps climbing while the window total restarts, which is the only pair that can say "this is getting worse"');
+});
+
 test('a timeout with no client to attribute it to is still counted, because the count is the point', () => {
   const logs = [];
   const guard = createTelegramKeepAliveGuard({ log: (level, message, meta) => logs.push({ level, message, meta }), now: () => 10_000 });
