@@ -23,6 +23,7 @@ import { captureSafety, readFallbackPoints } from './services/signal-safety.js';
 import { entryRangeBounds, readExpirySetting, readSlippageSetting, ORDER_TYPES } from './services/order-routing.js';
 import { readDashboardSignals } from './services/dashboard-signals.js';
 import { HEARTBEAT_INTERVAL_MS, createTelegramListener } from './services/telegram-listener.js';
+import { createTelegramKeepAliveGuard, createUnhandledRejectionGuard, isProviderKeepAliveTimeout } from './services/telegram-keepalive.js';
 import { createMetaApiTradingAdapter } from './services/metaapi-trading.js';
 import { createExecutionEngine, PLATFORM_PAUSE_MESSAGE } from './services/execution-engine.js';
 import { createExecutionWorker } from './services/execution-worker.js';
@@ -522,6 +523,14 @@ async function saveSignal(userId, message, channel = {}) {
  * messages which arrived while this instance was not running are pulled back out of Telegram -
  * `catchUp()` in this version of the library is an empty stub, so nothing else ever will.
  */
+/* Every client this process owns gets the same guard, and it has to be attached before `connect()` because that
+   is where GramJS starts the update loop whose ping race produces the noise. What it does is narrow: it
+   recognises one error (`TIMEOUT`, thrown by `client/updates.js` itself), counts it per client, and answers the
+   library's own logging gate "no" for that one print. Everything else the library logs - and everything our
+   handlers throw while the library is on the call stack, which is the failure mode a stack-substring filter
+   would have eaten - goes to the log untouched. */
+const telegramKeepAlive = createTelegramKeepAliveGuard({ log: (level, message, meta) => log(level, message, meta) });
+
 const telegramCapture = createTelegramListener({
   clients: telegramClients,
   pool,
@@ -543,6 +552,9 @@ const telegramCapture = createTelegramListener({
      survives for an admin's forced reconnect, which is the one thing worth trying before asking a human for their
      phone. Nulling it, as the unauthorised path in `restoreTelegramClient` does, is right when the key is provably
      dead and wrong when we merely failed to prove it alive. */
+  // What the provider's own ping loop last did to this client, so a beat that finds an unanswered socket during a
+  // flap waits one cycle instead of rebuilding a session the library was about to hand back.
+  transportFlap: (client) => telegramKeepAlive.flapFor(client),
   onSessionUnrecoverable: async (userId, reason, details = {}) => {
     const id = Number(userId);
     if (!Number.isInteger(id) || id <= 0) return;
@@ -608,9 +620,19 @@ async function runSignalDelete(pair) {
  * in one environment variable, and because a refused handshake would otherwise mean *no capture at all*, a
  * connect that fails with the option on retries once on the default transport and says so.
  */
-function telegramCaptureTransport() {
-  const base = { connectionRetries: 3, autoReconnect: true };
-  if (String(process.env.TELEGRAM_TRANSPORT || '').toLowerCase() !== 'wss') return { wss: false, options: base };
+function telegramCaptureTransport({ wss = null } = {}) {
+  /* `connectionRetries` is how many times the sender tries to *establish* a connection at `retryDelay` (1 s) apart
+     before it gives up, and `autoReconnect` is what lets it try again after that. Five, not three: the keep-alive
+     loop in `client/updates.js` gives the transport about forty seconds of its own retrying (a 9-second interval
+     and three 10-second races), so a session that stops trying at three is a session our watchdog then has to
+     rebuild from nothing - a longer outage than the one the library was already fixing, plus a fresh auth
+     handshake for a hiccup that would have healed. There is deliberately no request-timeout option here: this
+     version accepts `timeout` and stores it as `_connectTimeout`, which nothing reads, and an option that is not
+     read is worse than no option, because the next person to tune the file will believe it did something. */
+  const base = { connectionRetries: 5, autoReconnect: true };
+  const fromEnv = String(process.env.TELEGRAM_TRANSPORT || '').toLowerCase() !== 'wss' ? { wss: false } : { wss: true };
+  const overWss = wss === null ? fromEnv.wss : wss === true;
+  if (!overWss) return { wss: false, options: base };
   return { wss: true, options: { ...base, useWSS: true } };
 }
 
@@ -650,6 +672,7 @@ async function restoreTelegramClient(userId, { reason = 'restore', force = false
   const sessionString = decryptSecret(rows[0].telegram_session);
   const transport = telegramCaptureTransport();
   let client = new TelegramClient(new StringSession(sessionString), Number(process.env.API_ID), process.env.API_HASH, transport.options);
+  telegramKeepAlive.attach(client, { userId });
   try {
     await client.connect();
   } catch (error) {
@@ -657,7 +680,10 @@ async function restoreTelegramClient(userId, { reason = 'restore', force = false
     // The experiment is allowed to fail; capture is not allowed to be the thing that pays for it.
     log('warn', 'Telegram WSS transport could not connect; reconnecting over the default transport', { userId, error: `${error?.message || error}`.slice(0, 160) });
     await client.disconnect().catch(() => {});
-    client = new TelegramClient(new StringSession(sessionString), Number(process.env.API_ID), process.env.API_HASH, { connectionRetries: 3, autoReconnect: true });
+    // The same tuned options over the plain port - restating them here is how a retry path ends up with the
+    // settings the primary one stopped having three releases ago.
+    client = new TelegramClient(new StringSession(sessionString), Number(process.env.API_ID), process.env.API_HASH, telegramCaptureTransport({ wss: false }).options);
+    telegramKeepAlive.attach(client, { userId });
     await client.connect();
   }
   if (!(await client.checkAuthorization())) {
@@ -910,7 +936,11 @@ const healthPayload = () => ({
 function telegramHeartbeatHealth() {
   try {
     const { beats, ...counters } = telegramCapture.heartbeatSummary();
-    return { ...counters, sessions: Array.isArray(beats) ? beats.length : 0 };
+    /* One number from the keep-alive guard, on the endpoint an operator reads when something is wrong: how many
+       of the provider's own ping timeouts this process has swallowed since boot. A count rather than a stack
+       trace is the whole argument for the guard, and it belongs here rather than on the user's status route
+       because a trader can do nothing with it - while whoever is deciding whether to restart a fleet can. */
+    return { ...counters, keepAliveTimeouts: telegramKeepAlive.stats().count, sessions: Array.isArray(beats) ? beats.length : 0 };
   } catch {
     // A diagnostic must not be able to take the endpoint the platform's health check depends on with it.
     return null;
@@ -3332,5 +3362,18 @@ async function shutdown() {
   await pool.end().catch(() => {});
   process.exit(0);
 }
+/* Node ends the process on an unhandled rejection, and that is the right default for anything of ours. The one
+   exception this installs is the provider's keep-alive timeout: `Error: TIMEOUT` from inside
+   `telegram/client/updates.js`, which GramJS produces when its own ping does not come back, prints itself, and is
+   recovered from by its own reconnect - a rejection of that shape is not a fault in this application, and a
+   deploy should not restart because of it. Everything the predicate does not recognise is rethrown on the next
+   tick, so it becomes the uncaught exception it would have been anyway: same crash, same stack. Suppressing at
+   the printer is what stops the log flood; this is what stops the *process* from being killable by a ping, and
+   the two are deliberately separate because they are two different risks. */
+process.on('unhandledRejection', createUnhandledRejectionGuard({
+  isNoise: isProviderKeepAliveTimeout,
+  onNoise: (reason) => { telegramKeepAlive.observe(reason); },
+  onOther: (reason) => { process.nextTick(() => { throw reason instanceof Error ? reason : new Error(`${reason}`); }); },
+}));
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
