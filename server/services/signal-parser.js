@@ -175,7 +175,8 @@ function findSymbol(text) {
  * numbered-target channel produced a take-profit of 1 point and a hundred and thirty-two broker
  * rejections.
  *
- * The separator class now carries a dash and a bullet as well as `: = @`: `SL - 4011.00`, `SL • 4011`,
+ * The separator class now carries a dash and a bullet as well as a colon, an equals sign and an at-sign: for
+ * instance `SL - 4011.00` or `SL • 4011`,
  * `SL → 4011` are how a message with a template and no typographic care looks, and each of them used to
  * leave the leg simply absent - which reads as "the channel forgot the stop" and hands the trade to the
  * workspace's fallback distance instead of the one the trader wrote down.
@@ -572,7 +573,7 @@ export const MANAGEMENT_BLOCKER_MESSAGE = 'This message manages a trade that is 
 export function findManagementMarkers(text) {
   const value = String(text ?? '');
   const markers = [];
-  for (const [name, pattern] of [['target-hit', MANAGEMENT_HIT], ['close-instruction', MANAGEMENT_EXIT], ['break-even', MANAGEMENT_BREAK_EVEN], ['pips-result', MANAGEMENT_RESULT], ['trade-running', MANAGEMENT_RUNNING]]) {
+  for (const [name, pattern] of /** @type {[string, RegExp][]} */ ([['target-hit', MANAGEMENT_HIT], ['close-instruction', MANAGEMENT_EXIT], ['break-even', MANAGEMENT_BREAK_EVEN], ['pips-result', MANAGEMENT_RESULT], ['trade-running', MANAGEMENT_RUNNING]])) {
     pattern.lastIndex = 0;
     if (pattern.test(value)) markers.push(name);
   }

@@ -20,7 +20,7 @@ import { Api, TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { _handleUpdate } from 'telegram/client/updates.js';
 import { NewMessage } from 'telegram/events/index.js';
-import { CATCH_UP_COOLDOWN_MS, HEARTBEAT_INTERVAL_MS, STREAM_REBUILD_COOLDOWN_MS, GAP_CATCH_UP_MS, GAP_CATCH_UP_SPREAD_MS, SILENCE_SUSPECT_MS, createTelegramListener, normalizeUpdateState, readUpdateState, UPDATE_STATE_KEY } from '../services/telegram-listener.js';
+import { CATCH_UP_COOLDOWN_MS, HEARTBEAT_INTERVAL_MS, STREAM_REBUILD_COOLDOWN_MS, GAP_CATCH_UP_MS, GAP_CATCH_UP_SPREAD_MS, SILENCE_SUSPECT_MS, createTelegramListener, isValidWorkspaceId, normalizeUpdateState, readUpdateState, UPDATE_STATE_KEY } from '../services/telegram-listener.js';
 import { telegramPeerIdVariants, telegramMessageText } from '../services/telegram-peer.js';
 
 const USER_ID = '5036a3d3-0671-4cbf-9728-e5e3bf1eea9b';
@@ -1362,4 +1362,37 @@ test('keep-alive noise on a session that answers is not a deaf stream, a strike,
   const [session] = harness.listener.telegramFleetSummary().sessions;
   assert.deepEqual({ keepAliveTimeouts: session.keepAliveTimeouts, transportFlapping: session.transportFlapping, reauthRequired: session.reauthRequired },
     { keepAliveTimeouts: 412, transportFlapping: false, reauthRequired: false }, 'the count reaches the panel, so the noise is visible without being loud');
+});
+
+/* `isValidWorkspaceId` exists because the consequence of a dead session was written against the wrong column
+   type: `users.id` is a UUID, and the guard it replaced asked for a positive integer. These two tests are the
+   pair the fix needs - the rule on its own, and the rule against the id the listener actually carries. */
+test('a workspace id counts as an id because it is present, not because it is a number', () => {
+  assert.equal(isValidWorkspaceId(USER_ID), true, 'the production shape is a UUID as text, and it is a valid id');
+  assert.equal(isValidWorkspaceId('7'), true, 'a legacy integer id that arrived as text');
+  assert.equal(isValidWorkspaceId(7), true, 'and as a number');
+  assert.equal(isValidWorkspaceId(0), false, 'while 0 is not anybody\'s row');
+  assert.equal(isValidWorkspaceId(-3), false, 'nor a negative');
+  assert.equal(isValidWorkspaceId(NaN), false, 'nor the result of coercing something that was never a number');
+  assert.equal(isValidWorkspaceId(Infinity), false, 'nor an unbounded number, which is what a coercion of a bad value can leave behind');
+  assert.equal(isValidWorkspaceId(''), false, 'nor empty text');
+  assert.equal(isValidWorkspaceId('   '), false, 'nor text that is only a space');
+  assert.equal(isValidWorkspaceId(null), false, 'nor null');
+  assert.equal(isValidWorkspaceId(undefined), false, 'nor a missing argument');
+  assert.equal(isValidWorkspaceId({ id: 7 }), false, 'nor an object that happens to hold an id');
+});
+
+test('the verdict hands over the id the client is keyed by, untouched', async () => {
+  const declared = [];
+  const harness = makeStateHarness({
+    onSessionUnrecoverable: async (userId, reason, details) => { declared.push({ userId, reason, details }); },
+    serverPts: (index) => (index === 0 ? 4200 : 4260),
+    difference: () => { throw rpcError('AUTH_KEY_UNREGISTERED', 'AUTH_KEY_UNREGISTERED', { errorCode: 401 }); },
+  });
+  await harness.cycle();
+  await harness.cycle();
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(declared.length, 1, 'the verdict fires once');
+  assert.equal(typeof declared[0].userId, 'string', 'and what it fires with is the map key the app holds, as text');
+  assert.equal(declared[0].userId, USER_ID, 'the same value, character for character - nothing here coerces, pads or rewrites it');
 });

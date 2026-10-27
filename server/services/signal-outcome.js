@@ -92,15 +92,19 @@ function paid(status) {
 }
 
 /**
- * @param input.executionReady   the parser found a symbol, side and prices
- * @param input.autoTradingEnabled the workspace's own switch
- * @param input.runtimeEnabled   the service is allowed to reach the broker at all
- * @param input.paused           the platform kill switch (an unreadable switch counts as paused)
- * @param input.subscriptionStatus  the workspace plan status
- * @param input.accountState     state of the account selected for execution, if any
- * @param input.accountSelected  whether an execution account is selected
+ * @typedef {Object} SignalOutcomeInput
+ * @property {boolean} [manual] - a hand-written note rather than a captured message: it is a record the user
+ *   keeps, never a trade that was missed, so it is answered before any other question is asked. The prose above
+ *   described that rule for as long as this function has had a doc block, and no type named the field until now
+ * @property {boolean} [executionReady] - the parser found a symbol, side and prices
+ * @property {boolean} [autoTradingEnabled] - the workspace's own switch
+ * @property {boolean} [runtimeEnabled] - the service is allowed to reach the broker at all
+ * @property {boolean} [paused] - the platform kill switch (an unreadable switch counts as paused)
+ * @property {string|null} [subscriptionStatus] - the workspace plan status
+ * @property {string|null} [accountState] - state of the account selected for execution, if any
+ * @property {boolean} [accountSelected] - whether an execution account is selected
  */
-export function decideSignalOutcome(input = {}) {
+export function decideSignalOutcome(/** @type {SignalOutcomeInput} */ input = {}) {
   if (input.executionReady !== true) {
     return { status: SIGNAL_STATUSES.unparsed, note: null, queue: false };
   }
@@ -179,6 +183,18 @@ const overlayStats = {
   lastSkippedNote: null,
 };
 
+/**
+ * One operator line, gated by `SIGNAL_OVERLAY_DEBUG`.
+ *
+ * `detail` is typed rather than defaulted to the empty string, because that default is the whole shape of the
+ * argument and the checker reads a default as a type: every call site here passes an object of facts, and a
+ * `detail = ''` said - wrongly - that a sentence belongs in that slot.
+ *
+ * @param {string} event
+ * @param {string|null} [id]
+ * @param {Record<string, any>|string|null} [detail]
+ * @param {{ dedupe?: string|null }} [options]
+ */
 function overlayTrace(event, id = null, detail = '', { dedupe = null } = {}) {
   if (dedupe !== null) {
     if (overlayTraceLines.has(dedupe)) return;
@@ -302,8 +318,13 @@ export function overlayLiveBlocker(signal, context = {}) {
  * `runtimeEnabled` is a function rather than a value because the flag is turned over by an administrator while
  * this process is running: read once at start-up, every row in the product would keep the sentence the boot
  * environment deserved.
+ *
+ * @typedef {Object} SignalOutcomeReaderDeps
+ * @property {PoolLike} [pool]
+ * @property {any} [platformControls]
+ * @property {Function} [runtimeEnabled]
  */
-export function createSignalOutcomeReader({ pool, platformControls, runtimeEnabled = () => false } = {}) {
+export function createSignalOutcomeReader(/** @type {SignalOutcomeReaderDeps} */ { pool, platformControls, runtimeEnabled = () => false } = {}) {
   if (!pool?.query) throw new TypeError('The outcome reader needs a pool to read from');
 
   // One line per process, and it is the line that answers "is the corrected code even running": a deployment

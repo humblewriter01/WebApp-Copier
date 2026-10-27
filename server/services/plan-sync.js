@@ -49,7 +49,15 @@ function providerMatches(provider, desired) {
     && String(provider.interval || desired.interval).toLowerCase() === String(desired.interval).toLowerCase();
 }
 
-export function createPlanSynchronizer({ flutterwave, pricing, config, logger = console } = {}) {
+/**
+ *
+ * @typedef {Object} PlanSynchronizerDeps
+ * @property {Record<string, any>} [flutterwave]
+ * @property {Record<string, any>} [pricing]
+ * @property {Record<string, any>} [config]
+ * @property {LoggerMethods} [logger]
+ */
+export function createPlanSynchronizer(/** @type {PlanSynchronizerDeps} */ { flutterwave, pricing, config, logger = console } = {}) {
   const log = (level, message, extra = {}) => logger?.[level]?.(message, extra);
 
   async function persist(planKey, currency, sync, actorId) {
@@ -63,8 +71,13 @@ export function createPlanSynchronizer({ flutterwave, pricing, config, logger = 
   /**
    * Creates or updates the Flutterwave payment plan for one Signal Desk plan in one currency, and verifies the
    * result. Never throws: the returned object always describes what an administrator should do next.
-   */
-  async function syncPlan({ planKey, currency = null, actorId = null } = {}) {
+ *
+ * @typedef {Object} SyncPlanInput
+ * @property {string} [planKey]
+ * @property {string|null} [currency]
+ * @property {string|null} [actorId]
+ */
+async function syncPlan(/** @type {SyncPlanInput} */ { planKey, currency = null, actorId = null } = {}) {
     const plan = await pricing.planFor(planKey);
     if (!plan) {
       return { planKey: String(planKey || ''), currency: normalizeCurrency(currency || config?.currency), status: 'failed', message: 'That plan is not available for pricing.', usable: false };
@@ -212,7 +225,13 @@ export function createPlanSynchronizer({ flutterwave, pricing, config, logger = 
    * "Sync": a plan that is in sync in naira and stale in dollars is a plan that will charge an international
    * customer the wrong amount, and the failure would only surface in another country.
    */
-  async function syncAll({ planKeys, currencies = null, actorId = null } = {}) {
+    /**
+ * @typedef {Object} SyncAllInput
+ * @property {string[]} [planKeys] - the plans to push; absent or empty means every plan this app defines
+ * @property {string[]|null} [currencies] - and the currencies to push them in, same rule
+ * @property {string|null} [actorId] - the administrator whose name goes in the history row
+ */
+  async function syncAll(/** @type {SyncAllInput} */ { planKeys, currencies = null, actorId = null } = {}) {
     const requested = Array.isArray(planKeys) && planKeys.length ? planKeys : (config?.plans || []).map((plan) => plan.key);
     const results = [];
     for (const planKey of requested) {

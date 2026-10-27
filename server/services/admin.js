@@ -345,8 +345,16 @@ export const SUBSCRIPTION_PERIOD_EXPRESSION = 'COALESCE($5::timestamptz,NOW() + 
  * (what the expiry is read from). The period is one expression used twice - an explicit end date wins,
  * otherwise it is counted from now - rather than two different statements, because a variant that
  * mentions `$5` only sometimes is exactly how a bind ends up with more values than slots.
+ *
+ * @typedef {Object} BuildSubscriptionGrantStatementsInput
+ * @property {string|null} [targetId]
+ * @property {Record<string, any>} [plan]
+ * @property {string|null} [interval]
+ * @property {Record<string, any>} [period]
+ * @property {string|null} [endsAt]
+ * @property {Record<string, any>} [limits]
  */
-export function buildSubscriptionGrantStatements({ targetId, plan, interval, period, endsAt = null, limits = {} } = {}) {
+export function buildSubscriptionGrantStatements(/** @type {BuildSubscriptionGrantStatementsInput} */ { targetId, plan, interval, period, endsAt = null, limits = {} } = {}) {
   if (!plan?.key) throw validationError('Choose a plan to grant.');
   const userUpdate = {
     sql: "UPDATE users SET subscription_status='active',subscription_plan=$2,plan_limits=$3 WHERE id=$1",
@@ -366,8 +374,14 @@ export function buildSubscriptionGrantStatements({ targetId, plan, interval, per
   return { userUpdate, subscription };
 }
 
-/** Moving an existing subscription's expiry without changing the plan. */
-export function buildSubscriptionExtendStatement({ targetId, days = null, endsAt = null } = {}) {
+/** Moving an existing subscription's expiry without changing the plan.
+ *
+ * @typedef {Object} BuildSubscriptionExtendStatementInput
+ * @property {string|null} [targetId]
+ * @property {number} [days]
+ * @property {string|null} [endsAt]
+ */
+export function buildSubscriptionExtendStatement(/** @type {BuildSubscriptionExtendStatementInput} */ { targetId, days = null, endsAt = null } = {}) {
   const assignment = endsAt
     ? 'current_period_end=$2::timestamptz'
     : `current_period_end=GREATEST(COALESCE(current_period_end,NOW()),NOW()) + ($2::int * INTERVAL '1 day')`;
@@ -382,8 +396,13 @@ export function buildSubscriptionExtendStatement({ targetId, days = null, endsAt
   return { sql, params };
 }
 
-/** Revoking a paid plan: both rows return to Free, and the limits with them. */
-export function buildSubscriptionReleaseStatements({ targetId, limits = {} } = {}) {
+/** Revoking a paid plan: both rows return to Free, and the limits with them.
+ *
+ * @typedef {Object} BuildSubscriptionReleaseStatementsInput
+ * @property {string|null} [targetId]
+ * @property {Record<string, any>} [limits]
+ */
+export function buildSubscriptionReleaseStatements(/** @type {BuildSubscriptionReleaseStatementsInput} */ { targetId, limits = {} } = {}) {
   const userUpdate = {
     sql: "UPDATE users SET subscription_status='free',subscription_plan='free',plan_limits=$2 WHERE id=$1",
     params: [targetId, JSON.stringify(limits || {})],
@@ -397,8 +416,15 @@ export function buildSubscriptionReleaseStatements({ targetId, limits = {} } = {
   return { userUpdate, subscription };
 }
 
-/** Re-deriving the enforced mirror from the subscription row, which is the truth after any change. */
-export function buildSubscriptionMirrorStatement({ targetId, status, planKey, limits = {} } = {}) {
+/** Re-deriving the enforced mirror from the subscription row, which is the truth after any change.
+ *
+ * @typedef {Object} BuildSubscriptionMirrorStatementInput
+ * @property {string|null} [targetId]
+ * @property {string|null} [status]
+ * @property {string} [planKey]
+ * @property {Record<string, any>} [limits]
+ */
+export function buildSubscriptionMirrorStatement(/** @type {BuildSubscriptionMirrorStatementInput} */ { targetId, status, planKey, limits = {} } = {}) {
   const sql = 'UPDATE users SET subscription_status=$2,subscription_plan=$3,plan_limits=$4 WHERE id=$1';
   const params = [targetId, status, planKey, JSON.stringify(limits || {})];
   assertQueryParameters(sql, params, 'Adjusting that plan (mirror)');

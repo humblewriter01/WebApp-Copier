@@ -83,7 +83,12 @@ test('a row is pushed to the socket only once the database has finished deciding
 test('a push can only reach the workspace that owns the row', () => {
   // Room scope is the audit requirement that decides whether this feature is safe at all: one socket server,
   // many workspaces, and a row that must never be announced to the wrong one.
-  const use = index.indexOf('io.use((socket, next) => {');
+  /* Anchored on the hook, not on the whole arrow signature: what this test guards is which token the handshake
+     trusts, and a JSDoc cast added to the parameter for the type-checker is nobody's business here. The
+     `notEqual` is what makes the looseness safe - if the hook is renamed or moved, this says so instead of
+     slicing an empty string and matching nothing. */
+  const use = index.indexOf('io.use((');
+  assert.notEqual(use, -1, 'the socket handshake guard exists in the server');
   const connection = index.indexOf("io.on('connection'", use);
   const guard = index.slice(use, connection);
   assert.match(guard, /jwt\.verify\(socket\.handshake\.auth\?\.token, process\.env\.JWT_SECRET\)/, 'the handshake token is verified with the same secret the REST routes use');
@@ -98,7 +103,12 @@ test('a closed support session stops streaming, not just stops reading', () => {
   // The REST half of this rule already existed; the live feed is a second door into the same rows, and a door
   // that authenticates once at the handshake would keep a closed session fed. Both halves are pinned together
   // so the pair cannot drift apart again.
-  const use = index.indexOf('io.use((socket, next) => {');
+  /* Anchored on the hook, not on the whole arrow signature: what this test guards is which token the handshake
+     trusts, and a JSDoc cast added to the parameter for the type-checker is nobody's business here. The
+     `notEqual` is what makes the looseness safe - if the hook is renamed or moved, this says so instead of
+     slicing an empty string and matching nothing. */
+  const use = index.indexOf('io.use((');
+  assert.notEqual(use, -1, 'the socket handshake guard exists in the server');
   const guard = index.slice(use, index.indexOf("io.on('connection'", use));
   assert.match(guard, /payload\.purpose \|\| ''\) !== 'impersonation'\) return next\(\);/, 'a normal user socket is not asked for a support session');
   assert.match(guard, /supportSessions\.redeem\(payload\.jti\)/, 'an impersonation socket is checked against the session table');

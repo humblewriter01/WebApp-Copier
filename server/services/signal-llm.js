@@ -272,8 +272,12 @@ const sameNumber = (values, value) => {
  * an unusable type, or a price that is not in the message. Each has its own code because each is a different
  * sentence for the reader - and "the model invented a price" must never be described as "the message was
  * unclear", because the second tells a user to fix their channel and the first tells us to fix our code.
+ *
+ * @typedef {Object} ValidateExtractionInput
+ * @property {string|null} [rawMessage]
+ * @property {Record<string, any>} [config]
  */
-export function validateExtraction(json, { rawMessage, config = {} } = {}) {
+export function validateExtraction(json, /** @type {ValidateExtractionInput} */ { rawMessage, config = {} } = {}) {
   const minConfidence = config.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
   if (!json || typeof json !== 'object' || Array.isArray(json)) {
     return { ok: false, code: 'malformed', reason: 'The AI reader did not return a usable answer.' };
@@ -386,7 +390,15 @@ export async function llmParseSignal(message, input = {}) {
   return result;
 }
 
-async function readSignalWithModel(message, { config, fetchImpl = globalThis.fetch, gate = null, priority = 'realtime' } = {}) {
+/**
+ *
+ * @typedef {Object} ReadSignalWithModelInput
+ * @property {Record<string, any>} [config]
+ * @property {any} [fetchImpl]
+ * @property {Record<string, any>|null} [gate]
+ * @property {string} [priority]
+ */
+async function readSignalWithModel(message, /** @type {ReadSignalWithModelInput} */ { config, fetchImpl = globalThis.fetch, gate = null, priority = 'realtime' } = {}) {
   // `disabledReason` names variables and endpoints, which is admin-facing information; it is kept on
   // `technical` and never put on a sentence the trader reads.
   if (!config?.enabled) {
@@ -427,8 +439,12 @@ async function readSignalWithModel(message, { config, fetchImpl = globalThis.fet
  * accept one wherever it is buried (`extractJsonObject` strips fences, prose and the model's own hedging).
  * Nothing here can be rejected by a provider's idea of a valid request, which is the only guarantee worth
  * having on a path where a refusal costs someone an entry.
+ *
+ * @typedef {Object} LlmRequestInput
+ * @property {Record<string, any>} [config]
+ * @property {(input: any, init?: any) => Promise<any>} [fetchImpl]
  */
-async function llmRequest(message, { config, fetchImpl = globalThis.fetch } = {}) {
+async function llmRequest(message, /** @type {LlmRequestInput} */ { config, fetchImpl = globalThis.fetch } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
   const payload = JSON.stringify({

@@ -720,8 +720,17 @@ function isLockWaitFailure(error) {
   return error?.code === '55P03' || error?.code === '40P01' || /lock timeout|deadlock detected/i.test(String(error?.message ?? ''));
 }
 
-/** An error that names its own statement, because "the schema failed" is not an answer anyone can act on. */
-function nameSchemaError(error, { statement, position, total, attempts }) {
+/** An error that names its own statement, because "the schema failed" is not an answer anyone can act on.
+ *
+ * @typedef {Object} NameSchemaErrorInput
+ * @property {string} [statement]
+ * @property {number} [position]
+ * @property {number} [total]
+ * @property {number} [attempts] - which try this was. The sentence only blames the lock when it is above one, so a
+ *   caller that names this key anything else loses the retry count from the operator's message without any other
+ *   symptom: this file had `attempt:` at one of its two call sites for exactly that long.
+ */
+function nameSchemaError(error, /** @type {NameSchemaErrorInput} */ { statement, position, total, attempts }) {
   const reason = attempts > 1 ? `never got the lock it needed after ${attempts} attempts` : 'failed';
   error.message = `Schema statement ${position + 1} of ${total} ${reason}: ${sqlPreview(statement)} - ${error.message}`;
   error.schemaStatement = sqlPreview(statement);
@@ -737,7 +746,7 @@ async function runStatement(client, statement, position, total, onStep) {
       await client.query(statement);
       return;
     } catch (error) {
-      if (!isLockWaitFailure(error)) throw nameSchemaError(error, { statement, position, total, attempt });
+      if (!isLockWaitFailure(error)) throw nameSchemaError(error, { statement, position, total, attempts: attempt });
       lastError = error;
       if (attempt === LOCK_ATTEMPTS) break;
       onStep({ step: 'waiting-for-lock', position, total, attempt, statement: sqlPreview(statement) });
@@ -753,8 +762,11 @@ async function runStatement(client, statement, position, total, onStep) {
  * `onStep` exists because a deploy that fails between two `console` calls leaves nothing to read: the
  * caller gets told when the connection is being opened, when a statement is queueing behind a lock, and
  * when the work is done, so the service log says which of those is the one that never finished.
+ *
+ * @typedef {Object} InitializeDatabaseInput
+ * @property {Function} [onStep]
  */
-export async function initializeDatabase({ onStep = () => {} } = {}) {
+export async function initializeDatabase(/** @type {InitializeDatabaseInput} */ { onStep = () => {} } = {}) {
   const startedAt = Date.now();
   onStep({ step: 'connecting', total: 0 });
   // A connection that never completes is the failure mode this whole function is built around, so even

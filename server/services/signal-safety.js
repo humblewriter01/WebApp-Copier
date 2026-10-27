@@ -120,8 +120,14 @@ function distanceInPoints(price, marketPrice, tickSize) {
  * It never invents a price - the fallback is only a distance until a live quote exists. What it decides
  * is whether the *missing leg* is still a reason to refuse the signal: it is, unless a net is configured
  * to cover it or the workspace has deliberately allowed that leg to be absent.
+ *
+ * @typedef {Object} CaptureSafetyInput
+ * @property {any} [parsed]
+ * @property {string} [source]
+ * @property {Record<string, any>} [settings]
+ * @property {any} [review]
  */
-export function captureSafety({ parsed, source = 'telegram', settings = {}, review = null } = {}) {
+export function captureSafety(/** @type {CaptureSafetyInput} */ { parsed, source = 'telegram', settings = {}, review = null } = {}) {
   /* A row the pipeline will not stand behind is never rescued by a fallback distance, and this is the
      place that decides it, because this is the moment `execution_ready` is written. The order matters
      against the other rules: a net that can supply a leg is normally the end of the argument, and here the
@@ -225,8 +231,26 @@ export function captureSafety({ parsed, source = 'telegram', settings = {}, revi
  * `sources` says where each leg came from - `signal`, `net`, `none` - which is what the trade's note and
  * the warning log are written from. `problems` names a net that exists but cannot be used for this
  * symbol, and is what the refusal says instead of a bare "no stop loss".
+ *
+ * @typedef {Object} ApplySafetyNetsInput
+ * @property {string|null} [side]
+ * @property {any} [marketPrice]
+ * @property {string|number|null} [bid]
+ * @property {string|number|null} [ask]
+ * @property {any} [tickSize]
+ * @property {any} [stopsLevelPoints]
+ * @property {any} [stopLoss]
+ * @property {any} [takeProfit]
+ * @property {any} [stopLossPips]
+ * @property {any} [takeProfitPips]
+ * @property {string|null} [symbol]
+ * @property {any} [fallbackStopLossPoints]
+ * @property {any} [fallbackTakeProfitPoints]
+ * @property {boolean} [blockExecutionWithoutStopLoss]
+ * @property {boolean} [blockExecutionWithoutTakeProfit]
+ * @property {string} [lotSizeMode]
  */
-export function applySafetyNets({
+export function applySafetyNets(/** @type {ApplySafetyNetsInput} */ {
   side,
   marketPrice,
   bid,

@@ -100,7 +100,18 @@ export function createSupabaseAuthBridge({
     }
   }
 
-  async function ensureLegacyLoginIdentity({ email, password, name, currentId }) {
+  /**
+   * `currentId` is optional because the caller's whole question is "does this workspace already have an id";
+   * the route that has no idea passes three fields and expects this function to look. The other three are not
+   * optional: without an email there is nothing to find, and without a password there is nothing to mint.
+   *
+   * @typedef {Object} LegacyLoginIdentityInput
+   * @property {string} email
+   * @property {string} password
+   * @property {string|null} [name]
+   * @property {string|null} [currentId]
+   */
+  async function ensureLegacyLoginIdentity(/** @type {LegacyLoginIdentityInput} */ { email, password, name, currentId }) {
     if (!isAdminConfigured()) return null;
     if (currentId) return currentId;
     const existing = await findUserByEmail(email);

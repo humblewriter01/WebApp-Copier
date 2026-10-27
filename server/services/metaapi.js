@@ -171,7 +171,20 @@ export function normalizeMetaApiToken(token) {
   throw error;
 }
 
-export async function metaApiRequest(apiToken, endpoint, { method = 'GET', body, transactionId, unauthorizedMessage } = {}) {
+/**
+ * The one HTTP call every MetaAPI request in this app makes.
+ *
+ * `transactionId` and `unauthorizedMessage` are not decoration: the first is what the reconciliation path
+ * correlates an order by, and the second is how a 401 from the provider becomes a sentence about the workspace's
+ * own account instead of a sentence about HTTP.
+ *
+ * @typedef {Object} MetaApiRequestInput
+ * @property {string} [method]
+ * @property {Record<string, any>|null} [body]
+ * @property {string|null} [transactionId]
+ * @property {string|null} [unauthorizedMessage]
+ */
+export async function metaApiRequest(apiToken, endpoint, /** @type {MetaApiRequestInput} */ { method = 'GET', body, transactionId, unauthorizedMessage } = {}) {
   if (typeof apiToken !== 'string' || !apiToken.trim()) throw new Error('MetaAPI token is required.');
   const headerToken = normalizeMetaApiToken(apiToken);
   if (!isAllowedRequest(method, endpoint, body)) throw new Error('Unsupported MetaAPI request.');

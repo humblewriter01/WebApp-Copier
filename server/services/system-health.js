@@ -133,8 +133,15 @@ export const CAPTURE_RECENT_BOOT_MS = 5 * 60 * 1000;
  * which is what a service that stops between visitors looks like. It is deliberately reported to the
  * administrator only: a workspace owner cannot act on their host sleeping, and a warning about it in
  * their dashboard would be noise wearing the costume of a fault.
+ *
+ * @typedef {Object} BuildCaptureHealthInput
+ * @property {any} [live]
+ * @property {any} [stored]
+ * @property {any} [now]
+ * @property {any} [quietMs]
+ * @property {any} [recentBootMs]
  */
-export function buildCaptureHealth({ live, stored, now = Date.now(), quietMs = CAPTURE_QUIET_MS, recentBootMs = CAPTURE_RECENT_BOOT_MS } = {}) {
+export function buildCaptureHealth(/** @type {BuildCaptureHealthInput} */ { live, stored, now = Date.now(), quietMs = CAPTURE_QUIET_MS, recentBootMs = CAPTURE_RECENT_BOOT_MS } = {}) {
   const facts = {
     available: Boolean(live),
     sessionsInMemory: Number(live?.sessionsInMemory || 0),
@@ -211,8 +218,17 @@ function stateFor(count, { failAt = 0, warnAt = 1 } = {}) {
  * Turns the raw numbers into a short list of checks. The wording is produced here rather than in
  * the browser so the panel can never invent a reassuring sentence, and an unreadable section is
  * reported as `unknown` - never as "fine".
+ *
+ * @typedef {Object} BuildHealthChecksInput
+ * @property {any} [killSwitch]
+ * @property {any} [runtimeEnabled]
+ * @property {any} [queue]
+ * @property {any} [counts]
+ * @property {Record<string, any>} [thresholds]
+ * @property {Record<string, any>|null} [capture]
+ * @property {Record<string, any>|null} [llm]
  */
-export function buildHealthChecks({ killSwitch, runtimeEnabled, queue, counts, thresholds = {}, capture = null, llm = null } = {}) {
+export function buildHealthChecks(/** @type {BuildHealthChecksInput} */ { killSwitch, runtimeEnabled, queue, counts, thresholds = {}, capture = null, llm = null } = {}) {
   const checks = [];
   const switchState = killSwitch?.state;
   checks.push({
@@ -319,7 +335,18 @@ export function mapCaptureState(row = {}) {
   };
 }
 
-export function createSystemHealthService({ pool, controls, runtimeEnabled = false, logger = console, now = () => new Date(), capture = null, llm = null } = {}) {
+/**
+ *
+ * @typedef {Object} SystemHealthServiceDeps
+ * @property {PoolLike} [pool]
+ * @property {any} [controls]
+ * @property {boolean} [runtimeEnabled]
+ * @property {LoggerMethods} [logger]
+ * @property {Function} [now]
+ * @property {Record<string, any>|null} [capture]
+ * @property {Record<string, any>|null} [llm]
+ */
+export function createSystemHealthService(/** @type {SystemHealthServiceDeps} */ { pool, controls, runtimeEnabled = false, logger = console, now = () => new Date(), capture = null, llm = null } = {}) {
   if (!pool?.query) throw new TypeError('System health needs a database pool.');
   const log = (level, message, extra = {}) => logger?.[level]?.(message, extra);
 

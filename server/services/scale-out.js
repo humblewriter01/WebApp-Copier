@@ -87,8 +87,23 @@ export function selectTarget({ mode = 'first_target', takeProfit = null, levels 
  *
  * Returns `{ eligible, reason }` when there is no plan to trade - and the caller then sends the order
  * with the target it already had, which is the behaviour a workspace had before this existed.
+ *
+ * The plan's shape is `ScaleOutPlan`, declared in `types/app.d.ts` rather than here, because the engine holds one
+ * between the sizing decision and the order, the panel reads its `dropped` list, and a type that lives in the file
+ * that produces it is invisible to both of them.
+ *
+ * @returns {ScaleOutPlan}
+ *
+ * @typedef {Object} PlanScaleOutLevelsInput
+ * @property {any[]} [levels]
+ * @property {string|null} [side]
+ * @property {string|number|null} [bid]
+ * @property {string|number|null} [ask]
+ * @property {number|null} [volume]
+ * @property {Record<string, any>|null} [specification]
+ * @property {number} [minRidePercent]
  */
-export function planScaleOutLevels({ levels, side, bid, ask, volume, specification, minRidePercent = SCALE_OUT_MIN_RIDE_PERCENT } = {}) {
+export function planScaleOutLevels(/** @type {PlanScaleOutLevelsInput} */ { levels, side, bid, ask, volume, specification, minRidePercent = SCALE_OUT_MIN_RIDE_PERCENT } = {}) {
   if (side !== 'buy' && side !== 'sell') return { eligible: false, reason: 'direction' };
   const prices = (Array.isArray(levels) ? levels : []).map(number).filter((value) => value !== null && value > 0);
   if (prices.length < 2) return { eligible: false, reason: 'needs-two-targets' };
@@ -166,8 +181,14 @@ export function planScaleOutLevels({ levels, side, bid, ask, volume, specificati
  * How much of the position may be closed right now. The live volume is read from the terminal rather
  * than from the plan, because a user may have trimmed the trade by hand, and a plan that ignores that
  * would close volume that is no longer there.
+ *
+ * @typedef {Object} ResolveCloseVolumeInput
+ * @property {number|null} [plannedVolume]
+ * @property {number|null} [liveVolume]
+ * @property {number|null} [minVolume]
+ * @property {any} [volumeStep]
  */
-export function resolveCloseVolume({ plannedVolume, liveVolume, minVolume, volumeStep } = {}) {
+export function resolveCloseVolume(/** @type {ResolveCloseVolumeInput} */ { plannedVolume, liveVolume, minVolume, volumeStep } = {}) {
   const planned = number(plannedVolume);
   const live = number(liveVolume);
   const min = number(minVolume);

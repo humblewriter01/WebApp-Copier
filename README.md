@@ -39,6 +39,7 @@ A deployable React/Vite and Express app for capturing Telegram channel messages,
 - Persistence: Supabase PostgreSQL (or another PostgreSQL 13+ database)
 - Telegram client: GramJS (`telegram` npm package)
 - MetaAPI access: HTTPS REST API via Node's built-in `fetch`
+- Type checking: TypeScript 5.9 running over the JavaScript sources (`allowJs` + `checkJs`), with no build step and no renamed files
 
 ## Local development
 
@@ -64,6 +65,25 @@ A deployable React/Vite and Express app for capturing Telegram channel messages,
 6. Open the Vite URL printed by the client. The API health endpoint is `http://localhost:5000/health`.
 
 The app creates its PostgreSQL tables and indexes on backend startup. The new `metaapi_credentials` and `metaapi_accounts` tables have row-level security enabled; the backend uses its private database role.
+
+### Tests, and what the type checker is for
+
+`npm test` in `server/` runs the type check first and then the suite - 799 tests, 12 of which exist to keep the
+check itself honest. `npm run typecheck` runs the checker on its own, and `render.yaml` runs that same command in
+the build, which is where a type error stops a deploy rather than joining a backlog.
+
+Nothing was renamed to TypeScript. `server/tsconfig.json` turns on `allowJs` and `checkJs` with `strict` off, so
+every application source is checked as it is written, and `server/types/app.d.ts` declares the four things an
+inference over JavaScript cannot see: what a service is allowed to put on an `Error`, what the logging seam looks
+like, what a database handle accepts, and what a row of `users`, `channels`, `signals`, `trades`, `settings` or
+`promo_codes` contains. The last of those matters more than it looks: `pg` returns `NUMERIC` as a **string**, so a
+price is `string | null` in the types and every arithmetic use of it is written `Number(row.entry_price)`. That is
+why the service contains four hundred `Number(` calls, and it is the reason `row.entry_price > 0` - a comparison
+with no coercion - is now a compile error instead of a rule of thumb.
+
+Two deliberate gaps, both recorded in `TODO.md`: the tests are excluded, because their fixtures are duck-typed
+shapes that are meant to be wrong in instructive ways; and `pg` is left untyped, so the query sites still read
+`rows` as `any` until the row typedefs are attached to them directory by directory.
 
 ## Telegram connection state in the UI
 
@@ -411,6 +431,8 @@ center - a distinction nobody can make from sixty identical-looking lines. No sp
 the numbers are the judgement, and an invented threshold is a lie that gets believed. The same predicate guards `unhandledRejection`, because Node stops the process on one and a ping timeout should not restart a deploy - and anything it does not recognise is rethrown on the next tick, so a genuine unhandled rejection still dies loudly with its stack. The watchdog is deliberately told what a flap is *not*: `transportFlap` lets one unanswered beat inside the grace window (`KEEP_ALIVE_FLAP_GRACE_MS`, 60 s, covering the library's own ~40 s of retrying) be recorded and waited out instead of triggering `heartbeat-no-answer`, because rebuilding a socket the provider is re-establishing is a longer outage than the one being reacted to; a *second* consecutive unanswered beat is rebuilt whatever the transport is doing, and a flap on its own can never mark a session `deaf`, grow a strike, or end a session. On the client side `connectionRetries` is 5 rather than 3 for the same reason - the library gets at least as long to reconnect as it gives itself to time out - and no request-timeout option is passed at all, because in 2.26.22 the `timeout` parameter is stored as `_connectTimeout` and never read, which is worth knowing before anyone tunes it and believes the change.
 
 **The port is a knob, not a promise.** `TELEGRAM_TRANSPORT=wss` passes GramJS's `useWSS` to the capture client, and it is worth naming exactly what that does on a Node server: there is no WebSocket transport in the Node build (`PromisedWebSockets` is the browser's socket layer), so the option moves the data centre from port 80 to 443 and puts the same obfuscated MTProto on it - "carried on 443", not "wrapped in WSS". It is still the second thing to try when a host shapes or reaps idle flows on the API's plain port, and because a 443 endpoint that refuses obfuscated traffic would otherwise cost somebody their signals, a connect that fails with the option on logs `Telegram WSS transport could not connect; reconnecting over the default transport` and retries once on the default. The login clients keep the plain transport deliberately: sending a code is an interactive one-shot handshake, not an idle connection, and an experiment aimed at the second has no business in the first.
+
+**Everything that knows GramJS now lives in one file.** `server/services/telegram-adapter.js` is the only module in the application that imports the `telegram` package, and the only one allowed to name one of its members: the client constructor and `StringSession`, the four transport option keys, `invoke`/`getMe(true)`/`sendCode`/`signInWithPassword`/`getDialogs`, the `updates.GetState` and `updates.GetDifference` requests, the `[eventBuilder, handler]` pair shape the watchdog reads to decide whether a session is listening, the private `_log` and the `onError` accessor the keep-alive guard needs, and the thirty-odd other accesses that used to be spread across `index.js`, `telegram-listener.js` and `telegram-keepalive.js`. The package is 2.26.22 (February 2025) and its repository is archived, so the goal is not to fix the client but to be cheap to leave: a swap should touch this file and the names at the call sites, not the reconciliation ladder, the strike counter, the login routes or the tests that pin them. What the adapter deliberately does *not* hold is any decision - it has no `try`, no default, no coercion and no swallowed rejection, and `test/telegram-adapter.test.js` asserts all three halves of that: the touchpoint list matches the file's accesses in both directions (a symbol used without being listed fails, a listed symbol nobody uses fails), no other application file contains a library token at all, and every forward returns what the library returned with the same arguments. `telegram_peer`'s chat-id shapes and the update-state cache on the client object stay where they are on purpose: they are about our data, not about its API. And the seam is off the path a signal travels - `ingestMessage` never touches a client, which is what keeps the 30-second beat and the sub-second capture latency untouched by a wrapper.
 
 **Lateness is a number now, in four places, and in one public place.** `Telegram update arrived late` is logged at `warn` with the measured `delayMs` whenever an update takes longer than the silence threshold to reach us; `streamHealth(userId)` reports `silenceMs`, `lastDelayMs`, `suspect` and `catchUpOverdue` to the sweep; and the fleet summary the Admin Panel's System Health tab reads carries `maxDelayMs`, `medianDelayMs`, `longestSilenceSeconds` beside each session's `silenceSeconds`/`lastDelayMs`/`attachedAt`. `streamIdle` is left as the fifteen-minute flag it always was - a channel with nothing to say is not an idle stream, and a panel that cries wolf every ninety seconds is a panel nobody reads - but it is now `max(STREAM_IDLE_MS, silenceSuspectMs)`, so the moment the threshold for suspicion is tightened in one place the summary follows it instead of contradicting it. Nothing of this is shown to a trader: on a workspace's own Telegram tab the listener still just says whether it is listening, because "our socket is lagging" is an operator's problem and a support ticket's evidence, not a dashboard widget. Fourth, the heartbeat: `Telegram heartbeat sent` is logged once per cycle with `sessions`, `sent`, `answered`, `dead`, `stalled`, `worstMs` and the interval, `streamBeatFor(userId)` keeps each session's `pts`/`ms`/`stalls` for the admin summary, and `/health` answers a `telegram` block of the same counters with the per-session array destructured away - counts on a public route, detail only behind the admin panel.
 

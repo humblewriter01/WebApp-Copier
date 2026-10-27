@@ -30,6 +30,8 @@
  * `info`/`warn`/`debug` behaviour untouched, and never touches a global that other code logs through.
  */
 
+import * as telegramAdapter from './telegram-adapter.js';
+
 /** How often one client may say "the keep-alive is timing out" out loud, however many times it happens. */
 export const KEEP_ALIVE_SUMMARY_MS = 5 * 60_000;
 /**
@@ -78,8 +80,14 @@ export function isProviderKeepAliveTimeout(error) {
  * `attach` is called on a client that has just been constructed and not yet connected, because the update loop
  * starts inside `connect()` - a guard installed afterwards would miss exactly the first flap, which is the one
  * that happens while the session is being rebuilt.
+ *
+ * @typedef {Object} TelegramKeepAliveGuardDeps
+ * @property {Function} [log]
+ * @property {Function} [now]
+ * @property {any} [summaryEveryMs]
+ * @property {number} [markTtlMs]
  */
-export function createTelegramKeepAliveGuard({ log = () => {}, now = () => Date.now(), summaryEveryMs = KEEP_ALIVE_SUMMARY_MS, markTtlMs = KEEP_ALIVE_MARK_TTL_MS } = {}) {
+export function createTelegramKeepAliveGuard(/** @type {TelegramKeepAliveGuardDeps} */ { log = () => {}, now = () => Date.now(), summaryEveryMs = KEEP_ALIVE_SUMMARY_MS, markTtlMs = KEEP_ALIVE_MARK_TTL_MS } = {}) {
   const states = new Set();
   const byClient = new WeakMap();
   // Everything the process-level handler recognises lands here: there is no client to attribute it to, but there
@@ -154,11 +162,11 @@ export function createTelegramKeepAliveGuard({ log = () => {}, now = () => Date.
     states.add(state);
     byClient.set(client, state);
     try {
-      const logger = client._log;
-      if (logger && typeof logger.canSend === 'function' && !logger[GUARD_FLAG]) {
-        const canSend = logger.canSend.bind(logger);
+      const logger = telegramAdapter.clientLogger(client);
+      if (logger && telegramAdapter.hasLoggerGate(logger) && !logger[GUARD_FLAG]) {
+        const canSend = telegramAdapter.bindLoggerGate(logger);
         logger[GUARD_FLAG] = true;
-        logger.canSend = (level) => {
+        telegramAdapter.patchLoggerGate(logger, (level) => {
           const pending = state.pending;
           // Consume on read: the mark is for the error that was just offered to `_errorHandler`, one print, no more.
           if (pending !== null && level === 'error' && now() - pending <= markTtlMs) {
@@ -167,11 +175,11 @@ export function createTelegramKeepAliveGuard({ log = () => {}, now = () => Date.
           }
           if (pending !== null) state.pending = null;
           return Boolean(canSend(level));
-        };
+        });
       }
       // `onError` is the documented setter for `_errorHandler`, and the library calls it for every error it
       // catches in the update loop - the only place a timeout can be recognised before it is printed.
-      client.onError = (error) => { note(error, state); };
+      telegramAdapter.setClientErrorHandler(client, (error) => { note(error, state); });
     } catch (error) {
       // A client whose internals have changed shape is a client whose noise we will simply keep printing: the
       // guard is an improvement to the logs, and losing it must not be able to lose the session.

@@ -38,12 +38,21 @@ export const DEFAULT_REPLAY_WAIT_MS = 20_000;
 const PRIORITIES = { realtime: 0, replay: 1 };
 
 /**
- * @param input.maxConcurrent   how many model requests may be open at once
- * @param input.replayQueue     how many replayed messages may wait at all
- * @param input.replayWaitMs    how long one of them may wait before it is given up on
- * @param input.waiters         test seam for the clock the give-up deadline uses
+ * The gate's whole configuration, and the reason it is written down rather than inferred: the doc block used to
+ * describe its members in prose (`@param input.waiters  test seam for the clock`), and that prose had quietly
+ * rotted - there is no `waiters` any more, the clock seam is `now` plus the two timer injections, and nothing
+ * in a test would notice a sentence about a name the code no longer has. A `@property` line the compiler reads
+ * is the only kind of documentation that cannot say something false this quietly.
+ *
+ * @typedef {Object} LlmGateDeps
+ * @property {number} [maxConcurrent] - how many model requests may be open at once
+ * @property {number} [replayQueue] - how many replayed messages may wait at all
+ * @property {number} [replayWaitMs] - how long one of them may wait before it is given up on
+ * @property {() => number} [now] - the clock the give-up deadline reads, injected so a test does not sleep
+ * @property {(fn: () => void, ms: number) => any} [setTimeoutImpl]
+ * @property {(timer: any) => void} [clearTimeoutImpl]
  */
-export function createLlmGate({
+export function createLlmGate(/** @type {LlmGateDeps} */ {
   maxConcurrent = DEFAULT_MAX_CONCURRENT,
   replayQueue = DEFAULT_REPLAY_QUEUE,
   replayWaitMs = DEFAULT_REPLAY_WAIT_MS,
@@ -52,7 +61,7 @@ export function createLlmGate({
   clearTimeoutImpl = (timer) => clearTimeout(timer),
 } = {}) {
   const limit = Math.max(1, Number(maxConcurrent) || DEFAULT_MAX_CONCURRENT);
-  const queues = new Map([...Object.keys(PRIORITIES).map((key) => [key, []])]);
+  const queues = new Map(/** @type {[string, any[]][]} */ (Object.keys(PRIORITIES).map((key) => [key, []])));
   const running = new Set();
   /** Only for the panel: how many requests have been refused because the queue was full. */
   let gatedCount = 0;

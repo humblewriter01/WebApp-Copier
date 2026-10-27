@@ -80,8 +80,11 @@ export function isTechnicalNote(value) {
  *
  * @returns {{ text: string, replaced: boolean, original: string|null }} `original` is what to store in
  *          `signals.technical_note` when `replaced` - so the exact reason is never lost, only moved.
+ *
+ * @typedef {Object} FriendlySignalNoteInput
+ * @property {string} [fallback]
  */
-export function friendlySignalNote(value, { fallback = FRIENDLY_NOTES.generic } = {}) {
+export function friendlySignalNote(value, /** @type {FriendlySignalNoteInput} */ { fallback = FRIENDLY_NOTES.generic } = {}) {
   const raw = typeof value === 'string' ? value.trim() : '';
   if (!raw) return { text: fallback, replaced: false, original: null };
   if (!isTechnicalNote(raw)) return { text: raw, replaced: false, original: null };

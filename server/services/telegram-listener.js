@@ -41,7 +41,7 @@
  *    already asks for, and a gap our handler has not consumed is closed with `updates.GetDifference` - the
  *    request the library never makes - before anything is torn down and rebuilt.
  */
-import { NewMessage } from 'telegram/events/index.js';
+import * as telegramAdapter from './telegram-adapter.js';
 import { isTelegramServiceMessage, resolveTelegramChatId, telegramMessageText, telegramPeerIdVariants } from './telegram-peer.js';
 import { KEEP_ALIVE_FLAP_GRACE_MS } from './telegram-keepalive.js';
 
@@ -231,7 +231,71 @@ export const STREAM_IDLE_MS = 15 * 60 * 1000;
 
 const EMPTY_STATS = () => ({ seen: 0, saved: 0, ignored: 0, lastAt: null, lastChatId: null, lastError: null, catchUpSaved: 0, lastDelayMs: null, lastSentAt: null, lastMessageId: null });
 
-export function createTelegramListener({ clients, pool, log = console, saveSignal, now = () => Date.now(), catchUpLimit = CATCH_UP_LIMIT, catchUpCooldownMs = CATCH_UP_COOLDOWN_MS, catchUpBudgetMs = CATCH_UP_BUDGET_MS, silenceSuspectMs = SILENCE_SUSPECT_MS, probeDeadlineMs = STREAM_PROBE_DEADLINE_MS, gapCatchUpMs = GAP_CATCH_UP_MS, gapCatchUpSpreadMs = GAP_CATCH_UP_SPREAD_MS, heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS, ptsStallBeats = PTS_STALL_BEATS, rebuildCooldownMs = STREAM_REBUILD_COOLDOWN_MS,
+/**
+ * Whether a workspace id handed to `onSessionUnrecoverable` can address a row of `users`.
+ *
+ * `users.id` is a UUID, and the capture map is keyed by whatever `req.userId` was, which is that UUID as text.
+ * The guard this replaces asked "is it a positive integer", so every real workspace failed it: a session that
+ * could not recover was never marked for re-authentication, its client stayed in the map being beaten every
+ * thirty seconds, and the panel went on reporting Telegram as connected to a stream that would never deliver
+ * again. Asking only that the id be present is the whole of what a database write needs, and the legacy
+ * integer ids this app also carries are still accepted so a test fixture or an old row behaves the same way.
+ */
+export function isValidWorkspaceId(value) {
+  if (typeof value === 'number') return Number.isInteger(value) && value > 0;
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+/**
+ * Everything the capture loop is allowed to need from the outside, in one bag.
+ *
+ * Documented as a type because the alternative was a compiler that could not see the seam at all: the checker
+ * inferred this parameter from its `= {}` default and from the defaults of its members, which produced two
+ * claims that were both wrong and both load-bearing. It believed `log` was `console` - an object, not a
+ * function - so the twenty-six `log('warn', ...)` calls in this file were "calling a non-callable", and it
+ * believed `clients` and `pool` did not exist, because a member with no default contributes nothing to an
+ * inferred shape.
+ *
+ * The first of those was not only a compiler complaint. `log = console` below is a genuine trap: this function
+ * is called with a `log` by the server and by every test, so the default never ran, but a caller who omitted it
+ * would have got `TypeError: log is not a function` from inside the heartbeat - inside a `catch` that logs with
+ * the same missing function. The default is now a no-op shaped like the seam, which is what "silence is
+ * allowed, logging is not required" should have meant here.
+ *
+ * @typedef {Object} TelegramListenerDeps
+ * @property {Map<string, any>} clients - the live clients, keyed by the workspace id as text; the map is the
+ *   server's, so a session that never gets a listener is still visible to the HTTP routes that report on it
+ * @property {PoolLike} pool - reads the enabled channels and writes what the capture decided
+ * @property {(userId: string, message: any, channel: any) => Promise<any>} saveSignal - the only write this
+ *   file performs through anything other than `pool`, and the reason capture does not know what a signal row is
+ * @property {ServiceLogger} [log] - `log(level, sentence, facts)`; absent means silent, not `console`
+ * @property {() => number} [now] - milliseconds, injected so a test can move the clock instead of waiting on it
+ * @property {number} [catchUpLimit] - how many recent messages a replay is allowed to read
+ * @property {number} [catchUpCooldownMs] - how long before the same session is replayed again
+ * @property {number} [catchUpBudgetMs] - how long one replay may take before it is left for the next cycle
+ * @property {number} [silenceSuspectMs] - how long a listening session may be silent before it is worth asking about
+ * @property {number} [probeDeadlineMs] - how long a stream probe waits for the answer that decides deaf or not
+ * @property {number} [gapCatchUpMs] - the gap that turns a reconciliation into a replay
+ * @property {number} [gapCatchUpSpreadMs] - how far apart two workspaces' gap checks are pushed
+ * @property {number} [heartbeatIntervalMs] - the beat, exported so the server's interval and this file cannot disagree
+ * @property {number} [ptsStallBeats] - beats of an unchanged pts before the stream is called stalled
+ * @property {number} [rebuildCooldownMs] - how often one session may be rebuilt
+ * @property {number} [differenceMaxSteps] - how many slices a single reconciliation may walk
+ * @property {number} [differenceBudgetMs] - and for how long
+ * @property {number} [floodWaitMs] - the default wait when the provider asks for one without saying how long
+ * @property {number} [ptsGapStrikes] - beats of an unclosable gap before the workspace is asked to sign in
+ * @property {number} [gapReauthWindowMs] - the window those strikes have to fall inside
+ * @property {(client: any) => any} [transportFlap] - what the provider's own ping loop last did to this client
+ * @property {number} [keepAliveFlapGraceMs] - how recent a flap has to be to excuse one failed beat
+ * @property {(userId: string, reason: string, options?: { force?: boolean, escalate?: boolean }) => any} [onDeadStream] -
+ *   the rebuild, which only the server can perform
+ * @property {(userId: string, reason: string, details?: any) => any} [onSessionUnrecoverable] -
+ *   the verdict that no rebuild is coming, which only the server can record
+ */
+/* `Partial`, because the whole bag defaults to `{}` and the first line of the body is the check that decides
+   whether the three required members arrived: the type says "anything you do pass has to be shaped right", and
+   the `throw` says "and these three you may not leave out". */
+export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>} */ { clients, pool, log = () => {}, saveSignal, now = () => Date.now(), catchUpLimit = CATCH_UP_LIMIT, catchUpCooldownMs = CATCH_UP_COOLDOWN_MS, catchUpBudgetMs = CATCH_UP_BUDGET_MS, silenceSuspectMs = SILENCE_SUSPECT_MS, probeDeadlineMs = STREAM_PROBE_DEADLINE_MS, gapCatchUpMs = GAP_CATCH_UP_MS, gapCatchUpSpreadMs = GAP_CATCH_UP_SPREAD_MS, heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS, ptsStallBeats = PTS_STALL_BEATS, rebuildCooldownMs = STREAM_REBUILD_COOLDOWN_MS,
   differenceMaxSteps = DIFFERENCE_MAX_STEPS, differenceBudgetMs = DIFFERENCE_BUDGET_MS, floodWaitMs = FLOOD_BACKOFF_MS,
   ptsGapStrikes = PTS_GAP_STRIKES, gapReauthWindowMs = PTS_GAP_REAUTH_WINDOW_MS, transportFlap = null, keepAliveFlapGraceMs = KEEP_ALIVE_FLAP_GRACE_MS, onDeadStream = null, onSessionUnrecoverable = null } = {}) {
   if (!clients || !pool || !saveSignal) throw new Error('createTelegramListener requires clients, pool and saveSignal');
@@ -280,10 +344,10 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
    */
   function handlerIsLive(client, handler) {
     if (!client || !handler) return false;
-    if (typeof client.listEventHandlers !== 'function') return true;
+    if (!telegramAdapter.canListEventHandlers(client)) return true;
     let builders = [];
-    try { builders = client.listEventHandlers() || []; } catch { return true; }
-    return builders.some((pair) => Array.isArray(pair) && pair[1] === handler);
+    try { builders = telegramAdapter.listEventHandlers(client) || []; } catch { return true; }
+    return telegramAdapter.isHandlerAttached(builders, handler);
   }
 
   /**
@@ -302,12 +366,11 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
    * be caught by the gap sweep anyway.
    */
   async function probeUpdateStream(client, { deadlineMs = probeDeadlineMs } = {}) {
-    if (!client || client.connected !== true) return { alive: false, state: 'no-socket' };
-    if (typeof client.invoke !== 'function') return { alive: true, state: 'unknown' };
+    if (!client || !telegramAdapter.isConnected(client)) return { alive: false, state: 'no-socket' };
+    if (!telegramAdapter.canInvoke(client)) return { alive: true, state: 'unknown' };
     let request = null;
     try {
-      const { Api } = await import('telegram');
-      if (Api?.updates?.GetState) request = new Api.updates.GetState();
+      request = await telegramAdapter.createStateRequest();
     } catch {
       return { alive: true, state: 'unknown' };
     }
@@ -316,7 +379,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
     let timer = null;
     try {
       const state = await Promise.race([
-        Promise.resolve().then(() => client.invoke(request)),
+        Promise.resolve().then(() => telegramAdapter.invoke(client, request)),
         new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('probe-timeout')), deadlineMs); timer.unref?.(); }),
       ]);
       /* The answer is the account's own state, and this is the one request the beat already makes, so the whole
@@ -358,21 +421,21 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
    */
   async function resyncUpdateState(client, { userId = null, reason = 'resync', state = null, seenAdvanced = false, force = false, deadlineMs = probeDeadlineMs, maxSteps = differenceMaxSteps, budgetMs = differenceBudgetMs } = {}) {
     const outcome = { action: 'unavailable', serverPts: null, statePts: null, gap: 0, messages: 0, otherUpdates: 0, steps: 0, partial: false, backoffMs: 0, error: null, ms: null };
-    if (!client || client.connected !== true || typeof client.invoke !== 'function') return outcome;
+    if (!client || !telegramAdapter.isConnected(client) || !telegramAdapter.canInvoke(client)) return outcome;
     const startedAt = now();
-    let Api = null;
+    let reconcilable = false;
     try {
-      ({ Api } = await import('telegram'));
+      reconcilable = await telegramAdapter.canReconcileUpdates();
     } catch {
       return outcome;
     }
-    if (!Api?.updates?.GetState || !Api?.updates?.GetDifference) return outcome;
+    if (!reconcilable) return outcome;
 
     const invoke = async (request) => {
       let timer = null;
       try {
         return await Promise.race([
-          Promise.resolve().then(() => client.invoke(request)),
+          Promise.resolve().then(() => telegramAdapter.invoke(client, request)),
           new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('state-sync-timeout')), deadlineMs); timer.unref?.(); }),
         ]);
       } finally {
@@ -387,11 +450,11 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
          request is worth having on purpose: the dispatcher consults `_selfInputPeer` while it decides whether a
          pushed message counts as incoming for *every* event builder, and an exception in that path is swallowed by
          the library. */
-      if (typeof client.getMe === 'function') {
-        try { await client.getMe(true); } catch (error) { outcome.error = `identity: ${`${error?.message || error}`.slice(0, 80)}`; }
+      if (telegramAdapter.canGetSelf(client)) {
+        try { await telegramAdapter.getSelf(client); } catch (error) { outcome.error = `identity: ${`${error?.message || error}`.slice(0, 80)}`; }
       }
       const provided = state && (state.updateState || state.pts !== undefined) ? (state.updateState || state) : null;
-      const server = normalizeUpdateState(provided || await invoke(new Api.updates.GetState()));
+      const server = normalizeUpdateState(provided || await invoke(await telegramAdapter.createStateRequest()));
       outcome.serverPts = server.pts;
       const cached = readUpdateState(client);
       outcome.statePts = cached?.pts ?? null;
@@ -450,7 +513,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
         outcome.steps += 1;
         let difference = null;
         try {
-          difference = await invoke(new Api.updates.GetDifference({ pts: adopted.pts, qts: adopted.qts, date: adopted.date }));
+          difference = await invoke(await telegramAdapter.createDifferenceRequest({ pts: adopted.pts, qts: adopted.qts, date: adopted.date }));
         } catch (error) {
           /* The refusals that matter, told apart, because each one wants a different thing from us: a flood wait
              is a pause, `CHANNEL_DIFFERENCE_TOO_LONG`/`UPDATES_TOO_OLD` is "the gap is beyond the difference API"
@@ -634,7 +697,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
   async function beatUpdateStreams({ reason = 'heartbeat' } = {}) {
     const targets = [];
     for (const [userId, entry] of clients.entries?.() || []) {
-      if (!entry?.client || entry.client.connected !== true) continue;
+      if (!entry?.client || !telegramAdapter.isConnected(entry.client)) continue;
       targets.push([userId, entry]);
     }
     const cycleStartedAt = now();
@@ -974,7 +1037,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
          watchdog that reads it as a fault will reconnect a fleet that was about to be fine. */
       keepAliveTimeouts: Number((typeof transportFlap === 'function' ? transportFlap(entry?.client) : null)?.count) || 0,
       transportFlapping: beat?.flapping === true,
-      listening: Boolean(entry?.handler) && handlerIsLive(entry.client, entry.handler) && entry.client?.connected === true,
+      listening: Boolean(entry?.handler) && handlerIsLive(entry.client, entry.handler) && telegramAdapter.isConnected(entry.client),
     };
   }
 
@@ -1070,11 +1133,11 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
     if (current.handler && handlerIsLive(client || current.client, current.handler)) return current;
     const target = client || current.client;
     if (!target) return current;
-    if (current.handler && typeof target.removeEventHandler === 'function') {
-      try { target.removeEventHandler(current.handler, new NewMessage({})); } catch { /* the old client is gone */ }
+    if (current.handler && telegramAdapter.canRemoveMessageHandler(target)) {
+      try { telegramAdapter.removeMessageHandler(target, current.handler, telegramAdapter.createMessageEventFilter()); } catch { /* the old client is gone */ }
     }
     const handler = (event) => ingestMessage(userId, event?.message, event);
-    target.addEventHandler(handler, new NewMessage({}));
+    telegramAdapter.addMessageHandler(target, handler, telegramAdapter.createMessageEventFilter());
     current.handler = handler;
     if (!current.stats) current.stats = EMPTY_STATS();
     /* Every re-attach asks what was missed, whatever the statistics say. This used to be conditioned on
@@ -1110,7 +1173,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
    */
   async function runCatchUp(userId) {
     const current = clients.get(String(userId)) || clients.get(userId);
-    if (!current?.client || current.client.connected !== true) return { ran: false, reason: 'NO_CLIENT', stored: 0 };
+    if (!current?.client || !telegramAdapter.isConnected(current.client)) return { ran: false, reason: 'NO_CLIENT', stored: 0 };
     /* Two runs for one user would read the same 25 messages twice and race each other on the dedupe check,
        and the two ways a catch-up starts - the reconnect itself and the periodic re-arm sweep - are not
        coordinated with each other. Whichever arrives second gives up immediately; the flag stays set, so the
@@ -1158,8 +1221,8 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
       let messages = [];
       for (const handle of handles) {
         try {
-          const entity = await current.client.getEntity(handle);
-          messages = await current.client.getMessages(entity, { limit: catchUpLimit });
+          const entity = await telegramAdapter.getEntity(current.client, handle);
+          messages = await telegramAdapter.getMessages(current.client, entity, { limit: catchUpLimit });
           break;
         } catch (error) {
           log('warn', 'Telegram catch-up could not read that channel', { userId, channel: channel.channelId, handle: String(handle), error: error.message });
@@ -1207,14 +1270,14 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
       const stats = entry.stats || EMPTY_STATS();
       const beatInfo = streamBeats.get(String(userId));
       const attached = Boolean(entry.handler) && handlerIsLive(entry.client, entry.handler);
-      if (attached && entry.client?.connected) listening += 1;
+      if (attached && telegramAdapter.connectedFlag(entry.client)) listening += 1;
       seen += Number(stats.seen) || 0;
       saved += Number(stats.saved) || 0;
       if (stats.lastAt && (!lastMessageAt || stats.lastAt > lastMessageAt)) lastMessageAt = stats.lastAt;
       sessions.push({
         userId: String(userId),
-        connected: entry.client?.connected === true,
-        listening: attached && entry.client?.connected === true,
+        connected: telegramAdapter.isConnected(entry.client),
+        listening: attached && telegramAdapter.isConnected(entry.client),
         needsCatchUp: entry.needsCatchUp === true,
         messagesSeen: Number(stats.seen) || 0,
         messagesIgnored: Number(stats.ignored) || 0,
@@ -1258,7 +1321,9 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
     const instanceStartedAt = startedAt.toISOString();
     const idleMs = lastMessageAt ? Math.max(0, now() - Date.parse(lastMessageAt)) : null;
     const delays = sessions.map((session) => session.lastDelayMs).filter((value) => Number.isFinite(value));
-    const slowestSilence = sessions.reduce((worst, session) => (session.silenceSeconds != null && (worst === null || session.silenceSeconds > worst) ? session.silenceSeconds : worst), null);
+    /* The accumulator is not a session, which is what `reduce`'s inference concluded from a `null` seed; the
+       annotation is the shortest way to say what the loop actually carries. */
+    const slowestSilence = sessions.reduce((/** @type {number|null} */ worst, session) => (session.silenceSeconds != null && (worst === null || session.silenceSeconds > worst) ? session.silenceSeconds : worst), null);
     return {
       sessions,
       sessionsInMemory: sessions.length,

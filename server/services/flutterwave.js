@@ -165,7 +165,13 @@ export function payloadHash({ amountMinor, currency, email, txRef, secretKey }) 
  * garbage request into a 500. An unset hash refuses everything rather than accepting everything: a workspace
  * that has not finished configuring must not be able to hand out plans to whoever knocks.
  */
-export function verifyWebhookHash({ header, expectedHash } = {}) {
+/**
+ * @typedef {Object} VerifyWebhookHashInput
+ * @property {any} [header] - the `verif-hash` header exactly as it arrived: anything that is not a string has to
+ *   be refused rather than coerced into a comparison, which is why the value is not typed as a string here
+ * @property {any} [expectedHash] - the secret this deployment chose in the dashboard
+ */
+export function verifyWebhookHash(/** @type {VerifyWebhookHashInput} */ { header, expectedHash } = {}) {
   const expected = String(expectedHash || '').trim();
   const provided = String(header ?? '').trim();
   if (!expected || !provided || provided.length !== expected.length) return false;
@@ -305,9 +311,16 @@ export function isProviderNotFound(error) {
     || /not found|does not exist|no [a-z ]{0,20}(was )?found/i.test(String(error?.message || ''));
 }
 
-/* ------------------------------------------------------------------------- the client ------------------------------------------------------------------------ */
-
-export function createFlutterwaveClient({ config, fetchImpl } = {}) {
+/* ------------------------------------------------------------------------- the client ------------------------------------------------------------------------
+ */
+/**
+ * The client's two seams: the settings it reads and the function it sends with.
+ *
+ * @typedef {Object} FlutterwaveClientDeps
+ * @property {Record<string, any>} [config] - the resolved provider settings; absent means every call answers "not configured", which is the shape a test and a misconfigured deploy both arrive at
+ * @property {(input: any, init?: any) => Promise<any>} [fetchImpl] - injected so a test can answer without a network
+ */
+export function createFlutterwaveClient(/** @type {FlutterwaveClientDeps} */ { config, fetchImpl } = {}) {
   const settings = config || {};
   const doFetch = fetchImpl || globalThis.fetch;
   const base = String(settings.baseUrl || DEFAULT_BASE_URL).trim().replace(/\/+$/, '');
@@ -323,7 +336,13 @@ export function createFlutterwaveClient({ config, fetchImpl } = {}) {
     }
   }
 
-  async function call(path, { method = 'GET', body } = {}) {
+/**
+ *
+ * @typedef {Object} CallInput
+ * @property {string} [method]
+ * @property {Record<string, any>|null} [body]
+ */
+  async function call(path, /** @type {CallInput} */ { method = 'GET', body } = {}) {
     ensureConfigured();
     let response;
     try {

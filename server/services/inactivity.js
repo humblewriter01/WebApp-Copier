@@ -73,8 +73,23 @@ export function inactivityExemption({ admin = false, subscribed = false, suspend
  * The whole policy, as a pure decision so it can be tested without a database.
  * `positionState` is null when it could not be read, which fails closed: an account
  * whose position state is unknown is never deleted.
+ *
+ * @typedef {Object} InactivityDecisionInput
+ * @property {number} [daysInactive]
+ * @property {string|null} [accountState]
+ * @property {boolean} [subscribed]
+ * @property {boolean} [suspended]
+ * @property {boolean} [admin]
+ * @property {boolean} [alreadyWarned]
+ * @property {boolean} [gaveUp]
+ * @property {boolean} [retryBlocked]
+ * @property {Record<string, any>|null} [positionState]
+ * @property {number} [warningDays]
+ * @property {number} [deletionDays]
+ * @property {number} [maxAttempts]
+ * @property {number} [attempts]
  */
-export function inactivityDecision({
+export function inactivityDecision(/** @type {InactivityDecisionInput} */ {
   daysInactive,
   accountState = null,
   subscribed = false,
@@ -121,7 +136,22 @@ export function inactivityDecision({
   return { action: 'delete' };
 }
 
-export function createInactivityService({
+/**
+ *
+ * @typedef {Object} InactivityServiceDeps
+ * @property {PoolLike} [pool]
+ * @property {Record<string, any>} [trading]
+ * @property {Record<string, any>} [accountCleanup]
+ * @property {Function|null} [resolveToken]
+ * @property {number} [warningDays]
+ * @property {number} [deletionDays]
+ * @property {number} [retryHours]
+ * @property {number} [sweepLimit]
+ * @property {number} [maxAttempts]
+ * @property {Function} [now]
+ * @property {LoggerMethods} [logger]
+ */
+export function createInactivityService(/** @type {InactivityServiceDeps} */ {
   pool,
   trading = null,
   accountCleanup,
