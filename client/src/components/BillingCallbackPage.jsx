@@ -6,15 +6,21 @@ function readToken() {
 }
 
 /**
- * Landing page for Paystack's callback_url. Paystack appends `reference` (and the
- * legacy `trxref`), which is verified server-side before anything is granted.
+ * Landing page for Flutterwave's `redirect_url`. Flutterwave appends `tx_ref` plus its own `status` and
+ * `transaction_id`, and the reference this app issued is what ties them back to a plan - so the reference is
+ * read from wherever it is, then handed to GET /api/billing/verify, which asks Flutterwave directly before
+ * anything is granted. A visit to this page has never bought anything: it can only confirm what the provider
+ * already says was paid.
  */
 export default function BillingCallbackPage() {
   const [state, setState] = useState({ phase: 'checking', message: 'Verifying your payment…' });
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const reference = params.get('reference') || params.get('trxref') || '';
+    // `tx_ref` is what Flutterwave sends back; `reference`/`trxref` are the older spellings, kept so a checkout
+    // started before this deploy still lands somewhere honest instead of on "missing reference".
+    const reference = params.get('tx_ref') || params.get('reference') || params.get('trxref') || '';
+    const reported = String(params.get('status') || '').toLowerCase();
     const token = readToken();
     if (!token) {
       setState({ phase: 'error', message: 'Sign in to finish confirming this payment.' });
@@ -24,6 +30,10 @@ export default function BillingCallbackPage() {
       setState({ phase: 'error', message: 'This payment link is missing its reference. Return to Billing to try again.' });
       return;
     }
+    if (reported === 'failed' || reported === 'cancelled' || reported === 'canceled') {
+      setState({ phase: 'error', message: 'Flutterwave reported this payment as not completed. Nothing was charged, so you can try again from Billing.' });
+      return;
+    }
     request(`/api/billing/verify?reference=${encodeURIComponent(reference)}`, token)
       .then((result) => {
         if (result.subscription?.status === 'active') {
@@ -31,7 +41,7 @@ export default function BillingCallbackPage() {
         } else if (result.alreadyProcessed) {
           setState({ phase: 'success', message: 'This payment was already confirmed.', subscription: result.subscription });
         } else {
-          setState({ phase: 'pending', message: 'Paystack has not confirmed this payment yet. Refresh in a moment or check Billing.', subscription: result.subscription });
+          setState({ phase: 'pending', message: 'Flutterwave has not confirmed this payment yet. Refresh in a moment or check Billing.', subscription: result.subscription });
         }
       })
       .catch((error) => {

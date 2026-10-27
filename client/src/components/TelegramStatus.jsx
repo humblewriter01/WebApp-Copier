@@ -100,7 +100,7 @@ const fetchTelegramStatus = (token) => request(TELEGRAM_STATUS_ENDPOINT, token);
 
 /**
  * `fetchStatus` is a seam: the flows are testable without a network, exactly like the
- * server's fake MetaAPI and Paystack adapters.
+ * server's fake MetaAPI and Flutterwave adapters.
  */
 export function TelegramStatusProvider({ token, children, pollIntervalMs = TELEGRAM_POLL_INTERVAL_MS, fetchStatus = fetchTelegramStatus }) {
   const { state, refresh, publish } = useStatusResource({

@@ -11,7 +11,7 @@ A deployable React/Vite and Express app for capturing Telegram channel messages,
 - Reference-only account notes.
 - **MT4/MT5 account setup:** signed-in users can create an account setup and enter broker credentials on a MetaAPI-hosted secure page.
 - **Admin panel:** workspace administrators get a `/admin` dashboard with user totals, user management (roles, suspension), promo-code creation, and billing activity.
-- **Paystack subscriptions:** a free review-only tier plus Starter, Pro, and Premium plans, with a hosted Paystack checkout, promo codes, verified webhooks, plan-based limits the server enforces, and automatic renewal through Paystack Plan Codes that are kept in step with the price an admin saves.
+- **Flutterwave subscriptions:** a free review-only tier plus Starter, Pro, and Premium plans, each priced in naira **and** US dollars, with a hosted Flutterwave checkout, promo codes, a `verif-hash` webhook and server-side verification, plan-based limits the server enforces, and automatic renewal through Flutterwave payment plans that are kept in step with the price an admin saves — one plan per currency, because a Flutterwave plan holds one amount.
 - **Optional Auto-Trading:** a user can let clearly parsed Telegram signals place market orders on their own connected MT4/MT5 account, behind a chain of safety gates, with break-even and trailing stop protection for the positions it opened (see [Auto-Trading and break even](#auto-trading-and-break-even)).
 - **Break-even stop moves:** the stop of a trade Signal Desk opened is moved to the entry price (plus an optional offset) once the market has travelled the configured distance in favour of the trade.
 - **Limit and stop orders, with an expiry:** a signal that publishes a price the market has not reached is placed as a pending order on the broker instead of being skipped, carries that expiry as its own `ORDER_TIME_SPECIFIED` deadline, and is cancelled and reconciled by a sweeper if it never fills. A market order is judged against a drift allowance the workspace sets, and a fill better than the published price is always taken.
@@ -417,62 +417,84 @@ Captured messages are removable, by their owner and by an administrator. Trades 
 
 Two indexes ship with this so a purge stays cheap instead of scanning: `signals(created_at)` and the partial `trades(signal_id) WHERE signal_id IS NOT NULL`.
 
-## Paystack billing
+## Flutterwave billing
 
-Signal Desk sells a free tier and three paid plans. Every price, limit, and label comes from `PLAN_DEFINITIONS` and `FREE_PLAN` in `server/services/billing.js`, and the amount charged is always computed on the server, so a modified browser request can never change the charge. Nothing else needs to know how many paid plans exist — pricing storage, Paystack plan synchronisation, the Billing page, and the Admin Panel all iterate over that catalogue.
+Signal Desk sells a free tier and three paid plans, each priced in **naira and in US dollars**. Every price, limit, and label comes from `PLAN_DEFINITIONS` and `FREE_PLAN` in `server/services/billing.js`, and the amount charged is always computed on the server. The only thing a browser gets to choose is *which of the two stored prices* to pay, so a modified request can neither invent a discount nor charge a customer in a currency the row was not quoted in. Nothing else needs to know how many paid plans exist — pricing storage, the Flutterwave payment-plan synchronisation, the Billing page, and the Admin Panel all iterate over that catalogue.
 
-| Plan | Default price | Trading accounts | Telegram channels | Signals/day |
-|---|---|---:|---:|---:|
-| Free | ₦0 | none (review only) | 2 | 50 |
-| Starter | ₦60,000 / month | 1 | 10 | 200 |
-| Pro | ₦105,000 / month | 3 | 50 | 500 |
-| Premium | ₦150,000 / month | 5 | 100 | 2,000 |
+| Plan | Default NGN / month | Default USD / month | Trading accounts | Telegram channels | Signals/day |
+|---|---:|---:|---:|---:|---:|
+| Free | ₦0 | $0 | none (review only) | 2 | 50 |
+| Starter | ₦60,000 | $39 | 1 | 10 | 200 |
+| Pro | ₦105,000 | $69 | 3 | 50 | 500 |
+| Premium | ₦150,000 | $99 | 5 | 100 | 2,000 |
 
-The paid prices are set against what a MetaAPI account costs this workspace each month, so one automated account is the cheapest paid tier and every step up pays for more accounts and more traffic. **Free cannot execute at all**, and that is enforced where an order would be created rather than where a preference is stored: `maxTradingAccounts: 0` blocks a new link, the execution worker refuses an order for an unpaid workspace, and the same refusal is re-checked immediately before the broker call — so a workspace that connected an account while it was paying and later lapsed still cannot place orders. Signal capture and the workspace's own switches (Auto-Trading, break even, trailing stop) are *not* plan-gated: a Free user can state their intent, sees every captured signal, and is told per signal that execution needs an upgrade. Gating the switches themselves produced a red banner for a setting nobody could change and added no safety.
+The paid prices are set against what a MetaAPI account costs this workspace each month, so one automated account is the cheapest paid tier and every step up pays for more accounts and more traffic. **Free cannot execute at all**, and that is enforced where an order would be created rather than where a preference is stored: `maxTradingAccounts: 0` blocks a new link, the execution worker refuses an order for an unpaid workspace, and the same refusal is re-checked immediately before the broker call — so a workspace that connected an account while it was paying and later lapsed still cannot place orders. Signal capture and the workspace's own switches (Auto-Trading, break even, trailing stop) are *not* plan-gated: a Free user can state their intent, sees every captured signal, and is told per signal that execution needs an upgrade.
 
 A limit of `0` is a real limit, not "unset": it survives the `plan_limits` snapshot, and the error says the tier does not include that thing rather than announcing a zero allowance. For any plan the catalogue still lists, the deployed definition outranks the snapshot stored at purchase, so re-pricing or re-limiting a tier cannot leave existing subscribers on allowances nobody advertises; a snapshot only carries a retired plan key.
 
-**Prices are data, not configuration.** An administrator sets the active Starter, Pro, and Premium prices in the Admin Panel (Pricing & Plans), and they are stored in the `admin_settings` table under the keys `starter_price`, `pro_price`, and `premium_price`, each with a short change history and the identity of whoever saved it. The environment variables below are only the fallback used while no price has been saved (and a saved price can be cleared to return to it). Every read order is the same: database first, then `PAYSTACK_PLAN_*_AMOUNT`.
+### The unit, because it is the whole risk
 
-Checkout flow:
+Paystack was fed **kobo** — hundredths — and Flutterwave is fed **naira and dollars**. Every stored money figure in this repository stays in hundredths (`plans.price_ngn_minor`, `billing_transactions.amount_minor`, the promo arithmetic, the API's `amountMinor`), because that is the unit that already had a schema, a history, and a webhook comparison written against it. The division by 100 happens exactly once, in `toMajorAmount` in `server/services/flutterwave.js`, at the moment the provider is spoken to — and the identical string is what `payload_hash` is computed over, so the amount in the request and the amount in the checksum can never disagree. `toProviderAmount(6000000)` is `60000`, and `toProviderAmount(3900)` is `39`: a workspace that sent the stored number to Flutterwave would charge ₦6,000,000 for a ₦60,000 plan, and a workspace that divided twice would sell Premium for ₦1,500. `server/test/billing-multi-currency.test.js` asserts both numbers on the request body that would go over the wire.
 
-1. `POST /api/billing/checkout` recalculates the price from the active (database) price, applies any promo code, creates a `pending` row in `billing_transactions`, then calls Paystack's `POST /transaction/initialize` with that amount and a server-generated reference. When the price is undiscounted and its Paystack Plan Code is confirmed to hold exactly that amount, the request also carries `plan`, which lets Paystack renew the customer automatically.
-2. The browser is redirected to the `authorization_url` Paystack returns. Card details are only ever entered on Paystack.
-3. Paystack redirects back to `/billing/callback?reference=…`. The page calls `GET /api/billing/verify`, which re-verifies with `GET /transaction/verify/:reference` before granting anything.
-4. Paystack also sends events to `POST /api/billing/webhook`: `charge.success` for first payments, and `invoice.create`, `invoice.update`, `invoice.payment_failed`, `subscription.create`, `subscription.enable`, `subscription.not_renew`, `subscription.disable` for the renewal cycle. The handler verifies the `x-paystack-signature` header (HMAC SHA512 of the raw request body using `PAYSTACK_SECRET_KEY`) and ignores everything else.
+The unit also decides what "the minimum charge" means: `minimumChargeMinor('NGN')` is ₦100 and `minimumChargeMinor('USD')` is $1, which is what a promo code may not take a price below.
 
-Both paths share one fulfilment routine: the transaction is marked `success` once, the amount and currency must match the stored row, the user's plan and `plan_limits` are updated, and the promo code's `current_uses` is incremented. Replays are idempotent because the update is conditional on the row not already being `success`.
+**Prices are data, not configuration.** An administrator sets the Starter, Pro, and Premium prices — per currency, in two fields on one card — in the Admin Panel (Pricing & Plans). They live in the `plans` table (`plan_key`, `interval`, `price_ngn_minor`, `price_usd_minor`, `price_history`, `updated_by`) with a short change history and the identity of whoever saved it, and the mirror of what Flutterwave was told lives in `plan_provider_sync`, one row per **plan and currency**. The environment variables below are the fallback used while a currency has no saved price, and clearing one field returns that currency to its deployed default without touching the other. Every read order is the same: database first, then `FLW_PLAN_*_AMOUNT`.
 
-Recurring billing is driven by Paystack Plan Codes, one per paid plan, kept on the server only (`admin_settings` key `paystack_plan_starter` / `paystack_plan_pro` / `paystack_plan_premium`, with the plan code, plan id, amount, currency, interval, and last sync result). `cancel` marks `cancel_at_period_end` (access continues until the period ends) and Paystack is asked to stop renewing; `resume` re-enables the Paystack subscription and clears the flag. A paid `invoice.update` extends the period from `max(now, current_period_end)` and records a `billing_transactions` row with `source = 'renewal'`; because renewal invoices reuse no local reference, idempotency is keyed on the Paystack `INV_…` invoice code, so a replayed webhook changes nothing. `invoice.payment_failed` sets `past_due` (access continues), and a completed or cancelled subscription keeps its access until the period ends and is then downgraded. An hourly sweep downgrades anyone whose period has passed back to the Free limits.
+### Checkout flow
 
-### Keeping the Plan Code in step with the price
+1. `POST /api/billing/checkout` with `{ plan, currency, promoCode }`. The currency is validated against the currencies this workspace offers, the price for it is looked up in the `plans` table, any promo code is applied in that currency, and a `pending` row is written to `billing_transactions` with the amount **in hundredths** and the currency it was quoted in. A reference (`sdb_<user id>_<unix seconds>_<random>`) is generated here, which is Flutterwave's `tx_ref`.
+2. The server calls `POST /v3/payments` with `amount` in the major unit, `currency`, `redirect_url`, the customer's email, a `payload_hash` checksum, and `payment_plan` when a confirmed Flutterwave payment plan holds exactly this price in this currency. It returns a hosted link, which is what `client/src/lib/flutterwave.js` opens — Flutterwave's inline modal when its script loaded, the hosted page otherwise. Card details are only ever entered on Flutterwave.
+3. Flutterwave redirects back to `/billing/callback?status=…&tx_ref=…`. The page calls `GET /api/billing/verify?reference=…`, which asks Flutterwave `GET /v3/transactions/verify_by_reference?tx_ref=…` before granting anything. Nothing on that page is trusted: the browser contributes a reference and nothing else, and the reference is checked against this workspace's own row first, so another customer's successful payment cannot be spent here.
+4. Flutterwave posts to `POST /api/billing/webhook`. The `verif-hash` header is compared with `FLW_WEBHOOK_HASH` in constant time — there is no body signature in this protocol — and a workspace with no `FLW_WEBHOOK_HASH` set refuses every request rather than accept any. `charge.completed` fulfils a checkout; `subscribe.renewed`, `subscribe.payment_failed`, `subscribe.cancelled`/`disabled`/`deactivated`, `subscribe.enabled`/`activated`, and `subscribe.created` drive the renewal cycle. Anything else is answered with a 200 and ignored, because a non-2xx makes Flutterwave retry for an hour.
 
-A Paystack plan's amount overrides the amount in `transaction/initialize`, so a stale plan price would silently charge the old figure. Saving a price therefore synchronises the plan immediately (`server/services/plan-sync.js`):
+Both paths share one fulfilment routine: the row moves to `success` once (the conditional update *is* the claim), the amount and currency are compared with the stored row, the user's plan and `plan_limits` are updated, the currency is recorded on the subscription, and the promo code's `current_uses` is incremented. An underpayment or a different currency is refused with `409` (`AMOUNT_MISMATCH`, `CURRENCY_MISMATCH`); an overpayment grants the plan and logs the difference for a human to refund, which is Flutterwave's own guidance. Replays are idempotent because the update is conditional on the row not already being `success`.
+
+### Recurring billing, one payment plan per currency
+
+A Flutterwave payment plan charges its own stored amount every interval, and it holds exactly one amount in one currency — so a two-currency workspace keeps two mirrored plans per tier (`plan_provider_sync` is keyed on `plan_key, currency`). `cancel` marks `cancel_at_period_end` (access continues until the period ends) and calls `PUT /v3/subscriptions/:id/cancel`; `resume` calls `…/activate` and clears the flag — Flutterwave needs only the subscription id, not the email token and authorization code Paystack demanded.
+
+A renewal arrives as a `subscribe.*` event with no reference this server issued, so it is keyed on the subscription and the cycle it bought (`sdb_flwsub_<id>_<yyyymmdd>`), which is what makes a replayed notification a no-op instead of a second free month. Renewals are matched to an account by the email Flutterwave holds — a Flutterwave subscription is tied to a customer email and cannot be moved — and any event that cannot be tied to exactly one account is dropped, never guessed. An hourly sweep downgrades anyone whose period has passed back to the Free limits.
 
 | Situation | Call | Result |
 |---|---|---|
-| No plan code yet | `POST /plan` with `name`, `amount`, `interval`, currency | `synced`, the returned `PLN_…` code is stored |
-| Code exists, amount and interval already match | none | `in_sync` (no write, no churn) |
-| Code exists, amount differs | `PUT /plan/:code` with `update_existing_subscriptions` | `synced`, plus the "n subscription(s) affected" count read from the response message |
-| Paystack no longer knows the code | `POST /plan` after the failed `GET /plan/:code` | `synced` with a fresh code |
+| No plan id yet for this currency | `POST /v3/payment-plans` with `name`, `amount`, `interval`, `currency` | `synced`, and the returned plan id is stored against that currency |
+| Id exists, amount, currency and interval already match | none | `in_sync` (no write, no churn) |
+| Id exists, amount differs | `PUT /v3/payment-plans/:id` | `synced`, and existing subscribers pay the new amount next cycle |
+| "Do not re-price my subscribers" is switched on | `POST /v3/payment-plans` instead of the update | `synced` on a **new** id; whoever is already subscribed keeps the plan they agreed to |
+| Flutterwave no longer knows the id | create after the failed `GET /v3/payment-plans/:id` | `synced` with a fresh id |
+| This currency has no stored price | none | `not_priced`, said plainly, and no plan is created for zero |
 
-`PUT /plan` returns no body, so every write is followed by a `GET /plan/:code` and the amount, currency, and interval are compared with what this workspace charges. Only a match marks the plan `usable`; any mismatch, provider error, or network error is stored as `failed` with the message shown in the Admin Panel. Because the amount is verified, a failed sync cannot over- or under-charge: the plan code simply stops being sent and checkout continues as a one-time charge at the saved price, and **Re-sync** in the panel repairs it. Cancelling a price (clearing the input) restores the deployed default and re-syncs. Automatic renewal can also be switched off globally (`recurringEnabled`), which stops plan codes being sent without touching the stored prices, and `updateExistingSubscriptions` decides whether a price change moves subscribers who are already on a plan.
+Every write is followed by a `GET /v3/payment-plans/:id` and the amount, currency, and interval are compared with what this workspace charges. Only a match marks the plan `usable`; any mismatch, provider error, or network error is stored as `failed` with the message shown in the Admin Panel. Because the amount is verified, a failed sync cannot over- or under-charge: the plan id simply stops being sent and checkout continues as a verified one-time charge at the saved price, and **Re-sync** in the panel repairs it. `planChargeDecision` is where that rule lives, and it is per currency — a plan whose naira mirror is confirmed and whose dollar mirror is stale charges naira renewals and takes a one-time dollar payment. Automatic renewal can also be switched off globally (`recurringEnabled`), which stops plan ids being sent without touching the stored prices.
 
 Every plan boundary is a server check. `server/services/plan-limits.js` resolves the effective limits for a user and the routes that create resources call `enforcePlanLimit` before writing: adding a monitored channel and connecting a trading account both answer `402` with `code: PLAN_LIMIT_REACHED` and `upgradeRequired: true`, which the frontend uses to route the visitor to the Billing page. `maxDailySignals` is counted per UTC day against `signals`, and an over-limit user keeps read access to everything already stored.
 
-Billing settings and prices are read and written through `GET`/`PUT /api/admin/pricing` and `POST /api/admin/pricing/sync`, all admin-only; plan codes and sync state never leave the server, and `GET /api/billing/plans` only returns names, amounts, intervals, limits, and whether the plan currently renews automatically.
+Billing settings, prices, and sync state are read and written through `GET`/`PUT /api/admin/pricing` and `POST /api/admin/pricing/sync`, all admin-only; plan ids and sync state never leave the server, and `GET /api/billing/plans` returns names, both prices, intervals, limits, and whether each plan renews automatically **in each currency**. `GET /api/admin/billing` totals revenue per currency and never across them — ₦6,000,000 and $39 added together is a number that describes neither.
+
+### What the trader sees, and what the administrator sees
+
+The Billing page carries a `[ NGN ] [ USD ]` switch above the plan cards, defaulting to naira. Pressing it re-labels every price on the page from the `prices` map in the same payload — no refetch, because a price that only changes after a round trip is a price a visitor can be shown the wrong side of — and the checkout then sends that currency. A plan with no price in the selected currency says "Not sold in USD" and its button is disabled rather than quietly charging the naira figure. Admin Panel → Pricing & Plans has two fields per plan, two sync states per plan, and a "use the deployed default" control per currency.
+
+Provider vocabulary stays out of the trader's page: no `tx_ref`, no kobo, no checksum, no plan codes. What a customer is told is the amount, the currency, and that Flutterwave processes the payment.
 
 Configure in Render → API service → Environment:
 
 | Variable | Required | Purpose |
 |---|---:|---|
-| `PAYSTACK_SECRET_KEY` | Yes | Server-only key used for initialize, verify, and webhook signatures. Never expose it to the browser. |
-| `PAYSTACK_CURRENCY` | No | Defaults to `NGN`. |
-| `PAYSTACK_PLAN_STARTER_AMOUNT` / `PAYSTACK_PLAN_PRO_AMOUNT` / `PAYSTACK_PLAN_PREMIUM_AMOUNT` | No | Fallback price in the smallest currency unit (kobo), used only while no price is saved in `admin_settings`. Defaults `6000000`, `10500000`, and `15000000`. |
-| `PAYSTACK_PLAN_INTERVAL` | No | Billing interval for created plans: `monthly` (default), `annually`, `quarterly`, or `biannually`. |
-| `PAYSTACK_API_URL` | No | HTTPS base URL override; defaults to `https://api.paystack.co`. |
+| `FLW_SECRET_KEY` | Yes | Server-only key for `POST /v3/payments`, verification, plan writes, and the `payload_hash`. Never expose it to the browser. |
+| `FLW_PUBLIC_KEY` | No | Sent to the browser so the inline modal can open; the hosted link works without it. |
+| `FLW_WEBHOOK_HASH` | Yes for renewals | The static string in the `verif-hash` header. Without it the webhook endpoint answers 503 to everything. |
+| `FLW_ENCRYPTION_KEY` | No | Only needed if the account has data validation and encryption enabled; nothing here decrypts a payload. |
+| `FLW_CURRENCY` | No | The currency the Billing page defaults to. Defaults to `NGN`. |
+| `FLW_PLAN_STARTER_AMOUNT` / `FLW_PLAN_PRO_AMOUNT` / `FLW_PLAN_PREMIUM_AMOUNT` | No | Fallback naira price in the smallest unit (hundredths), used only while no price is saved in `plans`. Defaults `6000000`, `10500000`, `15000000`. |
+| `FLW_PLAN_STARTER_USD_AMOUNT` / `FLW_PLAN_PRO_USD_AMOUNT` / `FLW_PLAN_PREMIUM_USD_AMOUNT` | No | Same, in US cents: `3900`, `6900`, `9900`. |
+| `FLW_PLAN_INTERVAL` | No | Interval for created payment plans: `monthly` (default), `quarterly`, `biannually`, `annually`. |
+| `FLW_API_URL` | No | HTTPS base URL override; defaults to `https://api.flutterwave.com`. |
 
-Then add the webhook URL in the Paystack dashboard (Settings → API Keys & Webhooks), in the same mode as the key (test or live): `https://<api-service-host>/api/billing/webhook`, with `charge.success` and the `invoice.*` and `subscription.*` events above enabled (renewals and cancellations arrive through them). The callback URL is derived from `CLIENT_URL`, so that variable must be the exact public frontend origin.
+Then, in the Flutterwave dashboard (Settings → Webhooks), set the endpoint to `https://<api-service-host>/api/billing/webhook`, paste the same string into both the dashboard's verification hash and `FLW_WEBHOOK_HASH`, and enable `charge.completed` plus the `subscribe.*` events — renewals and cancellations arrive through them, and the endpoint must answer 200, which it does. The customer's return URL is derived from `CLIENT_URL`, so that variable must be the exact public frontend origin.
+
+### Migrating from Paystack
+
+Prices move, plan codes do not. The `starter_price` / `pro_price` / `premium_price` rows in `admin_settings` are copied into `plans` at boot (naira only; the dollar column starts empty until an administrator types one), and the legacy `paystack_plan_*` mirror is deliberately left behind: a `PLN_…` code belongs to a Paystack account and cannot be honoured by Flutterwave. A workspace that deploys this therefore charges every customer a verified **one-time** payment at the right price until someone presses Sync, which is the safe state rather than a broken one, and the Admin Panel says so per currency. Rows written by Paystack keep `provider = 'paystack'` in `billing_transactions` and `subscriptions`, so an old receipt is still labelled with the gateway that took the money.
 
 ## Failure messages that survive the round trip
 
@@ -560,7 +582,7 @@ The panel provides:
 
 - Dashboard totals: total users, administrators, suspended users, new sign-ups (7/30 days), promo codes, linked trading accounts, signals, and trades.
 - User management table: search by name or email, change role, suspend with a required reason, and restore access. Suspend, Adjust plan, and Impersonate open centred over the panel in a dialog rather than inside the row that was pressed: a seven-column cell could not hold a paragraph and three fields, and on a phone it held nothing readable. Escape and a click outside cancel, the first field takes focus, and both buttons are held while the request is in flight. An admin cannot demote or suspend their own account, and that refusal is now visible in three places at once: the panel shows the server's own sentence, `log('warn', 'Admin account edit refused', …)` prints the actor, the target, the status, and the *field names* that arrived (never their values), and a refused suspension writes a `user.suspension.refused` row to the audit trail. Before this, a refused account edit left no server-side trace at all, which is why "Suspend does nothing" could not be answered from the logs.
-- Pricing & Plans: the active Starter, Pro, and Premium prices, how many subscribers a change would affect, whether each plan's Paystack plan is in sync (with its `PLN_…` code and last error), the per-plan price history, the two recurring-billing switches, a "Re-sync all plans with Paystack" action, and the promo-code creator: code, percentage or fixed discount, optional maximum uses, and optional expiry. Existing codes can be paused, re-activated, or deleted. Codes are applied at Paystack checkout, and their `current_uses` increment only after a verified payment.
+- Pricing & Plans: the active Starter, Pro, and Premium prices in **both currencies** (two fields per plan, because a Flutterwave payment plan is single-currency), how many subscribers a change would affect, whether each plan is in sync in each currency (with its Flutterwave plan id and last error), the per-plan price history, a use-the-deployed-default control per currency, the two recurring-billing switches, a "Re-sync every plan and currency with Flutterwave" action, and the promo-code creator: code, percentage or fixed discount, optional maximum uses, and optional expiry. Existing codes can be paused, re-activated, or deleted. Codes are applied at checkout, and their `current_uses` increment only after a verified payment.
 - Billing activity: active subscriptions, successful and pending payments, gross collected, discounts given, and the latest customer transactions.
 - System health: the platform switch, the execution queue, and the newest MetaAPI and Telegram errors, with the **global auto-trading kill switch** at the top of the tab.
 - Announcements: publish, correct, schedule, and retire the dashboard banner every signed-in user sees.
@@ -662,7 +684,7 @@ The server enforces what the banner promises:
 - `days` (1-365) or `endsAt` moves `subscriptions.current_period_end` from the later of now and the current end, so extending never shortens a paid period. A `canceled` or expired row is revived as `non_renewing` with `cancel_at_period_end` set - paid to the new date, but not silently re-subscribed.
 - Moving an account to `free` clears the paid plan and its period in one step.
 
-Paystack is not touched: the response says so, and says so again when a gateway subscription is attached, because that renewal keeps its own schedule until it is cancelled in Payments. Every adjustment is written to `admin_audit_logs` (`subscription.grant`, `subscription.extend`, `subscription.clear`).
+Flutterwave is not touched: the response says so, and says so again when a gateway subscription is attached, because that renewal keeps its own schedule until it is cancelled in Payments. Every adjustment is written to `admin_audit_logs` (`subscription.grant`, `subscription.extend`, `subscription.clear`).
 
 ### Announcements
 
@@ -699,10 +721,12 @@ Fixing the catalogue exposed one latent schema bug: `subscriptions.plan_key` sti
 | `LLM_MODEL_NAME` | No | Defaults to `llama-3.1-8b-instant` |
 | `LLM_TIMEOUT_MS` / `LLM_MIN_CONFIDENCE` / `LLM_MAX_MESSAGE_CHARS` | No | Request budget (default 6000 ms, capped at 30000), the confidence a reading must reach to be usable (default 0.85), and how much of a message is sent (default 2000 characters) |
 | `LLM_MAX_CONCURRENT` | No | How many AI-reading requests may be open at once across the instance; defaults to `2`, floor `1`. Replayed messages share a waiting line of `8` in front of that gate and are left for review after `20000 ms` of waiting, which is what stops a reconnect's catch-up from spending the latency of a live signal |
-| `PAYSTACK_SECRET_KEY` | For billing | Server-only Paystack key for checkout, verification, and webhook signatures |
-| `PAYSTACK_CURRENCY` | No | Billing currency; defaults to `NGN` |
-| `PAYSTACK_PLAN_STARTER_AMOUNT` / `PAYSTACK_PLAN_PRO_AMOUNT` / `PAYSTACK_PLAN_PREMIUM_AMOUNT` | No | Fallback plan prices in kobo; the Admin Panel can override them at runtime |
-| `PAYSTACK_PLAN_INTERVAL` | No | Interval for Paystack plans; defaults to `monthly` |
+| `FLW_SECRET_KEY` | For billing | Server-only Flutterwave key for checkout, verification, plan writes, and the `payload_hash` checksum |
+| `FLW_WEBHOOK_HASH` | For renewals | The static `verif-hash` the webhook header is compared with; unset means the endpoint refuses every event |
+| `FLW_PUBLIC_KEY` | No | Lets the browser open Flutterwave's own payment modal; the hosted link is the fallback |
+| `FLW_CURRENCY` | No | The currency the Billing page defaults to; defaults to `NGN`, and the visitor can switch to `USD` |
+| `FLW_PLAN_{STARTER,PRO,PREMIUM}_AMOUNT` and `FLW_PLAN_{…}_USD_AMOUNT` | No | Fallback plan prices in the smallest unit of each currency (hundredths, not the major unit Flutterwave is sent); the Admin Panel overrides them at runtime, per currency |
+| `FLW_PLAN_INTERVAL` | No | Interval for Flutterwave payment plans; defaults to `monthly` |
 | `AUTO_TRADING_RUNTIME_ENABLED` | No | `true` enables the MetaAPI execution runtime (orders and break-even stop moves). It is read at boot and cannot change while the process runs - the Admin Panel's global kill switch is the runtime control, and it sits above this flag rather than replacing it |
 | `BREAK_EVEN_SWEEP_INTERVAL_MS` | No | Milliseconds between break-even sweeps; defaults to `5000` and never runs faster than every `1000` |
 | `SCALE_OUT_SWEEP_INTERVAL_MS` | No | Milliseconds between scale-out target sweeps, which price each `trade_tp_levels` row and close its share; defaults to `5000` and never runs faster than every `1000` |
@@ -802,7 +826,7 @@ The static site is served over HTTPS and includes a linked web app manifest, 192
 - `POST /api/auth/prepare-password-reset`, `POST /api/auth/sync-password`, `DELETE /api/auth/account`
 - `GET /api/admin/overview`, `GET /api/admin/users`, `PATCH /api/admin/users/:id`
 - `GET/POST /api/admin/promo-codes`, `PATCH/DELETE /api/admin/promo-codes/:id`, `GET /api/admin/billing`
-- `GET/PUT /api/admin/pricing`, `POST /api/admin/pricing/sync` – admin-only plan prices, recurring-billing settings, and Paystack Plan Code synchronisation
+- `GET/PUT /api/admin/pricing`, `POST /api/admin/pricing/sync` – admin-only plan prices per currency, recurring-billing settings, and Flutterwave payment-plan synchronisation
 - `GET /api/admin/health`, `GET/PUT /api/admin/execution-switch` – recent MetaAPI and Telegram errors with queue state, and the global auto-trading kill switch
 - `GET /api/admin/audit-logs` – the administrator audit trail (filter by action, search by admin email or wording)
 - `DELETE /api/admin/health/errors` – clear the recorded Telegram parsing reason from every captured message that carries one
@@ -816,7 +840,7 @@ The static site is served over HTTPS and includes a linked web app manifest, 192
 - `GET /api/announcements/active`, `POST /api/announcements/:id/dismiss` – the dashboard banner and its per-user dismissal
 - `GET /api/billing/plans` – public plan catalogue
 - `GET /api/billing/subscription`, `GET /api/billing/quote`, `POST /api/billing/checkout`, `GET /api/billing/verify`, `POST /api/billing/cancel`, `POST /api/billing/resume`
-- `POST /api/billing/webhook` – Paystack callback, authenticated by signature only
+- `POST /api/billing/webhook` – Flutterwave event sink, authenticated by the `verif-hash` header alone, and answered with 200 whatever it decides to do
 - `GET /api/dashboard` – the Overview's counts, settings and `signals`: at most **three** rows, and only ones that state a price (`execution_ready`, a status that has outlived `unparsed`, or a non-null entry/stop/target). A workspace with nothing actionable gets its three most recent messages instead and `signalsScope: "recent"`, which is the one case in which the panel says so in a line of its own. It also returns `signalsLastCaptureAt` (the newest row of any kind, taken from the unfiltered list the read already performs) and `signalsNewerCaptures` (how many messages arrived after the newest row it chose to show - counted only when the two lists prove there is at least one, so the common poll still costs nothing extra): the two numbers behind the one line that answers *is this feed dead* without requiring the reader to know that a bulletin is not a setup. The full history is `GET /api/signals`, which the Overview's **View all** opens
 - `GET/POST /api/channels`, `DELETE /api/channels/:id`
 - `GET/POST /api/signals`, `DELETE /api/signals/:id`, `DELETE /api/signals` — every stored message with its outcome: `status` (`received`, `queued`, `unexecuted`, `expired`, `unparsed`, `executed`, `rejected`, `unknown`, `failed` — the last one meaning the account was blocked, not the signal), `executionNote` (the sentence explaining an outcome that was not a trade), `directionInferred`, and the parsed prices; `DELETE` removes captured messages only and unlinks any trade they produced

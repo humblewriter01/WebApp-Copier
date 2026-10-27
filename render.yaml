@@ -48,22 +48,38 @@ services:
         value: "25"
       - key: INACTIVITY_DELETION_DAYS
         value: "30"
-      - key: PAYSTACK_SECRET_KEY
+      # Flutterwave replaces Paystack. Keys and the webhook hash are secrets and stay
+      # sync: false, so each environment (test/live) is set from its own dashboard.
+      - key: FLW_SECRET_KEY
         sync: false
-      - key: PAYSTACK_CURRENCY
+      - key: FLW_PUBLIC_KEY
+        sync: false
+      - key: FLW_WEBHOOK_HASH
+        sync: false
+      - key: FLW_ENCRYPTION_KEY
+        sync: false
+      - key: FLW_CURRENCY
         value: NGN
-      # Fallback prices only: the active Starter/Pro/Premium prices are stored in the
-      # admin_settings table and managed from Admin Panel -> Pricing & Plans, which
-      # also re-syncs the matching Paystack Plan Code so renewals use the new amount.
-      # These defaults are priced against the per-account cost MetaAPI bills.
-      - key: PAYSTACK_PLAN_STARTER_AMOUNT
-        value: "6000000"
-      - key: PAYSTACK_PLAN_PRO_AMOUNT
-        value: "10500000"
-      - key: PAYSTACK_PLAN_PREMIUM_AMOUNT
-        value: "15000000"
-      - key: PAYSTACK_PLAN_INTERVAL
+      - key: FLW_PLAN_INTERVAL
         value: monthly
+      # Fallback prices only, in the SMALLEST unit (hundredths): Flutterwave's API is
+      # fed the main unit and that conversion lives in server/services/flutterwave.js.
+      # The active Starter/Pro/Premium prices - in naira AND dollars - are stored in the
+      # plans table and managed from Admin Panel -> Pricing & Plans, which re-syncs the
+      # matching Flutterwave payment plan per currency so renewals use the new amount.
+      # These defaults are priced against the per-account cost MetaAPI bills.
+      - key: FLW_PLAN_STARTER_AMOUNT
+        value: "6000000"
+      - key: FLW_PLAN_PRO_AMOUNT
+        value: "10500000"
+      - key: FLW_PLAN_PREMIUM_AMOUNT
+        value: "15000000"
+      - key: FLW_PLAN_STARTER_USD_AMOUNT
+        value: "3900"
+      - key: FLW_PLAN_PRO_USD_AMOUNT
+        value: "6900"
+      - key: FLW_PLAN_PREMIUM_USD_AMOUNT
+        value: "9900"
   - type: web
     name: telegram-copier-web
     runtime: static
