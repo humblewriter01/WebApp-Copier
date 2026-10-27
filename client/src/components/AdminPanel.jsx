@@ -22,10 +22,13 @@ const HEALTH_WINDOWS = [
   { hours: 168, label: 'last 7 days' },
 ];
 const SYNC_COPY = {
-  synced: 'Saved in Paystack',
-  in_sync: 'Already matched Paystack',
-  failed: 'Paystack sync failed',
-  not_configured: 'Paystack not configured',
+  synced: 'Saved in Flutterwave',
+  in_sync: 'Already matched Flutterwave',
+  failed: 'Flutterwave sync failed',
+  not_configured: 'Flutterwave not configured',
+  // A currency with no stored price is not a failure, and calling it one sends an admin looking for a bug
+  // that is really a switch they have not thrown yet.
+  not_priced: 'No price in this currency',
   pending: 'Not synced yet',
 };
 
@@ -74,12 +77,18 @@ function formatDateTime(value) {
 }
 
 function formatMoney(amountMinor, currency = 'NGN') {
+  const code = String(currency || 'NGN').toUpperCase();
   const value = Number(amountMinor || 0) / 100;
   try {
-    return new Intl.NumberFormat('en-NG', { style: 'currency', currency, maximumFractionDigits: 2 }).format(value);
+    return new Intl.NumberFormat(CURRENCY_LOCALES[code] || 'en-NG', { style: 'currency', currency: code, maximumFractionDigits: 2 }).format(value);
   } catch {
-    return `${currency} ${value.toFixed(2)}`;
+    return `${code} ${value.toFixed(2)}`;
   }
+}
+
+/** A price the workspace has not set is reported as unset, never as 0 of something. */
+function moneyOrNone(amountMinor, currency) {
+  return amountMinor === null || amountMinor === undefined ? 'no price stored' : formatMoney(amountMinor, currency);
 }
 
 function Stat({ label, value, note }) {
@@ -94,6 +103,14 @@ function StatusBadge({ suspended, plan }) {
 function syncCopy(status) {
   return SYNC_COPY[status] || 'Not synced yet';
 }
+
+/* The currency decides the locale as much as the symbol: $39.00 and ₦60,000 are not the same sentence in the
+   same language, and a panel that reads naira-style numbers to a US customer is a panel nobody trusts. */
+const CURRENCY_LOCALES = { NGN: 'en-NG', USD: 'en-US' };
+/** One input per (plan, currency): a Flutterwave payment plan holds one amount in one currency. */
+const priceField = (planKey, code) => `${planKey}__${code}`;
+/** The field name the pricing API reads for a currency, in the unit it expects (major, not hundredths). */
+const priceInputKey = (code) => (String(code).toUpperCase() === 'USD' ? 'usdAmount' : 'amount');
 
 export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const [stats, setStats] = useState(null);
@@ -643,13 +660,22 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   };
 
   /* ------------------------------ pricing ------------------------------ */
+  const currencyCodes = () => (pricing?.supportedCurrencies?.length ? pricing.supportedCurrencies : ['NGN', 'USD']);
+
+  /* Only the fields that actually moved are sent. A plan priced in naira and dollars is two prices: saving one
+     must never look to the server like clearing the other, and it must never re-sync a currency nobody edited. */
   const changedPlans = () => {
     const changes = {};
     for (const plan of pricing?.plans || []) {
-      const raw = String(priceInputs[plan.key] ?? '').trim();
-      if (!raw) continue;
-      if (Number(raw) === Number(plan.amount) && !priceNote.trim()) continue;
-      changes[plan.key] = { amount: raw };
+      const entry = {};
+      for (const code of currencyCodes()) {
+        const raw = String(priceInputs[priceField(plan.key, code)] ?? '').trim();
+        if (!raw) continue;
+        const storedMinor = plan.prices?.[code]?.amountMinor;
+        if (storedMinor !== null && storedMinor !== undefined && Number(raw) === Number(storedMinor / 100) && !priceNote.trim()) continue;
+        entry[priceInputKey(code)] = raw;
+      }
+      if (Object.keys(entry).length) changes[plan.key] = entry;
     }
     return changes;
   };
@@ -657,9 +683,9 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const reportSyncs = (data) => {
     const syncs = data?.syncs || [];
     setSyncResults(syncs);
-    const broken = syncs.filter((sync) => sync.usable !== true);
+    const broken = syncs.filter((sync) => sync.usable !== true && sync.status !== 'not_priced');
     if (broken.length) {
-      setError(`${broken.map((sync) => `${sync.planKey}: ${sync.message}`).join(' ')} Checkout still works: users are charged the saved price as a one-time payment until the plan syncs.`);
+      setError(`${broken.map((sync) => `${sync.planKey} (${sync.currency}): ${sync.message}`).join(' ')} Checkout still works: users are charged the saved price as a one-time payment until the plan syncs.`);
     }
   };
 
@@ -667,7 +693,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     event?.preventDefault?.();
     const plans = changedPlans();
     if (!Object.keys(plans).length) {
-      setNotice('Enter a new price before saving.');
+      setNotice(priceNote.trim() ? 'Enter a new price to go with that note.' : 'Enter a new price before saving.');
       return;
     }
     setSavingPricing(true);
@@ -700,19 +726,23 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     }
   };
 
-  const clearPlanPrice = async (plan) => {
-    if (!window.confirm(`Use the deployed default price for ${plan.name}? This removes the saved price for this plan.`)) return;
+  /* `null` for one currency clears only that currency, which is the smallest thing an administrator can ask
+     for here: "stop overriding the dollar price, leave naira alone". The deployed default takes over again, and
+     the panel names that number before it is what a customer sees. */
+  const clearPlanPrice = async (plan, code) => {
+    if (!window.confirm(`Stop storing a ${code} price for ${plan.name}? It falls back to the deployed default.`)) return;
     setSavingPricing(true);
     setError('');
     setNotice('');
     try {
       const data = await request('/api/admin/pricing', token, {
         method: 'PUT',
-        body: { plans: { [plan.key]: null }, billing: { recurringEnabled: pricing?.billing?.recurringEnabled !== false } },
+        body: { plans: { [plan.key]: { [priceInputKey(code)]: null } }, billing: { recurringEnabled: pricing?.billing?.recurringEnabled !== false } },
       });
       await loadPricing();
       reportSyncs(data);
-      setNotice(`${plan.name} now uses the deployed default price (${formatMoney(plan.environmentAmountMinor, plan.currency)}).`);
+      const environmentMinor = code === 'USD' ? plan.environmentUsdAmountMinor : plan.environmentAmountMinor;
+      setNotice(`${plan.name} now uses the deployed ${code} default (${moneyOrNone(environmentMinor, code)}).`);
     } catch (clearError) {
       setError(clearError.userMessage || clearError.message);
     } finally {
@@ -730,7 +760,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
       setSyncResults(data.syncs || []);
       const usable = (data.syncs || []).filter((sync) => sync.usable);
       if ((data.syncs || []).length && usable.length === data.syncs.length) {
-        setNotice(`Paystack plans match the saved prices${data.syncs[0]?.planCode ? ` (${data.syncs.map((sync) => sync.planCode).filter(Boolean).join(', ')})` : ''}.`);
+        setNotice(`Flutterwave payment plans match the saved prices${data.syncs[0]?.planId ? ` (${data.syncs.map((sync) => `${sync.currency} #${sync.planId}`).filter(Boolean).join(', ')})` : ''}.`);
       } else {
         reportSyncs(data);
       }
@@ -748,8 +778,8 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
       const data = await request('/api/admin/pricing', token, { method: 'PUT', body: { billing: { [key]: value } } });
       setPricing(data.pricing);
       setNotice(key === 'recurringEnabled'
-        ? (value ? 'Recurring billing is on: users who pay through a synced Paystack plan are billed again each period.' : 'Recurring billing is off: every checkout is a one-time payment for one period.')
-        : (value ? 'Price changes will move existing Paystack subscriptions to the new price.' : 'Price changes will apply to new subscriptions only.'));
+        ? (value ? 'Recurring billing is on: users who pay through a synced Flutterwave payment plan are billed again each period.' : 'Recurring billing is off: every checkout is a one-time payment for one period.')
+        : (value ? 'Price changes are applied to the existing payment plan, so subscribers pay the new amount next cycle.' : 'Price changes create a new payment plan for new customers; existing subscribers keep the amount they agreed to.'));
       const syncs = data.syncs || [];
       if (syncs.length) reportSyncs(data);
     } catch (toggleError) {
@@ -901,7 +931,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
                     <td data-label="Status">
                       <StatusBadge suspended={isSuspended} plan={user.subscriptionPlan} />
                       <small>{user.subscriptionStatus && user.subscriptionStatus !== 'active' ? `${user.subscriptionStatus} · ` : ''}{user.periodEnd ? `paid until ${formatDate(user.periodEnd)}` : 'no paid period'}</small>
-                      {user.hasProviderSubscription ? <small className="admin-reason">Renews through Paystack</small> : null}
+                      {user.hasProviderSubscription ? <small className="admin-reason">Renews through Flutterwave</small> : null}
                     </td>
                     <td data-label="Joined">{formatDate(user.createdAt)}</td>
                     <td data-label="Last sign-in">{formatDateTime(user.lastLogin)}</td>
@@ -945,26 +975,36 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
       <section className="panel admin-panel pricing-panel">
         <div className="panel-heading">
           <div><p className="eyebrow">PRICING</p><h2>Plan prices</h2></div>
-          <span className={`status-pill ${pricing?.configured ? 'online' : ''}`}>{pricing?.configured ? 'Paystack connected' : 'Paystack not configured'}</span>
+          <span className={`status-pill ${pricing?.configured ? 'online' : ''}`}>{pricing?.configured ? 'Flutterwave connected' : 'Flutterwave not configured'}</span>
+          {pricing && !pricing.webhookConfigured ? <span className="status-pill pricing-webhook-flag" title="Set FLW_WEBHOOK_HASH and paste the same string into Flutterwave's webhook settings">Renewals will not arrive</span> : null}
         </div>
         <p className="muted">
-          Prices are saved in the workspace database and are what the Billing page shows and charges. Leaving a plan without a saved price falls back to its deployed default
-          (PAYSTACK_PLAN_{'{'}STARTER|PRO|PREMIUM{'}'}_AMOUNT). Saving a price also creates or updates the matching Paystack plan, so recurring charges follow you here.
-          Limits and the free tier live in the deployed catalogue (server/services/billing.js): Free is signal review with no trading accounts, and a saved price applies to
-          existing subscribers as soon as their next charge.
+          Every plan carries two prices - naira and US dollars - because a customer is charged in the currency they were shown, and a Flutterwave payment plan holds one amount in one currency.
+          Prices are saved in the workspace database and are what the Billing page shows and charges; leaving a field empty falls back to its deployed default
+          (FLW_PLAN_{'{'}STARTER|PRO|PREMIUM{'}'}_AMOUNT and FLW_PLAN_{'{'}…{'}'}_USD_AMOUNT). Saving a price also creates or updates the matching Flutterwave payment plan for that
+          currency, so recurring charges follow you here. Limits and the free tier live in the deployed catalogue (server/services/billing.js): Free is signal review with no
+          trading accounts, and a saved price applies to existing subscribers as soon as their next charge.
         </p>
 
-        {!pricing?.plans?.length ? <div className="empty-state"><strong>No paid plans available</strong><span>Set a Paystack secret key to enable plan pricing.</span></div> : <form className="pricing-plans" onSubmit={savePricing}>
+        {!pricing?.plans?.length ? <div className="empty-state"><strong>No paid plans available</strong><span>Set a Flutterwave secret key to enable plan pricing.</span></div> : <form className="pricing-plans" onSubmit={savePricing}>
           {pricing.plans.map((plan) => {
-            const dirty = String(priceInputs[plan.key] ?? '').trim() && Number(priceInputs[plan.key]) !== Number(plan.amount);
-            const amount = priceInputs[plan.key] ?? String(plan.amount);
+            const codes = currencyCodes();
+            const savedCodes = codes.filter((code) => plan.sources?.[code] === 'database');
+            const dirty = codes.some((code) => {
+              const raw = String(priceInputs[priceField(plan.key, code)] ?? '').trim();
+              const storedMinor = plan.prices?.[code]?.amountMinor;
+              if (!raw) return false;
+              return storedMinor === null || storedMinor === undefined || Number(raw) !== Number(storedMinor / 100);
+            });
             return <article className="pricing-plan-card" key={plan.key}>
               <header className="pricing-plan-head">
                 <div>
                   <h3>{plan.name}</h3>
                   <small>{plan.description}</small>
                 </div>
-                <span className={`badge ${plan.source === 'database' ? 'badge-buy' : ''}`}>{plan.source === 'database' ? 'Saved price' : 'Deployed default'}</span>
+                <span className={`badge ${savedCodes.length ? 'badge-buy' : ''}`}>
+                  {savedCodes.length === codes.length ? 'Saved prices' : savedCodes.length ? `${savedCodes.join(' + ')} saved` : 'Deployed default'}
+                </span>
               </header>
 
               <div className="pricing-plan-limits">
@@ -974,43 +1014,57 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
                 <span>{plan.activeSubscribers ?? 0} active subscribers</span>
               </div>
 
-              <label className="pricing-price-field">
-                Price per {plan.interval} ({plan.currency})
-                <div className="pricing-price-row">
-                  <input
-                    type="text"
-                    inputMode="decimal"
-                    value={amount}
-                    onChange={(event) => setPriceInputs({ ...priceInputs, [plan.key]: event.target.value })}
-                    aria-label={`${plan.name} price in ${plan.currency} per ${plan.interval}`}
-                    maxLength={12}
-                  />
-                  {plan.source === 'database' && Number(plan.environmentAmountMinor) !== Number(plan.amountMinor)
-                    ? <button type="button" className="button button-secondary button-small" disabled={savingPricing} onClick={() => clearPlanPrice(plan)}>Use default</button>
-                    : null}
-                </div>
-                <small className="muted">
-                  {plan.source === 'database'
-                    ? <>Active price <strong>{formatMoney(plan.amountMinor, plan.currency)}</strong>{plan.updatedAt ? <> · saved {formatDate(plan.updatedAt)}{plan.updatedBy ? ` by ${plan.updatedBy}` : ''}</> : null}</>
-                    : <>Deployed default <strong>{formatMoney(plan.environmentAmountMinor, plan.currency)}</strong> · not stored in the database yet</>}
-                </small>
-              </label>
+              <div className="pricing-price-fields">
+                {codes.map((code) => {
+                  const field = priceField(plan.key, code);
+                  const storedMinor = plan.prices?.[code]?.amountMinor ?? null;
+                  const environmentMinor = code === 'USD' ? plan.environmentUsdAmountMinor : plan.environmentAmountMinor;
+                  const value = priceInputs[field] ?? (storedMinor === null ? '' : String(storedMinor / 100));
+                  return <label className="pricing-price-field" key={code}>
+                    <span className="pricing-price-currency">{code === 'NGN' ? '₦ Naira' : '$ US dollars'}<small>per {plan.interval}</small></span>
+                    <div className="pricing-price-row">
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        value={value}
+                        placeholder={storedMinor === null ? `not offered in ${code}` : ''}
+                        onChange={(event) => setPriceInputs({ ...priceInputs, [field]: event.target.value })}
+                        aria-label={`${plan.name} price in ${code} per ${plan.interval}`}
+                        maxLength={12}
+                      />
+                      {storedMinor !== null && Number(environmentMinor) !== Number(storedMinor)
+                        ? <button type="button" className="button button-secondary button-small" disabled={savingPricing} onClick={() => clearPlanPrice(plan, code)}>Use default</button>
+                        : null}
+                    </div>
+                    <small className="muted">
+                      {storedMinor !== null
+                        ? <>Stored price <strong>{formatMoney(storedMinor, code)}</strong>{plan.updatedAt ? <> · saved {formatDate(plan.updatedAt)}{plan.updatedBy ? ` by ${plan.updatedBy}` : ''}</> : null}</>
+                        : <>No {code} price, so nobody can be charged in {code}. The deployed default would be <strong>{moneyOrNone(environmentMinor, code)}</strong>.</>}
+                    </small>
+                  </label>;
+                })}
+              </div>
 
-              <div className={`pricing-sync pricing-sync-${plan.paystack?.syncStatus || 'pending'}`}>
-                <strong>{syncCopy(plan.paystack?.syncStatus)}</strong>
-                <small>
-                  {plan.paystack?.planCode ? <code>{plan.paystack.planCode}</code> : 'No Paystack plan created yet.'}
-                  {plan.paystack?.syncedAmountMinor != null ? ` · Paystack charges ${formatMoney(plan.paystack.syncedAmountMinor, plan.paystack?.currency || plan.currency)}` : ''}
-                  {plan.paystack?.syncedAt ? ` · ${formatDateTime(plan.paystack.syncedAt)}` : ''}
-                </small>
-                {plan.paystack?.message || plan.paystack?.error ? <small className="pricing-sync-detail">{plan.paystack.error || plan.paystack.message}</small> : null}
+              <div className="pricing-sync-list">
+                {codes.map((code) => {
+                  const sync = plan.provider?.[code] || {};
+                  return <div key={code} className={`pricing-sync pricing-sync-${sync.syncStatus || 'pending'}`}>
+                    <strong>{code} · {syncCopy(sync.syncStatus)}</strong>
+                    <small>
+                      {sync.planId ? <code>plan {sync.planId}</code> : `No Flutterwave payment plan in ${code} yet.`}
+                      {sync.syncedAmountMinor != null ? ` · Flutterwave charges ${formatMoney(sync.syncedAmountMinor, sync.currency || code)}` : ''}
+                      {sync.syncedAt ? ` · ${formatDateTime(sync.syncedAt)}` : ''}
+                    </small>
+                    {sync.message || sync.error ? <small className="pricing-sync-detail">{sync.error || sync.message}</small> : null}
+                    <span className={`badge ${plan.renewsAutomatically?.[code] ? 'badge-buy' : ''}`}>
+                      {plan.renewsAutomatically?.[code] ? 'Recurring ready' : 'One-time only'}
+                    </span>
+                  </div>;
+                })}
                 <div className="admin-row-actions">
                   <button type="button" className="button button-secondary button-small" disabled={syncingPlans || savingPricing} onClick={() => syncPlans(plan.key)}>
-                    {syncingPlans ? 'Syncing…' : 'Sync with Paystack'}
+                    {syncingPlans ? 'Syncing…' : 'Sync both currencies with Flutterwave'}
                   </button>
-                  <span className={`badge ${plan.renewsAutomatically ? 'badge-buy' : ''}`}>
-                    {plan.renewsAutomatically ? 'Recurring ready' : 'One-time only'}
-                  </span>
                 </div>
               </div>
               {dirty ? <span className="pricing-dirty-note">Unsaved change — press Save changes below.</span> : null}
@@ -1020,12 +1074,12 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
           <div className="pricing-settings">
             <label className="checkbox-row">
               <input type="checkbox" checked={pricing?.billing?.recurringEnabled !== false} onChange={(event) => toggleBillingSwitch('recurringEnabled', event.target.checked)} />
-              <span>Automatic renewal through Paystack plans</span>
+              <span>Automatic renewal through Flutterwave payment plans</span>
             </label>
-            <small className="muted">Turn this off to make every checkout a single payment for one period. A synced plan is only used when the price matches Paystack exactly, and discounted checkouts are always one-time.</small>
+            <small className="muted">Turn this off to make every checkout a single payment for one period. A synced payment plan is only used when the price matches Flutterwave exactly in that currency, and discounted checkouts are always one-time.</small>
             <label className="checkbox-row">
               <input type="checkbox" checked={pricing?.billing?.updateExistingSubscriptions !== false} onChange={(event) => toggleBillingSwitch('updateExistingSubscriptions', event.target.checked)} />
-              <span>Move existing Paystack subscriptions to a new price</span>
+              <span>Re-price existing subscribers with a new plan</span>
             </label>
             <small className="muted">When off, a price change applies to new subscribers only and existing customers keep paying the price they signed up at.</small>
             <label>Change note (optional, stored in the price history)
@@ -1035,15 +1089,15 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
 
           <div className="button-row pricing-actions">
             <button className="button button-primary" type="submit" disabled={savingPricing}>{savingPricing ? 'Saving…' : `Save changes${pendingChanges ? ` (${pendingChanges})` : ''}`}</button>
-            <button className="button button-secondary" type="button" disabled={syncingPlans || savingPricing} onClick={() => syncPlans(null)}>{syncingPlans ? 'Syncing…' : 'Re-sync all plans with Paystack'}</button>
+            <button className="button button-secondary" type="button" disabled={syncingPlans || savingPricing} onClick={() => syncPlans(null)}>{syncingPlans ? 'Syncing…' : 'Re-sync every plan and currency with Flutterwave'}</button>
           </div>
         </form>}
 
         {syncResults.length ? <div className="pricing-sync-results">
           <strong>Last sync result</strong>
-          {syncResults.map((sync) => <p key={`${sync.planKey}-${sync.status}`}>
+          {syncResults.map((sync) => <p key={`${sync.planKey}-${sync.currency}-${sync.status}`}>
             <span className={`badge ${sync.usable ? 'badge-buy' : 'badge-suspended'}`}>{sync.usable ? 'OK' : 'Attention'}</span>
-            {' '}{sync.planKey}: {sync.message}{sync.affectedSubscriptions != null ? ` (${sync.affectedSubscriptions} existing subscription(s) updated)` : ''}
+            {' '}{sync.planKey} · {sync.currency}: {sync.amountMinor != null ? `${formatMoney(sync.amountMinor, sync.currency)} → ` : ''}{sync.message}
           </p>)}
         </div> : null}
 
@@ -1063,7 +1117,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
       <div className="panel-grid">
         <section className="panel admin-panel">
           <div className="panel-heading"><div><p className="eyebrow">DISCOUNTS</p><h2>Create promo code</h2></div></div>
-          <p className="muted">Promo codes apply at checkout. A discounted period is billed once, because a Paystack plan charges its own price and cannot be discounted.</p>
+          <p className="muted">Promo codes apply at checkout. A discounted period is billed once, because a Flutterwave payment plan charges its own price and cannot be discounted. A percentage applies in either currency; a fixed amount is read as major units of whatever the trader is charged in, so a naira code and a dollar code need separate values.</p>
           <form className="form-stack" onSubmit={createPromoCode}>
             <label>Code<input value={promoForm.code} onChange={(event) => setPromoForm({ ...promoForm, code: event.target.value.toUpperCase() })} placeholder="LAUNCH25" required maxLength={50} pattern="[A-Za-z0-9][A-Za-z0-9_-]{2,49}" /></label>
             <div className="form-row">
@@ -1109,16 +1163,22 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
       <section className="panel admin-panel" aria-labelledby="admin-billing-title">
         <div className="panel-heading">
           <div><p className="eyebrow">BILLING</p><h2 id="admin-billing-title">Subscriptions and payments</h2></div>
-          <span className={`status-pill ${billing?.configured ? 'online' : ''}`}>{billing?.configured ? 'Paystack ready' : 'Payments off'}</span>
+          <span className={`status-pill ${billing?.configured ? 'online' : ''}`}>{billing?.configured ? 'Flutterwave ready' : 'Payments off'}</span>
         </div>
         <div className="metrics-grid admin-metrics">
           <Stat label="Active subscriptions" value={billing?.summary?.activeSubscriptions ?? 0} note="Paid plans currently active" />
           <Stat label="Successful payments" value={billing?.summary?.successfulPayments ?? 0} note={`${billing?.summary?.pendingPayments ?? 0} pending checkouts`} />
-          <Stat label="Gross collected" value={formatMoney(billing?.summary?.grossMinor, billing?.summary?.currency)} note="Verified Paystack payments" />
-          <Stat label="Discounts given" value={formatMoney(billing?.summary?.discountsMinor, billing?.summary?.currency)} note="Applied promo codes" />
+          <Stat
+            label="Gross collected"
+            value={billing?.summary?.revenue?.length
+              ? billing.summary.revenue.map((entry) => formatMoney(entry.grossMinor, entry.currency)).join('  +  ')
+              : formatMoney(billing?.summary?.grossMinor, billing?.summary?.currency)}
+            note="Verified Flutterwave payments, counted per currency - naira and dollars are never added together"
+          />
+          <Stat label="Discounts given" value={billing?.summary?.revenue?.length ? billing.summary.revenue.map((entry) => formatMoney(entry.discountsMinor, entry.currency)).join('  +  ') : formatMoney(billing?.summary?.discountsMinor, billing?.summary?.currency)} note="Applied promo codes" />
         </div>
 
-        {!billing?.transactions?.length ? <div className="empty-state"><strong>No payments yet</strong><span>Successful and pending Paystack transactions will appear here.</span></div> : <div className="admin-table-wrap admin-billing-table">
+        {!billing?.transactions?.length ? <div className="empty-state"><strong>No payments yet</strong><span>Successful and pending Flutterwave transactions will appear here.</span></div> : <div className="admin-table-wrap admin-billing-table">
           <table className="admin-table">
             <caption className="sr-only">Recent billing transactions</caption>
             <thead><tr><th scope="col">Customer</th><th scope="col">Plan</th><th scope="col">Amount</th><th scope="col">Status</th><th scope="col">Created</th></tr></thead>
@@ -1480,7 +1540,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     <AdminActionModal
       open={Boolean(adjustFor)}
       title={`Manual adjustment for ${adjustFor?.name || 'this account'}`}
-      intro={`Currently ${adjustFor?.currentPlan || 'free'} (${adjustFor?.currentStatus || 'free'}), ${adjustFor?.periodEnd ? `paid until ${formatDate(adjustFor.periodEnd)}` : 'no paid period'}. ${adjustFor?.hasProviderSubscription ? 'This workspace renews through Paystack, so a gateway subscription keeps billing on its own schedule until it is cancelled there.' : 'No gateway subscription is attached to this workspace.'}`}
+      intro={`Currently ${adjustFor?.currentPlan || 'free'} (${adjustFor?.currentStatus || 'free'}), ${adjustFor?.periodEnd ? `paid until ${formatDate(adjustFor.periodEnd)}` : 'no paid period'}. ${adjustFor?.hasProviderSubscription ? 'This workspace renews through Flutterwave, so a payment plan keeps billing on its own schedule until it is cancelled there.' : 'No gateway subscription is attached to this workspace.'}`}
       confirmLabel="Save adjustment"
       busy={Boolean(adjustFor) && busyUser === adjustFor.userId}
       onCancel={cancelAdjustment}

@@ -623,6 +623,79 @@ const SCHEMA_SQL = `
      * against a table that is mostly history. A partial index on the live rows is the difference between a
      * cheap lookup and a scan of every trade the workspace has ever made. */
     CREATE INDEX IF NOT EXISTS trades_pending_expiry_idx ON trades(expiry_timestamp) WHERE status = 'pending';
+
+    /* Billing moved from Paystack to Flutterwave, and the prices a customer is charged now live in a table of
+     * their own instead of in an admin_settings JSON blob. Two things make the change worth a migration:
+     * a price needs a type (kobo and cents are both BIGINT, and the unit is in the column name because the
+     * providers disagree about it), and one Signal Desk plan now holds one price PER CURRENCY - naira for the
+     * traders it was built for, dollars for the ones Paystack's rejected application was meant to serve.
+     *
+     * plan_provider_sync is separate rather than a pair of columns because a Flutterwave payment plan carries
+     * exactly one amount in exactly one currency: Starter in naira and Starter in dollars are two provider
+     * objects that sync, fail, and get re-priced independently. */
+    CREATE TABLE IF NOT EXISTS plans (
+      plan_key TEXT PRIMARY KEY,
+      interval TEXT NOT NULL DEFAULT 'monthly',
+      price_ngn_minor BIGINT,
+      price_usd_minor BIGINT,
+      price_history JSONB NOT NULL DEFAULT '[]'::jsonb,
+      updated_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'plans_price_ngn_minor_check' AND conrelid = 'plans'::regclass) THEN
+        ALTER TABLE plans ADD CONSTRAINT plans_price_ngn_minor_check CHECK (price_ngn_minor IS NULL OR price_ngn_minor > 0);
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'plans_price_usd_minor_check' AND conrelid = 'plans'::regclass) THEN
+        ALTER TABLE plans ADD CONSTRAINT plans_price_usd_minor_check CHECK (price_usd_minor IS NULL OR price_usd_minor > 0);
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'plans_interval_check' AND conrelid = 'plans'::regclass) THEN
+        ALTER TABLE plans ADD CONSTRAINT plans_interval_check CHECK (interval IN ('hourly', 'daily', 'weekly', 'monthly', 'quarterly', 'biannually', 'annually'));
+      END IF;
+    END $$;
+    CREATE TABLE IF NOT EXISTS plan_provider_sync (
+      plan_key TEXT NOT NULL,
+      currency TEXT NOT NULL,
+      provider_plan_id BIGINT,
+      provider_plan_token TEXT,
+      sync_status TEXT NOT NULL DEFAULT 'pending',
+      synced_amount_minor BIGINT,
+      synced_at TIMESTAMPTZ,
+      provider_name TEXT,
+      interval TEXT,
+      message TEXT,
+      error TEXT,
+      updated_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (plan_key, currency)
+    );
+    ALTER TABLE billing_transactions ADD COLUMN IF NOT EXISTS provider_reference TEXT;
+    ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS currency TEXT;
+    /* New rows are Flutterwave; rows written by Paystack keep their provider, because the panel and the
+     * cancel/resume paths read it to decide which gateway a live subscription is actually on. */
+    ALTER TABLE billing_transactions ALTER COLUMN provider SET DEFAULT 'flutterwave';
+    /* What an account is being charged in. A subscriber who pays dollars must not be shown a naira renewal
+     * date beside a naira price, and the currency is the only thing that makes that sentence true. */
+    /* The stored prices carry over untouched: one SELECT per plan key that exists, and a plan with no stored
+     * price simply gets no row, which is what "fall back to the deployed default" already means here.
+     * The Paystack plan mirror is deliberately NOT copied: a plan code belongs to a Paystack account and
+     * cannot be honoured by Flutterwave, so leaving the mirror empty is what makes every checkout a verified
+     * one-time charge until an administrator re-syncs - the safe state, not a broken one. */
+    INSERT INTO plans(plan_key,interval,price_ngn_minor,price_usd_minor,price_history,updated_by,created_at,updated_at)
+    SELECT replace(setting_key,'_price',''),
+           COALESCE(NULLIF(setting_value ->> 'interval',''),'monthly'),
+           CASE WHEN (setting_value ->> 'amountMinor') ~ '^[0-9]+$' THEN (setting_value ->> 'amountMinor')::bigint ELSE NULL END,
+           CASE WHEN (setting_value ->> 'amountUsdMinor') ~ '^[0-9]+$' THEN (setting_value ->> 'amountUsdMinor')::bigint
+                WHEN (setting_value ->> 'usdAmountMinor') ~ '^[0-9]+$' THEN (setting_value ->> 'usdAmountMinor')::bigint
+                ELSE NULL END,
+           CASE WHEN jsonb_typeof(setting_value -> 'history') = 'array' THEN setting_value -> 'history' ELSE '[]'::jsonb END,
+           updated_by,created_at,updated_at
+    FROM admin_settings
+    WHERE setting_key IN ('starter_price','pro_price','premium_price')
+      AND jsonb_typeof(setting_value) = 'object'
+    ON CONFLICT (plan_key) DO NOTHING;
 `;
 
 /** The schema exactly as it will be sent: one entry per statement, in the order it is written above. */

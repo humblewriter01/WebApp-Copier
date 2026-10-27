@@ -26,7 +26,7 @@ export const AUDIT_TARGET_TYPES = Object.freeze(['user', 'promo_code', 'plan', '
  */
 export const AUDIT_ACTIONS = Object.freeze({
   'pricing.update': 'Pricing changed',
-  'pricing.sync': 'Paystack plans re-synced',
+  'pricing.sync': 'Flutterwave payment plans re-synced',
   'promo_code.create': 'Promo code created',
   'promo_code.update': 'Promo code changed',
   'promo_code.delete': 'Promo code removed',

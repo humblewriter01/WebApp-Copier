@@ -29,8 +29,8 @@ import { createExecutionWorker } from './services/execution-worker.js';
 import { createSupabaseAuthBridge } from './services/supabase-auth.js';
 import { createAdminAccess, normalizePromoCodeInput, normalizePromoCodeUpdate, normalizeUserUpdate, assertAllowedSelfUpdate, normalizeSubscriptionAdjustment, assertAllowedImpersonation, adminActionError, buildUserAdminUpdate, buildSubscriptionGrantStatements, buildSubscriptionExtendStatement, buildSubscriptionReleaseStatements, buildSubscriptionMirrorStatement, buildSignalOwnershipDelete, buildAdminSignalDelete, buildSignalsPurgeForUser, buildSignalsPurgeOlderThan, buildSignalsPurgeCount } from './services/admin.js';
 import { createAccountCleanup } from './services/account-cleanup.js';
-import { billingConfig, verifyWebhookSignature, normalizeReference, findPlan, FREE_PLAN } from './services/billing.js';
-import { createPaystackClient } from './services/paystack.js';
+import { billingConfig, normalizeReference, findPlan, normalizeCurrency, isSupportedCurrency, formatAmount, FREE_PLAN } from './services/billing.js';
+import { createFlutterwaveClient, verifyWebhookHash } from './services/flutterwave.js';
 import { createBillingService } from './services/billing-service.js';
 import { createPricingStore, normalizePricingUpdate, normalizeBillingSettings, planChargeDecision, publicPricing } from './services/pricing.js';
 import { createPlanSynchronizer } from './services/plan-sync.js';
@@ -101,22 +101,27 @@ const parserConfig = llmConfig(process.env);
 const llmGate = createLlmGate({ maxConcurrent: Number(process.env.LLM_MAX_CONCURRENT) || undefined });
 
 const accountCleanup = createAccountCleanup({ logger: { warn: (message, extra = {}) => log('warn', message, extra) } });
-const paystackConfig = billingConfig();
-const paystackClient = createPaystackClient({ config: paystackConfig });
+const flutterwaveConfig = billingConfig();
+const flutterwaveClient = createFlutterwaveClient({ config: flutterwaveConfig });
 const serviceLogger = {
   info: (message, extra = {}) => log('info', message, extra),
   warn: (message, extra = {}) => log('warn', message, extra),
   error: (message, extra = {}) => log('error', message, extra),
 };
-// Prices are stored in `admin_settings` and maintained from the admin panel, with
-// the environment as the fallback whenever a plan has no stored price.
-const pricingStore = createPricingStore({ pool, config: paystackConfig, logger: serviceLogger });
-const planSynchronizer = createPlanSynchronizer({ paystack: paystackClient, pricing: pricingStore, config: paystackConfig, logger: serviceLogger });
+// Prices live in the `plans` table (one row per plan, one column per currency) and are maintained from the
+// admin panel, with the environment as the fallback whenever a plan has no stored price.
+const pricingStore = createPricingStore({ pool, config: flutterwaveConfig, logger: serviceLogger });
+const planSynchronizer = createPlanSynchronizer({
+  flutterwave: flutterwaveClient,
+  pricing: pricingStore,
+  config: flutterwaveConfig,
+  logger: serviceLogger,
+});
 const billingService = createBillingService({
   pool,
   pricing: pricingStore,
-  paystack: paystackClient,
-  config: paystackConfig,
+  flutterwave: flutterwaveClient,
+  config: flutterwaveConfig,
   logger: serviceLogger,
 });
 
@@ -152,8 +157,10 @@ app.use(cors({
   },
   credentials: true,
 }));
-// Capture the raw body so the Paystack webhook can be verified against the exact
-// bytes Paystack signed (HMAC SHA512 of the raw payload).
+// The raw body is captured so a Flutterwave webhook can be refused for a malformed payload before the JSON is
+// trusted. Flutterwave does not sign its body - the `verif-hash` header is the check - so nothing here is
+// hashed, but reading the exact bytes the provider sent is still what makes "we could not parse it" a fact
+// rather than an inference from a re-serialised object.
 app.use(express.json({
   limit: '1mb',
   verify: (req, _res, buffer) => { req.rawBody = Buffer.from(buffer); },
@@ -1587,9 +1594,14 @@ app.get('/api/trades', authenticate, asyncRoute(async (req, res) => {
 }));
 
 /* -------------------------------- Billing --------------------------------
- * Paystack checkout, verification, and webhooks. Prices live in the plan
- * definitions and are never trusted from the browser: the server always
- * recalculates the amount (including any promo code) before charging.
+ * Flutterwave checkout, verification, and webhooks, in NGN and USD.
+ *
+ * Prices live in the plan definitions and the `plans` table and are never trusted from the browser: the server
+ * recalculates the amount for the currency the visitor picked (including any promo code) before charging, and
+ * only ever sends Flutterwave that number. The one thing the browser does choose is the currency, and it chooses
+ * between two prices that both came from the database - so the worst a tampered request can do is ask to be
+ * charged the dollar price while looking at the naira one, which is refused at verification because the stored
+ * row says which currency it quoted.
  */
 async function currentPlanLimits(userId) {
   const { rows } = await pool.query(
@@ -1613,12 +1625,16 @@ async function enforcePlanLimit(userId, limitKey, countSql) {
 
 app.get('/api/billing/plans', asyncRoute(async (_req, res) => {
   // Prices are read per request so a price saved in the admin panel is what the
-  // visitor sees and pays, with no cache or stale build to wait for.
+  // visitor sees and pays, with no cache or stale build to wait for. Both currencies
+  // go out in the same response, because the toggle on the billing page has to work
+  // offline-ish (instantly, without a round trip) and a price that only exists after a
+  // fetch is a price a visitor can be shown the wrong side of.
   const snapshot = await pricingStore.snapshot();
   res.set('Cache-Control', 'no-store').json({
     plans: publicPricing(snapshot),
-    configured: paystackConfig.configured,
+    configured: flutterwaveConfig.configured,
     currency: snapshot.currency,
+    supportedCurrencies: [...flutterwaveConfig.supportedCurrencies],
     interval: snapshot.interval,
     recurringEnabled: snapshot.recurringEnabled,
   });
@@ -1631,15 +1647,24 @@ app.get('/api/billing/subscription', authenticate, asyncRoute(async (req, res) =
 }));
 
 app.get('/api/billing/quote', authenticate, billingLimiter, asyncRoute(async (req, res) => {
-  const quote = await billingService.quote({ planKey: req.query.plan, promoCode: req.query.code });
+  const quote = await billingService.quote({ planKey: req.query.plan, promoCode: req.query.code, currency: req.query.currency });
   res.set('Cache-Control', 'no-store').json({ quote });
 }));
 
 app.post('/api/billing/checkout', authenticate, billingLimiter, asyncRoute(async (req, res) => {
+  /* The currency is validated at this edge rather than defaulted deep inside the service: an unsupported code
+     is a bug in the caller or an attempt to be charged something else, and both deserve a 400 that names it. */
+  const requested = req.body?.currency === undefined || req.body?.currency === null || req.body?.currency === ''
+    ? normalizeCurrency(flutterwaveConfig.currency)
+    : String(req.body.currency).trim().toUpperCase();
+  if (!isSupportedCurrency(requested)) {
+    return fail(res, 400, `Choose ${flutterwaveConfig.supportedCurrencies.join(' or ')} as the currency to pay in.`);
+  }
   const checkout = await billingService.initialize({
     userId: req.userId,
     planKey: req.body?.plan,
     promoCode: req.body?.promoCode,
+    currency: requested,
   });
   res.set('Cache-Control', 'no-store').json({ checkout });
 }));
@@ -1661,26 +1686,31 @@ app.post('/api/billing/resume', authenticate, billingLimiter, asyncRoute(async (
   res.set('Cache-Control', 'no-store').json({ subscription });
 }));
 
-// Paystack calls this endpoint. The HMAC SHA512 signature is computed over the
-// exact raw bytes received, so it is verified before anything else happens.
+/* Flutterwave posts here. Its documented check is a `verif-hash` header equal to the secret hash configured in
+   the dashboard - there is no body signature to recompute - so the header is compared first, in constant time,
+   and nothing else in the request is read until it matches. A missing FLW_WEBHOOK_HASH refuses every request:
+   a workspace that has not finished configuring must not be able to hand out plans to whoever knocks.
+   Flutterwave requires a 200 and does not read the body, so a webhook that was understood-but-ignored answers
+   200 too (otherwise the provider retries for an hour over an event we have deliberately dropped), while a
+   refused or unreadable request answers 401/400 because those are not us acknowledging anything. */
 app.post('/api/billing/webhook', webhookLimiter, asyncRoute(async (req, res) => {
-  const signature = req.headers['x-paystack-signature'];
-  if (!paystackConfig.secretKey) {
-    log('error', 'Paystack webhook received but PAYSTACK_SECRET_KEY is not configured');
+  const header = req.headers['verif-hash'];
+  if (!flutterwaveConfig.webhookHash) {
+    log('error', 'Flutterwave webhook received but FLW_WEBHOOK_HASH is not configured');
     return res.status(503).json({ error: 'Payments are not configured.' });
   }
-  if (!verifyWebhookSignature(req.rawBody, signature)) {
-    log('warn', 'Paystack webhook signature rejected', { hasSignature: Boolean(signature) });
-    return res.status(401).json({ error: 'Invalid signature.' });
+  if (!verifyWebhookHash({ header, expectedHash: flutterwaveConfig.webhookHash })) {
+    log('warn', 'Flutterwave webhook hash rejected', { hasHeader: Boolean(header) });
+    return res.status(401).json({ error: 'Invalid webhook hash.' });
   }
   let event;
   try { event = JSON.parse(req.rawBody.toString('utf8')); }
   catch {
-    log('warn', 'Paystack webhook body was not valid JSON');
+    log('warn', 'Flutterwave webhook body was not valid JSON');
     return res.status(400).json({ error: 'Invalid payload.' });
   }
   const result = await billingService.handleWebhookEvent(event);
-  log('info', 'Paystack webhook processed', { event: result.event, handled: result.handled, reason: result.reason });
+  log('info', 'Flutterwave webhook processed', { event: result.event, handled: result.handled, reason: result.reason });
   res.json({ received: true, result });
 }));
 
@@ -2087,16 +2117,16 @@ app.delete('/api/admin/promo-codes/:id', authenticate, requireAdmin, asyncRoute(
 }));
 
 /* --------------------------- Admin: pricing control -------------------------
- * Prices live in `admin_settings` (`pro_price`, `premium_price`), and every write
- * also mirrors the price into a Paystack plan so recurring charges match what the
- * site advertises. A sync problem is reported, never hidden, and never blocks
- * saving the price.
+ * Prices live in the `plans` table - one row per plan, one column per currency - and every write
+ * also mirrors the price into a Flutterwave payment plan per currency, so a renewal charges exactly
+ * what the site advertises. A sync problem is reported, never hidden, and never blocks saving the
+ * price: the worst case is a customer who pays once instead of being subscribed, which is a billing
+ * conversation, not a broken login.
  */
 /** Money for audit summaries only: minor units are the stored truth, the label is for humans. */
 function describeMoney(amountMinor, currency = 'NGN') {
   if (amountMinor === null || amountMinor === undefined || amountMinor === '') return 'not priced';
-  const value = Number(amountMinor) / 100;
-  return `${value.toLocaleString('en-NG', { maximumFractionDigits: 2 })} ${currency}`.trim();
+  return formatAmount(amountMinor, currency);
 }
 
 function describeDiscount(input = {}) {
@@ -2114,6 +2144,25 @@ function describePromoUpdate(update = {}) {
   return parts.join(', ') || 'nothing changed';
 }
 
+/** One provider mirror, in the shape the panel renders. `null` when that currency has never been synced. */
+function describeProviderMirror(sync, currency) {
+  if (!sync || (sync.planId === null && sync.syncStatus === 'pending')) {
+    return { planId: null, syncStatus: 'pending', syncedAmountMinor: null, currency, message: null, error: null, name: null, interval: null, syncedAt: null };
+  }
+  return {
+    planId: sync.planId ?? null,
+    legacyCode: sync.legacyCode || null,
+    syncStatus: sync.syncStatus || 'pending',
+    syncedAmountMinor: sync.syncedAmountMinor ?? null,
+    syncedAt: sync.syncedAt || null,
+    currency: sync.currency || currency,
+    interval: sync.interval || null,
+    name: sync.name || null,
+    message: sync.message || null,
+    error: sync.error || null,
+  };
+}
+
 async function adminPricingPayload() {
   const snapshot = await pricingStore.snapshot();
   let subscribers = [];
@@ -2129,8 +2178,10 @@ async function adminPricingPayload() {
   const counts = new Map(subscribers.map((row) => [String(row.plan_key), Number(row.active_subscriptions || 0)]));
   return {
     currency: snapshot.currency,
+    supportedCurrencies: [...flutterwaveConfig.supportedCurrencies],
     interval: snapshot.interval,
-    configured: paystackConfig.configured,
+    configured: flutterwaveConfig.configured,
+    webhookConfigured: flutterwaveConfig.webhookConfigured,
     billing: {
       recurringEnabled: snapshot.recurringEnabled,
       updateExistingSubscriptions: snapshot.updateExistingSubscriptions,
@@ -2142,30 +2193,29 @@ async function adminPricingPayload() {
       limits: plan.limits,
       amountMinor: plan.amountMinor,
       amount: plan.amount,
+      usdAmountMinor: plan.usdAmountMinor,
+      usdAmount: plan.usdAmount,
       currency: plan.currency,
       interval: plan.interval,
       source: plan.source,
+      sources: plan.sources,
+      prices: plan.prices,
       environmentAmountMinor: plan.environmentAmountMinor,
-      environmentAmount: plan.environmentAmountMinor / 100,
+      environmentAmount: plan.environmentAmountMinor === null ? null : plan.environmentAmountMinor / 100,
+      environmentUsdAmountMinor: plan.environmentUsdAmountMinor,
+      environmentUsdAmount: plan.environmentUsdAmountMinor === null ? null : plan.environmentUsdAmountMinor / 100,
       updatedAt: plan.updatedAt,
       updatedBy: plan.updatedBy,
       history: plan.history,
       activeSubscribers: counts.get(plan.key) || 0,
-      paystack: plan.paystack
-        ? {
-          planCode: plan.paystack.planCode || null,
-          planId: plan.paystack.planId ?? null,
-          syncStatus: plan.paystack.syncStatus || 'pending',
-          syncedAmountMinor: plan.paystack.syncedAmountMinor ?? null,
-          syncedAt: plan.paystack.syncedAt || null,
-          currency: plan.paystack.currency || null,
-          interval: plan.paystack.interval || null,
-          name: plan.paystack.name || null,
-          message: plan.paystack.message || null,
-          error: plan.paystack.error || null,
-        }
-        : null,
-      renewsAutomatically: planChargeDecision({ plan, recurringEnabled: snapshot.recurringEnabled }).usePlan,
+      provider: Object.fromEntries([...flutterwaveConfig.supportedCurrencies].map((code) => [
+        code,
+        describeProviderMirror(plan.provider?.[code], code),
+      ])),
+      renewsAutomatically: Object.fromEntries([...flutterwaveConfig.supportedCurrencies].map((code) => [
+        code,
+        planChargeDecision({ plan, currency: code, recurringEnabled: snapshot.recurringEnabled }).usePlan,
+      ])),
     })),
   };
 }
@@ -2177,37 +2227,45 @@ app.get('/api/admin/pricing', authenticate, requireAdmin, asyncRoute(async (_req
 app.put('/api/admin/pricing', authenticate, requireAdmin, asyncRoute(async (req, res) => {
   let update;
   try {
-    update = normalizePricingUpdate({ input: req.body || {}, config: paystackConfig });
+    update = normalizePricingUpdate({ input: req.body || {}, config: flutterwaveConfig });
   } catch (error) {
     return fail(res, error.status || 400, error.userMessage || error.message);
   }
 
-  const priceBefore = new Map((await adminPricingPayload()).plans.map((plan) => [plan.key, plan.amountMinor]));
+  const before = new Map((await adminPricingPayload()).plans.map((plan) => [plan.key, plan]));
   const saved = [];
   for (const entry of update.entries) {
-    const result = await pricingStore.savePlanPrice({
+    const result = await pricingStore.savePlanPrices({
       planKey: entry.planKey,
-      amountMinor: entry.amountMinor,
+      amounts: entry.amounts,
+      written: entry.written,
       actorId: req.userId,
       actorEmail: req.userEmail,
       note: update.note,
     });
-    saved.push({ planKey: entry.planKey, ...result });
+    saved.push({ planKey: entry.planKey, amounts: entry.amounts, ...result });
   }
   if (Object.keys(update.billing).length) {
     await pricingStore.saveBillingSettings({ settings: update.billing, actorId: req.userId });
   }
 
+  /* Only the currencies whose price actually moved are re-synced, and a `not_priced` result is a state to show,
+     not a failure: an administrator who edits the naira price has not broken the dollar plan. */
   const syncs = [];
-  for (const planKey of update.syncPlanKeys) {
-    syncs.push(await planSynchronizer.syncPlan({ planKey, actorId: req.userId }));
+  for (const entry of update.syncPlanKeys) {
+    for (const currency of entry.currencies) {
+      const result = await planSynchronizer.syncPlan({ planKey: entry.planKey, currency, actorId: req.userId });
+      syncs.push(result);
+    }
   }
-  const failed = syncs.filter((sync) => !sync.usable);
-  const priceChanges = update.entries.map((entry) => {
-    const from = describeMoney(priceBefore.get(entry.planKey), paystackConfig.currency);
-    const to = entry.amountMinor === null || entry.amountMinor === undefined ? 'cleared (environment price)' : describeMoney(entry.amountMinor, paystackConfig.currency);
-    return `${entry.planKey}: ${from} → ${to}`;
-  });
+  const failed = syncs.filter((sync) => !sync.usable && sync.status !== 'not_priced');
+  const skipped = syncs.filter((sync) => sync.status === 'not_priced');
+  const priceChanges = update.entries.flatMap((entry) => Object.entries(entry.amounts || {}).map(([currency, amountMinor]) => {
+    const prior = before.get(entry.planKey);
+    const from = describeMoney(prior?.prices?.[currency]?.amountMinor ?? null, currency);
+    const to = amountMinor === null || amountMinor === undefined ? 'cleared (environment price)' : describeMoney(amountMinor, currency);
+    return `${entry.planKey} ${currency}: ${from} → ${to}`;
+  }));
   await auditLog.record({
     actorId: req.userId,
     actorEmail: req.userEmail,
@@ -2216,34 +2274,45 @@ app.put('/api/admin/pricing', authenticate, requireAdmin, asyncRoute(async (req,
     targetId: priceChanges.length === 1 ? update.entries[0].planKey : null,
     summary: `Changed pricing - ${priceChanges.join('; ') || 'billing settings only'}.${update.note ? ` Note: ${update.note}` : ''}`,
     metadata: {
-      plans: update.entries.map((entry) => ({ planKey: entry.planKey, beforeMinor: priceBefore.get(entry.planKey) ?? null, afterMinor: entry.amountMinor ?? null })),
+      plans: update.entries.map((entry) => ({
+        planKey: entry.planKey,
+        beforeMinor: Object.fromEntries(Object.keys(entry.amounts || {}).map((code) => [code, before.get(entry.planKey)?.prices?.[code]?.amountMinor ?? null])),
+        afterMinor: Object.fromEntries(Object.entries(entry.amounts || {}).map(([code, value]) => [code, value ?? null])),
+      })),
       note: update.note || null,
       billing: update.billing || null,
-      syncStatuses: syncs.map((item) => `${item.planKey}:${item.status}`),
+      syncStatuses: syncs.map((item) => `${item.planKey}:${item.currency}:${item.status}`),
     },
   });
   log('info', 'Admin updated pricing', {
     actorId: req.userId,
-    plans: saved.map((item) => ({ planKey: item.planKey, amountMinor: item.amountMinor ?? null, cleared: Boolean(item.cleared) })),
-    syncStatuses: syncs.map((item) => `${item.planKey}:${item.status}`),
+    plans: saved.map((item) => ({ planKey: item.planKey, amounts: item.amounts ?? null, cleared: Boolean(item.cleared) })),
+    syncStatuses: syncs.map((item) => `${item.planKey}:${item.currency}:${item.status}`),
   });
   res.set('Cache-Control', 'no-store').json({
     pricing: await adminPricingPayload(),
     saved,
     syncs,
     notice: failed.length
-      ? `Saved, but Paystack could not confirm ${failed.map((item) => item.planKey).join(', ')}: ${failed[0].message} Users are charged the saved price as a one-time payment until the plan syncs.`
-      : 'Prices saved and mirrored to Paystack.',
+      ? `Saved, but Flutterwave could not confirm ${failed.map((item) => `${item.planKey} in ${item.currency}`).join(', ')}: ${failed[0].message} Users are charged the saved price as a one-time payment until the plan syncs.`
+      : skipped.length
+        ? `Prices saved and mirrored to Flutterwave. ${skipped.map((item) => `${item.planKey} has no ${item.currency} price, so that currency renews as a one-time payment.`).join(' ')}`
+        : 'Prices saved and mirrored to Flutterwave.',
   });
 }));
 
 app.post('/api/admin/pricing/sync', authenticate, requireAdmin, asyncRoute(async (req, res) => {
-  const requested = req.body?.plan ? [String(req.body.plan)] : paystackConfig.plans.map((plan) => plan.key);
+  const requested = req.body?.plan ? [String(req.body.plan)] : flutterwaveConfig.plans.map((plan) => plan.key);
   for (const planKey of requested) {
-    if (!paystackConfig.plans.some((plan) => plan.key === String(planKey).trim().toLowerCase())) {
+    if (!flutterwaveConfig.plans.some((plan) => plan.key === String(planKey).trim().toLowerCase())) {
       return fail(res, 400, 'Choose a valid plan to sync.');
     }
   }
+  const currencies = Array.isArray(req.body?.currencies) && req.body.currencies.length
+    ? req.body.currencies.map((code) => String(code).trim().toUpperCase())
+    : [...flutterwaveConfig.supportedCurrencies];
+  const unsupported = currencies.filter((code) => !isSupportedCurrency(code));
+  if (unsupported.length) return fail(res, 400, `That currency is not offered here: ${unsupported.join(', ')}.`);
   let billing;
   if (req.body && (Object.hasOwn(req.body, 'recurringEnabled') || Object.hasOwn(req.body, 'updateExistingSubscriptions'))) {
     try { billing = normalizeBillingSettings(req.body); }
@@ -2252,48 +2321,64 @@ app.post('/api/admin/pricing/sync', authenticate, requireAdmin, asyncRoute(async
   }
   const syncs = [];
   for (const planKey of requested) {
-    syncs.push(await planSynchronizer.syncPlan({ planKey, actorId: req.userId }));
+    for (const currency of currencies) {
+      syncs.push(await planSynchronizer.syncPlan({ planKey, currency, actorId: req.userId }));
+    }
   }
   await auditLog.record({
     actorId: req.userId,
     actorEmail: req.userEmail,
     action: 'pricing.sync',
     targetType: 'plan',
-    summary: `Re-synced Paystack plans for ${requested.join(', ')} (${syncs.map((item) => `${item.planKey}:${item.status}`).join(', ')}).`,
-    metadata: { plans: [...requested], billingSaved: Boolean(billing) },
+    summary: `Re-synced Flutterwave payment plans for ${requested.join(', ')} in ${currencies.join(', ')} (${syncs.map((item) => `${item.planKey}:${item.currency}:${item.status}`).join(', ')}).`,
+    metadata: { plans: [...requested], currencies: [...currencies], billingSaved: Boolean(billing) },
   });
-  log('info', 'Admin re-synced Paystack plans', { actorId: req.userId, results: syncs.map((item) => `${item.planKey}:${item.status}`) });
+  log('info', 'Admin re-synced Flutterwave payment plans', { actorId: req.userId, results: syncs.map((item) => `${item.planKey}:${item.currency}:${item.status}`) });
   res.set('Cache-Control', 'no-store').json({ pricing: await adminPricingPayload(), syncs, billingSaved: Boolean(billing) });
 }));
 
 app.get('/api/admin/billing', authenticate, requireAdmin, asyncRoute(async (_req, res) => {
-  const [summary, recent, subscriptions] = await Promise.all([
+  const [summary, byCurrencyRows, recent, subscriptions] = await Promise.all([
     pool.query(`SELECT
       (SELECT COUNT(*)::int FROM users WHERE subscription_plan <> 'free' AND subscription_status='active') AS active_subscriptions,
       (SELECT COUNT(*)::int FROM billing_transactions WHERE status='success') AS successful_payments,
-      (SELECT COUNT(*)::int FROM billing_transactions WHERE status='pending') AS pending_payments,
-      (SELECT COALESCE(SUM(amount_minor),0)::bigint FROM billing_transactions WHERE status='success') AS gross_minor,
-      (SELECT COALESCE(SUM(discount_minor),0)::bigint FROM billing_transactions WHERE status='success') AS discounts_minor`),
+      (SELECT COUNT(*)::int FROM billing_transactions WHERE status='pending') AS pending_payments`),
+    // Revenue is grouped by currency and never summed across one: ₦6,000,000 and $39 added together is a
+    // number that describes neither, and a dashboard total nobody can spend is worse than two totals.
+    pool.query(`SELECT currency,COALESCE(SUM(amount_minor),0)::bigint AS gross_minor,COALESCE(SUM(discount_minor),0)::bigint AS discounts_minor,
+        COUNT(*)::int AS successful_payments
+      FROM billing_transactions WHERE status='success' GROUP BY currency ORDER BY currency`),
     pool.query(`SELECT t.reference,t.plan_key AS "planKey",t.source,t.plan_code AS "planCode",t.status,t.amount_minor AS "amountMinor",t.currency,
         t.promo_code AS "promoCode",t.paid_at AS "paidAt",t.created_at AS "createdAt",u.email
       FROM billing_transactions t JOIN users u ON u.id=t.user_id ORDER BY t.created_at DESC LIMIT 25`),
-    pool.query(`SELECT s.plan_key AS "planKey",s.status,s.interval,s.current_period_end AS "currentPeriodEnd",
+    pool.query(`SELECT s.plan_key AS "planKey",s.status,s.interval,s.currency,s.current_period_end AS "currentPeriodEnd",
         s.cancel_at_period_end AS "cancelAtPeriodEnd",u.email,u.name
       FROM subscriptions s JOIN users u ON u.id=s.user_id ORDER BY s.updated_at DESC LIMIT 25`),
   ]);
   const row = summary.rows[0] || {};
+  const byCurrency = byCurrencyRows.rows.map((item) => ({
+    currency: String(item.currency || '').toUpperCase() || normalizeCurrency(flutterwaveConfig.currency),
+    grossMinor: Number(item.gross_minor || 0),
+    discountsMinor: Number(item.discounts_minor || 0),
+    successfulPayments: Number(item.successful_payments || 0),
+  }));
+  const primary = normalizeCurrency(flutterwaveConfig.currency);
+  const primaryTotals = byCurrency.find((item) => item.currency === primary) || { grossMinor: 0, discountsMinor: 0 };
   res.set('Cache-Control', 'no-store').json({
     summary: {
       activeSubscriptions: row.active_subscriptions ?? 0,
       successfulPayments: row.successful_payments ?? 0,
       pendingPayments: row.pending_payments ?? 0,
-      grossMinor: Number(row.gross_minor || 0),
-      discountsMinor: Number(row.discounts_minor || 0),
-      currency: paystackConfig.currency,
+      // `grossMinor` stays the naira-equivalent figure for anything still reading one number, and `revenue`
+      // is where the honest split lives.
+      grossMinor: primaryTotals.grossMinor,
+      discountsMinor: primaryTotals.discountsMinor,
+      currency: primary,
+      revenue: byCurrency,
     },
     transactions: recent.rows.map((item) => ({ ...item, amountMinor: Number(item.amountMinor) })),
-    subscriptions: subscriptions.rows,
-    configured: paystackConfig.configured,
+    subscriptions: subscriptions.rows.map((item) => ({ ...item, currency: item.currency || null })),
+    configured: flutterwaveConfig.configured,
   });
 }));
 
@@ -2632,7 +2717,7 @@ app.post('/api/auth/support/exit', authenticate, asyncRoute(async (req, res) => 
 }));
 
 /* --------------------------- Admin: manual adjustments ---------------------------
- * Support needs to hand out a plan or buy time on an existing one without touching Paystack.
+ * Support needs to hand out a plan or buy time on an existing one without touching Flutterwave.
  * `users` carries the plan the product enforces, `subscriptions` carries the period the expiry
  * sweeps read, so both are written together inside one transaction and the response always
  * reports the provider situation instead of implying this cancels a real subscription.
@@ -2660,13 +2745,13 @@ app.patch('/api/admin/users/:id/subscription', authenticate, requireAdmin, admin
   const targetId = String(req.params.id || '').trim();
   if (!UUID_PATTERN.test(targetId)) return fail(res, 400, 'Choose a valid user account.');
   let adjustment;
-  try { adjustment = normalizeSubscriptionAdjustment(req.body || {}, { plans: paystackConfig.plans }); }
+  try { adjustment = normalizeSubscriptionAdjustment(req.body || {}, { plans: flutterwaveConfig.plans }); }
   catch (error) { return fail(res, error.status || 400, error.message); }
 
   const { rows: targetRows } = await pool.query(`SELECT ${adminUserColumns} FROM users u WHERE u.id=$1 LIMIT 1`, [targetId]);
   const target = targetRows[0];
   if (!target) return fail(res, 404, 'That user could not be found.');
-  const plan = adjustment.planKey && adjustment.planKey !== 'free' ? findPlan(paystackConfig, adjustment.planKey) : null;
+  const plan = adjustment.planKey && adjustment.planKey !== 'free' ? findPlan(flutterwaveConfig, adjustment.planKey) : null;
   if (adjustment.planKey && adjustment.planKey !== 'free' && !plan) {
     return fail(res, 400, 'That plan is not available in the live catalogue.');
   }
@@ -2703,8 +2788,8 @@ app.patch('/api/admin/users/:id/subscription', authenticate, requireAdmin, admin
         targetId,
         plan,
         limits: plan.limits || {},
-        interval: paystackConfig.interval,
-        period: adjustment.days ? `${adjustment.days} days` : planPeriodInterval(paystackConfig.interval),
+        interval: flutterwaveConfig.interval,
+        period: adjustment.days ? `${adjustment.days} days` : planPeriodInterval(flutterwaveConfig.interval),
         endsAt: adjustment.endsAt,
       });
       await client.query(granted.userUpdate.sql, granted.userUpdate.params);
@@ -2734,7 +2819,7 @@ app.patch('/api/admin/users/:id/subscription', authenticate, requireAdmin, admin
     );
     const synced = syncedRows[0] || null;
     if (synced) {
-      const limits = findPlan(paystackConfig, synced.planKey)?.limits || FREE_PLAN.limits;
+      const limits = findPlan(flutterwaveConfig, synced.planKey)?.limits || FREE_PLAN.limits;
       const mirror = buildSubscriptionMirrorStatement({ targetId, status: synced.status, planKey: synced.planKey, limits });
       await client.query(mirror.sql, mirror.params);
       periodEnd = synced.periodEnd;
@@ -2766,7 +2851,7 @@ app.patch('/api/admin/users/:id/subscription', authenticate, requireAdmin, admin
     },
     auditEntries: entries.length,
     notice: existing?.providerSubscriptionCode
-      ? 'Paystack still bills on its own schedule: this moved the expiry Signal Desk enforces, not the gateway plan. Cancel or resume the renewal in Payments if the charge should stop.'
+      ? 'Flutterwave still bills on its own schedule: this moved the expiry Signal Desk enforces, not the payment plan. Cancel or resume the renewal in Payments if the charge should stop.'
       : 'Saved. No gateway charge was created by this adjustment.',
   });
 }));
