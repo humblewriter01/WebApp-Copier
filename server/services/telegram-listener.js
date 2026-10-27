@@ -41,7 +41,7 @@
  *    already asks for, and a gap our handler has not consumed is closed with `updates.GetDifference` - the
  *    request the library never makes - before anything is torn down and rebuilt.
  */
-import { NewMessage } from 'telegram/events/index.js';
+import * as telegramAdapter from './telegram-adapter.js';
 import { isTelegramServiceMessage, resolveTelegramChatId, telegramMessageText, telegramPeerIdVariants } from './telegram-peer.js';
 import { KEEP_ALIVE_FLAP_GRACE_MS } from './telegram-keepalive.js';
 
@@ -280,10 +280,10 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
    */
   function handlerIsLive(client, handler) {
     if (!client || !handler) return false;
-    if (typeof client.listEventHandlers !== 'function') return true;
+    if (!telegramAdapter.canListEventHandlers(client)) return true;
     let builders = [];
-    try { builders = client.listEventHandlers() || []; } catch { return true; }
-    return builders.some((pair) => Array.isArray(pair) && pair[1] === handler);
+    try { builders = telegramAdapter.listEventHandlers(client) || []; } catch { return true; }
+    return telegramAdapter.isHandlerAttached(builders, handler);
   }
 
   /**
@@ -302,12 +302,11 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
    * be caught by the gap sweep anyway.
    */
   async function probeUpdateStream(client, { deadlineMs = probeDeadlineMs } = {}) {
-    if (!client || client.connected !== true) return { alive: false, state: 'no-socket' };
-    if (typeof client.invoke !== 'function') return { alive: true, state: 'unknown' };
+    if (!client || !telegramAdapter.isConnected(client)) return { alive: false, state: 'no-socket' };
+    if (!telegramAdapter.canInvoke(client)) return { alive: true, state: 'unknown' };
     let request = null;
     try {
-      const { Api } = await import('telegram');
-      if (Api?.updates?.GetState) request = new Api.updates.GetState();
+      request = await telegramAdapter.createStateRequest();
     } catch {
       return { alive: true, state: 'unknown' };
     }
@@ -316,7 +315,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
     let timer = null;
     try {
       const state = await Promise.race([
-        Promise.resolve().then(() => client.invoke(request)),
+        Promise.resolve().then(() => telegramAdapter.invoke(client, request)),
         new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('probe-timeout')), deadlineMs); timer.unref?.(); }),
       ]);
       /* The answer is the account's own state, and this is the one request the beat already makes, so the whole
@@ -358,21 +357,21 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
    */
   async function resyncUpdateState(client, { userId = null, reason = 'resync', state = null, seenAdvanced = false, force = false, deadlineMs = probeDeadlineMs, maxSteps = differenceMaxSteps, budgetMs = differenceBudgetMs } = {}) {
     const outcome = { action: 'unavailable', serverPts: null, statePts: null, gap: 0, messages: 0, otherUpdates: 0, steps: 0, partial: false, backoffMs: 0, error: null, ms: null };
-    if (!client || client.connected !== true || typeof client.invoke !== 'function') return outcome;
+    if (!client || !telegramAdapter.isConnected(client) || !telegramAdapter.canInvoke(client)) return outcome;
     const startedAt = now();
-    let Api = null;
+    let reconcilable = false;
     try {
-      ({ Api } = await import('telegram'));
+      reconcilable = await telegramAdapter.canReconcileUpdates();
     } catch {
       return outcome;
     }
-    if (!Api?.updates?.GetState || !Api?.updates?.GetDifference) return outcome;
+    if (!reconcilable) return outcome;
 
     const invoke = async (request) => {
       let timer = null;
       try {
         return await Promise.race([
-          Promise.resolve().then(() => client.invoke(request)),
+          Promise.resolve().then(() => telegramAdapter.invoke(client, request)),
           new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('state-sync-timeout')), deadlineMs); timer.unref?.(); }),
         ]);
       } finally {
@@ -387,11 +386,11 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
          request is worth having on purpose: the dispatcher consults `_selfInputPeer` while it decides whether a
          pushed message counts as incoming for *every* event builder, and an exception in that path is swallowed by
          the library. */
-      if (typeof client.getMe === 'function') {
-        try { await client.getMe(true); } catch (error) { outcome.error = `identity: ${`${error?.message || error}`.slice(0, 80)}`; }
+      if (telegramAdapter.canGetSelf(client)) {
+        try { await telegramAdapter.getSelf(client); } catch (error) { outcome.error = `identity: ${`${error?.message || error}`.slice(0, 80)}`; }
       }
       const provided = state && (state.updateState || state.pts !== undefined) ? (state.updateState || state) : null;
-      const server = normalizeUpdateState(provided || await invoke(new Api.updates.GetState()));
+      const server = normalizeUpdateState(provided || await invoke(await telegramAdapter.createStateRequest()));
       outcome.serverPts = server.pts;
       const cached = readUpdateState(client);
       outcome.statePts = cached?.pts ?? null;
@@ -450,7 +449,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
         outcome.steps += 1;
         let difference = null;
         try {
-          difference = await invoke(new Api.updates.GetDifference({ pts: adopted.pts, qts: adopted.qts, date: adopted.date }));
+          difference = await invoke(await telegramAdapter.createDifferenceRequest({ pts: adopted.pts, qts: adopted.qts, date: adopted.date }));
         } catch (error) {
           /* The refusals that matter, told apart, because each one wants a different thing from us: a flood wait
              is a pause, `CHANNEL_DIFFERENCE_TOO_LONG`/`UPDATES_TOO_OLD` is "the gap is beyond the difference API"
@@ -634,7 +633,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
   async function beatUpdateStreams({ reason = 'heartbeat' } = {}) {
     const targets = [];
     for (const [userId, entry] of clients.entries?.() || []) {
-      if (!entry?.client || entry.client.connected !== true) continue;
+      if (!entry?.client || !telegramAdapter.isConnected(entry.client)) continue;
       targets.push([userId, entry]);
     }
     const cycleStartedAt = now();
@@ -974,7 +973,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
          watchdog that reads it as a fault will reconnect a fleet that was about to be fine. */
       keepAliveTimeouts: Number((typeof transportFlap === 'function' ? transportFlap(entry?.client) : null)?.count) || 0,
       transportFlapping: beat?.flapping === true,
-      listening: Boolean(entry?.handler) && handlerIsLive(entry.client, entry.handler) && entry.client?.connected === true,
+      listening: Boolean(entry?.handler) && handlerIsLive(entry.client, entry.handler) && telegramAdapter.isConnected(entry.client),
     };
   }
 
@@ -1070,11 +1069,11 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
     if (current.handler && handlerIsLive(client || current.client, current.handler)) return current;
     const target = client || current.client;
     if (!target) return current;
-    if (current.handler && typeof target.removeEventHandler === 'function') {
-      try { target.removeEventHandler(current.handler, new NewMessage({})); } catch { /* the old client is gone */ }
+    if (current.handler && telegramAdapter.canRemoveMessageHandler(target)) {
+      try { telegramAdapter.removeMessageHandler(target, current.handler, telegramAdapter.createMessageEventFilter()); } catch { /* the old client is gone */ }
     }
     const handler = (event) => ingestMessage(userId, event?.message, event);
-    target.addEventHandler(handler, new NewMessage({}));
+    telegramAdapter.addMessageHandler(target, handler, telegramAdapter.createMessageEventFilter());
     current.handler = handler;
     if (!current.stats) current.stats = EMPTY_STATS();
     /* Every re-attach asks what was missed, whatever the statistics say. This used to be conditioned on
@@ -1110,7 +1109,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
    */
   async function runCatchUp(userId) {
     const current = clients.get(String(userId)) || clients.get(userId);
-    if (!current?.client || current.client.connected !== true) return { ran: false, reason: 'NO_CLIENT', stored: 0 };
+    if (!current?.client || !telegramAdapter.isConnected(current.client)) return { ran: false, reason: 'NO_CLIENT', stored: 0 };
     /* Two runs for one user would read the same 25 messages twice and race each other on the dedupe check,
        and the two ways a catch-up starts - the reconnect itself and the periodic re-arm sweep - are not
        coordinated with each other. Whichever arrives second gives up immediately; the flag stays set, so the
@@ -1158,8 +1157,8 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
       let messages = [];
       for (const handle of handles) {
         try {
-          const entity = await current.client.getEntity(handle);
-          messages = await current.client.getMessages(entity, { limit: catchUpLimit });
+          const entity = await telegramAdapter.getEntity(current.client, handle);
+          messages = await telegramAdapter.getMessages(current.client, entity, { limit: catchUpLimit });
           break;
         } catch (error) {
           log('warn', 'Telegram catch-up could not read that channel', { userId, channel: channel.channelId, handle: String(handle), error: error.message });
@@ -1207,14 +1206,14 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
       const stats = entry.stats || EMPTY_STATS();
       const beatInfo = streamBeats.get(String(userId));
       const attached = Boolean(entry.handler) && handlerIsLive(entry.client, entry.handler);
-      if (attached && entry.client?.connected) listening += 1;
+      if (attached && telegramAdapter.connectedFlag(entry.client)) listening += 1;
       seen += Number(stats.seen) || 0;
       saved += Number(stats.saved) || 0;
       if (stats.lastAt && (!lastMessageAt || stats.lastAt > lastMessageAt)) lastMessageAt = stats.lastAt;
       sessions.push({
         userId: String(userId),
-        connected: entry.client?.connected === true,
-        listening: attached && entry.client?.connected === true,
+        connected: telegramAdapter.isConnected(entry.client),
+        listening: attached && telegramAdapter.isConnected(entry.client),
         needsCatchUp: entry.needsCatchUp === true,
         messagesSeen: Number(stats.seen) || 0,
         messagesIgnored: Number(stats.ignored) || 0,

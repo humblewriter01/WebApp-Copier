@@ -9,8 +9,7 @@ import helmet from 'helmet';
 import compression from 'compression';
 import rateLimit from 'express-rate-limit';
 import { Server } from 'socket.io';
-import { Api, TelegramClient } from 'telegram';
-import { StringSession } from 'telegram/sessions/index.js';
+import * as telegramAdapter from './services/telegram-adapter.js';
 import { pool, initializeDatabase } from './db.js';
 import { withDeadline } from './services/schema-sql.js';
 import { createMetaApiConfigurationLink, metaApiRequest, toSafeMetaApiAccount } from './services/metaapi.js';
@@ -562,7 +561,7 @@ const telegramCapture = createTelegramListener({
       log('warn', 'Telegram re-auth marking could not be saved', { userId: id, reason, error: error.message });
     });
     const entry = telegramClients.get(id);
-    if (entry?.client?.disconnect) await entry.client.disconnect().catch(() => {});
+    if (telegramAdapter.canDisconnect(entry?.client)) await telegramAdapter.disconnect(entry.client).catch(() => {});
     telegramClients.delete(id);
     log('warn', 'Telegram session left for the user to sign in again', {
       userId: id, reason, pts: details?.pts ?? null, gap: details?.gap ?? null, strikes: details?.strikes ?? null, error: details?.error ?? null,
@@ -629,11 +628,9 @@ function telegramCaptureTransport({ wss = null } = {}) {
      handshake for a hiccup that would have healed. There is deliberately no request-timeout option here: this
      version accepts `timeout` and stores it as `_connectTimeout`, which nothing reads, and an option that is not
      read is worse than no option, because the next person to tune the file will believe it did something. */
-  const base = { connectionRetries: 5, autoReconnect: true };
   const fromEnv = String(process.env.TELEGRAM_TRANSPORT || '').toLowerCase() !== 'wss' ? { wss: false } : { wss: true };
   const overWss = wss === null ? fromEnv.wss : wss === true;
-  if (!overWss) return { wss: false, options: base };
-  return { wss: true, options: { ...base, useWSS: true } };
+  return { wss: overWss, options: telegramAdapter.captureTransportOptions({ wss: overWss }) };
 }
 
 async function restoreTelegramClient(userId, { reason = 'restore', force = false, escalate = false } = {}) {
@@ -645,10 +642,10 @@ async function restoreTelegramClient(userId, { reason = 'restore', force = false
      them and returned the connected client, which is why a "forced" reconnect of a deaf session changed nothing
      but the timestamp on the audit row. */
   const mustRebuild = force === true || escalate === true;
-  if (!mustRebuild && current?.client?.connected === true && current.handler && telegramCapture.handlerIsLive(current.client, current.handler)) return current.client;
-  if (current?.client && current.client.connected !== true) {
-    try { await current.client.connect(); } catch (error) { log('warn', 'Telegram reconnect deferred', { userId, error: error.message }); }
-    if (current.client.connected === true) {
+  if (!mustRebuild && telegramAdapter.isConnected(current?.client) && current.handler && telegramCapture.handlerIsLive(current.client, current.handler)) return current.client;
+  if (current?.client && !telegramAdapter.isConnected(current.client)) {
+    try { await telegramAdapter.connect(current.client); } catch (error) { log('warn', 'Telegram reconnect deferred', { userId, error: error.message }); }
+    if (telegramAdapter.isConnected(current.client)) {
       /* A socket that came back is a socket whose update state may not have: Telegram stops pushing to a session
          that never reconciled the updates it missed, and GramJS never reconciles one. Asking now - two cheap
          requests, `updates.GetState` and, only if the account moved while we were out, `updates.GetDifference` -
@@ -662,7 +659,7 @@ async function restoreTelegramClient(userId, { reason = 'restore', force = false
   // Whatever half-connected object was here is dropped before a new one replaces it, so a wake does
   // not leave a second authorized session polling with the same StringSession - and so an escalated rebuild of a
   // session that still looks fine does not leave the deaf one attached and receiving.
-  if (current?.client && (current.client.connected !== true || mustRebuild)) await current.client.disconnect().catch(() => {});
+  if (current?.client && (!telegramAdapter.isConnected(current.client) || mustRebuild)) await telegramAdapter.disconnect(current.client).catch(() => {});
   const { rows } = await pool.query('SELECT telegram_session FROM users WHERE id=$1', [userId]);
   if (!rows[0]?.telegram_session) {
     if (current) telegramClients.delete(userId);
@@ -671,23 +668,23 @@ async function restoreTelegramClient(userId, { reason = 'restore', force = false
   if (!process.env.API_ID || !process.env.API_HASH) throw new Error('Telegram API credentials are not configured');
   const sessionString = decryptSecret(rows[0].telegram_session);
   const transport = telegramCaptureTransport();
-  let client = new TelegramClient(new StringSession(sessionString), Number(process.env.API_ID), process.env.API_HASH, transport.options);
+  let client = telegramAdapter.createClient({ sessionString, apiId: Number(process.env.API_ID), apiHash: process.env.API_HASH, options: transport.options });
   telegramKeepAlive.attach(client, { userId });
   try {
-    await client.connect();
+    await telegramAdapter.connect(client);
   } catch (error) {
     if (!transport.wss) throw error;
     // The experiment is allowed to fail; capture is not allowed to be the thing that pays for it.
     log('warn', 'Telegram WSS transport could not connect; reconnecting over the default transport', { userId, error: `${error?.message || error}`.slice(0, 160) });
-    await client.disconnect().catch(() => {});
+    await telegramAdapter.disconnect(client).catch(() => {});
     // The same tuned options over the plain port - restating them here is how a retry path ends up with the
     // settings the primary one stopped having three releases ago.
-    client = new TelegramClient(new StringSession(sessionString), Number(process.env.API_ID), process.env.API_HASH, telegramCaptureTransport({ wss: false }).options);
+    client = telegramAdapter.createClient({ sessionString, apiId: Number(process.env.API_ID), apiHash: process.env.API_HASH, options: telegramCaptureTransport({ wss: false }).options });
     telegramKeepAlive.attach(client, { userId });
-    await client.connect();
+    await telegramAdapter.connect(client);
   }
-  if (!(await client.checkAuthorization())) {
-    await client.disconnect().catch(() => {});
+  if (!(await telegramAdapter.checkAuthorization(client))) {
+    await telegramAdapter.disconnect(client).catch(() => {});
     await pool.query('UPDATE users SET telegram_connected=FALSE,telegram_session=NULL WHERE id=$1', [userId]);
     telegramClients.delete(userId);
     log('warn', 'Telegram session is no longer authorized', { userId, reason });
@@ -846,7 +843,7 @@ async function rearmTelegramListeners() {
   let rearmed = 0;
   const catchUps = [];
   for (const [userId, entry] of telegramClients.entries()) {
-    if (entry.client?.connected === true && (!entry.handler || !telegramCapture.handlerIsLive(entry.client, entry.handler))) {
+    if (telegramAdapter.isConnected(entry.client) && (!entry.handler || !telegramCapture.handlerIsLive(entry.client, entry.handler))) {
       await startTelegramListener(userId, entry.client);
       rearmed += 1;
     }
@@ -855,7 +852,7 @@ async function rearmTelegramListeners() {
        waited behind the first workspace's flood wait - while every one of those workspaces was still receiving
        live updates on their own clients. Nothing in this loop needs another user's result, so nothing in it
        may wait for one. */
-    if (entry.needsCatchUp && entry.client?.connected === true) {
+    if (entry.needsCatchUp && telegramAdapter.isConnected(entry.client)) {
       catchUps.push(telegramCapture.runCatchUp(userId).catch((error) => log('warn', 'Telegram catch-up failed', { userId, error: error.message })));
     }
   }
@@ -1184,7 +1181,7 @@ app.delete('/api/auth/account', authenticate, asyncRoute(async (req, res) => {
 
   for (const map of [telegramClients, telegramLogins]) {
     const entry = map.get(user.id);
-    if (entry?.client) await entry.client.disconnect().catch(() => {});
+    if (entry?.client) await telegramAdapter.disconnect(entry.client).catch(() => {});
     map.delete(user.id);
   }
   io.in(`user:${user.id}`).disconnectSockets(true);
@@ -2943,7 +2940,7 @@ app.post('/api/announcements/:id/dismiss', authenticate, asyncRoute(async (req, 
 app.get('/api/telegram/status', authenticate, asyncRoute(async (req, res) => {
   const { rows } = await pool.query('SELECT telegram_connected FROM users WHERE id=$1', [req.userId]);
   const configured = Boolean(process.env.API_ID && process.env.API_HASH && process.env.SESSION_ENCRYPTION_KEY);
-  let connected = Boolean(rows[0]?.telegram_connected && telegramClients.get(req.userId)?.client?.connected);
+  let connected = Boolean(rows[0]?.telegram_connected && telegramAdapter.connectedFlag(telegramClients.get(req.userId)?.client));
   if (rows[0]?.telegram_connected && !connected && configured) {
     try { connected = Boolean(await restoreTelegramClient(req.userId)); } catch (error) { log('warn', 'Telegram session restore deferred', { userId: req.userId, error: error.message }); }
   }
@@ -2951,13 +2948,13 @@ app.get('/api/telegram/status', authenticate, asyncRoute(async (req, res) => {
   // A connected client whose handler is not in GramJS's own list is the exact shape of the
   // silent-drop failure this workspace keeps hitting, so it is repaired here, before the answer is
   // composed, rather than being reported as a healthy session that receives nothing.
-  if (entry?.client?.connected && (!entry.handler || !telegramCapture.handlerIsLive(entry.client, entry.handler))) await startTelegramListener(req.userId, entry.client).catch(() => {});
+  if (telegramAdapter.connectedFlag(entry?.client) && (!entry.handler || !telegramCapture.handlerIsLive(entry.client, entry.handler))) await startTelegramListener(req.userId, entry.client).catch(() => {});
   const { rows: channelRows } = await pool.query('SELECT COUNT(*)::int AS count FROM channels WHERE user_id=$1 AND enabled=TRUE', [req.userId]);
   const stats = entry?.stats || {};
   res.json({
     configured,
     connected,
-    listening: Boolean(entry?.client?.connected && entry.handler && telegramCapture.handlerIsLive(entry.client, entry.handler)),
+    listening: Boolean(telegramAdapter.connectedFlag(entry?.client) && entry.handler && telegramCapture.handlerIsLive(entry.client, entry.handler)),
     catchUpQueued: entry?.needsCatchUp === true,
     /* Set when the reconciliation ladder ran out of rungs: the stream is not slow, it is finished, and the fix is a
        sign-in. Phrased for the log and the panel and never for the trader UI, which has no idea what a `pts` is. */
@@ -2973,7 +2970,7 @@ app.get('/api/telegram/status', authenticate, asyncRoute(async (req, res) => {
   });
 }));
 async function persistTelegramLoginAttempt(userId, attempt) {
-  const stringSession = attempt.client.session.save();
+  const stringSession = telegramAdapter.exportSessionString(attempt.client);
   if (!stringSession) throw new Error('Telegram returned an empty pending session');
   const encryptedState = encryptSecret(JSON.stringify({ phoneNumber: attempt.phoneNumber, phoneCodeHash: attempt.phoneCodeHash, stringSession }));
   await pool.query(
@@ -2987,7 +2984,7 @@ async function persistTelegramLoginAttempt(userId, attempt) {
 async function loadTelegramLoginAttempt(userId) {
   const inMemory = telegramLogins.get(userId);
   if (inMemory && inMemory.expiresAt > Date.now()) return inMemory;
-  if (inMemory?.client) await inMemory.client.disconnect().catch(() => {});
+  if (inMemory?.client) await telegramAdapter.disconnect(inMemory.client).catch(() => {});
   telegramLogins.delete(userId);
 
   const { rows } = await pool.query(
@@ -3013,10 +3010,10 @@ async function loadTelegramLoginAttempt(userId) {
     return null;
   }
   const apiId = Number(process.env.API_ID);
-  const client = new TelegramClient(new StringSession(state.stringSession), apiId, process.env.API_HASH, { connectionRetries: 3 });
-  try { await client.connect(); }
+  const client = telegramAdapter.createClient({ sessionString: state.stringSession, apiId, apiHash: process.env.API_HASH, options: telegramAdapter.loginTransportOptions() });
+  try { await telegramAdapter.connect(client); }
   catch (error) {
-    await client.disconnect().catch(() => {});
+    await telegramAdapter.disconnect(client).catch(() => {});
     throw error;
   }
   const attempt = { client, phoneNumber: state.phoneNumber, phoneCodeHash: state.phoneCodeHash, expiresAt };
@@ -3040,7 +3037,7 @@ async function loadTelegramLoginAttemptOrRespond(userId, res) {
 
 async function discardTelegramLoginAttempt(userId, attempt = telegramLogins.get(userId)) {
   telegramLogins.delete(userId);
-  if (attempt?.client) await attempt.client.disconnect().catch(() => {});
+  if (attempt?.client) await telegramAdapter.disconnect(attempt.client).catch(() => {});
   await pool.query('DELETE FROM telegram_login_attempts WHERE user_id=$1', [userId]);
 }
 
@@ -3053,11 +3050,11 @@ app.post('/api/telegram/request-code', authenticate, asyncRoute(async (req, res)
   const phoneNumber = String(req.body.phoneNumber || '').trim();
   if (!/^\+[1-9]\d{7,14}$/.test(phoneNumber)) return fail(res, 400, 'Use an international phone number, such as +15551234567.');
 
-  const client = new TelegramClient(new StringSession(''), apiId, process.env.API_HASH, { connectionRetries: 3 });
+  const client = telegramAdapter.createClient({ sessionString: '', apiId, apiHash: process.env.API_HASH, options: telegramAdapter.loginTransportOptions() });
   let sentToTelegram = false;
   try {
-    await client.connect();
-    const sent = await client.sendCode({ apiId, apiHash: process.env.API_HASH }, phoneNumber);
+    await telegramAdapter.connect(client);
+    const sent = await telegramAdapter.sendCode(client, { apiId, apiHash: process.env.API_HASH }, phoneNumber);
     sentToTelegram = true;
     if (!sent?.phoneCodeHash) {
       const error = new Error('Telegram did not return a phone code hash');
@@ -3067,11 +3064,11 @@ app.post('/api/telegram/request-code', authenticate, asyncRoute(async (req, res)
     const attempt = { client, phoneNumber, phoneCodeHash: sent.phoneCodeHash, expiresAt: Date.now() + 5 * 60_000 };
     await persistTelegramLoginAttempt(req.userId, attempt);
     const previous = telegramLogins.get(req.userId);
-    if (previous?.client && previous.client !== client) await previous.client.disconnect().catch(() => {});
+    if (previous?.client && previous.client !== client) await telegramAdapter.disconnect(previous.client).catch(() => {});
     telegramLogins.set(req.userId, attempt);
     return res.json({ ok: true, message: 'Telegram sent a login code. Enter the newest code here to continue.' });
   } catch (error) {
-    await client.disconnect().catch(() => {});
+    await telegramAdapter.disconnect(client).catch(() => {});
     if (sentToTelegram && !getTelegramErrorCode(error)) {
       log('error', 'Pending Telegram login could not be stored', { userId: req.userId, errorType: error?.constructor?.name || 'Error' });
       return fail(res, 500, 'Telegram sent a code, but the secure login state could not be saved. Request a new code and try again.');
@@ -3083,7 +3080,7 @@ app.post('/api/telegram/request-code', authenticate, asyncRoute(async (req, res)
 }));
 
 async function finishTelegramLogin(req, res, attempt) {
-  const session = attempt.client.session.save();
+  const session = telegramAdapter.exportSessionString(attempt.client);
   const encrypted = encryptSecret(session);
   await pool.query('UPDATE users SET telegram_session=$1,telegram_connected=TRUE,telegram_phone=$2 WHERE id=$3', [encrypted, attempt.phoneNumber, req.userId]);
   await pool.query('DELETE FROM telegram_login_attempts WHERE user_id=$1', [req.userId]);
@@ -3101,12 +3098,12 @@ app.post('/api/telegram/verify-code', authenticate, asyncRoute(async (req, res) 
   if (!/^\d{3,10}$/.test(code)) return fail(res, 400, 'Enter the numeric code sent by Telegram.');
 
   try {
-    const result = await attempt.client.invoke(new Api.auth.SignIn({
+    const result = await telegramAdapter.invoke(attempt.client, telegramAdapter.createSignInRequest({
       phoneNumber: attempt.phoneNumber,
       phoneCodeHash: attempt.phoneCodeHash,
       phoneCode: code,
     }));
-    if (result instanceof Api.auth.AuthorizationSignUpRequired) {
+    if (telegramAdapter.isSignUpRequired(result)) {
       await discardTelegramLoginAttempt(req.userId, attempt);
       return res.status(409).json({ error: 'This phone number is not registered to a Telegram account (PHONE_NUMBER_UNOCCUPIED).', telegramErrorCode: 'PHONE_NUMBER_UNOCCUPIED' });
     }
@@ -3137,10 +3134,11 @@ app.post('/api/telegram/verify-password', authenticate, asyncRoute(async (req, r
 
   let passwordAuthError = null;
   try {
-    await attempt.client.signInWithPassword(
+    await telegramAdapter.signInWithPassword(
+      attempt.client,
       { apiId: Number(process.env.API_ID), apiHash: process.env.API_HASH },
       {
-        password: async () => password,
+        password,
         onError: async (error) => { passwordAuthError = error; return true; },
       },
     );
@@ -3162,22 +3160,22 @@ app.post('/api/telegram/verify-password', authenticate, asyncRoute(async (req, r
 app.get('/api/telegram/chats', authenticate, asyncRoute(async (req, res) => {
   const client = await restoreTelegramClient(req.userId);
   if (!client) return fail(res, 409, 'Connect Telegram first.');
-  const dialogs = await client.getDialogs({ limit: 200 });
+  const dialogs = await telegramAdapter.getDialogs(client, { limit: 200 });
   const chats = dialogs
-    .filter((dialog) => dialog.isChannel || dialog.isGroup)
+    .filter((dialog) => telegramAdapter.dialogIsChannelLike(dialog))
     .map((dialog) => ({
-      channelId: dialog.id.toString(),
-      title: dialog.title || 'Telegram chat',
-      username: dialog.entity?.username || null,
-      type: dialog.isGroup || dialog.entity?.megagroup ? 'Group' : 'Channel',
+      channelId: telegramAdapter.dialogPeerIdText(dialog),
+      title: telegramAdapter.dialogTitle(dialog) || 'Telegram chat',
+      username: telegramAdapter.dialogUsername(dialog) || null,
+      type: telegramAdapter.dialogIsGroupLike(dialog) ? 'Group' : 'Channel',
     }));
   res.json({ chats, limit: 200 });
 }));
 app.post('/api/telegram/disconnect', authenticate, asyncRoute(async (req, res) => {
   const current = telegramClients.get(req.userId);
-  if (current?.client) await current.client.disconnect().catch(() => {});
+  if (current?.client) await telegramAdapter.disconnect(current.client).catch(() => {});
   const login = telegramLogins.get(req.userId);
-  if (login?.client) await login.client.disconnect().catch(() => {});
+  if (login?.client) await telegramAdapter.disconnect(login.client).catch(() => {});
   telegramClients.delete(req.userId);
   telegramLogins.delete(req.userId);
   await pool.query('DELETE FROM telegram_login_attempts WHERE user_id=$1', [req.userId]);
@@ -3356,8 +3354,8 @@ async function shutdown() {
   });
   await executionWorker.stop();
   await serverClosed;
-  for (const entry of telegramClients.values()) await entry.client.disconnect().catch(() => {});
-  for (const entry of telegramLogins.values()) await entry.client.disconnect().catch(() => {});
+  for (const entry of telegramClients.values()) await telegramAdapter.disconnect(entry.client).catch(() => {});
+  for (const entry of telegramLogins.values()) await telegramAdapter.disconnect(entry.client).catch(() => {});
   await tradingAdapter.close().catch(() => {});
   await pool.end().catch(() => {});
   process.exit(0);

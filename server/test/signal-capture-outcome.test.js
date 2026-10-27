@@ -21,6 +21,9 @@ const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 // invariants this file guards - storage before any execution decision, no plan gate in the listener -
 // are worth keeping, but they now live in the service, not in the routing file.
 const listenerSource = readFileSync(new URL('../services/telegram-listener.js', import.meta.url), 'utf8');
+// Telegram's library shape now lives in one file, so the invariants that used to be pinned where the calls were
+// made are pinned here instead: the same numbers, asserted against the module that owns them.
+const adapterSource = readFileSync(new URL('../services/telegram-adapter.js', import.meta.url), 'utf8');
 const engineSource = readFileSync(new URL('../services/execution-engine.js', import.meta.url), 'utf8');
 
 function section(source, startMarker, endMarker) {
@@ -304,7 +307,7 @@ test('a live message is never dropped without saying where it went', () => {
   // and the counters survive into the status route, so "is it even listening?" has an answer
   const statusRoute = section(index, "app.get('/api/telegram/status'", 'async function persistTelegramLoginAttempt');
   assert.match(index, /void resumeTelegramSessions\(\{ reason: 'boot' \}\)/, 'sessions are re-armed at boot, without waiting for someone to open the dashboard');
-  assert.match(statusRoute, /listening: Boolean\(entry\?\.client\?\.connected && entry\.handler && telegramCapture\.handlerIsLive\(entry\.client, entry\.handler\)\)/, 'listening is read from GramJS\'s handler list, not from a flag of ours');
+  assert.match(statusRoute, /listening: Boolean\(telegramAdapter\.connectedFlag\(entry\?\.client\) && entry\.handler && telegramCapture\.handlerIsLive\(entry\.client, entry\.handler\)\)/, 'listening is read from GramJS\'s handler list, not from a flag of ours');
   assert.match(statusRoute, /messagesSeen|signalsSaved/, 'the panel can tell a silent listener from a quiet channel');
   assert.match(statusRoute, /await startTelegramListener\(req\.userId, entry\.client\)/, 'a connected client with no live handler is attached on the spot');
 });
@@ -549,10 +552,10 @@ test('the sweep asks the channel what it said, and the heartbeat is what asks th
      connected client is precisely the case being rebuilt - leaving it alive would keep two authorized sessions
      on one StringSession, which is how a "fix" becomes a second opinion. */
   const restore = section(index, 'async function restoreTelegramClient(', '\n/** How many recent messages');
-  const restoreEarly = section(index, 'async function restoreTelegramClient(', 'if (current?.client && current.client.connected !== true) {');
+  const restoreEarly = section(index, 'async function restoreTelegramClient(', 'if (current?.client && !telegramAdapter.isConnected(current.client)) {');
   assert.match(restoreEarly, /const mustRebuild = force === true \|\| escalate === true;/, 'the watchdog escalates, the operator forces, and either one rebuilds');
-  assert.match(restoreEarly, /if \(!mustRebuild && current\?\.client\?\.connected === true && current\.handler && telegramCapture\.handlerIsLive/, 'the shortcut is gated on that flag, not on good intentions');
-  assert.match(restore, /if \(current\?\.client && \(current\.client\.connected !== true \|\| mustRebuild\)\) await current\.client\.disconnect\(\)\.catch\(\(\) => \{\}\);/,
+  assert.match(restoreEarly, /if \(!mustRebuild && telegramAdapter\.isConnected\(current\?\.client\) && current\.handler && telegramCapture\.handlerIsLive/, 'the shortcut is gated on that flag, not on good intentions');
+  assert.match(restore, /if \(current\?\.client && \(!telegramAdapter\.isConnected\(current\.client\) \|\| mustRebuild\)\) await telegramAdapter\.disconnect\(current\.client\)\.catch\(\(\) => \{\}\);/,
     'a rebuilt session disconnects the client it replaces, connected or not');
   assert.match(restore, /await telegramCapture\.resyncUpdateState\(current\.client, \{ userId, reason: `\$\{reason\}:reconnected` \}\);/,
     'a socket that came back has its state reconciled before the handler is re-attached');
@@ -574,33 +577,37 @@ test('the sweep asks the channel what it said, and the heartbeat is what asks th
 test('the transport can be moved off the plain port, and the option can never cost capture its signals', () => {
   const transport = section(index, 'function telegramCaptureTransport(', '\nasync function restoreTelegramClient');
   assert.match(transport, /process\.env\.TELEGRAM_TRANSPORT \|\| ''\)\.toLowerCase\(\) !== 'wss'/, 'off by default: the beat is the fix, this is a knob');
-  assert.match(transport, /useWSS: true/, 'and when it is on, it is the library\'s own option rather than a hand-rolled socket');
-  assert.match(transport, /return \{ wss: false, options: base \}/, 'the shape tells the caller whether a fallback is even available');
+  assert.match(transport, /return \{ wss: overWss, options: telegramAdapter\.captureTransportOptions\(\{ wss: overWss \}\) \};/,
+    'one return, and the shape still tells the caller whether a fallback is even available');
+  assert.match(adapterSource, /useWSS: true/, 'and when it is on, it is the library\'s own option rather than a hand-rolled socket');
+  assert.equal(transport.includes('useWSS'), false, 'the routing file does not name the library option; it only decides');
 
   const restore = section(index, 'async function restoreTelegramClient(', '\n/** How many recent messages');
   assert.match(restore, /const transport = telegramCaptureTransport\(\);/, 'the capture client is built from it');
   assert.match(restore, /if \(!transport\.wss\) throw error;/, 'a failure with the option off is the ordinary failure');
   assert.match(restore, /Telegram WSS transport could not connect; reconnecting over the default transport/, 'and with it on, the fallback is announced');
-  assert.match(restore, /client = new TelegramClient\(new StringSession\(sessionString\), Number\(process\.env\.API_ID\), process\.env\.API_HASH, telegramCaptureTransport\(\{ wss: false \}\)\.options\);\n\s*telegramKeepAlive\.attach\(client, \{ userId \}\);\n\s*await client\.connect\(\);/,
+  assert.match(restore, /client = telegramAdapter\.createClient\(\{ sessionString, apiId: Number\(process\.env\.API_ID\), apiHash: process\.env\.API_HASH, options: telegramCaptureTransport\(\{ wss: false \}\)\.options \}\);\n\s*telegramKeepAlive\.attach\(client, \{ userId \}\);\n\s*await telegramAdapter\.connect\(client\);/,
     'retried on the default transport with the same session and the same tuned options - restating the numbers here is how a fallback path keeps settings the primary one stopped having');
-  const captureClients = index.match(/new TelegramClient\(new StringSession\(sessionString\)[^\n]*\);/g) || [];
+  const captureClients = index.match(/telegramAdapter\.createClient\(\{ sessionString,[^\n]*\}\);/g) || [];
   assert.equal(captureClients.length, 2, 'the two capture transports, primary and fallback, are both built here');
   assert.equal(captureClients.every((site) => /transport\.options|telegramCaptureTransport\(\{ wss: false \}\)\.options/.test(site)), true,
     'and neither names retry numbers of its own: both read them from the one function, which is what stops the fallback keeping settings the primary path no longer has');
-  assert.equal(/new TelegramClient\(new StringSession\(sessionString\)[^\n]*connectionRetries:/.test(index), false, 'nothing in the capture path restates the tuning');
+  assert.equal(/createClient\(\{[^\n]*connectionRetries:/.test(index), false, 'nothing in the capture path restates the tuning');
 
   /* The knob that was asked for and does not exist, pinned so nobody re-adds it from a README: 2.26.26 stores
      `timeout` as `_connectTimeout` on the sender and never reads it, so passing it would look like a tuned
      timeout and do precisely nothing. The retry count is the real lever. */
-  assert.match(transport, /connectionRetries: 5/, 'five attempts, not three, because the library gives its own transport about forty seconds to recover');
-  assert.equal(/timeout:\s*\d/.test(transport), false, 'no request-timeout option is passed, because in this version none is read');
-  assert.match(transport, /autoReconnect: true/, 'and the sender is left free to reconnect again after the attempts run out');
+  assert.match(adapterSource, /CAPTURE_CONNECTION_RETRIES = 5;/, 'five attempts, not three, because the library gives its own transport about forty seconds to recover');
+  assert.match(adapterSource, /LOGIN_CONNECTION_RETRIES = 3;/, 'and the one-shot login clients keep their own, smaller number');
+  assert.equal(/timeout:\s*\d/.test(transport) || /timeout:\s*\d/.test(adapterSource), false, 'no request-timeout option is passed anywhere, because in this version none is read');
+  assert.match(adapterSource, /autoReconnect: true/, 'and the sender is left free to reconnect again after the attempts run out');
 
   /* The login clients deliberately keep the plain transport: a user waiting for a code is waiting interactively,
      and an experiment that exists for long-lived idle connections has no business in a one-shot handshake. */
-  const loginSites = index.match(/new TelegramClient\(new StringSession\(''\)[^)]*\)\s*;?/g) || [];
-  assert.ok(loginSites.length >= 1, 'the login clients are constructed in the same file');
+  const loginSites = index.match(/telegramAdapter\.createClient\(\{[^\n]*loginTransportOptions\(\)/g) || [];
+  assert.equal(loginSites.length, 2, 'the code request and the pending-session restore, and nothing else, build a login client');
   assert.equal(loginSites.some((site) => site.includes('useWSS')), false, 'and none of them takes the knob');
+  assert.equal(/connectionRetries:/.test(index), false, 'the login tuning is spelled once, in the adapter, which is how a second login client cannot forget it');
 });
 
 /* ---------------------------------------------------------------------------
@@ -618,7 +625,15 @@ test('the keep-alive noise is counted at the client that produced it, and the pr
   assert.match(index, /const telegramKeepAlive = createTelegramKeepAliveGuard/, 'the guard is built once per process, from the module that knows what the noise looks like');
   assert.match(guard, /transportFlap: \(client\) => telegramKeepAlive\.flapFor\(client\)/,
     'and the watchdog is given the flap record, so an unanswered beat during a provider reconnect is waited out instead of torn down');
-  assert.match(index, /telegramKeepAlive\.attach\(client, \{ userId \}\);\n\s*await client\.connect\(\);/,
+  /* The invariant is per client, not per pattern: the primary build connects inside a `try`, the fallback does
+     not, so counting the adjacency would have found one and proved nothing. Splitting on the construction is what
+     lets the same claim be made about both transports. */
+  const captureBuilds = section(index, 'async function restoreTelegramClient(', 'Every workspace with a stored session')
+    .split('telegramAdapter.createClient({ sessionString').slice(1);
+  assert.equal(captureBuilds.length, 2, 'both capture transports build their client in the same function');
+  assert.equal(captureBuilds.every((chunk) => /telegramKeepAlive\.attach\(client, \{ userId \}\);[\s\S]{0,60}await telegramAdapter\.connect\(client\);/.test(chunk)), true,
+    'and each one is guarded before it connects, on the fallback as well as on the transport the operator asked for');
+  assert.match(index, /telegramKeepAlive\.attach\(client, \{ userId \}\);\n\s*await telegramAdapter\.connect\(client\);/,
     'attached before `connect()`, because that is where the update loop starts - after it would miss the first flap, which is the one that happens during a rebuild');
 
   // The process-level filter exists for the process, not for the log: it must never become a general silencer.
@@ -679,7 +694,7 @@ test('an operator can rebuild a deaf session by hand, and that is the one path a
 test('a deaf session is saved by the minute, and an unrecoverable one is ended by the server', () => {
   // The listener sets `needsCatchUp`; this is the code that reads it, and the interval that runs it.
   const rearm = section(index, 'async function rearmTelegramListeners(', 'io.use((');
-  assert.match(rearm, /if \(entry\.needsCatchUp && entry\.client\?\.connected === true\) \{[\s\S]{0,200}runCatchUp\(userId\)/,
+  assert.match(rearm, /if \(entry\.needsCatchUp && telegramAdapter\.isConnected\(entry\.client\)\) \{[\s\S]{0,200}runCatchUp\(userId\)/,
     'the flag the update-state reconciliation sets is the flag the re-arm pass acts on, so a session the account will not reconcile still gets its channels read back on the next pass rather than on the staggered one');
   const sweep = section(index, 'const telegramSweep = setInterval', 'telegramSweep.unref');
   assert.match(sweep, /resumeTelegramSessions\(\{ reason: 'sweep' \}\)[\s\S]{0,120}rearmTelegramListeners\(\)[\s\S]{0,120}checkTelegramStreams/,
