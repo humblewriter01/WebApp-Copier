@@ -231,6 +231,21 @@ export const STREAM_IDLE_MS = 15 * 60 * 1000;
 
 const EMPTY_STATS = () => ({ seen: 0, saved: 0, ignored: 0, lastAt: null, lastChatId: null, lastError: null, catchUpSaved: 0, lastDelayMs: null, lastSentAt: null, lastMessageId: null });
 
+/**
+ * Whether a workspace id handed to `onSessionUnrecoverable` can address a row of `users`.
+ *
+ * `users.id` is a UUID, and the capture map is keyed by whatever `req.userId` was, which is that UUID as text.
+ * The guard this replaces asked "is it a positive integer", so every real workspace failed it: a session that
+ * could not recover was never marked for re-authentication, its client stayed in the map being beaten every
+ * thirty seconds, and the panel went on reporting Telegram as connected to a stream that would never deliver
+ * again. Asking only that the id be present is the whole of what a database write needs, and the legacy
+ * integer ids this app also carries are still accepted so a test fixture or an old row behaves the same way.
+ */
+export function isValidWorkspaceId(value) {
+  if (typeof value === 'number') return Number.isInteger(value) && value > 0;
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
 export function createTelegramListener({ clients, pool, log = console, saveSignal, now = () => Date.now(), catchUpLimit = CATCH_UP_LIMIT, catchUpCooldownMs = CATCH_UP_COOLDOWN_MS, catchUpBudgetMs = CATCH_UP_BUDGET_MS, silenceSuspectMs = SILENCE_SUSPECT_MS, probeDeadlineMs = STREAM_PROBE_DEADLINE_MS, gapCatchUpMs = GAP_CATCH_UP_MS, gapCatchUpSpreadMs = GAP_CATCH_UP_SPREAD_MS, heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS, ptsStallBeats = PTS_STALL_BEATS, rebuildCooldownMs = STREAM_REBUILD_COOLDOWN_MS,
   differenceMaxSteps = DIFFERENCE_MAX_STEPS, differenceBudgetMs = DIFFERENCE_BUDGET_MS, floodWaitMs = FLOOD_BACKOFF_MS,
   ptsGapStrikes = PTS_GAP_STRIKES, gapReauthWindowMs = PTS_GAP_REAUTH_WINDOW_MS, transportFlap = null, keepAliveFlapGraceMs = KEEP_ALIVE_FLAP_GRACE_MS, onDeadStream = null, onSessionUnrecoverable = null } = {}) {

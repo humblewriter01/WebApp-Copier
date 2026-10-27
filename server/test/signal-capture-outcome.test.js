@@ -544,7 +544,10 @@ test('the sweep asks the channel what it said, and the heartbeat is what asks th
      sweep, which is a minute, and not off the silence clock, which is ninety seconds of already-lost time. */
   assert.match(index, /void beatTelegramStreams\(\{ reason: 'boot' \}\);\n\s*const telegramHeartbeat = setInterval\(\(\) => \{\n\s*void beatTelegramStreams\(\{ reason: 'interval' \}\);\n\s*\}, HEARTBEAT_INTERVAL_MS\);\n\s*telegramHeartbeat\.unref\?\.\(\);/,
     'the interval is the exported constant, is unref\'d so it can never hold a shutting-down process open, and its first cycle runs at boot');
-  assert.match(index, /import \{ HEARTBEAT_INTERVAL_MS, createTelegramListener \} from '\.\/services\/telegram-listener\.js'/,
+  /* Loosened on the name list and not on the meaning: this pin used to require the import to hold exactly two
+     names, which is not an invariant of anything, and it made adding a third a red test for no reason. Both names
+     it cares about are still required, from the same module, on the same line. */
+  assert.match(index, /import \{ HEARTBEAT_INTERVAL_MS, createTelegramListener,[^\n]*\} from '\.\/services\/telegram-listener\.js'/,
     'from the module that owns the beat, so the number cannot drift between the two files');
   const runner = section(index, 'async function beatTelegramStreams(', '\n/** Re-attach anything in memory');
   assert.match(runner, /catch \(error\) \{\n\s*log\('warn', 'Telegram heartbeat cycle failed'/,
@@ -717,7 +720,17 @@ test('a deaf session is saved by the minute, and an unrecoverable one is ended b
   assert.match(ctor, /onSessionUnrecoverable: async \(userId, reason, details = \{\}\) => \{/, 'the verdict has a handler wired, next to the rebuild handler it follows');
   assert.match(ctor, /UPDATE users SET telegram_connected=FALSE WHERE id=\$1/, 'which marks the account unlinked, the one fact every other part of the app already reads and shows');
   assert.equal(ctor.includes('telegram_session=NULL'), false, 'and deliberately does not destroy the session string: an admin’s forced reconnect is the last thing worth trying before a human is asked for their phone, and it needs that string to try');
-  assert.match(ctor, /telegramClients\.delete\(id\)/, 'the memory is dropped with the flag, so the resume query cannot hand the dead session straight back');
+  /* The key this handler addresses is where the bug lived, so it is pinned on the code rather than on the prose:
+     `users.id` is a UUID and `req.userId` is that UUID as text, and the first version of this handler asked
+     "is this a positive integer" before it wrote anything. Every real workspace failed that question, so the
+     marking, the disconnect and the log line below it never ran at all, and a session already known to be dead
+     went on being reported as connected for the life of the process. */
+  assert.match(ctor, /if \(!isValidWorkspaceId\(userId\)\) return;/, 'the id is validated as an id - present text - not as a number');
+  assert.equal(/Number\(userId\)/.test(ctor), false, 'and is never coerced anywhere in this handler, because coercion is what made it a no-op');
+  assert.match(ctor, /WHERE id=\$1', \[userId\]\)/, 'the write is addressed by the same text the map is keyed by');
+  assert.match(ctor, /telegramClients\.get\(userId\)/, 'the client is looked up by that same key');
+  assert.match(ctor, /telegramClients\.delete\(userId\)/, 'the memory is dropped with the flag by that same key, so the resume query cannot hand the dead session straight back');
+  assert.match(index, /telegramClients\.set\(userId, \{/, 'which is the key the map is filled with, three hundred lines away - set, get and delete have to agree or the map leaks a live client');
   assert.match(ctor, /log\('warn', 'Telegram session left for the user to sign in again'/, 'and the reason, the pts, the gap and the strike count are logged together, because that is the whole post-mortem');
 
   // The user-facing answer to "why does it say I need to reconnect", without a log search and without protocol in the UI.

@@ -21,7 +21,7 @@ import { TARGET_MODES } from './services/scale-out.js';
 import { captureSafety, readFallbackPoints } from './services/signal-safety.js';
 import { entryRangeBounds, readExpirySetting, readSlippageSetting, ORDER_TYPES } from './services/order-routing.js';
 import { readDashboardSignals } from './services/dashboard-signals.js';
-import { HEARTBEAT_INTERVAL_MS, createTelegramListener } from './services/telegram-listener.js';
+import { HEARTBEAT_INTERVAL_MS, createTelegramListener, isValidWorkspaceId } from './services/telegram-listener.js';
 import { createTelegramKeepAliveGuard, createUnhandledRejectionGuard, isProviderKeepAliveTimeout } from './services/telegram-keepalive.js';
 import { createMetaApiTradingAdapter } from './services/metaapi-trading.js';
 import { createExecutionEngine, PLATFORM_PAUSE_MESSAGE } from './services/execution-engine.js';
@@ -555,16 +555,20 @@ const telegramCapture = createTelegramListener({
   // flap waits one cycle instead of rebuilding a session the library was about to hand back.
   transportFlap: (client) => telegramKeepAlive.flapFor(client),
   onSessionUnrecoverable: async (userId, reason, details = {}) => {
-    const id = Number(userId);
-    if (!Number.isInteger(id) || id <= 0) return;
-    await pool.query('UPDATE users SET telegram_connected=FALSE WHERE id=$1', [id]).catch((error) => {
-      log('warn', 'Telegram re-auth marking could not be saved', { userId: id, reason, error: error.message });
+    /* Text, not a number, and validated as text: `users.id` is a UUID and the map below is keyed by `req.userId`,
+       which is that UUID. The first version of this guard coerced the id to a number and refused anything the
+       coercion did not turn into a positive integer, so in production it refused every single workspace, this
+       whole block never ran, and a session that was already known dead was reported as healthy for as long as the
+       process lived. The shape of the check is pinned by a test because the shape is the bug. */
+    if (!isValidWorkspaceId(userId)) return;
+    await pool.query('UPDATE users SET telegram_connected=FALSE WHERE id=$1', [userId]).catch((error) => {
+      log('warn', 'Telegram re-auth marking could not be saved', { userId, reason, error: error.message });
     });
-    const entry = telegramClients.get(id);
+    const entry = telegramClients.get(userId);
     if (telegramAdapter.canDisconnect(entry?.client)) await telegramAdapter.disconnect(entry.client).catch(() => {});
-    telegramClients.delete(id);
+    telegramClients.delete(userId);
     log('warn', 'Telegram session left for the user to sign in again', {
-      userId: id, reason, pts: details?.pts ?? null, gap: details?.gap ?? null, strikes: details?.strikes ?? null, error: details?.error ?? null,
+      userId, reason, pts: details?.pts ?? null, gap: details?.gap ?? null, strikes: details?.strikes ?? null, error: details?.error ?? null,
     });
   },
 });
