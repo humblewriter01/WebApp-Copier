@@ -102,6 +102,41 @@ export const UPDATE_STATE_KEY = '_sdbUpdateState';
  */
 export const STREAM_REBUILD_COOLDOWN_MS = 2 * 60_000;
 /**
+ * How many `updates.GetDifference` calls one reconciliation may make, and for how long.
+ *
+ * Telegram answers a difference request with `updates.differenceSlice` when the gap is bigger than one reply: the
+ * slice carries the new state and expects to be asked again from it, until the answer is a plain
+ * `updates.difference` (caught up) or a `differenceEmpty` (nothing left). A single call therefore closes a small
+ * gap and only *partly* closes a big one - which after days of downtime could mean a hundred round trips, so the
+ * loop is bounded twice over: `DIFFERENCE_MAX_STEPS` requests, and `DIFFERENCE_BUDGET_MS` of wall clock,
+ * whichever runs out first. A loop that stops early is not a failure: the state it adopted is further along than
+ * the one it started from, the next beat continues from there, and the catch-up is flagged either way, so the
+ * messages are recovered by history read whether or not the difference finishes.
+ */
+export const DIFFERENCE_MAX_STEPS = 5;
+export const DIFFERENCE_BUDGET_MS = 4_000;
+/**
+ * How long a `FLOOD_WAIT` backs off the *difference* requests specifically.
+ *
+ * Being throttled while asking "what did I miss" must not turn into being throttled forever, and it must not
+ * become a reason to give up on the session either: the backoff silences the reconciliation and nothing else -
+ * the beat still runs, the catch-up still reads the channels, and the stamp is cleared as soon as a difference is
+ * actually answered.
+ */
+export const FLOOD_BACKOFF_MS = 60_000;
+/**
+ * Consecutive beats of an unreconciled stream, after a rebuild has already been tried, before the workspace is
+ * told to sign in again.
+ *
+ * Three is the number, and the reason for it is the ladder: beat one adopts or asks, beat two escalates to a new
+ * session, beat three is a fresh session that is *already* failing - at which point the thing that has changed
+ * is not the transport but the account's view of this session, which no reconnect can repair. The strike counter
+ * is reset by any beat that reconciles, so a session that recovers for one beat and relapses starts over.
+ */
+export const PTS_GAP_STRIKES = 3;
+/** How recently a rebuild has to have been attempted for the strike ladder to be allowed to end a session. */
+export const PTS_GAP_REAUTH_WINDOW_MS = 10 * 60_000;
+/**
  * How often a session that passes its probe is still cross-checked against the channel.
  *
  * `pts` desync, a Telegram-side update drop, a builder that filtered something we cared about: every one of
@@ -145,12 +180,47 @@ export function normalizeUpdateState(answer) {
   };
 }
 
-/** What this session last reconciled itself to, or `null` when nothing has proved it yet. */
+/**
+ * What a thrown Telegram error actually means for the update state, because the answers are not interchangeable.
+ *
+ * `updates.differenceTooLong` is a *result* the library hands back, but a channel that has been unread for days
+ * is answered with an RPC error instead (`CHANNEL_DIFFERENCE_TOO_LONG`, `UPDATES_TOO_OLD`), and GramJS raises
+ * those as exceptions - `FloodWaitError` carries its own `seconds`, and the session-killing codes
+ * (`AUTH_KEY_UNREGISTERED`, `SESSION_REVOKED`, `USER_DEACTIVATED`) mean no amount of retrying on this session
+ * will ever work again. Classifying is what lets the caller back off, fall back, or stop, instead of treating
+ * every throw as the same "the socket is sad" and reconnecting in a loop against a flood limit.
+ */
+export function classifyProviderError(error) {
+  const name = String(error?.constructor?.name || '');
+  const raw = `${error?.errorMessage || ''} ${error?.message || ''}`.toUpperCase();
+  if (/FLOOD_WAIT|SLOW_MODE|WAIT OF \d+ SECONDS/.test(raw) || /Flood.*Wait/i.test(name)) return 'throttled';
+  if (/TOO_LONG|TOO OLD|UPDATES_TOO_OLD|DIFFERENCE_TOO_LONG/.test(raw) || /TooLong/i.test(name)) return 'too-long';
+  if (/AUTH_KEY_UNREGISTERED|AUTH_KEY_INVALID|SESSION_REVOKED|SESSION_TIMEOUT|USER_DEACTIVATED|UNAUTHORIZED|AUTH_KEY/.test(raw)) return 'session-revoked';
+  if (/TIMEOUT|NETWORK|ECONNRESET|EPIPE|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|SOCKET/.test(raw) || error?.name === 'AbortError') return 'network';
+  return 'unknown';
+}
+
+/** How long to stay quiet about difference requests, from a flood error: its own number of seconds, or the default. */
+export function floodBackoffMs(error, fallback = FLOOD_BACKOFF_MS) {
+  const seconds = Number(error?.seconds ?? error?.capture);
+  const ms = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : fallback;
+  return Math.min(Math.max(ms, 1_000), 15 * 60_000);
+}
+
+/**
+ * What this session last reconciled itself to, or `null` when nothing has proved it yet.
+ *
+ * `nextDifferenceAt` appears only while a flood wait is running: the three numbers are the state, and a key that
+ * is sometimes absent and sometimes a timestamp is easier to read in a log than one that is always `0`.
+ */
 export function readUpdateState(client) {
   const cached = client?.[UPDATE_STATE_KEY];
   const pts = updateCounter(cached?.pts);
   if (pts === null) return null;
-  return { pts, qts: updateCounter(cached?.qts), date: updateCounter(cached?.date), at: cached?.at ?? null };
+  const state = { pts, qts: updateCounter(cached?.qts), date: updateCounter(cached?.date), at: cached?.at ?? null };
+  const until = Number(cached?.nextDifferenceAt);
+  if (Number.isFinite(until) && until > 0) state.nextDifferenceAt = until;
+  return state;
 }
 
 /** One turn of the event loop, so a replay never runs two messages back to back. */
@@ -160,7 +230,9 @@ export const STREAM_IDLE_MS = 15 * 60 * 1000;
 
 const EMPTY_STATS = () => ({ seen: 0, saved: 0, ignored: 0, lastAt: null, lastChatId: null, lastError: null, catchUpSaved: 0, lastDelayMs: null, lastSentAt: null, lastMessageId: null });
 
-export function createTelegramListener({ clients, pool, log = console, saveSignal, now = () => Date.now(), catchUpLimit = CATCH_UP_LIMIT, catchUpCooldownMs = CATCH_UP_COOLDOWN_MS, catchUpBudgetMs = CATCH_UP_BUDGET_MS, silenceSuspectMs = SILENCE_SUSPECT_MS, probeDeadlineMs = STREAM_PROBE_DEADLINE_MS, gapCatchUpMs = GAP_CATCH_UP_MS, gapCatchUpSpreadMs = GAP_CATCH_UP_SPREAD_MS, heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS, ptsStallBeats = PTS_STALL_BEATS, rebuildCooldownMs = STREAM_REBUILD_COOLDOWN_MS, onDeadStream = null } = {}) {
+export function createTelegramListener({ clients, pool, log = console, saveSignal, now = () => Date.now(), catchUpLimit = CATCH_UP_LIMIT, catchUpCooldownMs = CATCH_UP_COOLDOWN_MS, catchUpBudgetMs = CATCH_UP_BUDGET_MS, silenceSuspectMs = SILENCE_SUSPECT_MS, probeDeadlineMs = STREAM_PROBE_DEADLINE_MS, gapCatchUpMs = GAP_CATCH_UP_MS, gapCatchUpSpreadMs = GAP_CATCH_UP_SPREAD_MS, heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS, ptsStallBeats = PTS_STALL_BEATS, rebuildCooldownMs = STREAM_REBUILD_COOLDOWN_MS,
+  differenceMaxSteps = DIFFERENCE_MAX_STEPS, differenceBudgetMs = DIFFERENCE_BUDGET_MS, floodWaitMs = FLOOD_BACKOFF_MS,
+  ptsGapStrikes = PTS_GAP_STRIKES, gapReauthWindowMs = PTS_GAP_REAUTH_WINDOW_MS, onDeadStream = null, onSessionUnrecoverable = null } = {}) {
   if (!clients || !pool || !saveSignal) throw new Error('createTelegramListener requires clients, pool and saveSignal');
   const startedAt = new Date();
   const catchUpRuns = new Map();
@@ -170,7 +242,16 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
      between "Telegram had nothing for us" and "Telegram sent it and our dispatcher never woke up". */
   const streamBeats = new Map();
   const rebuildCooldown = new Map();
-  const heartbeat = { cycles: 0, sent: 0, answered: 0, dead: 0, stalled: 0, rebuilt: 0, probing: 0, suppressed: 0, resynced: 0, recovered: 0, deaf: 0, gaps: 0, lastCycleAt: null, lastCycleMs: null, lastCycleSessions: 0 };
+  /* One re-auth verdict per session per window, whatever number of detectors reached it. A strike counter that
+     fired every 30 seconds would tell the user to sign in again sixty times an hour, which is not a diagnosis -
+     it is the outage wearing the diagnosis's clothes. */
+  const unrecoverableCooldown = new Map();
+  /* When this session was last handed to whoever owns reconnects, and how many times. `resetStreamBaseline` wipes
+     the beat record - a new session must not inherit a dead one's counters - so the evidence that a repair was
+     already attempted has to live somewhere the reset does not reach, or the strike ladder would keep
+     re-justifying a teardown that has already happened. */
+  const rebuildAttempts = new Map();
+  const heartbeat = { cycles: 0, sent: 0, answered: 0, dead: 0, stalled: 0, rebuilt: 0, probing: 0, suppressed: 0, resynced: 0, recovered: 0, deaf: 0, gaps: 0, partial: 0, throttled: 0, unrecoverable: 0, lastCycleAt: null, lastCycleMs: null, lastCycleSessions: 0 };
   let emptyCycleReported = false;
   let resumedAfterBoot = 0;
 
@@ -274,8 +355,8 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
    * `'difference-empty'` (the server insists we are current, which with a busy channel is the deaf-stream
    * confession), `'too-long'` (the gap is beyond repair - only a new session fixes it), `'failed'`.
    */
-  async function resyncUpdateState(client, { userId = null, reason = 'resync', state = null, seenAdvanced = false, force = false, deadlineMs = probeDeadlineMs } = {}) {
-    const outcome = { action: 'unavailable', serverPts: null, statePts: null, gap: 0, messages: 0, otherUpdates: 0, error: null, ms: null };
+  async function resyncUpdateState(client, { userId = null, reason = 'resync', state = null, seenAdvanced = false, force = false, deadlineMs = probeDeadlineMs, maxSteps = differenceMaxSteps, budgetMs = differenceBudgetMs } = {}) {
+    const outcome = { action: 'unavailable', serverPts: null, statePts: null, gap: 0, messages: 0, otherUpdates: 0, steps: 0, partial: false, backoffMs: 0, error: null, ms: null };
     if (!client || client.connected !== true || typeof client.invoke !== 'function') return outcome;
     const startedAt = now();
     let Api = null;
@@ -299,9 +380,6 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
     };
 
     try {
-      /* Identity first, and its failure is not fatal: `getMe` is what seeds the self peer GramJS's dispatcher
-         consults for the first pushed message after a reconnect, so asking for it here removes one more thing
-         that can only go right by accident. The state question is the one that has to be answered. */
       /* Identity first, and its failure is not fatal. `getMe(true)` is the form that matters: GramJS's `getMe()`
          always re-issues `users.GetUsers`, while the `true` form returns the cached self peer when there is one -
          so a healthy session pays nothing here and the first beat after a rebuild pays one request. That first
@@ -328,6 +406,17 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
         return outcome;
       }
 
+      /* A flood answer silences *this* reconciliation for the number of seconds Telegram asked for, and nothing
+         else: the beat goes on beating, the catch-up goes on reading history, and `force` (a human, or a
+         session that is being rebuilt anyway) still gets to ask. Silencing the retry is the difference between
+         backing off and a fleet of sessions hammering the same throttle every 30 seconds forever. */
+      const until = Number(cached.nextDifferenceAt || 0);
+      if (until > now()) {
+        outcome.action = 'throttled';
+        outcome.backoffMs = until - now();
+        return outcome;
+      }
+
       const gap = server.pts - cached.pts;
       outcome.gap = gap > 0 ? gap : 0;
       /* Nothing to close: either the account moved and we were shown every update (the ordinary case, and the
@@ -342,53 +431,99 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
         return outcome;
       }
 
-      const difference = await invoke(new Api.updates.GetDifference({
-        pts: cached.pts,
-        qts: Number.isFinite(cached.qts) ? cached.qts : 0,
-        date: Number.isFinite(cached.date) ? cached.date : Math.floor(startedAt / 1000),
-      }));
-      const className = String(difference?.className || difference?.constructor?.name || '');
-      outcome.messages = Array.isArray(difference?.newMessages) ? difference.newMessages.length : 0;
-      outcome.otherUpdates = Array.isArray(difference?.otherUpdates) ? difference.otherUpdates.length : 0;
-      /* Adopt whatever the answer says the state is now. On a repairable gap that is the difference's own state,
-         on `differenceTooLong` the server refuses to say - so fall back to GetState, which is at least the
-         number the account is on, and a stale cached value must never survive into the next beat. */
-      /* `updates.difference` and `differenceSlice` carry a `state`; `differenceEmpty` carries the numbers on the
-         object itself, and `differenceTooLong` refuses to say anything - which is why the fallback is the
-         GetState answer, and not the value we arrived with: a cached `pts` that survives a repair is a gap that
-         is still open on the next beat, and an open gap is what triggers a rebuild. */
-      const next = normalizeUpdateState(difference?.state || difference);
+      /* ------------------------------------------------------------------ the difference loop
+         A slice means "there is more, ask again from here", so this is a loop and not a call: each answer moves
+         the state we send next, and it ends on a plain `updates.difference` (caught up), a `differenceEmpty`
+         (nothing left), a refusal, or the step/time budget. `adopted` is written on every iteration, so a loop
+         that runs out of budget still leaves the session further along than it was - and never back at the pts
+         that produced the gap, which would ask the same question again on the next beat forever. */
       const keep = (value, fallback) => (Number.isFinite(value) ? value : fallback);
-      /* Field by field, because a partial answer must not *erase* what we already knew: `normalizeUpdateState`
-         returns `null` for anything the response did not carry, and a null `qts` here is a next difference
-         request sent with 0, which asks the server to replay secret chats we have never had. */
-      const adopted = Number.isFinite(next.pts)
-        ? {
-          pts: next.pts,
-          qts: keep(next.qts, keep(server.qts, cached.qts)),
-          date: keep(next.date, keep(server.date, cached.date)),
-          count: keep(next.count, keep(server.count, cached.count)),
+      const writeState = (state_, extra = {}) => {
+        try { client[UPDATE_STATE_KEY] = { ...state_, at: now(), ...extra }; } catch { /* a frozen test double */ }
+      };
+      let adopted = { pts: cached.pts, qts: keep(cached.qts, 0), date: keep(cached.date, Math.floor(startedAt / 1000)), count: keep(cached.count, 0) };
+      let lastClass = '';
+      let action = 'difference-empty';
+      let throttled = false;
+      while (outcome.steps < maxSteps && now() - startedAt < budgetMs) {
+        outcome.steps += 1;
+        let difference = null;
+        try {
+          difference = await invoke(new Api.updates.GetDifference({ pts: adopted.pts, qts: adopted.qts, date: adopted.date }));
+        } catch (error) {
+          /* The refusals that matter, told apart, because each one wants a different thing from us: a flood wait
+             is a pause, `CHANNEL_DIFFERENCE_TOO_LONG`/`UPDATES_TOO_OLD` is "the gap is beyond the difference API"
+             and wants the history read instead, and a revoked auth key is the end of this session no matter how
+             many times we rebuild it. Anything else is reported and left alone - a reconciliation that cannot be
+             completed is never a reason to tear down a socket that is answering. */
+          const kind = classifyProviderError(error);
+          const text = `${error?.errorMessage || ''} ${error?.message || error}`.slice(0, 160);
+          if (kind === 'throttled') {
+            const backoff = floodBackoffMs(error, floodWaitMs);
+            writeState(adopted, { nextDifferenceAt: now() + backoff });
+            throttled = true;
+            action = 'throttled';
+            outcome.backoffMs = backoff;
+            outcome.error = text;
+            break;
+          }
+          if (kind === 'too-long') { action = 'too-long'; adopted = { ...server }; }
+          else if (kind === 'session-revoked') action = 'session-revoked';
+          else action = 'failed';
+          outcome.error = text;
+          break;
         }
-        : server;
-      try { client[UPDATE_STATE_KEY] = { ...adopted, at: now() }; } catch { /* as above */ }
-
-      if (/toolong/i.test(className)) {
-        outcome.action = 'too-long';
-      } else if (outcome.messages || outcome.otherUpdates) {
-        outcome.action = 'difference-applied';
-      } else {
-        outcome.action = 'difference-empty';
+        lastClass = String(difference?.className || difference?.constructor?.name || '');
+        const reported = normalizeUpdateState(difference?.state || difference);
+        outcome.messages += Array.isArray(difference?.newMessages) ? difference.newMessages.length : 0;
+        outcome.otherUpdates += Array.isArray(difference?.otherUpdates) ? difference.otherUpdates.length : 0;
+        /* `updates.difference` and `differenceSlice` carry a `state`; `differenceEmpty` puts the numbers on the
+           object itself; a refusal says nothing at all, which is why the fallback is the GetState answer rather
+           than the value we arrived with - a cached pts that survives a repair is a gap reopened on the next
+           beat, and an open gap is what triggers a rebuild. */
+        if (Number.isFinite(reported.pts)) {
+          adopted = {
+            pts: reported.pts,
+            qts: keep(reported.qts, keep(server.qts, adopted.qts)),
+            date: keep(reported.date, keep(server.date, adopted.date)),
+            count: keep(reported.count, keep(server.count, adopted.count)),
+          };
+        }
+        if (/toolong/i.test(lastClass)) { action = 'too-long'; adopted = { ...server }; break; }
+        if (/empty/i.test(lastClass)) { action = outcome.messages || outcome.otherUpdates ? 'difference-applied' : 'difference-empty'; break; }
+        if (!/slic/i.test(lastClass)) { action = outcome.messages || outcome.otherUpdates ? 'difference-applied' : 'in-sync'; break; }
+        /* Still slicing: keep going while the account genuinely owes us updates, and stop the moment it does not,
+           so a session that has caught up mid-loop does not send one more request to be told so. */
+        if (Number.isFinite(server.pts) && adopted.pts >= server.pts) { action = 'difference-applied'; break; }
       }
-      if (outcome.messages || outcome.otherUpdates) {
-        // The missed content is the catch-up's job: it dedupes against `signals`, budgets itself, and labels rows
-        // `replayed: true`, which is the truth about a recovery. This function's job is only that pushes resume.
+      if (outcome.steps >= maxSteps && /slic/i.test(lastClass)) {
+        // Out of budget with the server still mid-answer: further along, not finished, and the next beat resumes
+        // from the adopted pts. Flagged so the log and the panel say "partial" rather than "repaired".
+        outcome.partial = true;
+        action = 'difference-partial';
+      }
+      /* The stamp is cleared by any difference that was actually answered - including one refused as too long - and
+         kept only by the beat that set it, or the backoff would last exactly as long as it takes to write it. */
+      if (!throttled) writeState(adopted, { nextDifferenceAt: 0 });
+
+      /* One rule for every answer that cost us a request: the channels are read back. Whether the difference
+         returned messages, refused to compute, was throttled, or swore nothing was missing while the sweep keeps
+         finding things, the recovery is the same history read - deduped against `signals`, budgeted, and labelled
+         `replayed: true`. This is also the safety net for a permanently deaf session: the push stream may never
+         recover, and the workspace still gets its messages on the next sweep. */
+      if (outcome.steps > 0) {
         const entry = entryFor(userId);
         if (entry) entry.needsCatchUp = true;
       }
-      log(outcome.action === 'too-long' ? 'warn' : 'info', 'Telegram update state reconciled', {
-        userId, action: outcome.action, from: cached.pts, to: adopted.pts, gap: outcome.gap,
-        messages: outcome.messages, otherUpdates: outcome.otherUpdates, providerClass: className || null, reason,
-      });
+      if (action !== 'in-sync' || outcome.messages || outcome.otherUpdates) {
+        log(action === 'too-long' || action === 'session-revoked' ? 'warn' : 'info', 'Telegram update state reconciled', {
+          userId, action, from: cached.pts, to: adopted.pts, gap: outcome.gap, steps: outcome.steps,
+          messages: outcome.messages, otherUpdates: outcome.otherUpdates, partial: outcome.partial,
+          backoffMs: outcome.backoffMs || null, providerClass: lastClass || null, error: outcome.error, reason,
+        });
+      }
+      outcome.action = action;
+      outcome.statePts = adopted.pts;
       return outcome;
     } catch (error) {
       outcome.action = 'failed';
@@ -436,6 +571,10 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
       log('warn', 'Telegram update stream needs a rebuild but no restorer is wired', { userId, reason });
       return false;
     }
+    const prior = rebuildAttempts.get(key);
+    // Counted here rather than in the restorer's success path, because "we replaced the session" is the fact the
+    // strike ladder needs: whether that replacement then worked is the next three beats' business.
+    rebuildAttempts.set(key, { at: now(), count: (Number(prior?.count) || 0) + 1 });
     heartbeat.rebuilt += 1;
     log('warn', 'Telegram update stream rebuild forced', { userId, reason, cooldownMs: rebuildCooldownMs, forced: force === true, escalated: escalate === true });
     // Deliberately not awaited by the caller: a reconnect is a minutes-long affair (handshake, resume, replay)
@@ -444,6 +583,40 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
     // session cannot become an unhandled rejection inside the interval.
     Promise.resolve().then(() => onDeadStream(userId, reason, { force: force === true, escalate: escalate === true })).catch((error) => {
       log('warn', 'Telegram update stream rebuild failed', { userId, reason, error: `${error?.message || error}`.slice(0, 200) });
+    });
+    return true;
+  }
+
+  /**
+   * Say out loud that no reconnect is going to fix this, and let whoever owns the user's session decide what the
+   * user is told.
+   *
+   * The listener deliberately does not touch `users` itself: the row is the server's, and the honest split is
+   * "we hold the evidence, they decide the consequence". What this guarantees is that the evidence arrives once
+   * per window rather than once per beat, and that the decision is recorded on the session so a status route can
+   * answer "why does my bot say it needs signing in" without reading logs.
+   */
+  /** Has a rebuild been asked for this session recently enough to count as "we already tried the strong fix"? */
+  function rebuildAttemptsFor(userId, withinMs = gapReauthWindowMs) {
+    const attempt = rebuildAttempts.get(String(userId));
+    return Boolean(attempt) && attempt.count > 0 && now() - attempt.at <= withinMs;
+  }
+
+  function declareSessionUnrecoverable(userId, reason, details = {}) {
+    const key = String(userId);
+    const last = unrecoverableCooldown.get(key) || 0;
+    if (now() - last < rebuildCooldownMs) return false;
+    unrecoverableCooldown.set(key, now());
+    heartbeat.unrecoverable += 1;
+    const entry = entryFor(userId);
+    if (entry) entry.reauthRequired = true;
+    if (typeof onSessionUnrecoverable !== 'function') {
+      log('warn', 'Telegram session needs a fresh sign-in but no re-auth handler is wired', { userId, reason, ...details });
+      return false;
+    }
+    log('warn', 'Telegram session marked for re-authentication', { userId, reason, cooldownMs: rebuildCooldownMs, ...details });
+    Promise.resolve().then(() => onSessionUnrecoverable(userId, reason, details)).catch((error) => {
+      log('warn', 'Telegram re-auth marking failed', { userId, reason, error: `${error?.message || error}`.slice(0, 200) });
     });
     return true;
   }
@@ -464,7 +637,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
       targets.push([userId, entry]);
     }
     const cycleStartedAt = now();
-    const results = { reason, sessions: targets.length, sent: 0, answered: 0, dead: 0, stalled: 0, quiet: 0, unknown: 0, resynced: 0, recovered: 0, deaf: 0, worstMs: 0 };
+    const results = { reason, sessions: targets.length, sent: 0, answered: 0, dead: 0, stalled: 0, quiet: 0, unknown: 0, resynced: 0, recovered: 0, deaf: 0, partial: 0, throttled: 0, unrecoverable: 0, worstMs: 0 };
     if (!targets.length) {
       heartbeat.cycles += 1;
       heartbeat.lastCycleAt = new Date(cycleStartedAt).toISOString();
@@ -561,36 +734,77 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
 
       let stalls = Number(previous?.stalls) || 0;
       let deaf = Number(previous?.deaf) || 0;
-      if (sync.action === 'too-long') {
+      let strikes = Number(previous?.strikes) || 0;
+      /* Whether this stream is still behind, judged from numbers that cannot argue with each other: what the
+         account says it owes us, what this session has been shown, and what the gap sweep had to go and fetch by
+         hand. `difference-partial` counts as well - a slice loop that ran out of budget is a gap left open,
+         however the beat's own delta looked. */
+      const openGap = Number.isFinite(gapBefore) && gapBefore > 0;
+      const unresolved = !restarted
+        && ((ptsAdvanced && !handlerKeptUp) || (ptsStatic && replayFound) || (openGap && !handlerKeptUp) || sync.action === 'difference-partial');
+      const rebuild = (reason, opts = {}) => requestStreamRebuild(userId, reason, opts);
+      if (sync.action === 'throttled') {
+        // Telegram asked for a pause. The session is not sick, it is on a clock: nothing escalates, nothing is
+        // forgiven either, and the stamp inside the client cache is the thing that does the waiting.
+        results.throttled += 1;
+        heartbeat.throttled += 1;
+        strikes = Number(previous?.strikes) || 0;
+      } else if (sync.action === 'session-revoked') {
+        /* The auth key is gone, which is the one answer no rebuild can serve - reconnecting against
+           `AUTH_KEY_UNREGISTERED` is how a watchdog becomes the outage it is watching for. So it goes straight to
+           the verdict, with no strike count in front of it. */
+        results.unrecoverable += 1;
+        declareSessionUnrecoverable(userId, 'telegram-session-revoked', { pts, gap: Number(sync.gap) || 0, error: sync.error });
+        strikes = 0;
+      } else if (sync.action === 'too-long') {
         /* Telegram has said in as many words that this session's `pts` is too far behind to be caught up by a
-           difference, and it will keep saying that until the session is new. Nothing else in this file forces an
-           exception to the rebuild cooldown; this is the one that has earned it, and the fresh client adopts a
-           current state on its next beat, so it cannot loop. */
-        requestStreamRebuild(userId, 'update-state-too-far-behind', { force: true });
+           difference - either as an answer (`updates.differenceTooLong`) or as a refusal
+           (`CHANNEL_DIFFERENCE_TOO_LONG`, `UPDATES_TOO_OLD`), which is why both arrive here. It will go on saying
+           it until the session is new, so this is the one reply that buys an exception to the rebuild cooldown, and
+           the fresh client adopts a current state on its next beat so it cannot loop. */
+        rebuild('update-state-too-far-behind', { force: true });
+        strikes = 0;
         stalls = 0;
         deaf = 0;
-      } else if (ptsStatic && replayFound && !restarted) {
-        deaf += 1;
-        results.deaf += 1;
-        heartbeat.deaf += 1;
-        if (deaf >= ptsStallBeats) {
-          /* Two beats of "the channel wrote, the account owes us nothing, and we had to go and read it
-             ourselves". The difference has already been asked for by then (`force` above), so the remaining
-             option is a session with no history: escalate, and keep the cooldown that stops a skewed clock from
-             turning this into a reconnect loop. */
-          requestStreamRebuild(userId, 'deaf-stream-pts-static', { escalate: true });
-          deaf = 0;
+      } else if (unresolved) {
+        strikes += 1;
+        if (sync.action === 'difference-partial') { results.partial += 1; heartbeat.partial += 1; }
+        if (ptsStatic && replayFound) {
+          deaf += 1;
+          results.deaf += 1;
+          heartbeat.deaf += 1;
+          if (deaf >= ptsStallBeats) {
+            /* Two beats of "the channel wrote, the account owes us nothing, and we had to go and read it
+               ourselves". The difference has already been asked for by then (`force` in the resync), so the only
+               thing left is a session with no history: escalate, and keep the cooldown that stops a skewed clock
+               from turning this into a reconnect loop. */
+            rebuild('deaf-stream-pts-static', { escalate: true });
+            deaf = 0;
+          }
+        } else if (ptsAdvanced && !handlerKeptUp) {
+          stalls += 1;
+          if (stalls >= ptsStallBeats) {
+            results.stalled += 1;
+            heartbeat.stalled += 1;
+            rebuild('update-stream-stalled');
+            stalls = 0;
+          }
         }
-      } else if (ptsAdvanced && !handlerKeptUp && !restarted) {
-        stalls += 1;
-        if (stalls >= ptsStallBeats) {
-          results.stalled += 1;
-          heartbeat.stalled += 1;
-          requestStreamRebuild(userId, 'update-stream-stalled');
+        if (strikes >= ptsGapStrikes && rebuildAttemptsFor(userId)) {
+          /* The escalation has just been tried, and the gap is being measured for the third beat running - about
+             90 seconds of "a brand-new session is behind in exactly the same way". What changed is not the
+             transport, so this stops being a fault the app can repair and becomes a sign-in, which is the only
+             action that mints an auth key. Judged after the escalation on purpose: no session is condemned without
+             having first been replaced. */
+          results.unrecoverable += 1;
+          declareSessionUnrecoverable(userId, 'pts-gap-unresolved', { pts, gap: Number(sync.gap) || (openGap ? gapBefore : 0), strikes, action: sync.action });
+          strikes = 0;
+          deaf = 0;
           stalls = 0;
         }
       } else {
         if (ptsAdvanced) results.quiet += 1;
+        strikes = 0;
         stalls = 0;
         deaf = 0;
       }
@@ -602,8 +816,13 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
         ms: Number(probe.ms) || 0,
         stalls,
         deaf,
+        strikes,
+        rebuilds: Number(rebuildAttempts.get(key)?.count) || 0,
         statePts: Number.isFinite(sync.serverPts) ? sync.serverPts : pts,
         gap: Number(sync.gap) || 0,
+        steps: Number(sync.steps) || 0,
+        partial: sync.partial === true,
+        throttledFor: Number(sync.backoffMs) || 0,
         action: sync.action,
         error: sync.error || null,
       });
@@ -625,7 +844,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
     heartbeat.lastCycleSessions = results.sessions;
     /* The line the operator greps to prove the watchdog is alive: once per cycle, with every count that decides
        anything in it, so "it is beating but the streams are dead" is one line rather than a correlation. */
-    log(results.dead || results.stalled || results.deaf ? 'warn' : 'info', 'Telegram heartbeat sent', {
+    log(results.dead || results.stalled || results.deaf || results.unrecoverable ? 'warn' : 'info', 'Telegram heartbeat sent', {
       ...results,
       intervalMs: heartbeatIntervalMs,
       slowestMs: results.worstMs,
@@ -644,6 +863,11 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
       gap: Number(beat.gap) || 0,
       action: beat.action || null,
       deaf: Number(beat.deaf) || 0,
+      strikes: Number(beat.strikes) || 0,
+      rebuilds: Number(beat.rebuilds) || 0,
+      steps: Number(beat.steps) || 0,
+      partial: beat.partial === true,
+      throttledFor: Number(beat.throttledFor) || 0,
       ms: Number.isFinite(beat.ms) ? beat.ms : null,
       stalls: Number(beat.stalls) || 0,
       error: beat.error || null,
@@ -682,6 +906,9 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
     const key = String(userId);
     const had = streamBeats.delete(key);
     rebuildCooldown.delete(key);
+    unrecoverableCooldown.delete(key);
+    const entry = entryFor(userId);
+    if (entry) entry.reauthRequired = false;
     return { cleared: had ? 1 : 0 };
   }
 
@@ -692,6 +919,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
     const lastAt = stats.lastAt ? Date.parse(stats.lastAt) : 0;
     const silenceMs = lastAt ? Math.max(0, now() - lastAt) : null;
     const lastRun = catchUpRuns.get(String(userId)) || 0;
+    const beat = streamBeats.get(String(userId)) || null;
     /* Staggered per workspace, deterministically: `gapCatchUpMs + spread` is the outer bound, and a user who
        signed up last is not the one that gets throttled every time the fleet is asked at once. */
     const spread = staggerFor(userId, gapCatchUpSpreadMs);
@@ -701,6 +929,16 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
       lastDelayMs: Number.isFinite(stats.lastDelayMs) ? stats.lastDelayMs : null,
       suspect: silenceMs !== null && silenceMs >= silenceSuspectMs,
       catchUpOverdue: now() - lastRun >= gapCatchUpMs + spread,
+      /* Two facts the sweep is allowed to act on sooner than its own stagger. `needsCatchUp` is the promise that a
+         deaf session is a *delay* and never a loss: the 60-second rearm pass consumes it, so a stream the account
+         refuses to reconcile still gets its channels read back within a minute instead of waiting on the staggered
+         gap check. `reauthRequired` is the one fact that means a human is needed, and it belongs in health rather
+         than in a log line, because "is it still recovering or is it finished" is the only question anybody asks. */
+      needsCatchUp: entry?.needsCatchUp === true,
+      reauthRequired: entry?.reauthRequired === true,
+      beatStrikes: Number(beat?.strikes) || 0,
+      beatRebuilds: Number(beat?.rebuilds) || 0,
+      beatAction: beat?.action || null,
       listening: Boolean(entry?.handler) && handlerIsLive(entry.client, entry.handler) && entry.client?.connected === true,
     };
   }
@@ -966,6 +1204,14 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
         beatGap: Number(beatInfo?.gap) || 0,
         beatAction: beatInfo?.action || null,
         beatDeaf: Number(beatInfo?.deaf) || 0,
+        /* The strike ladder in three numbers: how many beats in a row the stream has been behind, how many
+           rebuilds this session has already been given, and whether a workspace is now waiting on a sign-in.
+           `reauthRequired` is the only one of these that means "stop waiting for it to fix itself". */
+        beatStrikes: Number(beatInfo?.strikes) || 0,
+        beatRebuilds: Number(beatInfo?.rebuilds) || 0,
+        beatSteps: Number(beatInfo?.steps) || 0,
+        beatPartial: beatInfo?.partial === true,
+        reauthRequired: entry.reauthRequired === true,
         beatStalls: Number(beatInfo?.stalls) || 0,
         beatError: beatInfo?.error || null,
       });
@@ -1005,5 +1251,5 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
 
   function markSessionResumed() { resumedAfterBoot += 1; }
 
-  return { startTelegramListener, handlerIsLive, ingestMessage, runCatchUp, statsFor, telegramFleetSummary, probeUpdateStream, resyncUpdateState, readUpdateState: (client) => readUpdateState(client), streamHealth, beatUpdateStreams, heartbeatSummary, streamBeatFor, resetStreamBaseline, requestStreamRebuild, markSessionResumed, EMPTY_STATS };
+  return { startTelegramListener, handlerIsLive, ingestMessage, runCatchUp, statsFor, telegramFleetSummary, probeUpdateStream, resyncUpdateState, declareSessionUnrecoverable, readUpdateState: (client) => readUpdateState(client), streamHealth, beatUpdateStreams, heartbeatSummary, streamBeatFor, resetStreamBaseline, requestStreamRebuild, markSessionResumed, EMPTY_STATS };
 }

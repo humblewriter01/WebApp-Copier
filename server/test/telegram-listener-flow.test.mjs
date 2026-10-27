@@ -901,7 +901,13 @@ function makeStateHarness({ serverPts = () => 4200, difference = null, ...overri
       return { pts: BigInt(serverPts(beat)), qts: 11n, date: 1_760_000_000, count: 3 };
     }
     if (request.className === GET_DIFFERENCE) {
-      return difference ?? { className: 'updates.differenceEmpty', newMessages: [], pts: 4200n, currentDate: 1_760_000_000 };
+      /* A fixture may answer by call number rather than by a fixed object: `updates.differenceSlice` only makes
+         sense as a *sequence*, and a refusal that arrives on the second request is a different bug from one that
+         arrives on the first. The number is 1-based across the whole harness. */
+      harness.differenceAsked = (harness.differenceAsked || 0) + 1;
+      const answer = typeof difference === 'function' ? difference(request, harness.differenceAsked) : difference;
+      if (answer instanceof Error) throw answer;
+      return answer ?? { className: 'updates.differenceEmpty', newMessages: [], pts: 4200n, currentDate: 1_760_000_000 };
     }
     throw new Error(`the listener should not send ${request.className} here`);
   };
@@ -1056,4 +1062,242 @@ test('the state helpers read the shapes the library actually returns, including 
   const partial = { [UPDATE_STATE_KEY]: { pts: 10n } };
   assert.deepEqual(readUpdateState(partial), { pts: 10, qts: null, date: null, at: null }, 'a cached state missing a field is read as missing, not as zero');
   assert.equal(UPDATE_STATE_KEY, '_sdbUpdateState', 'the key is exported because the whole state lives in that one property');
+});
+
+/* ---------------------------------------------------------------------------
+ * THE FIVE ANSWERS A DIFFERENCE REQUEST CAN GET. `updates.GetDifference` replies with `updates.difference`
+ * (caught up), `updates.differenceSlice` (here is part of it, ask again from here), `updates.differenceEmpty`
+ * (the account owes you nothing) or `updates.differenceTooLong` (the hole is wider than this API will fill) - and
+ * it also *throws*, which is how Telegram answers the three cases that matter most: a channel unread for days
+ * (`UPDATES_TOO_OLD`), a fleet that asked too often (`FLOOD_WAIT_n`), and a session the account has dropped
+ * (`AUTH_KEY_UNREGISTERED`). GramJS raises the last two as `RPCError` subclasses and nothing in the library
+ * distinguishes them, so the distinction lives here: back off, fall back, or stop.
+ *
+ * Each one is tested for the same three things: what the cached state ends up as, what the beat records, and what
+ * is never done (a fabricated row, a reconnect against a dead key, a hammering retry against a flood limit).
+ * --------------------------------------------------------------------------- */
+
+const emptyAnswer = (pts) => ({ className: 'updates.differenceEmpty', newMessages: [], pts: BigInt(pts), currentDate: 1_760_000_000 });
+const rpcError = (message, code, extra = {}) => Object.assign(new Error(message), { errorMessage: code, ...extra });
+
+test('a differenceSlice is answered by asking again, from the state the slice just handed over', async () => {
+  const slices = [
+    { className: 'updates.differenceSlice', newMessages: [channelMessage({ id: 91 }), channelMessage({ id: 92 })], state: { pts: 4230n, qts: 12n, date: 1_760_000_300, count: 4 } },
+    { className: 'updates.differenceSlice', newMessages: [channelMessage({ id: 93 })], state: { pts: 4250n, qts: 12n, date: 1_760_000_500, count: 4 } },
+    { className: 'updates.difference', newMessages: [channelMessage({ id: 94 })], state: { pts: 4260n, qts: 12n, date: 1_760_000_600, count: 5 } },
+  ];
+  const harness = makeStateHarness({
+    serverPts: (index) => (index === 0 ? 4200 : 4260),
+    difference: (request, asked) => slices[asked - 1] || emptyAnswer(4260),
+  });
+  await harness.cycle();                          // 4200, adopted: nothing to reconcile against yet
+  await harness.cycle();                          // 4260 with a silent handler: a gap of 60, one reply cannot close it
+  assert.deepEqual(harness.differences().map((request) => Number(request.pts)), [4200, 4230, 4250],
+    'every request is sent from where the previous answer left the state, which is the only way a slice ends');
+  const beat = harness.listener.streamBeatFor(USER_ID);
+  assert.deepEqual({ action: beat.action, steps: beat.steps, gap: beat.gap }, { action: 'difference-applied', steps: 3, gap: 60 });
+  const state = harness.listener.readUpdateState(harness.client);
+  assert.equal(state.pts, 4260, 'and the session finishes the beat on the account’s own number');
+  assert.equal(state.qts, 12, 'every field of the last answer is what is cached, not the first one’s');
+  assert.equal(harness.entry().needsCatchUp, true, 'channel content is still the history read’s job, slice or no slice');
+  const line = harness.logs.filter((entry) => entry.message === 'Telegram update state reconciled').pop();
+  assert.deepEqual({ steps: line.meta.steps, messages: line.meta.messages, partial: line.meta.partial }, { steps: 3, messages: 4, partial: false },
+    'the log carries how many round trips the repair took and how much it found, because "reconciled" alone does not say');
+  assert.ok(harness.logs.every((entry) => !/captured/.test(entry.message)), 'a difference never writes a signal row itself');
+});
+
+test('a loop that runs out of budget is called partial, and the next beat resumes from where it stopped', async () => {
+  // A gap of 300, slices of 40, and three requests of budget: further along, not finished.
+  const harness = makeStateHarness({
+    differenceMaxSteps: 3,
+    serverPts: (index) => (index === 0 ? 4200 : 4500),
+    difference: (request, asked) => ({
+      className: 'updates.differenceSlice',
+      newMessages: [],
+      state: { pts: BigInt(Number(request.pts) + 40), qts: 12n, date: 1_760_000_000 + asked * 40, count: 3 },
+    }),
+  });
+  await harness.cycle();
+  await harness.cycle();
+  const beat = harness.listener.streamBeatFor(USER_ID);
+  assert.deepEqual({ action: beat.action, steps: beat.steps, partial: beat.partial }, { action: 'difference-partial', steps: 3, partial: true },
+    'an unfinished difference says so, instead of the "reconciled" that would hide a hole 180 updates wide');
+  assert.equal(harness.differences().length, 3, 'and it stops at the budget rather than catching up mid-outage forever');
+  assert.equal(harness.listener.readUpdateState(harness.client).pts, 4320, 'the state it leaves behind is the one it reached, never the one that produced the gap');
+  assert.equal(harness.entry().needsCatchUp, true, 'a partial difference is still a flagged session: the sweep reads the channels either way');
+  await harness.cycle();
+  assert.equal(harness.differences()[3] && Number(harness.differences()[3].pts), 4320, 'the next beat continues from 4320 instead of re-asking the whole 300');
+});
+
+test('a difference the server refuses to compute falls back to the history read instead of crashing', async () => {
+  const harness = makeStateHarness({
+    serverPts: (index) => (index === 0 ? 4200 : 94200),
+    difference: () => { throw rpcError('The referenced messages are too old to access', 'UPDATES_TOO_OLD', { errorCode: 400 }); },
+  });
+  await harness.cycle();
+  await harness.cycle();
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(harness.listener.streamBeatFor(USER_ID).action, 'too-long', 'a thrown refusal is classified, not lumped in with "the socket is sad"');
+  assert.equal(harness.listener.readUpdateState(harness.client).pts, 94200, 'the state adopts what the account is on, because the number that produced the refusal is a number to stop using');
+  assert.deepEqual(harness.rebuilt, [{ userId: USER_ID, reason: 'update-state-too-far-behind', forced: true, escalated: false }],
+    'and the session is replaced past the cooldown, since this refusal does not expire on its own');
+  assert.equal(harness.entry().needsCatchUp, true, 'the messages this session never saw are read back from history, which is the only API that answers for a hole this wide');
+  assert.ok(harness.logs.some((entry) => entry.message === 'Telegram update state reconciled' && entry.meta.action === 'too-long'));
+  // The counter-example that keeps this from being an outage amplifier: a *second* beat after the refusal is quiet.
+  await harness.cycle();
+  assert.equal(harness.differences().length, 1, 'the adopted state means the next beat has nothing to ask about');
+});
+
+test('a FLOOD_WAIT pauses the reconciliation and nothing else', async () => {
+  const harness = makeStateHarness({
+    serverPts: (index) => (index === 0 ? 4200 : 4260),
+    // Flooded once, and answered the second time the wait expires - a fixture that refused forever would prove
+    // nothing about the stamp being cleared.
+    difference: (request, asked) => {
+      if (asked === 1) throw rpcError('A wait of 57 seconds is required', 'FLOOD_WAIT_57', { seconds: 57 });
+      return emptyAnswer(4260);
+    },
+  });
+  await harness.cycle();
+  await harness.cycle();
+  const beat = harness.listener.streamBeatFor(USER_ID);
+  assert.deepEqual({ action: beat.action, throttledFor: beat.throttledFor }, { action: 'throttled', throttledFor: 57_000 },
+    'the wait the provider asked for is the wait we keep, in the record and in the log');
+  assert.equal(harness.listener.readUpdateState(harness.client).pts, 4200, 'a throttle never marks us caught up: the gap stays, so the next beat closes it');
+  await harness.cycle();
+  assert.equal(harness.differences().length, 1, 'and while the wait is running no second request is sent, which is what stops a fleet hammering the same limit every 30 seconds');
+  assert.equal(harness.listener.streamHealth(USER_ID).beatAction, 'throttled');
+  assert.deepEqual(harness.rebuilt, [], 'being rate limited is not a dead stream, and treating it as one is how a flood wait becomes an outage');
+  harness.advance(60_000);
+  await harness.cycle();
+  assert.equal(harness.differences().length, 2, 'the stamp expires instead of becoming a permanent silence');
+  assert.equal(harness.listener.streamBeatFor(USER_ID).action, 'difference-empty', 'and the second ask is answered normally');
+  assert.equal(harness.listener.readUpdateState(harness.client).nextDifferenceAt, undefined, 'a difference that is answered clears the stamp, so a pause is one pause and not a lifestyle');
+});
+
+test('an auth key the account no longer recognises ends the session instead of retrying it', async () => {
+  const declared = [];
+  const harness = makeStateHarness({
+    onSessionUnrecoverable: async (userId, reason, details) => { declared.push({ userId, reason, details }); },
+    serverPts: (index) => (index === 0 ? 4200 : 4260),
+    difference: () => { throw rpcError('AUTH_KEY_UNREGISTERED', 'AUTH_KEY_UNREGISTERED', { errorCode: 401 }); },
+  });
+  await harness.cycle();
+  await harness.cycle();
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(harness.listener.streamBeatFor(USER_ID).action, 'session-revoked');
+  assert.deepEqual(harness.rebuilt, [], 'nothing is reconnected: a new socket on a dead key is the same 401 in a different shape');
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(declared.length, 1, 'the workspace is asked to sign in, once, and not every beat afterwards');
+  assert.equal(declared[0].reason, 'telegram-session-revoked');
+  assert.equal(harness.listener.streamHealth(USER_ID).reauthRequired, true, 'the verdict is a fact about the session, readable without a log search');
+  assert.ok(harness.logs.some((entry) => entry.level === 'warn' && entry.message === 'Telegram session marked for re-authentication'));
+});
+
+test('three beats of a gap a rebuild could not close ask the user to sign in, about 90 seconds in', async () => {
+  const declared = [];
+  const harness = makeStateHarness({
+    onSessionUnrecoverable: async (userId, reason, details) => { declared.push({ reason, details }); },
+    // The gap grows every beat and the account keeps insisting it owes us nothing: the pattern is unambiguous.
+    serverPts: (index) => 4260 + index * 60,
+    difference: (request) => emptyAnswer(Number(request.pts)),
+  });
+  await harness.cycle();                                  // adopt
+  await harness.cycle();                                  // gap 60: a difference is asked and refused
+  assert.equal(harness.listener.streamBeatFor(USER_ID).strikes, 1, 'one beat of it is a measurement');
+  await harness.cycle();                                  // gap 120: the stall detector replaces the session
+  assert.equal(harness.rebuilt.length, 1, 'the rebuild comes before the verdict, never instead of it');
+  assert.equal(harness.listener.streamBeatFor(USER_ID).strikes, 2);
+  await harness.cycle();                                  // gap 180, on a session that is 30 seconds old
+  assert.equal(declared.length, 1, 'a brand-new session already failing the same way is not a transport problem any more');
+  assert.equal(declared[0].reason, 'pts-gap-unresolved');
+  assert.ok(declared[0].details.strikes >= 3 && declared[0].details.gap > 0, 'and the evidence travels with the verdict');
+  const verdictBeat = harness.listener.streamBeatFor(USER_ID);
+  assert.deepEqual({ action: verdictBeat.action, strikes: verdictBeat.strikes, rebuilds: verdictBeat.rebuilds }, { action: 'difference-empty', strikes: 0, rebuilds: 1 },
+    'the verdict resets the ladder it climbed, and the record keeps the evidence of what was tried');
+  const fleet = harness.listener.telegramFleetSummary().sessions[0];
+  assert.equal(fleet.reauthRequired, true, 'so is the panel field, which is the whole point of the strike counter');
+  await harness.cycle();
+  await harness.cycle();
+  assert.equal(declared.length, 1, 'one verdict per cooldown window, however long the gap goes on growing afterwards');
+  assert.equal(harness.listener.heartbeatSummary().unrecoverable, 1);
+});
+
+test('a stream that reconciles is forgiven, and the strike count starts over', async () => {
+  const declared = [];
+  const harness = makeStateHarness({
+    onSessionUnrecoverable: async (userId, reason) => { declared.push(reason); },
+    serverPts: (index) => 4260 + index * 60,
+    difference: (request) => emptyAnswer(Number(request.pts)),
+  });
+  await harness.cycle();
+  await harness.cycle();
+  await harness.cycle();
+  assert.equal(harness.listener.streamBeatFor(USER_ID).strikes, 2, 'two beats behind, and no verdict yet');
+  harness.entry().stats.seen = 5;                          // the handler starts being shown things again
+  await harness.cycle();
+  assert.equal(harness.listener.streamBeatFor(USER_ID).strikes, 0, 'a beat where the handler kept up wipes the history, because a recovering session is not a condemned one');
+  harness.entry().stats.seen = 6;
+  await harness.cycle();
+  await harness.cycle();
+  assert.equal(declared.length, 0, 'and the ladder has to be climbed again from the bottom');
+});
+
+test('a difference that finds nothing still queues the session for the next minute, not the next three', async () => {
+  // The shape of a permanently deaf stream: the account’s number never moves, the sweep keeps bringing back
+  // messages, and the difference answers "nothing is missing" every time it is asked.
+  const harness = makeStateHarness({ serverPts: () => 4200, difference: () => emptyAnswer(4200) });
+  await harness.cycle();
+  harness.entry().stats.catchUpSaved = 1;
+  await harness.cycle();
+  assert.equal(harness.listener.streamBeatFor(USER_ID).action, 'difference-empty', 'the server’s answer is in the record');
+  assert.equal(harness.differences().length, 1, 'and it was actually asked, which is the only way to tell "you are current" from "I have stopped telling you"');
+  assert.equal(harness.entry().needsCatchUp, true,
+    'the flag the 60-second sweep reads is set even though the difference found nothing: for a session the account will not reconcile, that read is the whole recovery, and a flag that only rises on a successful difference would leave the messages to the three-minute stagger');
+  const health = harness.listener.streamHealth(USER_ID);
+  assert.equal(health.needsCatchUp, true, 'health publishes the flag, which is the only way the minute-long re-arm pass can see it: the unit sets it, the server consumes it, and the pin for that hand-off lives in the index test');
+  assert.equal(health.beatAction, 'difference-empty', 'and it publishes the answer that produced it, so "the server insists this session is current" is a fact a panel can show without a log search');
+});
+
+test('a channel of thirty thousand members that stops pushing is caught by the state, and nothing is invented', async () => {
+  /* The failure mode a ping cannot see: the account’s `pts` moves because its *other* chats are loud, this
+     session is shown nothing for the monitored channel, and a difference request answers with `otherUpdates` -
+     the channel events it owes but never sent. The handler is not re-fed from a difference (that would mint a
+     `replayed: false` row for an event nobody pushed, which is the one number the workspace trusts); the answer
+     is to record the debt, flag the session, and let the history read bring the content back. */
+  const harness = makeStateHarness({
+    serverPts: (index) => 4200 + index * 40,
+    difference: () => ({ className: 'updates.difference', otherUpdates: [{ className: 'updateNewChannelMessage' }, { className: 'updateDeleteChannelMessage' }], state: { pts: 4240n, qts: 11n, date: 1_760_000_040, count: 3 } }),
+  });
+  await harness.cycle();
+  await harness.cycle();
+  const beat = harness.listener.streamBeatFor(USER_ID);
+  assert.deepEqual({ action: beat.action, gap: beat.gap }, { action: 'difference-applied', gap: 40 }, 'the debt is measured and closed as far as the API allows');
+  const line = harness.logs.filter((entry) => entry.message === 'Telegram update state reconciled').pop();
+  assert.deepEqual({ messages: line.meta.messages, otherUpdates: line.meta.otherUpdates }, { messages: 0, otherUpdates: 2 },
+    'the count of events that were owed, logged as the reason and never as a signal');
+  assert.ok(harness.logs.every((entry) => !/captured/.test(entry.message)), 'an update pulled by a difference is never a capture, so `replayed: false` stays proof of a real push');
+  assert.equal(harness.entry().needsCatchUp, true, 'and the channel content is fetched by the catch-up, which is GramJS’s only working recovery for a channel');
+  await harness.cycle();
+  await harness.cycle();
+  assert.deepEqual(harness.rebuilt.map((entry) => entry.reason), ['update-stream-stalled'], 'a pts that keeps outrunning a silent handler becomes a new session, on the same two-beat rule as any other stall');
+});
+
+test('a session that comes back from a sign-in is not still condemned by the failure it arrived with', async () => {
+  const declared = [];
+  const harness = makeStateHarness({
+    onSessionUnrecoverable: async (userId, reason) => { declared.push(reason); },
+    serverPts: (index) => (index === 0 ? 4200 : 4260),
+    difference: () => { throw rpcError('AUTH_KEY_UNREGISTERED', 'AUTH_KEY_UNREGISTERED', { errorCode: 401 }); },
+  });
+  await harness.cycle();
+  await harness.cycle();
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.equal(declared.length, 1, 'the verdict lands once');
+  assert.equal(harness.listener.streamHealth(USER_ID).reauthRequired, true);
+  assert.equal(harness.differences().length, 1, 'and while it stands, the beat stops asking the question that produced it');
+  harness.listener.resetStreamBaseline(USER_ID);
+  assert.equal(harness.listener.streamHealth(USER_ID).reauthRequired, false, 'a re-attach wipes the verdict: the row says the session was signed in again, and an old verdict must not survive that');
+  await harness.cycle();
+  assert.equal(harness.listener.streamBeatFor(USER_ID).strikes, 0, 'with the ladder, since a new session has to earn its own history');
 });

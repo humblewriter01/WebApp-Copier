@@ -527,9 +527,6 @@ const telegramCapture = createTelegramListener({
   pool,
   log: (level, message, meta) => log(level, message, meta),
   saveSignal: (userId, message, channel) => saveSignal(userId, message, channel),
-  /* The listener decides *when* a stream is not a stream; only this file can rebuild one, because a rebuild is a
-     disconnect, a fresh authorized client, a re-attach and a replay. Handing the callback down instead of
-     importing it keeps the watchdog testable without a server: a test injects a spy and asserts that it fired. */
   /* The listener decides *when* a stream is not a stream; only this file can rebuild one, because a rebuild is
      a disconnect, a fresh authorized client, a re-attach and a replay. Handing the callback down instead of
      importing it keeps the watchdog testable without a server: a test injects a spy and asserts it fired.
@@ -537,6 +534,28 @@ const telegramCapture = createTelegramListener({
      and it has no argument with an operator reading the evidence - and a restore retakes the beat's baseline,
      because a session that starts from zero counters would otherwise be accused of its own first minute. */
   onDeadStream: (userId, reason, { force = false, escalate = false } = {}) => restoreTelegramClient(userId, { reason, force, escalate }),
+  /* The last rung of the ladder, and the only one this file can climb with a database write rather than a socket:
+     `pts` still unreconciled three beats after a brand-new session was handed to it, or an auth key Telegram no
+     longer recognises. Both mean the same thing - the account has stopped treating *this login* as a live session -
+     and only the user can mint a new one, so the verdict is written where the app already looks for "is Telegram
+     linked" instead of being invented here. The session string is deliberately left in place:
+     `telegram_connected=FALSE` stops the resume loop and shows the user the connect flow, while the stored session
+     survives for an admin's forced reconnect, which is the one thing worth trying before asking a human for their
+     phone. Nulling it, as the unauthorised path in `restoreTelegramClient` does, is right when the key is provably
+     dead and wrong when we merely failed to prove it alive. */
+  onSessionUnrecoverable: async (userId, reason, details = {}) => {
+    const id = Number(userId);
+    if (!Number.isInteger(id) || id <= 0) return;
+    await pool.query('UPDATE users SET telegram_connected=FALSE WHERE id=$1', [id]).catch((error) => {
+      log('warn', 'Telegram re-auth marking could not be saved', { userId: id, reason, error: error.message });
+    });
+    const entry = telegramClients.get(id);
+    if (entry?.client?.disconnect) await entry.client.disconnect().catch(() => {});
+    telegramClients.delete(id);
+    log('warn', 'Telegram session left for the user to sign in again', {
+      userId: id, reason, pts: details?.pts ?? null, gap: details?.gap ?? null, strikes: details?.strikes ?? null, error: details?.error ?? null,
+    });
+  },
 });
 const startTelegramListener = (userId, client) => telegramCapture.startTelegramListener(userId, client);
 
@@ -2910,6 +2929,9 @@ app.get('/api/telegram/status', authenticate, asyncRoute(async (req, res) => {
     connected,
     listening: Boolean(entry?.client?.connected && entry.handler && telegramCapture.handlerIsLive(entry.client, entry.handler)),
     catchUpQueued: entry?.needsCatchUp === true,
+    /* Set when the reconciliation ladder ran out of rungs: the stream is not slow, it is finished, and the fix is a
+       sign-in. Phrased for the log and the panel and never for the trader UI, which has no idea what a `pts` is. */
+    reauthRequired: entry?.reauthRequired === true,
     monitoredChannels: channelRows[0]?.count ?? 0,
     messagesSeen: Number(stats.seen) || 0,
     messagesIgnored: Number(stats.ignored) || 0,
