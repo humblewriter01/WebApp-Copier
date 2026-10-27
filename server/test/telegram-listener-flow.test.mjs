@@ -1301,3 +1301,65 @@ test('a session that comes back from a sign-in is not still condemned by the fai
   await harness.cycle();
   assert.equal(harness.listener.streamBeatFor(USER_ID).strikes, 0, 'with the ladder, since a new session has to earn its own history');
 });
+
+/* ---------------------------------------------------------------------------
+ * THE PROVIDER'S OWN TIMEOUTS, AND WHAT THE WATCHDOG MAY NOT CONCLUDE FROM THEM. `telegram/client/updates.js`
+ * pings every 9 seconds with a 10-second race, three goes, and on failure it prints `Error: TIMEOUT` and calls
+ * `_sender.reconnect()`. So for up to about forty seconds a session can be perfectly healthy by the app's own
+ * measurement (`answered: 1, ms: 22`) while its socket is being re-established underneath. The guard in
+ * `services/telegram-keepalive.js` silences the print; what these tests cover is the other half - a beat that
+ * finds nothing to answer it *inside* that window waits one cycle instead of tearing a recovering session down,
+ * and a flap on its own is not allowed to become a deaf verdict, a strike, or a rebuild.
+ * --------------------------------------------------------------------------- */
+
+test('an unanswered beat during a provider keep-alive timeout waits one cycle, then acts', async () => {
+  const flap = { at: 1, count: 3 };
+  const harness = makeBeatHarness({ mode: 'error', transportFlap: () => flap, keepAliveFlapGraceMs: Number.MAX_SAFE_INTEGER });
+  await harness.cycle();
+  assert.deepEqual(harness.rebuilt, [], 'the first unanswered beat is not a verdict while the provider is reconnecting its own transport');
+  const beat = harness.listener.streamBeatFor(USER_ID);
+  assert.deepEqual({ flapping: beat.flapping, deadBeat: beat.deadBeat, keepAliveTimeouts: beat.keepAliveTimeouts }, { flapping: true, deadBeat: 1, keepAliveTimeouts: 3 },
+    'and it is recorded as a flap with a count, not as a healthy beat');
+  assert.equal(harness.listener.heartbeatSummary().flapping, 1, 'the cycle counts it separately from dead ones');
+  assert.ok(harness.logs.some((entry) => entry.level === 'warn' && entry.message === 'Telegram beat waits out a provider keep-alive timeout'),
+    'said once, out loud, because a deferred rebuild is a decision somebody should be able to see');
+  const health = harness.listener.streamHealth(USER_ID);
+  assert.equal(health.transportFlapping, true, 'and the panel can ask, rather than infer it from a missing signal');
+
+  await harness.cycle();
+  assert.deepEqual(harness.rebuilt.map((entry) => entry.reason), ['heartbeat-no-answer'],
+    'a second consecutive unanswered beat is a dead socket by our own measurement, whatever the provider is doing to its own');
+  assert.equal(harness.listener.streamBeatFor(USER_ID).flapping, false, 'the grace is one beat, not a policy of patience');
+
+  // The same window, expired: nothing is deferred, because the flap no longer explains the silence. (The fixture
+  // states the flap in absolute terms, so a grace of 1 ms is the same thing as a flap that happened an hour ago.)
+  const expired = makeBeatHarness({ mode: 'error', transportFlap: () => ({ at: 1, count: 3 }), keepAliveFlapGraceMs: 1 });
+  await expired.cycle();
+  assert.deepEqual(expired.rebuilt.map((entry) => entry.reason), ['heartbeat-no-answer'], 'outside the grace window a dead beat is a dead beat, immediately');
+  // And a session with no keep-alive noise at all keeps the behaviour it always had.
+  const quiet = makeBeatHarness({ mode: 'error', transportFlap: () => ({ at: 0, count: 0 }) });
+  await quiet.cycle();
+  assert.deepEqual(quiet.rebuilt.map((entry) => entry.reason), ['heartbeat-no-answer'], 'no flap, no forgiveness');
+});
+
+test('keep-alive noise on a session that answers is not a deaf stream, a strike, or a rebuild', async () => {
+  // The log the user is actually looking at: hundreds of provider TIMEOUTs, and a beat that answers in 22 ms.
+  const harness = makeStateHarness({
+    serverPts: (index) => 4200 + index * 5,
+    transportFlap: () => ({ at: 1, count: 412 }),
+    keepAliveFlapGraceMs: Number.MAX_SAFE_INTEGER,
+  });
+  await harness.cycle();
+  harness.entry().stats.seen = 5;                 // the handler is being shown messages, as it is in production
+  await harness.cycle();
+  harness.entry().stats.seen = 9;
+  await harness.cycle();
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.deepEqual(harness.rebuilt, [], 'four hundred provider timeouts do not add up to one reason to replace a session that answers');
+  const beat = harness.listener.streamBeatFor(USER_ID);
+  assert.deepEqual({ deaf: beat.deaf, strikes: beat.strikes, stalls: beat.stalls, flapping: Boolean(beat.flapping) }, { deaf: 0, strikes: 0, stalls: 0, flapping: false },
+    'and none of the stream detectors is fed by them: those read pts, the handler, and the sweep, never the provider’s logger');
+  const [session] = harness.listener.telegramFleetSummary().sessions;
+  assert.deepEqual({ keepAliveTimeouts: session.keepAliveTimeouts, transportFlapping: session.transportFlapping, reauthRequired: session.reauthRequired },
+    { keepAliveTimeouts: 412, transportFlapping: false, reauthRequired: false }, 'the count reaches the panel, so the noise is visible without being loud');
+});

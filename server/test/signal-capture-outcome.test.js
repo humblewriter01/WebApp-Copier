@@ -572,7 +572,7 @@ test('the sweep asks the channel what it said, and the heartbeat is what asks th
 });
 
 test('the transport can be moved off the plain port, and the option can never cost capture its signals', () => {
-  const transport = section(index, 'function telegramCaptureTransport()', '\nasync function restoreTelegramClient');
+  const transport = section(index, 'function telegramCaptureTransport(', '\nasync function restoreTelegramClient');
   assert.match(transport, /process\.env\.TELEGRAM_TRANSPORT \|\| ''\)\.toLowerCase\(\) !== 'wss'/, 'off by default: the beat is the fix, this is a knob');
   assert.match(transport, /useWSS: true/, 'and when it is on, it is the library\'s own option rather than a hand-rolled socket');
   assert.match(transport, /return \{ wss: false, options: base \}/, 'the shape tells the caller whether a fallback is even available');
@@ -581,14 +581,54 @@ test('the transport can be moved off the plain port, and the option can never co
   assert.match(restore, /const transport = telegramCaptureTransport\(\);/, 'the capture client is built from it');
   assert.match(restore, /if \(!transport\.wss\) throw error;/, 'a failure with the option off is the ordinary failure');
   assert.match(restore, /Telegram WSS transport could not connect; reconnecting over the default transport/, 'and with it on, the fallback is announced');
-  assert.match(restore, /client = new TelegramClient\(new StringSession\(sessionString\), Number\(process\.env\.API_ID\), process\.env\.API_HASH, \{ connectionRetries: 3, autoReconnect: true \}\);\n\s*await client\.connect\(\);/,
-    'retried on the default transport with the same session, so an operator can turn the knob from the dashboard without being able to break login or capture');
+  assert.match(restore, /client = new TelegramClient\(new StringSession\(sessionString\), Number\(process\.env\.API_ID\), process\.env\.API_HASH, telegramCaptureTransport\(\{ wss: false \}\)\.options\);\n\s*telegramKeepAlive\.attach\(client, \{ userId \}\);\n\s*await client\.connect\(\);/,
+    'retried on the default transport with the same session and the same tuned options - restating the numbers here is how a fallback path keeps settings the primary one stopped having');
+  const captureClients = index.match(/new TelegramClient\(new StringSession\(sessionString\)[^\n]*\);/g) || [];
+  assert.equal(captureClients.length, 2, 'the two capture transports, primary and fallback, are both built here');
+  assert.equal(captureClients.every((site) => /transport\.options|telegramCaptureTransport\(\{ wss: false \}\)\.options/.test(site)), true,
+    'and neither names retry numbers of its own: both read them from the one function, which is what stops the fallback keeping settings the primary path no longer has');
+  assert.equal(/new TelegramClient\(new StringSession\(sessionString\)[^\n]*connectionRetries:/.test(index), false, 'nothing in the capture path restates the tuning');
+
+  /* The knob that was asked for and does not exist, pinned so nobody re-adds it from a README: 2.26.26 stores
+     `timeout` as `_connectTimeout` on the sender and never reads it, so passing it would look like a tuned
+     timeout and do precisely nothing. The retry count is the real lever. */
+  assert.match(transport, /connectionRetries: 5/, 'five attempts, not three, because the library gives its own transport about forty seconds to recover');
+  assert.equal(/timeout:\s*\d/.test(transport), false, 'no request-timeout option is passed, because in this version none is read');
+  assert.match(transport, /autoReconnect: true/, 'and the sender is left free to reconnect again after the attempts run out');
 
   /* The login clients deliberately keep the plain transport: a user waiting for a code is waiting interactively,
      and an experiment that exists for long-lived idle connections has no business in a one-shot handshake. */
   const loginSites = index.match(/new TelegramClient\(new StringSession\(''\)[^)]*\)\s*;?/g) || [];
   assert.ok(loginSites.length >= 1, 'the login clients are constructed in the same file');
   assert.equal(loginSites.some((site) => site.includes('useWSS')), false, 'and none of them takes the knob');
+});
+
+/* ---------------------------------------------------------------------------
+   The provider's keep-alive noise, handled where it is produced. GramJS's `_updateLoop` races its own ping
+   against a 10-second timer, prints the resulting `Error: TIMEOUT` with `console.error`, and reconnects the
+   sender - so on a long-lived session with a flappy path it is one stack trace per nine seconds per user, for a
+   condition the library is already recovering from. Suppression has to happen at the client's logging gate
+   rather than in a global handler, because the error is *caught* by the library: it never reaches
+   `unhandledRejection` at all, and a filter written against that event would have hidden nothing while looking
+   like a fix.
+   --------------------------------------------------------------------------- */
+
+test('the keep-alive noise is counted at the client that produced it, and the process filter is not where it happens', () => {
+  const guard = section(index, 'const telegramCapture = createTelegramListener({', '\nconst startTelegramListener =');
+  assert.match(index, /const telegramKeepAlive = createTelegramKeepAliveGuard/, 'the guard is built once per process, from the module that knows what the noise looks like');
+  assert.match(guard, /transportFlap: \(client\) => telegramKeepAlive\.flapFor\(client\)/,
+    'and the watchdog is given the flap record, so an unanswered beat during a provider reconnect is waited out instead of torn down');
+  assert.match(index, /telegramKeepAlive\.attach\(client, \{ userId \}\);\n\s*await client\.connect\(\);/,
+    'attached before `connect()`, because that is where the update loop starts - after it would miss the first flap, which is the one that happens during a rebuild');
+
+  // The process-level filter exists for the process, not for the log: it must never become a general silencer.
+  const filter = section(index, "process.on('unhandledRejection'", "process.on('SIGTERM'");
+  assert.match(filter, /isNoise: isProviderKeepAliveTimeout/, 'it recognises exactly one error, by its message and the frame that throws it');
+  assert.match(filter, /onOther: \(reason\) => \{ process\.nextTick\(\(\) => \{ throw reason/, 'and everything else is rethrown, so a real unhandled rejection still ends the process with its stack');
+  assert.equal((index.match(/process\.on\('unhandledRejection'/g) || []).length, 1, 'one rejection handler, and it is this one');
+  assert.equal(index.includes("process.on('uncaughtException'"), false,
+    'and no synchronous exception handler: a throw out of a socket callback is not the provider clearing its ping, and this app is meant to die loudly for it');
+  assert.equal(/console\.(error|log) =/.test(index), false, 'and `console` is not patched: silencing a printer is how a log becomes unreliable for everyone who shares it');
 });
 
 test('an operator can rebuild a deaf session by hand, and that is the one path allowed to ignore the cooldown', () => {

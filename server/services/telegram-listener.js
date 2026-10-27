@@ -43,6 +43,7 @@
  */
 import { NewMessage } from 'telegram/events/index.js';
 import { isTelegramServiceMessage, resolveTelegramChatId, telegramMessageText, telegramPeerIdVariants } from './telegram-peer.js';
+import { KEEP_ALIVE_FLAP_GRACE_MS } from './telegram-keepalive.js';
 
 /** How many recent messages one channel is asked for when a session comes back. */
 export const CATCH_UP_LIMIT = 25;
@@ -232,7 +233,7 @@ const EMPTY_STATS = () => ({ seen: 0, saved: 0, ignored: 0, lastAt: null, lastCh
 
 export function createTelegramListener({ clients, pool, log = console, saveSignal, now = () => Date.now(), catchUpLimit = CATCH_UP_LIMIT, catchUpCooldownMs = CATCH_UP_COOLDOWN_MS, catchUpBudgetMs = CATCH_UP_BUDGET_MS, silenceSuspectMs = SILENCE_SUSPECT_MS, probeDeadlineMs = STREAM_PROBE_DEADLINE_MS, gapCatchUpMs = GAP_CATCH_UP_MS, gapCatchUpSpreadMs = GAP_CATCH_UP_SPREAD_MS, heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS, ptsStallBeats = PTS_STALL_BEATS, rebuildCooldownMs = STREAM_REBUILD_COOLDOWN_MS,
   differenceMaxSteps = DIFFERENCE_MAX_STEPS, differenceBudgetMs = DIFFERENCE_BUDGET_MS, floodWaitMs = FLOOD_BACKOFF_MS,
-  ptsGapStrikes = PTS_GAP_STRIKES, gapReauthWindowMs = PTS_GAP_REAUTH_WINDOW_MS, onDeadStream = null, onSessionUnrecoverable = null } = {}) {
+  ptsGapStrikes = PTS_GAP_STRIKES, gapReauthWindowMs = PTS_GAP_REAUTH_WINDOW_MS, transportFlap = null, keepAliveFlapGraceMs = KEEP_ALIVE_FLAP_GRACE_MS, onDeadStream = null, onSessionUnrecoverable = null } = {}) {
   if (!clients || !pool || !saveSignal) throw new Error('createTelegramListener requires clients, pool and saveSignal');
   const startedAt = new Date();
   const catchUpRuns = new Map();
@@ -251,7 +252,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
      already attempted has to live somewhere the reset does not reach, or the strike ladder would keep
      re-justifying a teardown that has already happened. */
   const rebuildAttempts = new Map();
-  const heartbeat = { cycles: 0, sent: 0, answered: 0, dead: 0, stalled: 0, rebuilt: 0, probing: 0, suppressed: 0, resynced: 0, recovered: 0, deaf: 0, gaps: 0, partial: 0, throttled: 0, unrecoverable: 0, lastCycleAt: null, lastCycleMs: null, lastCycleSessions: 0 };
+  const heartbeat = { cycles: 0, sent: 0, answered: 0, dead: 0, stalled: 0, rebuilt: 0, probing: 0, suppressed: 0, resynced: 0, recovered: 0, deaf: 0, gaps: 0, partial: 0, throttled: 0, unrecoverable: 0, flapping: 0, lastCycleAt: null, lastCycleMs: null, lastCycleSessions: 0 };
   let emptyCycleReported = false;
   let resumedAfterBoot = 0;
 
@@ -637,7 +638,7 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
       targets.push([userId, entry]);
     }
     const cycleStartedAt = now();
-    const results = { reason, sessions: targets.length, sent: 0, answered: 0, dead: 0, stalled: 0, quiet: 0, unknown: 0, resynced: 0, recovered: 0, deaf: 0, partial: 0, throttled: 0, unrecoverable: 0, worstMs: 0 };
+    const results = { reason, sessions: targets.length, sent: 0, answered: 0, dead: 0, flapping: 0, stalled: 0, quiet: 0, unknown: 0, resynced: 0, recovered: 0, deaf: 0, partial: 0, throttled: 0, unrecoverable: 0, worstMs: 0 };
     if (!targets.length) {
       heartbeat.cycles += 1;
       heartbeat.lastCycleAt = new Date(cycleStartedAt).toISOString();
@@ -666,7 +667,34 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
       if (!probe.alive) {
         results.dead += 1;
         heartbeat.dead += 1;
-        streamBeats.set(key, { ...(previous || {}), at: now(), error: probe.error || 'probe-timeout', stalls: 0 });
+        /* One exception to "a beat that cannot be answered is rebuilt now", and it needs saying precisely,
+           because it is the difference between a watchdog and an echo: GramJS runs its own keep-alive ping every
+           9 seconds with a 10-second race and three attempts, and while that loop is failing it calls
+           `_sender.reconnect()` - so for up to about forty seconds the socket is being re-established under us
+           and any request we send inside the gap can legitimately go unanswered. Rebuilding in the middle of
+           that tears down a session the provider was about to hand back, and it is exactly what a fleet of
+           sessions does at once when one data center hiccups. So the first unanswered beat *while the provider
+           reports a keep-alive timeout* is recorded and waited out; the next one is a dead socket by our own
+           measurement, and gets the same immediate rebuild it always got. */
+        const flap = typeof transportFlap === 'function' ? transportFlap(entry.client) : null;
+        const flapAge = Number.isFinite(flap?.at) && flap.at > 0 ? now() - flap.at : null;
+        const flapping = probe.state === 'dead' && flapAge !== null && flapAge >= 0 && flapAge < keepAliveFlapGraceMs;
+        if (flapping && !previous?.deadBeat) {
+          results.flapping += 1;
+          heartbeat.flapping += 1;
+          streamBeats.set(key, {
+            ...(previous || {}), at: now(), error: probe.error || 'probe-timeout', stalls: 0,
+            deadBeat: 1, flapping: true, keepAliveTimeouts: Number(flap.count) || 0,
+          });
+          log('warn', 'Telegram beat waits out a provider keep-alive timeout', {
+            userId, error: probe.error || 'probe-timeout', flapAgeMs: Math.round(flapAge), keepAliveTimeouts: Number(flap.count) || 0, graceMs: keepAliveFlapGraceMs,
+          });
+          return;
+        }
+        streamBeats.set(key, {
+          ...(previous || {}), at: now(), error: probe.error || 'probe-timeout', stalls: 0, deadBeat: 1,
+          flapping: false, keepAliveTimeouts: Number(flap?.count) || 0,
+        });
         requestStreamRebuild(userId, 'heartbeat-no-answer');
         return;
       }
@@ -868,6 +896,8 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
       steps: Number(beat.steps) || 0,
       partial: beat.partial === true,
       throttledFor: Number(beat.throttledFor) || 0,
+      keepAliveTimeouts: Number(beat.keepAliveTimeouts) || 0,
+      flapping: beat.flapping === true,
       ms: Number.isFinite(beat.ms) ? beat.ms : null,
       stalls: Number(beat.stalls) || 0,
       error: beat.error || null,
@@ -939,6 +969,11 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
       beatStrikes: Number(beat?.strikes) || 0,
       beatRebuilds: Number(beat?.rebuilds) || 0,
       beatAction: beat?.action || null,
+      /* The provider's own keep-alive, as seen by whoever is deciding whether this session is dying. A ping
+         timeout inside GramJS is not evidence about our stream - it is evidence about its transport - and a
+         watchdog that reads it as a fault will reconnect a fleet that was about to be fine. */
+      keepAliveTimeouts: Number((typeof transportFlap === 'function' ? transportFlap(entry?.client) : null)?.count) || 0,
+      transportFlapping: beat?.flapping === true,
       listening: Boolean(entry?.handler) && handlerIsLive(entry.client, entry.handler) && entry.client?.connected === true,
     };
   }
@@ -1212,6 +1247,10 @@ export function createTelegramListener({ clients, pool, log = console, saveSigna
         beatSteps: Number(beatInfo?.steps) || 0,
         beatPartial: beatInfo?.partial === true,
         reauthRequired: entry.reauthRequired === true,
+        /* The transport's own tally, read live rather than from the last beat: a session that answers every ping
+           test but has been flapping for an hour is the fact worth having next to its healthy `beatAction`. */
+        keepAliveTimeouts: Number((typeof transportFlap === 'function' ? transportFlap(entry.client) : null)?.count) || 0,
+        transportFlapping: beatInfo?.flapping === true,
         beatStalls: Number(beatInfo?.stalls) || 0,
         beatError: beatInfo?.error || null,
       });
