@@ -539,9 +539,26 @@ test('the sweep asks the channel what it said, and the heartbeat is what asks th
     'a cycle that throws once is logged, because an interval callback that rejects would stop the keep-alive permanently and silently - the exact failure this exists to prevent');
 
   // The rebuild goes through the one function that can do it, and the listener never reaches for it directly.
-  assert.match(index, /onDeadStream: \(userId, reason, \{ force = false \} = \{\}\) => restoreTelegramClient\(userId, \{ reason, force \}\)/,
+  assert.match(index, /onDeadStream: \(userId, reason, \{ force = false, escalate = false \} = \{\}\) => restoreTelegramClient\(userId, \{ reason, force, escalate \}\)/,
     'the listener decides when a stream is not a stream; the server owns the reconnect, which also re-attaches and replays');
   assert.equal((index.match(/force: true/g) || []).length, 1, 'exactly one caller in the server may bypass the rebuild cooldown, and it is the manual reconnect route');
+
+  /* The part of a "rebuild" that used to be missing: both escalation levels have to step past the shortcut that
+     returns the already-connected client, or the watchdog tears nothing down and the deaf session keeps its
+     stale update state along with its handler. And the disconnect is conditional on the same flag, because a
+     connected client is precisely the case being rebuilt - leaving it alive would keep two authorized sessions
+     on one StringSession, which is how a "fix" becomes a second opinion. */
+  const restore = section(index, 'async function restoreTelegramClient(', '\n/** How many recent messages');
+  const restoreEarly = section(index, 'async function restoreTelegramClient(', 'if (current?.client && current.client.connected !== true) {');
+  assert.match(restoreEarly, /const mustRebuild = force === true \|\| escalate === true;/, 'the watchdog escalates, the operator forces, and either one rebuilds');
+  assert.match(restoreEarly, /if \(!mustRebuild && current\?\.client\?\.connected === true && current\.handler && telegramCapture\.handlerIsLive/, 'the shortcut is gated on that flag, not on good intentions');
+  assert.match(restore, /if \(current\?\.client && \(current\.client\.connected !== true \|\| mustRebuild\)\) await current\.client\.disconnect\(\)\.catch\(\(\) => \{\}\);/,
+    'a rebuilt session disconnects the client it replaces, connected or not');
+  assert.match(restore, /await telegramCapture\.resyncUpdateState\(current\.client, \{ userId, reason: `\$\{reason\}:reconnected` \}\);/,
+    'a socket that came back has its state reconciled before the handler is re-attached');
+  assert.match(restore, /await telegramCapture\.resyncUpdateState\(client, \{ userId, reason: `\$\{reason\}:new-session`, force: mustRebuild \}\);/,
+    'and a brand-new client is told where the account stands before anything is asked of it - GetState alone is not a sync when the answer is thrown away');
+  assert.ok(restore.indexOf('resyncUpdateState') < restore.indexOf('telegramClients.set(userId, { client, handler: null'), 'the sync happens before this session exists to anyone else');
   assert.match(index, /telegramClients\.set\(userId, \{ client, handler: null, stats: telegramCapture\.EMPTY_STATS\(\) \}\);\n\s*telegramCapture\.resetStreamBaseline\(userId\);/,
     'a rebuilt session has its beat baseline retaken, because `seen` restarting at zero would otherwise read as a stalled stream and the watchdog would reconnect every session it had ever fixed');
 
@@ -610,4 +627,37 @@ test('an operator can rebuild a deaf session by hand, and that is the one path a
   assert.match(columns, /\(SELECT COUNT\(\*\)::int FROM channels c WHERE c\.user_id=u\.id AND c\.enabled=TRUE\) AS "monitorCount"/,
     'and so is how many channels that session is supposed to be hearing, which is what distinguishes a deaf stream from a workspace that never picked a channel');
   assert.equal(/AS [a-z][a-zA-Z]*(?![\w"])/.test(columns), false, 'no camelCase alias in that list is left unquoted');
+});
+
+/* ---------------------------------------------------------------------------
+   The two hand-offs between the listener and the server that a unit test cannot see: who consumes a flagged
+   session, and who is allowed to decide that a user must sign in again. Both are pinned here because both are
+   the sort of thing that silently stops being true when the file above it is refactored - and both are the
+   difference between "the app noticed" and "the app recovered".
+   --------------------------------------------------------------------------- */
+
+test('a deaf session is saved by the minute, and an unrecoverable one is ended by the server', () => {
+  // The listener sets `needsCatchUp`; this is the code that reads it, and the interval that runs it.
+  const rearm = section(index, 'async function rearmTelegramListeners(', 'io.use((');
+  assert.match(rearm, /if \(entry\.needsCatchUp && entry\.client\?\.connected === true\) \{[\s\S]{0,200}runCatchUp\(userId\)/,
+    'the flag the update-state reconciliation sets is the flag the re-arm pass acts on, so a session the account will not reconcile still gets its channels read back on the next pass rather than on the staggered one');
+  const sweep = section(index, 'const telegramSweep = setInterval', 'telegramSweep.unref');
+  assert.match(sweep, /resumeTelegramSessions\(\{ reason: 'sweep' \}\)[\s\S]{0,120}rearmTelegramListeners\(\)[\s\S]{0,120}checkTelegramStreams/,
+    'in one pass, in that order: resume, re-arm and replay, then the staggered gap check - which is why the flag does not need a second scheduler to mean anything');
+  assert.match(sweep, /\}, 60 \* 1000\);/, 'and the pass is a minute: that is the bound on how late a deaf session’s signals are, and it is a delay rather than a loss only because this line exists');
+
+  // The last rung of the ladder: the listener holds the evidence, the server owns the consequence.
+  const ctor = section(index, 'const telegramCapture = createTelegramListener({', '\nconst startTelegramListener =');
+  assert.match(ctor, /onSessionUnrecoverable: async \(userId, reason, details = \{\}\) => \{/, 'the verdict has a handler wired, next to the rebuild handler it follows');
+  assert.match(ctor, /UPDATE users SET telegram_connected=FALSE WHERE id=\$1/, 'which marks the account unlinked, the one fact every other part of the app already reads and shows');
+  assert.equal(ctor.includes('telegram_session=NULL'), false, 'and deliberately does not destroy the session string: an admin’s forced reconnect is the last thing worth trying before a human is asked for their phone, and it needs that string to try');
+  assert.match(ctor, /telegramClients\.delete\(id\)/, 'the memory is dropped with the flag, so the resume query cannot hand the dead session straight back');
+  assert.match(ctor, /log\('warn', 'Telegram session left for the user to sign in again'/, 'and the reason, the pts, the gap and the strike count are logged together, because that is the whole post-mortem');
+
+  // The user-facing answer to "why does it say I need to reconnect", without a log search and without protocol in the UI.
+  const statusRoute = section(index, "app.get('/api/telegram/status'", 'async function persistTelegramLoginAttempt');
+  assert.match(statusRoute, /reauthRequired: entry\?\.reauthRequired === true/, 'the status route publishes the verdict as a boolean, not as a story about pts');
+  const statusPayload = section(statusRoute, 'res.json({', '\n  });');
+  assert.equal(/\b\w*(pts|Pts|difference|Difference|GetState|stall)\w*:/.test(statusPayload), false,
+    'and none of the vocabulary that produced the verdict is a key in the payload the trader’s browser receives - a boolean they can act on, not a number they cannot');
 });
