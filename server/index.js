@@ -599,15 +599,6 @@ async function runSignalDelete(pair) {
 }
 
 /**
- * Bring one workspace's Telegram session up, and make sure something is listening on it.
- *
- * An entry whose client is present but not connected used to be left exactly as it was found: the
- * handler stayed attached to a socket that had already closed, `users.telegram_connected` still said
- * true, and the workspace was told it was connected forever. Reconnecting the same client and
- * re-attaching the handler is what a sleeping host needs, because a wake is a new process while the
- * flag in the database is inherited from the old one.
- */
-/**
  * How the capture client reaches Telegram, and what that option is really for.
  *
  * GramJS on Node has no WebSocket transport: `useWSS` moves the data centre from port 80 to 443 and leaves the
@@ -632,6 +623,16 @@ function telegramCaptureTransport({ wss = null } = {}) {
   const overWss = wss === null ? fromEnv.wss : wss === true;
   return { wss: overWss, options: telegramAdapter.captureTransportOptions({ wss: overWss }) };
 }
+
+/**
+ * Bring one workspace's Telegram session up, and make sure something is listening on it.
+ *
+ * An entry whose client is present but not connected used to be left exactly as it was found: the
+ * handler stayed attached to a socket that had already closed, `users.telegram_connected` still said
+ * true, and the workspace was told it was connected forever. Reconnecting the same client and
+ * re-attaching the handler is what a sleeping host needs, because a wake is a new process while the
+ * flag in the database is inherited from the old one.
+ */
 
 async function restoreTelegramClient(userId, { reason = 'restore', force = false, escalate = false } = {}) {
   const current = telegramClients.get(userId);

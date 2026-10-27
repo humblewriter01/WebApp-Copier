@@ -30,8 +30,17 @@ function section(source, startMarker, endMarker) {
   const start = source.indexOf(startMarker);
   assert.notEqual(start, -1, `${startMarker} is missing from the source`);
   const end = source.indexOf(endMarker, start + startMarker.length);
-  return source.slice(start, end === -1 ? source.length : end);
+  /* The end marker is required rather than optional. A slice that quietly runs to end-of-file keeps every
+     `assert.match` inside it green while bounding nothing - the one way a source pin can rot without ever
+     failing, and it did happen twice here, against a marker that has never existed in `index.js`. A caller that
+     genuinely wants "to the end" should slice deliberately, so the looseness is at least written down. */
+  assert.notEqual(end, -1, `${endMarker} does not follow ${startMarker}, so the section would read to end-of-file`);
+  return source.slice(start, end);
 }
+
+/* The declaration that follows `restoreTelegramClient`, named once for every section that has to stop there: three
+   pins bounded the same region, and one anchor is the difference between them agreeing and drifting apart. */
+const AFTER_RESTORE = '\n/**\n * Every workspace with a stored session gets a live listener';
 
 const saveSignalBody = section(index, 'async function saveSignal(', '\nconst telegramCapture = createTelegramListener(');
 const listenerBody = section(listenerSource, 'async function ingestMessage(', '  /**\n   * Attach the capture handler');
@@ -551,7 +560,9 @@ test('the sweep asks the channel what it said, and the heartbeat is what asks th
      stale update state along with its handler. And the disconnect is conditional on the same flag, because a
      connected client is precisely the case being rebuilt - leaving it alive would keep two authorized sessions
      on one StringSession, which is how a "fix" becomes a second opinion. */
-  const restore = section(index, 'async function restoreTelegramClient(', '\n/** How many recent messages');
+  const restore = section(index, 'async function restoreTelegramClient(', AFTER_RESTORE);
+  assert.equal(restore.includes('resumeTelegramSessions'), false,
+    'and the slice really does stop at the next declaration, so these pins bound the function they name');
   const restoreEarly = section(index, 'async function restoreTelegramClient(', 'if (current?.client && !telegramAdapter.isConnected(current.client)) {');
   assert.match(restoreEarly, /const mustRebuild = force === true \|\| escalate === true;/, 'the watchdog escalates, the operator forces, and either one rebuilds');
   assert.match(restoreEarly, /if \(!mustRebuild && telegramAdapter\.isConnected\(current\?\.client\) && current\.handler && telegramCapture\.handlerIsLive/, 'the shortcut is gated on that flag, not on good intentions');
@@ -582,7 +593,7 @@ test('the transport can be moved off the plain port, and the option can never co
   assert.match(adapterSource, /useWSS: true/, 'and when it is on, it is the library\'s own option rather than a hand-rolled socket');
   assert.equal(transport.includes('useWSS'), false, 'the routing file does not name the library option; it only decides');
 
-  const restore = section(index, 'async function restoreTelegramClient(', '\n/** How many recent messages');
+  const restore = section(index, 'async function restoreTelegramClient(', AFTER_RESTORE);
   assert.match(restore, /const transport = telegramCaptureTransport\(\);/, 'the capture client is built from it');
   assert.match(restore, /if \(!transport\.wss\) throw error;/, 'a failure with the option off is the ordinary failure');
   assert.match(restore, /Telegram WSS transport could not connect; reconnecting over the default transport/, 'and with it on, the fallback is announced');
@@ -628,7 +639,7 @@ test('the keep-alive noise is counted at the client that produced it, and the pr
   /* The invariant is per client, not per pattern: the primary build connects inside a `try`, the fallback does
      not, so counting the adjacency would have found one and proved nothing. Splitting on the construction is what
      lets the same claim be made about both transports. */
-  const captureBuilds = section(index, 'async function restoreTelegramClient(', 'Every workspace with a stored session')
+  const captureBuilds = section(index, 'async function restoreTelegramClient(', AFTER_RESTORE)
     .split('telegramAdapter.createClient({ sessionString').slice(1);
   assert.equal(captureBuilds.length, 2, 'both capture transports build their client in the same function');
   assert.equal(captureBuilds.every((chunk) => /telegramKeepAlive\.attach\(client, \{ userId \}\);[\s\S]{0,60}await telegramAdapter\.connect\(client\);/.test(chunk)), true,
