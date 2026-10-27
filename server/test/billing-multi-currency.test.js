@@ -20,7 +20,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { billingConfig } from '../services/billing.js';
-import { createFlutterwaveClient, payloadHash } from '../services/flutterwave.js';
+import { createFlutterwaveClient, payloadHash, checkoutPresentation, CURRENCY_CHECKOUT_PRESENTATION } from '../services/flutterwave.js';
 import { createPricingStore, mergePlanPricing } from '../services/pricing.js';
 import { createBillingService } from '../services/billing-service.js';
 import { verifyWebhookHash } from '../services/flutterwave.js';
@@ -190,6 +190,106 @@ test('a payment plan is attached per currency, only where the mirror is confirme
   const stale = await checkoutFor({ planKey: 'pro', currency: 'USD', snapshot });
   assert.equal(stale.provider.last().body.payment_plan, undefined, 'a mirror a hundred cents out is not used, so the dollar customer pays the price on the page once instead of a stale price forever');
   assert.equal(stale.checkout.renewsAutomatically, false);
+});
+
+/* ----------------------------------------------- which country, and which payment methods the page offers ------------------------------------------------ */
+
+test('a dollar checkout names the country and the one method that can settle it', async () => {
+  const { provider, checkout } = await checkoutFor({ planKey: 'pro', currency: 'USD' });
+  assert.equal(provider.last().body.currency, 'USD', 'the currency the toggle picked is the currency in the request, not the workspace default');
+  assert.equal(provider.last().body.country, 'US', 'the country is stated so the provider does not read it off the payer');
+  assert.equal(provider.last().body.payment_options, 'card', 'bank transfer and ussd are naira rails, and a dollar price offered only those is a page with no way to pay');
+  assert.equal(checkout.country, 'US', 'and the same two fields travel to the browser, which configures the modal');
+  assert.equal(checkout.paymentOptions, 'card');
+});
+
+test('a naira checkout keeps the local rails a naira payment can actually use', async () => {
+  const { provider, checkout } = await checkoutFor({ planKey: 'pro', currency: 'NGN' });
+  assert.equal(provider.last().body.currency, 'NGN');
+  assert.equal(provider.last().body.country, 'NG');
+  assert.equal(provider.last().body.payment_options, 'card,banktransfer,ussd', 'restricting dollars to cards must not quietly take away the methods naira customers pay with');
+  assert.equal(checkout.country, 'NG');
+  assert.equal(checkout.paymentOptions, 'card,banktransfer,ussd');
+});
+
+test('a charge bound to a payment plan is card-only in either currency', async () => {
+  const snapshot = mergePlanPricing({
+    config,
+    planRows: { pro: { NGN: 10_500_000, USD: 6_900, interval: 'monthly', history: [], updatedAt: null, updatedBy: null } },
+    providerPlans: {
+      pro: {
+        NGN: { planId: 42, syncStatus: 'synced', syncedAmountMinor: 10_500_000, currency: 'NGN', interval: 'monthly' },
+      },
+    },
+  });
+  const naira = await checkoutFor({ planKey: 'pro', currency: 'NGN', snapshot });
+  assert.equal(naira.provider.last().body.payment_plan, 42, 'this checkout is the first charge of a subscription');
+  assert.equal(naira.provider.last().body.payment_options, 'card', 'and a renewal is taken by card every cycle, so the local rails are not offered on a page that will be charged again');
+  assert.equal(naira.provider.last().body.country, 'NG', 'the country still says which market the card belongs to');
+  assert.equal(naira.checkout.renewsAutomatically, true);
+  assert.equal(naira.checkout.paymentOptions, 'card', 'the modal is told the same thing the API was');
+});
+
+test('the presentation is a property of the currency, decided from a table nobody can edit at runtime', () => {
+  assert.deepEqual({ ...checkoutPresentation('usd') }, { country: 'US', paymentOptions: 'card' }, 'a lower-case code from a form still resolves');
+  assert.deepEqual({ ...checkoutPresentation(' NGN ') }, { country: 'NG', paymentOptions: 'card,banktransfer,ussd' });
+  assert.deepEqual({ ...checkoutPresentation('EUR') }, { country: null, paymentOptions: null }, 'a currency this workspace does not price gets no guess from us');
+  assert.deepEqual({ ...checkoutPresentation(null) }, { country: null, paymentOptions: null });
+  assert.deepEqual({ ...checkoutPresentation('NGN', { planBound: true }) }, { country: 'NG', paymentOptions: 'card' });
+  assert.deepEqual({ ...checkoutPresentation('XXX', { planBound: true }) }, { country: null, paymentOptions: 'card' }, 'an unknown currency still cannot be renewed by bank transfer');
+  assert.throws(() => { CURRENCY_CHECKOUT_PRESENTATION.USD.country = 'GB'; }, TypeError, 'the rules are not mutable by anything that imported them');
+});
+
+test('a reused pending checkout carries the presentation its own row implies', async () => {
+  const oneTime = {
+    reference: 'sdb_pro_usd_1', authorization_url: 'https://checkout.flutterwave.com/pay/earlier', amount_minor: 6_900, currency: 'USD', plan_code: '',
+  };
+  const provider = flutterwaveDouble();
+  const pool = poolDouble([
+    ['FROM users WHERE id=$1 LIMIT 1', { rows: [user], rowCount: 1 }],
+    ['FROM billing_transactions', { rows: [oneTime], rowCount: 1 }],
+  ]);
+  const reused = await billingFor({ provider, pool }).initialize({ userId: user.id, planKey: 'pro', currency: 'USD' });
+  assert.equal(reused.reused, true);
+  assert.equal(provider.requests.length, 0, 'nothing is re-initialised, so the page the browser goes back to is the page Flutterwave already built');
+  assert.equal(reused.country, 'US');
+  assert.equal(reused.paymentOptions, 'card');
+
+  /* A subscription page stays a subscription page only while the mirror still agrees. The pending query pins the
+     plan code, so these two cases are the whole difference between "reopen it" and "the offer changed". */
+  const boundRow = {
+    reference: 'sdb_pro_ngn_2', authorization_url: 'https://checkout.flutterwave.com/pay/bound', amount_minor: 10_500_000, currency: 'NGN', plan_code: '42',
+  };
+  const boundPool = () => poolDouble([
+    ['FROM users WHERE id=$1 LIMIT 1', { rows: [user], rowCount: 1 }],
+    ['FROM billing_transactions', ({ params }) => (params[3] === boundRow.plan_code ? { rows: [boundRow], rowCount: 1 } : { rows: [], rowCount: 0 })],
+    ['INSERT INTO billing_transactions', { rows: [{ id: 't2' }], rowCount: 1 }],
+  ]);
+  const mirrored = mergePlanPricing({
+    config,
+    planRows: { pro: { NGN: 10_500_000, USD: 6_900, interval: 'monthly', history: [], updatedAt: null, updatedBy: null } },
+    providerPlans: { pro: { NGN: { planId: 42, syncStatus: 'synced', syncedAmountMinor: 10_500_000, currency: 'NGN', interval: 'monthly' } } },
+  });
+  const stillBound = flutterwaveDouble();
+  const reopened = await billingFor({ provider: stillBound, pool: boundPool(), snapshot: mirrored }).initialize({ userId: user.id, planKey: 'pro', currency: 'NGN' });
+  assert.equal(reopened.reused, true);
+  assert.equal(stillBound.requests.length, 0);
+  assert.equal(reopened.paymentOptions, 'card', 'a reopened renewal page does not offer a method that cannot charge again next cycle');
+
+  const driftedProvider = flutterwaveDouble();
+  const drifted = await billingFor({ provider: driftedProvider, pool: boundPool() }).initialize({ userId: user.id, planKey: 'pro', currency: 'NGN' });
+  assert.equal(drifted.reused, false, 'with no mirror to charge against, the old page is not reopened');
+  assert.equal(driftedProvider.last().body.payment_plan, undefined);
+  assert.equal(driftedProvider.last().body.payment_options, 'card,banktransfer,ussd', 'and a one-time naira charge offers every rail that can settle it');
+});
+
+test('the route hands the browser the whole checkout object, presentation included', () => {
+  const route = indexSource.slice(
+    indexSource.indexOf("app.post('/api/billing/checkout'"),
+    indexSource.indexOf("app.get('/api/billing/verify'"),
+  );
+  assert.match(route, /\.json\(\{ checkout \}\)/, 'the service response is forwarded, not copied field by field, so a new one reaches the modal without a second edit');
+  assert.match(route, /isSupportedCurrency\(requested\)/, 'and the currency is settled before a price is looked up in it');
 });
 
 /* ------------------------------------------------------------------------ currency refusals ------------------------------------------------------------------------ */

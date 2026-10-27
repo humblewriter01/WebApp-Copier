@@ -6,9 +6,9 @@
  *
  * There is deliberately no `flutterwave-react-v3` here. That package was read before it was rejected: its
  * payment callback builds an analytics string out of the account's public key and posts it to the author's own
- * AWS endpoint, and it computes that string with `payment_options.split(',')`, which throws when - as here -
- * `payment_options` is not part of the request. A payment step that leaks which accounts are being paid and
- * crashes on a field we never sent is not a dependency worth taking, so this file talks to the script
+ * AWS endpoint, and it derives that string with `payment_options.split(',')` - a field that is easy for a
+ * caller to leave out, and a crash when they do. A payment step that leaks which accounts are being paid and
+ * breaks on a missing optional field is not a dependency worth taking, so this file talks to the script
  * Flutterwave itself hosts and nothing else.
  *
  * Two ways to pay, one behaviour:
@@ -56,6 +56,35 @@ export function loadCheckoutSdk() {
 }
 
 /**
+ * Which country the provider renders, and which payment methods it offers, per currency.
+ *
+ * Flutterwave infers both from the payer's IP when a checkout says nothing, and a Nigerian IP being shown the
+ * Nigerian page is exactly the failure this exists to prevent: the dollar price was in the request, and the
+ * modal still offered a naira bank transfer that cannot settle a USD charge. So both fields are set explicitly,
+ * from the currency, on both halves of the payment - the server's `POST /v3/payments` body and this config.
+ *
+ * This table is a mirror of `CURRENCY_CHECKOUT_PRESENTATION` in `server/services/flutterwave.js`, and it exists
+ * only for the case the server response predates those fields (a tab that was open across a deploy). The test
+ * in `client/test/billing-currency-toggle-ui.test.mjs` imports both tables and fails if they ever disagree, so
+ * the duplication is checked rather than trusted.
+ */
+export const CURRENCY_CHECKOUT_PRESENTATION = Object.freeze({
+  NGN: Object.freeze({ country: 'NG', paymentOptions: 'card,banktransfer,ussd' }),
+  USD: Object.freeze({ country: 'US', paymentOptions: 'card' }),
+});
+
+/** `card` only: a charge bound to a Flutterwave payment plan is settled by card each interval, in any currency. */
+export const PLAN_BOUND_PAYMENT_OPTIONS = 'card';
+
+export function checkoutPresentation(currency, { planBound = false } = {}) {
+  const rule = CURRENCY_CHECKOUT_PRESENTATION[String(currency || '').toUpperCase().trim()] || null;
+  return {
+    country: rule ? rule.country : null,
+    paymentOptions: planBound ? PLAN_BOUND_PAYMENT_OPTIONS : (rule ? rule.paymentOptions : null),
+  };
+}
+
+/**
  * The one place a price is turned into something Flutterwave can charge.
  *
  * `amount` is the MAIN unit on purpose - Flutterwave is told `60000` for ₦60,000 and `39` for $39, while every
@@ -66,11 +95,23 @@ export function loadCheckoutSdk() {
  */
 export function checkoutRequest(checkout) {
   const amount = checkout?.providerAmount ?? checkout?.amount;
+  /* The server sends the country and the allowed methods with the price; a response that predates those fields
+     falls back to the mirrored table so an old tab still opens the right page. */
+  const inferred = checkoutPresentation(checkout?.currency, { planBound: Boolean(checkout?.renewsAutomatically) });
+  const presented = {
+    // Field by field, so a response that carries one but not the other is completed rather than overridden: the
+    // server's value always wins, and the rule only fills a gap a deploy left behind.
+    country: checkout?.country || inferred.country,
+    paymentOptions: checkout?.paymentOptions || inferred.paymentOptions,
+  };
   return {
     public_key: checkout?.publicKey || undefined,
     tx_ref: checkout?.reference,
     amount: typeof amount === 'number' ? String(amount) : amount,
     currency: checkout?.currency,
+    // Both fields are what stop the provider guessing a payment method from the payer's IP address.
+    ...(presented.country ? { country: presented.country } : {}),
+    ...(presented.paymentOptions ? { payment_options: presented.paymentOptions } : {}),
     redirect_url: checkout?.redirectUrl,
     customer: { email: checkout?.customer?.email, fullname: checkout?.customer?.name || undefined },
     customization: { title: `Signal Desk ${checkout?.planName || 'plan'}`, description: 'Signal Desk subscription' },
@@ -78,6 +119,19 @@ export function checkoutRequest(checkout) {
     // Flutterwave recomputes this from its own copy of the four fields and refuses the charge if one is edited.
     payload_hash: checkout?.payloadHash || undefined,
   };
+}
+
+/**
+ * Which of the two payment surfaces a checkout can be opened on - decided in one place so the rule is testable.
+ *
+ * The inline modal is configured here, in the browser, which is why it also needs the currency in the response:
+ * an amount of `39` with no currency is Flutterwave charging whatever the account defaults to, and on a naira
+ * account that is thirty-nine naira for a thirty-nine dollar plan. The hosted link is a different case - the
+ * server's own `POST /v3/payments` call named its currency - so an incomplete response still opens a correct
+ * page, and refusing it would turn a working payment into a dead end for nobody's benefit.
+ */
+export function checkoutSurface(checkout, { sdk = null } = {}) {
+  return sdk && checkout?.publicKey && checkout?.currency ? 'inline' : 'redirect';
 }
 
 export function useFlutterwave() {
@@ -96,7 +150,7 @@ export function useFlutterwave() {
     setError('');
     if (!checkout?.reference) throw new Error('The payment session did not start correctly. Try again.');
     const open = sdk || await loadCheckoutSdk();
-    if (open && checkout.publicKey) {
+    if (checkoutSurface(checkout, { sdk: open }) === 'inline') {
       try {
         opened.current = true;
         open(checkoutRequest(checkout));

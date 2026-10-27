@@ -443,7 +443,7 @@ The unit also decides what "the minimum charge" means: `minimumChargeMinor('NGN'
 ### Checkout flow
 
 1. `POST /api/billing/checkout` with `{ plan, currency, promoCode }`. The currency is validated against the currencies this workspace offers, the price for it is looked up in the `plans` table, any promo code is applied in that currency, and a `pending` row is written to `billing_transactions` with the amount **in hundredths** and the currency it was quoted in. A reference (`sdb_<user id>_<unix seconds>_<random>`) is generated here, which is Flutterwave's `tx_ref`.
-2. The server calls `POST /v3/payments` with `amount` in the major unit, `currency`, `redirect_url`, the customer's email, a `payload_hash` checksum, and `payment_plan` when a confirmed Flutterwave payment plan holds exactly this price in this currency. It returns a hosted link, which is what `client/src/lib/flutterwave.js` opens — Flutterwave's inline modal when its script loaded, the hosted page otherwise. Card details are only ever entered on Flutterwave.
+2. The server calls `POST /v3/payments` with `amount` in the major unit, `currency`, `country` and `payment_options` for that currency, `redirect_url`, the customer's email, a `payload_hash` checksum, and `payment_plan` when a confirmed Flutterwave payment plan holds exactly this price in this currency. It returns a hosted link plus those two presentation fields, which is what `client/src/lib/flutterwave.js` opens — Flutterwave's inline modal when its script loaded, the hosted page otherwise. Card details are only ever entered on Flutterwave.
 3. Flutterwave redirects back to `/billing/callback?status=…&tx_ref=…`. The page calls `GET /api/billing/verify?reference=…`, which asks Flutterwave `GET /v3/transactions/verify_by_reference?tx_ref=…` before granting anything. Nothing on that page is trusted: the browser contributes a reference and nothing else, and the reference is checked against this workspace's own row first, so another customer's successful payment cannot be spent here.
 4. Flutterwave posts to `POST /api/billing/webhook`. The `verif-hash` header is compared with `FLW_WEBHOOK_HASH` in constant time — there is no body signature in this protocol — and a workspace with no `FLW_WEBHOOK_HASH` set refuses every request rather than accept any. `charge.completed` fulfils a checkout; `subscribe.renewed`, `subscribe.payment_failed`, `subscribe.cancelled`/`disabled`/`deactivated`, `subscribe.enabled`/`activated`, and `subscribe.created` drive the renewal cycle. Anything else is answered with a 200 and ignored, because a non-2xx makes Flutterwave retry for an hour.
 
@@ -491,6 +491,27 @@ Configure in Render → API service → Environment:
 | `FLW_API_URL` | No | HTTPS base URL override; defaults to `https://api.flutterwave.com`. |
 
 Then, in the Flutterwave dashboard (Settings → Webhooks), set the endpoint to `https://<api-service-host>/api/billing/webhook`, paste the same string into both the dashboard's verification hash and `FLW_WEBHOOK_HASH`, and enable `charge.completed` plus the `subscribe.*` events — renewals and cancellations arrive through them, and the endpoint must answer 200, which it does. The customer's return URL is derived from `CLIENT_URL`, so that variable must be the exact public frontend origin.
+
+### Which payment methods the page offers
+
+Flutterwave decides what a payer is shown from the **country** it believes the payment is happening in, and when a request does not say, it infers the country from the payer's IP. That is a sensible default for a single-currency product and a trap for this one: a trader in Lagos toggling to USD was taken to a page offering bank transfer and ussd for a dollar price — the currency in the request was right, and the page was still unusable, because those rails settle naira.
+
+So both fields are stated explicitly, in one table, keyed on the currency (`CURRENCY_CHECKOUT_PRESENTATION` in `server/services/flutterwave.js`):
+
+| Currency | `country` | `payment_options` | Why |
+|---|---|---|---|
+| `NGN` | `NG` | `card,banktransfer,ussd` | the local rails work, so a customer is not narrowed to a card |
+| `USD` | `US` | `card` | dollars have no local rails here; anything else on the page is a dead end |
+| anything else | *omitted* | *omitted* | an unexpected currency gets no guess from us, not a wrong country |
+
+Three consequences worth knowing before you change it:
+
+- The same values are returned by the checkout endpoint and put into the modal config, because the hosted link is configured by the **server's** request while the inline modal is configured by the **browser's** — if the two derived their own answers, one of the two payment paths would keep the bug. `client/src/lib/flutterwave.js` mirrors the table only as a fallback for a response that predates the fields, and `client/test/billing-currency-toggle-ui.test.mjs` compares the two tables directly.
+- A charge bound to a Flutterwave payment plan is `card` in **either** currency: that is how the provider takes the renewal, so offering bank transfer on a page that will be charged again next month promises something the plan cannot do.
+- Because the modal's config is written by the browser and the hosted page's by the server, the currency has to arrive in the response for the modal to open at all: `amount: 39` with no `currency` is a naira account being asked for thirty-nine naira. `checkoutSurface()` sends such a checkout to the hosted link instead of refusing the payment, since that link was built by a request that named its currency.
+- Nothing about this is configurable by environment variable. A `FLW_PAYMENT_OPTIONS` knob would let one setting re-create the exact failure this fixed, for every currency at once, from a config file nobody reads while a price change is being made — so the rule lives with the currency instead.
+
+If a USD customer still sees naira methods after this, the payload is not the problem: check that **USD payments are enabled on the Flutterwave account** (Settings → Adjustments → Currency), because a merchant account set to settle in naira alone has no dollar page for the provider to render.
 
 ### Migrating from Paystack
 
