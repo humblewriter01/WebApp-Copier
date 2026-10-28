@@ -9,6 +9,10 @@
  * - **Containment.** No other application file imports `telegram`, mentions `TelegramClient`/`StringSession`/
  *   `Api`/`NewMessage`, or reaches for a client member. This is the part that makes the seam worth having: with it,
  *   the library swap is one file; without it, it is a grep that somebody loses.
+ * - **The dependency's own facts.** Four properties of the installed library decide whether an edited post can
+ *   reach the database at all - which module exports the edit builder, whether a message carries an edit
+ *   timestamp, how a handler pair is chosen for removal, and what the dispatcher hands to each builder. They are
+ *   asserted against `node_modules/telegram`, because an archived package is not going to tell us when it changes.
  * - **Purity.** The adapter forwards. Each function returns what the library returned, with the same arguments,
  *   and adds no `catch`, no default, no coercion. Behaviour-preserving is the whole promise of a refactor, so the
  *   promise is asserted per function rather than reviewed by eye.
@@ -19,7 +23,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import * as telegramAdapter from '../services/telegram-adapter.js';
 import { TelegramClient } from 'telegram';
@@ -92,6 +96,8 @@ const NEEDLES = {
   'TelegramClient': /new TelegramClient\(/,
   'StringSession': /new StringSession\(/,
   'NewMessage': /new NewMessage\(\{\}\)/,
+  'EditedMessage': /new EditedMessage\(\{\}\)/,
+  'telegram/events/EditedMessage deep import': /from 'telegram\/events\/EditedMessage\.js'/,
   'Api.auth.SignIn': /new Api\.auth\.SignIn\(/,
   'Api.auth.AuthorizationSignUpRequired': /result instanceof Api\.auth\.AuthorizationSignUpRequired/,
   'Api.updates.GetState': /api\?\.updates\?\.GetState|api\.updates\.GetState/,
@@ -141,13 +147,16 @@ const ALLOWED_MEMBERS = new Set([
   'session.save', 'api.updates', 'Api.auth', 'module.Api',
 ]);
 const ALLOWED_CONSTRUCTORS = new Set([
-  'TelegramClient', 'StringSession', 'NewMessage', 'api.updates.GetState', 'api.updates.GetDifference', 'Api.auth.SignIn',
+  'TelegramClient', 'StringSession', 'NewMessage', 'EditedMessage', 'api.updates.GetState', 'api.updates.GetDifference', 'Api.auth.SignIn',
 ]);
 
 test('the touchpoint list is the whole seam, in both directions', () => {
   const listed = telegramAdapter.TELEGRAM_TOUCHPOINTS;
   assert.equal(Array.isArray(listed), true, 'the inventory is data, not a comment');
-  assert.equal(listed.length, 36, 'the count the refactor was scoped on; a new touchpoint must be argued for, not slipped in');
+  /* 36 from the seam itself, plus the two an edited post needed: constructing the library's edit filter, and the
+   * deep import that filter has to come through (the barrel does not export it - see the version pin below, which
+   * is what makes that a checked fact rather than a memory). Argued for in the PR that added them, as promised. */
+  assert.equal(listed.length, 38, 'the count the refactor was scoped on; a new touchpoint must be argued for, not slipped in');
   assert.equal(new Set(listed).size, listed.length, 'nothing is listed twice, which would make the count a fiction');
   assert.deepEqual(Object.isFrozen(listed), true, 'the seam cannot be extended by pushing onto the list at runtime');
 
@@ -243,6 +252,8 @@ test('every forwarded call is exactly the call the app used to make, with the sa
     ['getMessages', () => telegramAdapter.getMessages(client, 'E', { limit: 25 }), ['getMessages', ['E', { limit: 25 }]]],
     ['addMessageHandler', () => telegramAdapter.addMessageHandler(client, handler, 'F'), ['addEventHandler', [handler, 'F']], 'void'],
     ['removeMessageHandler', () => telegramAdapter.removeMessageHandler(client, handler, 'F'), ['removeEventHandler', [handler, 'F']], 'void'],
+    ['addEditHandler', () => telegramAdapter.addEditHandler(client, handler, 'F'), ['addEventHandler', [handler, 'F']], 'void'],
+    ['removeEditHandler', () => telegramAdapter.removeEditHandler(client, handler, 'F'), ['removeEventHandler', [handler, 'F']], 'void'],
     ['listEventHandlers', () => telegramAdapter.listEventHandlers(client), ['listEventHandlers', []]],
     ['checkAuthorization', () => telegramAdapter.checkAuthorization(client), ['checkAuthorization', []]],
     ['exportSessionString', () => telegramAdapter.exportSessionString(client), ['session.save', []]],
@@ -346,6 +357,50 @@ test('the message filter is built per registration, because the library compares
   const first = telegramAdapter.createMessageEventFilter();
   const second = telegramAdapter.createMessageEventFilter();
   assert.notEqual(first, second, 'two calls are two objects, exactly as the two `new NewMessage({})` calls were');
+
+  /* The edited-post filter is a different builder class, and that is the whole mechanism: the dispatcher asks
+   * every registered builder to claim an update, `NewMessage.build()` answers only the two "new" updates and
+   * `EditedMessage.build()` only the two "edit" updates, so one post fires one handler and one edit fires the
+   * other. Same class twice would have been a second name for one subscription, and a signal captured twice. */
+  const edits = telegramAdapter.createEditEventFilter();
+  const posts = telegramAdapter.createMessageEventFilter();
+  assert.notEqual(telegramAdapter.createEditEventFilter(), edits, 'built per registration here too');
+  assert.equal(edits.constructor.name, 'EditedMessage', 'the library class, not a look-alike of ours');
+  assert.equal(posts.constructor.name, 'NewMessage');
+  assert.notEqual(edits.constructor, posts.constructor, 'two builders, two update types each claiming a different one');
+  assert.equal(typeof edits.build, 'function', 'and it is a real builder: the dispatcher calls build() on it');
+});
+
+/* The seam is allowed to be this thin only because four things are true of the installed library. They are not
+ * style notes: each one decides whether an edited post reaches the database at all, and each is a fact about a
+ * dependency whose repository is archived - so they are checked against the code that shipped, and a version that
+ * changes one of them fails here instead of turning capture into a silent half. */
+test('the library facts the edit subscription rests on', () => {
+  const at = (rel) => new URL(`../node_modules/telegram/${rel}`, import.meta.url);
+  const read = (url) => readFileSync(url, 'utf8');
+  const { version } = JSON.parse(read(at('package.json')));
+  const skip = existsSync(at('events/index.js')) ? null : 'the package layout moved, which is itself the news this test exists to report';
+  if (skip) { console.log(`skipped: ${skip}`); return; }
+
+  // 1. The event the task named does not exist by that name, and the barrel does not export it either.
+  const barrel = read(at('events/index.js'));
+  assert.equal(/exports\.(MessageEdited|EditedMessage)\b/.test(barrel), false, `telegram@${version}: events/index.js exports no edited-post builder, so the deep import in the adapter is not a preference`);
+  assert.match(read(at('events/EditedMessage.js')), /exports\.EditedMessage = EditedMessage/, 'the class is `EditedMessage`, in the file the adapter imports');
+  assert.equal(existsSync(at('events/MessageEdited.js')), false, 'and there is no `MessageEdited` module to import by mistake - a name from the library\'s documentation, which would have been `undefined` at `new`');
+
+  // 2. `editDate` is on the message the update carries, because it is in the schema the classes are generated from.
+  const schema = read(at('tl/apiTl.js'));
+  assert.match(schema, /message#\w+ [^;]*edit_date:flags\.\d+\?int/, `telegram@${version}: messages.Message states edit_date as a flagged timestamp, so message.editDate is the channel\'s own stamp and not our clock`);
+
+  // 3. A detached pair is chosen by filter OR callback, which is why capture is two callbacks and not one.
+  const updates = read(at('client/updates.js'));
+  assert.match(updates, /removeEventHandler\(client, callback, event\)[\s\S]{0,180}item\[0\] !== event && item\[1\] !== callback/, 'removal matches either half, so one callback under two filters could not be unsubscribed once');
+  assert.match(readFileSync(new URL('../services/telegram-listener.js', import.meta.url), 'utf8'), /const handler = \(event\) => ingestMessage\(userId, event\?\.message, event\);\n\s+telegramAdapter\.addMessageHandler\(target, handler, telegramAdapter\.createMessageEventFilter\(\)\);\n\s+current\.handler = handler;\n\s+attachEditHandler\(target, current, userId\);/,
+    'and the listener really does register the post handler and the edit handler as two separate callbacks');
+
+  // 4. Every update type reaches every builder, so a second registration is enough - no dispatcher patch needed.
+  assert.match(updates, /for \(const \[builder, callback\] of client\._eventBuilders\)/, 'the dispatcher asks each registered builder to claim the update, in registration order');
+  assert.match(read(at('events/NewMessage.js')), /build\(update, callback, selfId\)\s*\{\s*if \(update instanceof tl_1\.Api\.UpdateNewMessage \|\|\s*update instanceof tl_1\.Api\.UpdateNewChannelMessage\)/, 'and NewMessage.build claims only the two new-post updates, which is why an edited post never reached capture before this existed');
 });
 
 test('the requests the ladder makes are the library\'s own, or null - never a half-built guess', async () => {

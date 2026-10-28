@@ -37,6 +37,7 @@ import { createPlanSynchronizer } from './services/plan-sync.js';
 import { planLimitsFor, buildLimitError } from './services/plan-limits.js';
 import { SIGNAL_OUTCOME_CONTEXT_SQL, createSignalOutcomeReader, decideSignalOutcome, overlayLiveBlocker, describeOverlayDiagnostics } from './services/signal-outcome.js';
 import { friendlySignalNote } from './services/signal-wording.js';
+import { planSignalEdit, EDITABLE_SIGNAL_STATUSES } from './services/signal-edit.js';
 import {
   createInactivityService, daysInactiveSince,
   INACTIVITY_WARNING_DAYS, INACTIVITY_DELETION_DAYS, INACTIVITY_SWEEP_LIMIT,
@@ -377,6 +378,14 @@ const { withLiveBlockers } = createSignalOutcomeReader({
   runtimeEnabled: () => autoTradingRuntimeEnabled,
 });
 
+/* The capture's read of one signal row, in the camelCase every reader of it uses: the row pushed to the socket,
+   the row a redelivered message answers with, and the row an edited message returns after its UPDATE. One list
+   rather than three, because "what a captured signal contains" is one fact, and the day it is written out twice
+   is the day a client renders a field the write path stopped selecting. */
+const SIGNAL_CAPTURE_ROW_COLUMNS = `id,channel_id AS "channelId",channel_title AS "channelTitle",telegram_message_id AS "telegramMessageId",source,message,symbol,side,
+  entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt",
+  direction_inferred AS "directionInferred",take_profit_levels AS "takeProfitLevels",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",needs_review AS "needsReview",order_type AS "orderType",order_type_stated AS "orderTypeStated",is_scalping AS "isScalping",entry_range AS "entryRange",sent_at AS "sentAt",edited_at AS "editedAt"`;
+
 async function saveSignal(userId, message, channel = {}) {
   const source = channel.source === 'manual' ? 'manual' : 'telegram';
   /* Which end of the AI reader's queue this message stands in. A message pushed by Telegram is live; a
@@ -420,8 +429,65 @@ async function saveSignal(userId, message, channel = {}) {
      showing it. */
   const pre = await prelude;
   if (pre.error) throw pre.error;
-  const [guardResult, { parsed, review, provenance }] = pre.value;
+  const [guardResult, reading] = pre.value;
+  /* `parsed` is the reading the row is written from, and two lines below it may be replaced by the *merged* one.
+     That is why these are bindings rather than a destructure in place: every judgement after them - the safety
+     nets, the status, the sentence, whether a job is queued - has to be about the text and the numbers the row
+     will actually hold, and there has to be one set of them. A second `captureSafety` call for the edit path is how
+     a signal ends up stored as executable and refused by the engine for the same reason it was stored as one. */
+  let parsed = reading.parsed;
+  let review = reading.review;
+  let provenance = reading.provenance;
   const guard = guardResult.rows[0] || {};
+  /* An edited message is not a new signal. It is the same post, with the channel's own correction in it, and the
+     row that post was captured into is the thing to fix - which is what `services/signal-edit.js` decides, in the
+     open, as data: the read below answers "what does the row hold", the plan answers "what may this edit change",
+     and only then does anything write. The row is looked up by `telegram_message_id`, the same three columns the
+     unique index is built on, so "the row for that message" is one question with one answer.
+     A note on the round trip: this read is deliberately *not* folded into the prelude above. A new message - the
+     path every trader is waiting on - never takes it, and an edit is a channel amending an old post, for which one
+     extra query is not the thing worth saving. */
+  let editPlan = null;
+  if (channel.edited === true && source === 'telegram' && telegramMessageId) {
+    const stored = await pool.query(
+      `SELECT * FROM signals WHERE user_id=$1 AND channel_id=$2 AND telegram_message_id=$3 AND source='telegram' LIMIT 1`,
+      [userId, channel.channelId, telegramMessageId],
+    );
+    editPlan = planSignalEdit({ row: stored.rows[0] || null, parsed, review, provenance, savedText, editedAt: channel.editedAt ?? null });
+    /* Two answers cost the row nothing. `refuse` is the status gate - the signal has been queued or traded, and
+       those numbers are what an order was built from - and `none` is an edit the parser agrees with completely.
+       Both return the row as the database holds it, because "the edit was seen" is not the same claim as "the edit
+       was applied", and only the second one would justify a socket event. */
+    if (editPlan.action === 'refuse' || editPlan.action === 'none') {
+      log('info', editPlan.action === 'refuse' ? 'Telegram edit ignored: that signal has already moved' : 'Telegram edit changed nothing the row does not already hold', {
+        userId, messageId: telegramMessageId, signalId: editPlan.row?.id ?? null, status: editPlan.row?.status ?? null, reason: editPlan.reason,
+      });
+      return editPlan.row;
+    }
+    if (editPlan.action === 'text') {
+      const { rows: refreshed } = await pool.query(
+        `UPDATE signals
+           SET message=$2,edited_at=$3
+           WHERE id=$1 AND status = ANY($4::text[])
+           RETURNING ${SIGNAL_CAPTURE_ROW_COLUMNS}`,
+        [editPlan.row.id, savedText, editPlan.editedAt ? new Date(editPlan.editedAt) : null, EDITABLE_SIGNAL_STATUSES],
+      );
+      const row = refreshed[0] || editPlan.row;
+      /* The reading is untouched, and the log says so in the same breath as the write: a provider replacing a
+         signal with a headline is the case this branch exists for, and "the text moved, the trade did not" is the
+         whole answer to the question a trader asks next. */
+      log('info', 'Telegram edit refreshed the message only', { userId, messageId: telegramMessageId, signalId: row?.id ?? null, reason: editPlan.reason, lost: editPlan.lost?.length ? editPlan.lost.join('|') : null });
+      io.to(`user:${userId}`).emit('signal:received', row);
+      return row;
+    }
+    /* The row is being rewritten from a reading that is not this message alone, so from here down every judgement
+       below is made about the merged one. */
+    if (editPlan.action === 'update') {
+      parsed = editPlan.reading;
+      review = editPlan.review;
+      provenance = editPlan.provenance;
+    }
+  }
   /* Which refusals this workspace's own safety rules can answer: a fallback distance may complete a leg
      the channel forgot, an override may send the order without it, and neither is true when the block is
      up and no net is set. A direction inferred from the prices never becomes eligible at all - reading a
@@ -431,7 +497,19 @@ async function saveSignal(userId, message, channel = {}) {
   /* `needs_review` is the pipeline's answer, kept separate from `execution_ready` on purpose: a row can be
      complete and still need a human, and a reviewer cannot tell a blocked signal from a broken one if both
      collapse into the same flag. */
-  const safety = captureSafety({ parsed, source, settings: guard, review });
+  const safetyResult = captureSafety({ parsed, source, settings: guard, review });
+  /* Rule 3 of `services/signal-edit.js`, applied to the row rather than to the reading. An edit that moved no
+     price does not get to re-decide eligibility, because a stored row can hold all three prices and still be
+     refused - the workspace's rules moved since it was written, or a person fixed one column - and promoting that
+     row into an order on the strength of a typo fix is the provider's edit doing something nobody asked for. */
+  const safety = editPlan?.action === 'update' && editPlan.eligibility === 'stored'
+    ? {
+      executionReady: editPlan.row.execution_ready === true,
+      parseError: editPlan.row.parse_error || null,
+      technicalNote: null,
+      reviewRequired: editPlan.row.needs_review === true,
+    }
+    : safetyResult;
   const executionReady = safety.executionReady === true;
   const parseError = safety.parseError || null;
   const { rows } = await pool.query(
@@ -441,32 +519,75 @@ async function saveSignal(userId, message, channel = {}) {
        reaches us five minutes late must not be described as five minutes fresh - which is what a row with only
        `created_at` would say. */
     `INSERT INTO signals(user_id,channel_id,channel_title,telegram_message_id,source,message,symbol,side,entry_price,stop_loss,take_profit,execution_ready,parse_error,status,direction_inferred,take_profit_levels,
-       needs_review,parsed_by,parse_confidence,llm_used,stop_loss_pips,take_profit_pips,order_type,order_type_stated,is_scalping,entry_range,technical_note,sent_at)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26::jsonb,$27,$28::timestamptz)
+       needs_review,parsed_by,parse_confidence,llm_used,stop_loss_pips,take_profit_pips,order_type,order_type_stated,is_scalping,entry_range,technical_note,sent_at,edited_at)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26::jsonb,$27,$28::timestamptz,$29::timestamptz)
      ON CONFLICT DO NOTHING
-     RETURNING id,channel_id AS "channelId",channel_title AS "channelTitle",telegram_message_id AS "telegramMessageId",source,message,symbol,side,
-       entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt",
-       direction_inferred AS "directionInferred",take_profit_levels AS "takeProfitLevels",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",needs_review AS "needsReview",order_type AS "orderType",order_type_stated AS "orderTypeStated",is_scalping AS "isScalping",entry_range AS "entryRange"`,
+     RETURNING ${SIGNAL_CAPTURE_ROW_COLUMNS}`,
     [userId, channel.channelId || null, channel.title || null, telegramMessageId, source, savedText, parsed.symbol, parsed.side, parsed.entryPrice, parsed.stopLoss, parsed.takeProfit, executionReady, parseError, executionReady ? 'received' : 'unparsed', parsed.directionInferred === true, scaleOutLadder(parsed),
       review.required === true, provenance.parsedBy, provenance.confidence, provenance.llmUsed === true, parsed.stopLossPips, parsed.takeProfitPips, ORDER_TYPES.includes(parsed.orderType) ? parsed.orderType : 'market', parsed.orderTypeStated === true, parsed.isScalping === true, entryRangeValue(parsed),
       /* What the reader or the broker actually said. Stored for the admin panel and never selected by a route a
          user reads. */
       safety.technicalNote || review.technical || null,
-      channel.sentAt ? new Date(channel.sentAt) : null],
+      channel.sentAt ? new Date(channel.sentAt) : null,
+      /* An edit whose row this workspace never saw (the post was corrected while we were not connected, or the row
+         has since been purged) is stored as the capture it is and stamped as the correction it carries: there is
+         nothing to update, and losing the fact that the text we stored was already amended is how a later reader
+         audits the wrong message. */
+      channel.editedAt ? new Date(channel.editedAt) : null],
   );
   let signal = rows[0];
   if (!signal && telegramMessageId) {
     const existing = await pool.query(
-      `SELECT id,channel_id AS "channelId",channel_title AS "channelTitle",telegram_message_id AS "telegramMessageId",source,message,symbol,side,
-         entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",direction_inferred AS "directionInferred",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt",
-         take_profit_levels AS "takeProfitLevels",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",needs_review AS "needsReview",order_type AS "orderType",order_type_stated AS "orderTypeStated",is_scalping AS "isScalping",entry_range AS "entryRange"
+      `SELECT ${SIGNAL_CAPTURE_ROW_COLUMNS}
        FROM signals WHERE user_id=$1 AND channel_id=$2 AND telegram_message_id=$3 AND source='telegram' LIMIT 1`,
       [userId, channel.channelId, telegramMessageId],
     );
     signal = existing.rows[0];
-    return signal;
+    /* Two writers can reach here, and they want different things from the row they found. A redelivered *post* is a
+       duplicate: the row that exists is the whole answer, and annotating it again would move a status the engine
+       may already have written over. An *edit* whose own insert lost that race is not: the message is stored, it is
+       stored once, and the reading below is what decides whether it trades. */
+    if (!editPlan) return signal;
   }
   if (!signal) throw new Error('The signal could not be saved.');
+
+  /* The correction itself, one statement, guarded twice over: on the status list this file shares with
+     `services/signal-edit.js` (so the decision and the write cannot disagree about what "still open" means) and on
+     the message id (so an id that belongs to another channel's row is never touched by accident). If it matches
+     nothing, the row moved between the read above and this statement - a job claimed, an order sent - and the
+     answer is to stop: not to annotate a signal the engine has taken over, and not to queue one behind it. */
+  if (editPlan?.action === 'update') {
+    const columns = editPlan.columns;
+    const { rows: applied } = await pool.query(
+      `UPDATE signals
+         SET symbol=$2,side=$3,entry_price=$4,stop_loss=$5,take_profit=$6,stop_loss_pips=$7,take_profit_pips=$8,
+             take_profit_levels=$9::jsonb,entry_range=$10::jsonb,order_type=$11,order_type_stated=$12,is_scalping=$13,
+             direction_inferred=$14,needs_review=$15,parsed_by=$16,parse_confidence=$17,llm_used=$18,execution_ready=$19,
+             parse_error=$20,status=$21,message=$22,technical_note=COALESCE($23,technical_note),edited_at=$24
+         WHERE id=$1 AND telegram_message_id=$25 AND status = ANY($26::text[])
+         RETURNING ${SIGNAL_CAPTURE_ROW_COLUMNS}`,
+      [signal.id, columns.symbol, columns.side, columns.entry_price, columns.stop_loss, columns.take_profit, columns.stop_loss_pips, columns.take_profit_pips,
+        scaleOutLadder(parsed), entryRangeValue(parsed), columns.order_type, columns.order_type_stated, columns.is_scalping,
+        columns.direction_inferred, review.required === true, provenance.parsedBy, provenance.confidence, provenance.llmUsed === true, executionReady,
+        parseError, executionReady ? 'received' : 'unparsed', savedText, safety.technicalNote || review.technical || null,
+        editPlan.editedAt ? new Date(editPlan.editedAt) : null, telegramMessageId, EDITABLE_SIGNAL_STATUSES],
+    );
+    if (!applied.length) {
+      log('warn', 'Telegram edit could not be applied: that signal had already moved', { userId, messageId: telegramMessageId, signalId: signal.id, status: signal.status || null });
+      return signal;
+    }
+    signal = applied[0];
+    /* The sentence a trader would want if they asked why this signal traded when the channel's first version said
+       nothing tradeable: the block was real, the edit lifted it, and the decision to queue is made below by the
+       same code that decides it for every other signal - not by a rule this path invented. The two lists say who
+       supplied what, which is the question that gets asked next: did the channel give that stop loss, or did the
+       platform quietly make one up? `changed` is the edit's doing and `keptFromRow` is the row's own, and the case
+       this line exists for - a bare "SELL NOW" corrected into a full signal - has every leg in the first list and
+       nothing in the second, which is what `filled` has always meant in this pipeline. */
+    if (editPlan.wasBlocked && executionReady) {
+      log('info', 'Edited signal became executable', { userId, messageId: telegramMessageId, signalId: signal.id, changed: editPlan.changedColumns?.join('|') || null, keptFromRow: editPlan.filled?.join('|') || null });
+    }
+  }
 
   /* Nothing below decides whether the message is stored - it already is. Plan, linked accounts,
      the execution runtime and the platform switch decide only whether a job is queued, and the

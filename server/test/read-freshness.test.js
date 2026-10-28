@@ -65,7 +65,7 @@ test('a row is pushed to the socket only once the database has finished deciding
   const body = index.slice(at, index.indexOf('\nfunction ', index.indexOf('INSERT INTO execution_jobs', at)));
   const insert = body.indexOf('INSERT INTO signals');
   const update = body.indexOf('UPDATE signals SET status=$2');
-  const emit = body.indexOf("emit('signal:received'");
+  const emit = body.lastIndexOf("emit('signal:received'");
   const queue = body.indexOf("INSERT INTO execution_jobs");
   assert.notEqual(insert, -1, 'the row is stored');
   assert.notEqual(update, -1, 'then the outcome is written onto it');
@@ -95,8 +95,14 @@ test('a push can only reach the workspace that owns the row', () => {
   assert.match(guard, /socket\.userId = payload\.sub;/, 'and the identity the room is built from is the token\'s, not anything the client claims');
   assert.match(index.slice(connection, connection + 260), /socket\.join\(`user:\$\{socket\.userId\}`\)/, 'so a connection joins exactly one workspace room');
   assert.match(index, /io\.to\(`user:\$\{userId\}`\)\.emit\('signal:received', signal\);[\s\S]{0,60}return signal;\s*\}/, 'and the only emit targets that room, using the row owner\'s id');
+  const scoped = index.match(/io\.to\(`user:\$\{userId\}`\)\.emit\('signal:received'/g) || [];
   const emits = index.match(/emit\('signal:received'/g) || [];
-  assert.equal(emits.length, 1, 'one place announces a captured row, so no capture path can forget it');
+  /* Two writers announce a row: the capture path, and the path that refreshes only a message's text after an
+     edited post. The count used to be the assertion, and the count was really standing in for the rule - so the
+     rule is asserted instead, and it is the stronger form: every announce site is room-scoped, and a third one
+     that forgot the room would make these two numbers disagree. */
+  assert.equal(emits.length, 2, 'the capture and the edit refresh are the only two places a row is announced');
+  assert.equal(scoped.length, emits.length, 'and every one of them targets the room of the row owner, never a broadcast');
 });
 
 test('a closed support session stops streaming, not just stops reading', () => {
@@ -199,7 +205,10 @@ test('no name in the capture function is read before the line that declares it',
   const offenders = [];
   for (const declaration of stripped.matchAll(/\b(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=/g)) {
     const name = declaration[1];
-    const use = stripped.search(new RegExp(`(^|[^\\w$.])${name}\\b`));
+    /* `(?!\s*:)` because `{ row: x }` is a key and `row` is not a read of anything. The pin used to be satisfied
+     * by an object literal that named a later local, which is the same class of false positive as a comment: it
+     * reports a hazard that is not there, and a test that cries wolf about TDZ gets ignored the day there is one. */
+    const use = stripped.search(new RegExp(`(^|[^\\w$.])${name}\\b(?!\\s*:)`));
     if (use !== -1 && use < declaration.index) offenders.push(name);
   }
   assert.deepEqual(offenders, [], 'every value the statements hand to a query is declared by the line above them');
