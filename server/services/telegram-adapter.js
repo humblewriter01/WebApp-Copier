@@ -38,6 +38,14 @@
 import { Api, TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { NewMessage } from 'telegram/events/index.js';
+/* The edited-post filter, from the file that defines it rather than from the barrel: `telegram/events/index.js`
+   exports `Raw`, `NewMessage` and `NewMessageEvent` and *nothing else* (verified against 2.26.22), so a
+   `MessageEdited` import - the name the library's own documentation uses - would resolve to `undefined` and die
+   on the first `new`. The class here is called `EditedMessage`, it extends `NewMessage`, and its `build()` answers
+   exactly the two updates `NewMessage.build()` refuses (`UpdateEditMessage`, `UpdateEditChannelMessage`), which is
+   what makes the two handlers a partition rather than a duplication: a new post fires one, an edit fires the other,
+   and neither fires twice. */
+import { EditedMessage } from 'telegram/events/EditedMessage.js';
 
 /**
  * Every GramJS access this module owns. The count is the contract: the test asserts both that each of these
@@ -47,6 +55,8 @@ export const TELEGRAM_TOUCHPOINTS = Object.freeze([
   'TelegramClient',
   'StringSession',
   'NewMessage',
+  'EditedMessage',
+  'telegram/events/EditedMessage deep import',
   'Api.auth.SignIn',
   'Api.auth.AuthorizationSignUpRequired',
   'Api.updates.GetState',
@@ -239,7 +249,8 @@ export function signInWithPassword(client, context, { password, onError }) {
 }
 
 /* ------------------------------------------------------------------------------- handlers and events
-   Capture is one `NewMessage` handler per client, and the library keeps its handlers in `_eventBuilders` as
+   Capture is two handlers per client - `NewMessage` for posts, `EditedMessage` for corrections - and the library
+   keeps its handlers in `_eventBuilders` as
    `[builder, handler]` pairs. `listEventHandlers()` is the only authoritative answer to "is my handler still on
    this socket", which is why the watchdog reads it instead of trusting `entry.handler`.
    ------------------------------------------------------------------------------- */
@@ -249,15 +260,44 @@ export function createMessageEventFilter() {
   return new NewMessage({});
 }
 
+/**
+ * The filter an edited-post handler registers with.
+ *
+ * Same emptiness, same reason: which chats this workspace trades is a database question, not an event-filter one,
+ * and an edit has to reach the same channel matching the new message went through.
+ */
+export function createEditEventFilter() {
+  return new EditedMessage({});
+}
+
 export function addMessageHandler(client, handler, filter) {
   client.addEventHandler(handler, filter);
 }
 
+/**
+ * The edit half of the pair.
+ *
+ * A *separate callback* is not a style choice here. `removeEventHandler` drops every pair that matches the filter
+ * **or** the callback (`updates.js`: `item[0] !== event && item[1] !== callback`), so one handler registered twice
+ * could not be unsubscribed once: removing the new-message pair would take the edit pair with it and leave the
+ * workspace hearing posts but not corrections - the exact bug this seam exists to make impossible to re-introduce.
+ * Two callbacks, two filters, and each half can be re-attached on its own.
+ */
+export function addEditHandler(client, handler, filter) {
+  client.addEventHandler(handler, filter);
+}
+
+/** Whether this client can detach a handler at all - a question about the client, so both filters use it. */
 export function canRemoveMessageHandler(client) {
   return typeof client?.removeEventHandler === 'function';
 }
 
 export function removeMessageHandler(client, handler, filter) {
+  client.removeEventHandler(handler, filter);
+}
+
+/** Detaches an edited-post handler, and only that one - see `addEditHandler` for why the callback is what separates them. */
+export function removeEditHandler(client, handler, filter) {
   client.removeEventHandler(handler, filter);
 }
 

@@ -150,6 +150,13 @@ const SCHEMA_SQL = `
     ALTER TABLE signals ADD COLUMN IF NOT EXISTS telegram_message_id TEXT;
     ALTER TABLE signals ADD COLUMN IF NOT EXISTS execution_ready BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE signals ADD COLUMN IF NOT EXISTS parse_error TEXT;
+    /* Set when a captured row's text was replaced by an edited Telegram post, to the moment the *channel* says it
+     edited - never to our clock, because "we only just noticed" is a different fact and created_at already holds
+     it. NULL means the row is still the original reading, which is the answer a reader of a signal card needs: is
+     the message that produced this row still the message the channel is showing. No backticks in this comment, in
+     the same idiom as every other comment in this literal, because a backtick ends the string and the service
+     dies at boot on a SyntaxError. */
+    ALTER TABLE signals ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ;
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS auto_trading_enabled BOOLEAN NOT NULL DEFAULT TRUE;
     ALTER TABLE settings ALTER COLUMN auto_trading_enabled SET DEFAULT TRUE;
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS lot_size_mode TEXT NOT NULL DEFAULT 'fixed';

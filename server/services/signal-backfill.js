@@ -83,14 +83,20 @@ const levels = (value) => {
   return numbers.length > 1 ? numbers : null;
 };
 
-/** What the current parser says about a row's own message, in the shape the table stores. */
 /** The parse and the reading, kept apart so a caller can refuse a leg without re-parsing the message. */
 export function readMessage(message) {
   const parsed = parseSignal(message);
   return { parsed, values: valuesFromParse(parsed) };
 }
 
-function valuesFromParse(parsed) {
+/**
+ * What the current parser says about a message, in the shape the table stores.
+ *
+ * Exported because it is the only definition of "how a reading becomes a row": the offline re-read writes through
+ * it, and `services/signal-edit.js` writes an edited message through it, so the two cannot drift into two
+ * different answers about the same text.
+ */
+export function valuesFromParse(parsed) {
   return {
     symbol: text(parsed.symbol),
     side: text(parsed.side),
@@ -146,8 +152,13 @@ export function writableLegs(parsed) {
   return { allow: PRICE_LEGS.filter((column) => !reasons[column]), reasons };
 }
 
-/** Values as the table holds them, so a comparison is between like things and not `4011` against `'4011.00'`. */
-function storedValues(row) {
+/**
+ * Values as the table holds them, so a comparison is between like things and not `4011` against `'4011.00'`.
+ *
+ * The same reason `valuesFromParse` is exported: a row that "did not change" has to be decided by the code that
+ * decides what a row *is*, and an edit that reads a change where the re-read sees none is two policies again.
+ */
+export function storedValues(row) {
   return {
     symbol: text(row.symbol),
     side: text(row.side),
@@ -165,7 +176,7 @@ function storedValues(row) {
   };
 }
 
-const same = (left, right) => {
+export const same = (left, right) => {
   if (Array.isArray(left) || Array.isArray(right)) return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
   return (left ?? null) === (right ?? null);
 };

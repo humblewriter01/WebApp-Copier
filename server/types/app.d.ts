@@ -194,6 +194,8 @@ type SignalRow = {
   status: string;
   created_at: string;
   sent_at: Date | null;
+  /** The channel's own edit stamp, set only on a row whose text was replaced by an edited post. */
+  edited_at: Date | null;
   source: string;
   telegram_message_id: string | null;
   /** null when the parser took the stop from the workspace's fallback distance rather than from the message. */
@@ -261,6 +263,53 @@ type SettingsRow = {
  * The take-profit plan one trade is about to run: what `planScaleOutLevels` decides and the execution engine
  * carries from the sizing decision to the order, declared globally because three files touch it.
  */
+/**
+ * What `services/signal-edit.js` decided to do about an edited Telegram message, as `index.js` receives it.
+ *
+ * A discriminated union written as one shape with optional members, because that is how it is used: every caller
+ * reads `action` first and then only the fields that answer belongs to. Declaring it is what makes a plan field
+ * that does not exist - `editPlan.changed`, `editPlan.lostt` - a compile error at the writer instead of
+ * `undefined` at run time, which in this file would read as an UPDATE that quietly stopped setting a column.
+ */
+/* Every member except `action` is optional, and not as a hedge: the five answers genuinely differ, and an
+ * 'insert' has no row to describe. `action` is the discriminator the writer switches on first, so the shape is
+ * only ever read inside a branch that already knows which answer it holds. When `strictNullChecks` arrives (see
+ * TODO.md) this becomes a discriminated union per branch, and the checker will read the switch. */
+type SignalEditPlan = {
+  /** What the row may do about it: correct the reading, refresh only the text, leave it alone, or decline. */
+  action: 'insert' | 'update' | 'text' | 'none' | 'refuse';
+  /** Why a write was skipped or narrowed, or null when there was nothing to explain. */
+  reason?: string | null;
+  /** The channel's own edit stamp, ISO, or null when the update carried no `editDate` to trust. */
+  editedAt?: string | null;
+  /** The row as the database held it, snake_case and all, or null when there was no row to correct. */
+  row?: Record<string, any> | null;
+  /** The sentence for the log when the status gate refused the edit. */
+  detail?: string;
+  /** Whether the edited text differs from the text the row stores. */
+  textChanged?: boolean;
+  /** The merged reading the row would hold, or null for every action that writes no reading. */
+  reading?: Record<string, any> | null;
+  /** That reading in the table's own column names, from the converter the offline re-read uses as well. */
+  columns?: Record<string, any> | null;
+  /** Which legs the *stored row* contributed - filled in by the merge rather than restated by the edit. */
+  filled?: string[];
+  /** What the merge refused to use and why, carried through for the row's `technical_note`. */
+  dropped?: any[];
+  /** Prices the row holds that this reading would clear: the reason for `REFUSES_TO_DROP_A_PRICE`. */
+  lost?: string[];
+  /** Which columns the write moves, compared on the numbers rather than their spellings. */
+  changedColumns?: string[];
+  /** Did a price move? Rule 3's test, and the only thing that lets an edit re-decide eligibility. */
+  legsChanged?: boolean;
+  /** 'recompute' when the safety nets are asked again, 'stored' when the row's own verdict carries over. */
+  eligibility?: 'recompute' | 'stored';
+  /** True when the row was not executable before this edit, which is the promotion worth logging. */
+  wasBlocked?: boolean;
+  review?: Record<string, any>;
+  provenance?: Record<string, any>;
+};
+
 type ScaleOutPlan = {
   /** false means "send the order as the signal described it", not "something failed". */
   eligible: boolean;

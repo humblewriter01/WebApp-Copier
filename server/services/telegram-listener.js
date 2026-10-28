@@ -229,7 +229,7 @@ const yieldToEventLoop = () => new Promise((resolve) => setImmediate(resolve));
 /** Connected, listening, and nothing through the handler for this long is worth saying out loud. */
 export const STREAM_IDLE_MS = 15 * 60 * 1000;
 
-const EMPTY_STATS = () => ({ seen: 0, saved: 0, ignored: 0, lastAt: null, lastChatId: null, lastError: null, catchUpSaved: 0, lastDelayMs: null, lastSentAt: null, lastMessageId: null });
+const EMPTY_STATS = () => ({ seen: 0, saved: 0, ignored: 0, edits: 0, lastAt: null, lastChatId: null, lastError: null, catchUpSaved: 0, lastDelayMs: null, lastSentAt: null, lastMessageId: null });
 
 /**
  * Whether a workspace id handed to `onSessionUnrecoverable` can address a row of `users`.
@@ -1038,17 +1038,26 @@ export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>}
       keepAliveTimeouts: Number((typeof transportFlap === 'function' ? transportFlap(entry?.client) : null)?.count) || 0,
       transportFlapping: beat?.flapping === true,
       listening: Boolean(entry?.handler) && handlerIsLive(entry.client, entry.handler) && telegramAdapter.isConnected(entry.client),
+      // Reported apart from `listening` on purpose: `listening` is the watchdog's trigger and a session whose only
+      // loss is the edit handler must not be rebuilt for it, but it is still a fault with a name, and the name is
+      // the only thing that makes it findable when a trader asks why a corrected signal never arrived.
+      editsAttached: Boolean(entry?.editHandler) && handlerIsLive(entry.client, entry.editHandler),
     };
   }
 
   /* The one place a message becomes a row. Both the pushed-update path and the catch-up path call
-     it, so "it was captured" means the same thing in production and in the replay. */
-  async function ingestMessage(userId, message, event, { replayed = false } = {}) {
+     it, so "it was captured" means the same thing in production and in the replay - and so does the edit
+     path, which is the same question asked about a post this workspace already stored. */
+  async function ingestMessage(userId, message, event, { replayed = false, edited = false } = {}) {
     const stats = statsFor(userId) || EMPTY_STATS();
     const entry = entryFor(userId);
     if (entry) entry.stats = stats;
     try {
       if (!replayed) stats.seen += 1;
+      // Counted as an arrival before anything is decided about it, because "the channel edited four posts while
+      // we were reconnecting" is a fact about the stream, and a counter that only moved on a stored row could not
+      // tell a stream of edits from a socket that had stopped delivering them.
+      if (edited) stats.edits = (stats.edits || 0) + 1;
       const chatId = resolveTelegramChatId(message, event);
       const arrivedAt = now();
       stats.lastAt = new Date(arrivedAt).toISOString();
@@ -1058,11 +1067,18 @@ export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>}
          lagging" is unanswerable after the fact, because `signals.created_at` is only ever the write time. GramJS
          gives the Telegram date in epoch seconds, so the delay is one subtraction, and it is recorded on every
          update - including the ones this workspace does not trade - because a quiet handler and a deaf one are
-         the same shape from the outside. */
+         the same shape from the outside.
+         Two moments, and the difference between them is the whole point of keeping both. `sentAt` is when the
+         channel *wrote the post*: it is what lands in `signals.sent_at`, which is what the age guard, the expiry and
+         every "stale" skip measure against, and an edit does not make a stale signal fresh. The lag is measured
+         from `editDate` when there is one, because an amendment to a post from yesterday arrived the instant it
+         was written - a delay taken from `date` would put an "update arrived late" warning on every correction a
+         provider makes to an old message, which is the noise that would then hide a real one. */
       const sentAtMs = Number(message?.date) * 1000;
       const sentAt = Number.isFinite(sentAtMs) && sentAtMs > 0 ? new Date(sentAtMs).toISOString() : null;
+      const stampMs = Number(edited ? (message?.editDate ?? message?.date) : message?.date) * 1000;
       stats.lastSentAt = sentAt;
-      stats.lastDelayMs = sentAt ? Math.max(0, Math.round(arrivedAt - sentAtMs)) : null;
+      stats.lastDelayMs = Number.isFinite(stampMs) && stampMs > 0 ? Math.max(0, Math.round(arrivedAt - stampMs)) : null;
       if (stats.lastDelayMs !== null && stats.lastDelayMs >= silenceSuspectMs) {
         log('warn', 'Telegram update arrived late', { userId, messageId: message?.id ?? null, delayMs: stats.lastDelayMs, replayed: replayed === true });
       }
@@ -1092,21 +1108,36 @@ export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>}
         return { stored: false, reason: 'NOT_MONITORED' };
       }
       // A replay must not invent a second row for a message the workspace already has, and the
-      // table has no unique constraint to fall back on, so the check happens here.
+      // table has no unique constraint to fall back on, so the check happens here. It asks for the stored *text*
+      // as well as the id, because a catch-up runs exactly when this instance was not hearing the socket, and a
+      // post edited while we were deaf is the one case where the row we already hold is the row that is wrong: the
+      // update that carried the correction was sent to a connection that did not exist yet. Same merge and same
+      // guards as a live edited-post event - which is why this hands `edited` to the writer instead of returning -
+      // so the choice was never "apply it or lose it", it was "apply it on the replay or wait for a next edit that
+      // may not come".
       if (replayed && message?.id != null) {
         const known = await pool.query(
-          `SELECT 1 FROM signals WHERE user_id=$1 AND channel_id=$2 AND telegram_message_id=$3 AND source='telegram' LIMIT 1`,
+          `SELECT message FROM signals WHERE user_id=$1 AND channel_id=$2 AND telegram_message_id=$3 AND source='telegram' LIMIT 1`,
           [userId, rows[0].channelId, String(message.id)],
         ).catch(() => ({ rows: [] }));
-        if (known.rows?.length) return { stored: false, reason: 'ALREADY_CAPTURED' };
+        if (known.rows?.length) {
+          const storedText = String(known.rows[0]?.message ?? '');
+          if (storedText && storedText !== text) edited = true;
+          else return { stored: false, reason: 'ALREADY_CAPTURED' };
+        }
       }
       /* `delayMs` rides on the line that proves the row exists, so one log entry answers "did we get it" and "how
          late was it" together - the pair an operator actually has to compare, and the only way the difference
          between a quiet channel and a deaf socket survives past the buffer for a report. */
-      log('info', replayed ? 'Telegram message captured from catch-up' : 'Telegram message captured', { userId, chatId, channel: rows[0].title, chars: text.length, messageId: message?.id ?? null, delayMs: stats.lastDelayMs, sentAt: stats.lastSentAt });
+      log('info', edited ? 'Telegram message re-read after an edit' : (replayed ? 'Telegram message captured from catch-up' : 'Telegram message captured'), { userId, chatId, channel: rows[0].title, chars: text.length, messageId: message?.id ?? null, delayMs: stats.lastDelayMs, sentAt: stats.lastSentAt });
       // The signal is stored whatever the parser makes of it - a message from a monitored channel that
       // reads as prose is still a captured message, and it is shown as such instead of vanishing.
-      await saveSignal(userId, text, { source: 'telegram', channelId: rows[0].channelId, title: rows[0].title, telegramMessageId: message?.id ?? null, sentAt, delayMs: stats.lastDelayMs, replayed });
+      await saveSignal(userId, text, {
+        source: 'telegram', channelId: rows[0].channelId, title: rows[0].title, telegramMessageId: message?.id ?? null, sentAt, delayMs: stats.lastDelayMs, replayed,
+        // Added to the payload only when it is true, because the capture payload is asserted property for property
+        // by the flow tests and an edit is a different ask with different consequences downstream.
+        ...(edited ? { edited: true, editedAt: message?.editDate ?? null } : {}),
+      });
       stats.saved += 1;
       if (replayed) stats.catchUpSaved = (stats.catchUpSaved || 0) + 1;
       return { stored: true };
@@ -1130,15 +1161,31 @@ export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>}
   async function startTelegramListener(userId, client) {
     const current = clients.get(String(userId)) || clients.get(userId);
     if (!current) return null;
-    if (current.handler && handlerIsLive(client || current.client, current.handler)) return current;
     const target = client || current.client;
     if (!target) return current;
+    const postsLive = Boolean(current.handler) && handlerIsLive(target, current.handler);
+    const editsLive = Boolean(current.editHandler) && handlerIsLive(target, current.editHandler);
+    if (postsLive && editsLive) return current;
+    /* Half-attached is the state this branch exists for. A session that lost only its edit handler still hears
+       every new post, so `listening` stays true, every counter keeps moving, and the workspace quietly stops
+       seeing corrections to messages it already stored - the failure this file exists to refuse, in a better
+       costume. Re-arming that half alone resets nothing: `attachedAt` and `needsCatchUp` belong to the post
+       handler, and a replay triggered by an edit re-arm would re-read the channel for no reason at all. */
+    if (postsLive) {
+      attachEditHandler(target, current, userId);
+      log('info', 'Telegram edit handler re-attached', { userId });
+      return current;
+    }
     if (current.handler && telegramAdapter.canRemoveMessageHandler(target)) {
       try { telegramAdapter.removeMessageHandler(target, current.handler, telegramAdapter.createMessageEventFilter()); } catch { /* the old client is gone */ }
+    }
+    if (current.editHandler && telegramAdapter.canRemoveMessageHandler(target)) {
+      try { telegramAdapter.removeEditHandler(target, current.editHandler, telegramAdapter.createEditEventFilter()); } catch { /* the old client is gone */ }
     }
     const handler = (event) => ingestMessage(userId, event?.message, event);
     telegramAdapter.addMessageHandler(target, handler, telegramAdapter.createMessageEventFilter());
     current.handler = handler;
+    attachEditHandler(target, current, userId);
     if (!current.stats) current.stats = EMPTY_STATS();
     /* Every re-attach asks what was missed, whatever the statistics say. This used to be conditioned on
        "we have never seen a message on this session", which is the only case where the flag was obviously
@@ -1161,6 +1208,21 @@ export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>}
       .then((outcome) => { if (outcome && outcome.action && outcome.action !== 'in-sync') log('debug', 'Telegram update state seeded on attach', { userId, action: outcome.action }); })
       .catch((error) => log('warn', 'Telegram update state could not be seeded', { userId, error: `${error?.message || error}`.slice(0, 160) }));
     return current;
+  }
+
+  /**
+   * Put the edited-post half of the capture pair on this client.
+   *
+   * A *separate* callback, and `addEditHandler` in the adapter says why: the library detaches a handler pair by
+   * filter **or** by callback, so one function registered under two filters could not be removed under one.
+   * Nothing else about it is different from the post handler - the same channel matching, the same parser, the
+   * same writer, with `edited: true` to say which end of the row's life this message came from.
+   */
+  function attachEditHandler(client, entry, userId) {
+    if (!client) return;
+    const handler = (event) => ingestMessage(userId, event?.message, event, { edited: true });
+    telegramAdapter.addEditHandler(client, handler, telegramAdapter.createEditEventFilter());
+    entry.editHandler = handler;
   }
 
   /**

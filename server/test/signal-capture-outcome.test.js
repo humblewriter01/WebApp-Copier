@@ -43,6 +43,11 @@ function section(source, startMarker, endMarker) {
 const AFTER_RESTORE = '\n/**\n * Every workspace with a stored session gets a live listener';
 
 const saveSignalBody = section(index, 'async function saveSignal(', '\nconst telegramCapture = createTelegramListener(');
+/* One column list, three statements: the INSERT's RETURNING, the read that answers a redelivered message, and the
+   UPDATE an edited message writes. The pins below that used to read the aliases out of the capture function read
+   them from here instead, plus an assertion that the capture function still points at this one - which is the
+   part that actually matters, and a literal list in a test could never have said it. */
+const captureRowColumns = section(index, 'const SIGNAL_CAPTURE_ROW_COLUMNS = `', 'async function saveSignal(userId, message, channel = {}) {');
 const listenerBody = section(listenerSource, 'async function ingestMessage(', '  /**\n   * Attach the capture handler');
 const settingsPut = section(index, "app.put('/api/settings'", '\napp.get(\'/api/trades\'');
 
@@ -264,9 +269,18 @@ test('only a fully eligible Telegram signal is queued, and a hand-written note n
 test('a queued signal is handed to the worker on the spot, and the emit is not held up by the order', () => {
   const queueAt = saveSignalBody.indexOf("INSERT INTO execution_jobs(user_id,signal_id,status,expires_at)");
   const notifyAt = saveSignalBody.indexOf('executionWorker.notify()');
-  const emitAt = saveSignalBody.indexOf("emit('signal:received'");
+  const emitAt = saveSignalBody.lastIndexOf("emit('signal:received'");
   assert.ok(queueAt > 0 && notifyAt > queueAt, 'the wake-up follows the statement that put the job in the table, and cannot run before there is anything to claim');
   assert.ok(emitAt > notifyAt, 'and it is fire-and-forget: the row reaches the browser on the same tick, not after the broker answers');
+  /* The other announce site is an edited message that refreshed its row's text and stopped: no status moved, so
+     there is nothing for the queue branch to do and no reason for a card to wait on one. It has to sit *after*
+     that write, which is the same rule in a different costume - a client must never render a row that is half
+     updated - and it must not be inside the queue branch, or a wording-only edit would wake the worker. */
+  const textBranchAt = saveSignalBody.indexOf("if (editPlan.action === 'text') {");
+  const textEmit = saveSignalBody.indexOf("emit('signal:received'", textBranchAt);
+  assert.ok(textBranchAt > 0 && textEmit > textBranchAt, 'the text-only edit path announces its row too, because the card the trader is reading changed');
+  assert.equal(/execution_jobs|decideSignalOutcome|captureSafety\(/.test(saveSignalBody.slice(textBranchAt, textEmit)), false,
+    'and the path that refreshed text touches none of the execution machinery: no policy asked, no outcome decided, no job queued');
   assert.equal(/await executionWorker\.notify|notify\(\)\.then/.test(saveSignalBody), false, 'nothing awaits it, so a slow order cannot delay a delivery');
   assert.ok(saveSignalBody.indexOf('if (outcome.queue) {') < notifyAt, 'inside the queueing branch only - a row that will never trade does not wake the loop');
 });
@@ -342,7 +356,8 @@ test('the safety nets are read before the row is written, and the decision is no
   assert.equal(beforeInsert.includes('auto_trading_enabled'), false, 'the capture decision never reads the trading switch');
   assert.equal(/pool\.query\(\s*'UPDATE settings/.test(beforeInsert), false, 'reading the guard never writes to settings');
   // The inferred direction is stored with the signal, so the badge survives a reload.
-  assert.match(saveSignalBody, /direction_inferred AS "directionInferred"/);
+  assert.match(captureRowColumns, /direction_inferred AS "directionInferred"/, 'the inferred direction is read back with the row');
+  assert.match(saveSignalBody, /RETURNING \$\{SIGNAL_CAPTURE_ROW_COLUMNS\}/, 'and the capture reads it back through the one shared list, not its own copy');
   assert.match(saveSignalBody, /parsed\.directionInferred === true/);
 });
 
@@ -358,8 +373,8 @@ test('the technical half of a row is written for the admin panel and read by nob
      boundary is a test rather than a habit: the admin column list has it, the capture statements write it, and
      the routes a browser polls - plus the payload pushed over the socket - do not read it. */
   assert.ok(index.includes('s.technical_note AS "technicalNote"'), 'the admin signal list reads it, which is the point of the column');
-  assert.match(index, /entry_range,technical_note,sent_at\)\n\s+VALUES\(\$1,\$2,\$3,\$4,\$5,\$6,\$7,\$8,\$9,\$10,\$11,\$12,\$13,\$14,\$15,\$16::jsonb,\$17,\$18,\$19,\$20,\$21,\$22,\$23,\$24,\$25,\$26::jsonb,\$27,\$28::timestamptz\)/, 'the capture writes it, and the channel clock rides along in the same statement');
-  assert.match(index, /channel\.sentAt \? new Date\(channel\.sentAt\) : null\],/, 'the bound value is the time the channel posted, and a source without one stores NULL rather than "just now"');
+  assert.match(index, /entry_range,technical_note,sent_at,edited_at\)\n\s+VALUES\(\$1,\$2,\$3,\$4,\$5,\$6,\$7,\$8,\$9,\$10,\$11,\$12,\$13,\$14,\$15,\$16::jsonb,\$17,\$18,\$19,\$20,\$21,\$22,\$23,\$24,\$25,\$26::jsonb,\$27,\$28::timestamptz,\$29::timestamptz\)/, 'the capture writes it, and the channel clock rides along in the same statement');
+  assert.match(index, /channel\.sentAt \? new Date\(channel\.sentAt\) : null,\n\s+\/\*[\s\S]*?\*\/\n\s+channel\.editedAt \? new Date\(channel\.editedAt\) : null\],/, 'the bound value is the time the channel posted, a source without one stores NULL rather than "just now", and so does an edit with no `editDate` - our own clock is not evidence about the channel');
   const userReads = ["app.get('/api/signals'", "app.get('/api/dashboard'", "const dashboardColumns"];
   for (const marker of userReads) {
     const at = index.indexOf(marker);
@@ -469,10 +484,11 @@ test('the zone a message published is stored beside the bound the row was credit
      has run through the range, and the row that has to show what was offered - and both read the stored value
      rather than re-parsing the message. So the write is pinned here: a row that lost its zone would quietly
      go back to trading a dead setup as a bargain. */
-  assert.match(saveSignalBody, /is_scalping,entry_range,technical_note,sent_at\)/, 'the INSERT carries the column');
+  assert.match(saveSignalBody, /is_scalping,entry_range,technical_note,sent_at,edited_at\)/, 'the INSERT carries the column, and the stamp that says an edited post produced this text');
   assert.match(saveSignalBody, /\$26::jsonb,\$27/, 'as jsonb, like the target ladder beside it, with the admin-only half last');
   assert.match(saveSignalBody, /entryRangeValue\(parsed\),/, 'from the parse, not from a re-read of the message');
-  assert.match(saveSignalBody, /entry_range AS "entryRange"/, 'and the row read back has it, so the client sees the row that was written');
+  assert.match(captureRowColumns, /entry_range AS "entryRange"/, 'and the row read back has it, so the client sees the row that was written');
+  assert.match(saveSignalBody, /entry_range=\$10::jsonb/, 'the edit path writes the zone through the same converter, as jsonb, in the same statement that carries the correction');
 
   const helper = section(index, 'function entryRangeValue(parsed) {', '\nasync function saveSignal(');
   assert.match(helper, /entryRangeBounds\(parsed\?\.entryRange\)/, 'normalised through the same reader the execution engine uses');
@@ -498,7 +514,7 @@ test('a late capture is stored as late, and the execution guard reads the channe
   assert.equal(/ALTER TABLE signals ADD COLUMN IF NOT EXISTS sent_at[^;]*;[^;]*ALTER TABLE signals ADD COLUMN IF NOT EXISTS sent_at/.test(schema), false,
     'once, in one statement');
 
-  assert.match(saveSignalBody, /sent_at\)/, 'the capture writes it');
+  assert.match(saveSignalBody, /sent_at,edited_at\)/, 'the capture writes it');
   assert.match(saveSignalBody, /channel\.sentAt \? new Date\(channel\.sentAt\) : null/,
     'from the update, or NULL when the source has no send time - never from the wall clock, which would defeat the column');
 

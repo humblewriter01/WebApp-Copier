@@ -20,6 +20,8 @@ import { Api, TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { _handleUpdate } from 'telegram/client/updates.js';
 import { NewMessage } from 'telegram/events/index.js';
+import { EditedMessage } from 'telegram/events/EditedMessage.js';
+import * as telegramAdapter from '../services/telegram-adapter.js';
 import { CATCH_UP_COOLDOWN_MS, HEARTBEAT_INTERVAL_MS, STREAM_REBUILD_COOLDOWN_MS, GAP_CATCH_UP_MS, GAP_CATCH_UP_SPREAD_MS, SILENCE_SUSPECT_MS, createTelegramListener, isValidWorkspaceId, normalizeUpdateState, readUpdateState, UPDATE_STATE_KEY } from '../services/telegram-listener.js';
 import { telegramPeerIdVariants, telegramMessageText } from '../services/telegram-peer.js';
 
@@ -30,7 +32,7 @@ const BARE_CHANNEL_ID = '2440709664';
 const CHANNEL_TITLE = 'XM Crypto News';
 const SIGNAL_TEXT = 'BUY XAUUSD\nEntry: 2650.00\nSL: 2640.00\nTP: 2670.00';
 
-function makePool({ channels = [{ channelId: STORED_CHANNEL_ID, title: CHANNEL_TITLE }], knownMessageIds = [] } = {}) {
+function makePool({ channels = [{ channelId: STORED_CHANNEL_ID, title: CHANNEL_TITLE }], knownMessageIds = [], knownText = null, storedRow = null } = {}) {
   const calls = [];
   const known = new Set(knownMessageIds.map((id) => String(id)));
   return {
@@ -45,7 +47,13 @@ function makePool({ channels = [{ channelId: STORED_CHANNEL_ID, title: CHANNEL_T
         return { rows: rows.map((channel) => ({ channelId: channel.channelId, title: channel.title, username: channel.username ?? null })) };
       }
       if (sql.includes('FROM signals WHERE user_id=$1 AND channel_id=$2 AND telegram_message_id=$3')) {
-        return { rows: known.has(String(params[2])) ? [{ '?column?': 1 }] : [] };
+        if (!known.has(String(params[2]))) return { rows: [] };
+        /* Two callers ask this question, and the fixture answers both: the replay asks for the stored *text* (a
+           post whose text differs from its row is an edit this instance never heard about), and the writer asks for
+           the row itself. `storedRow` is what an edit test puts there, in the table's own column names, because
+           that is the shape `planSignalEdit` reads. */
+        if (sql.includes('SELECT * FROM signals')) return { rows: storedRow ? [{ ...storedRow }] : [{ id: 'row-1', status: 'unparsed', message: knownText ?? SIGNAL_TEXT }] };
+        return { rows: [{ message: knownText ?? SIGNAL_TEXT }] };
       }
       throw new Error(`Unexpected query from the capture path: ${sql.replace(/\s+/g, ' ').slice(0, 90)}`);
     },
@@ -95,7 +103,7 @@ function makeHarness(options = {}) {
  * failures. A message whose decoration failed used to read as "no text" and be dropped, so the
  * shape under test is deliberately the undecorated one.
  */
-function channelMessage({ id = 77, text = SIGNAL_TEXT, decorated = true, out = false } = {}) {
+function channelMessage({ id = 77, text = SIGNAL_TEXT, decorated = true, out = false, editDate = undefined } = {}) {
   const peerId = new Api.PeerChannel({ channelId: BigInt(BARE_CHANNEL_ID) });
   const message = new Api.Message({
     id,
@@ -108,11 +116,22 @@ function channelMessage({ id = 77, text = SIGNAL_TEXT, decorated = true, out = f
     mediaUnread: false,
     unread: false,
     post: false,
+    ...(editDate === undefined ? {} : { editDate: Math.floor(editDate / 1000) }),
   });
   // `Message.text` is a getter over `_text`, and `_finishInit()` is what fills `_text` in. Setting
   // it here reproduces a decorated message without depending on the library's entity resolution.
   if (decorated) message._text = text;
   return message;
+}
+
+/** Which builders a client is holding handlers for, in alphabetical order: the pair list, not our bookkeeping. */
+function builderNames(client) {
+  return client.listEventHandlers().map((pair) => pair?.[0]?.constructor?.name).sort();
+}
+
+/** The harness clock, in milliseconds, for a message that has to be dated relative to it. */
+function clock_of() {
+  return Date.parse('2026-10-23T13:00:00.000Z');
 }
 
 async function dispatch(harness, update) {
@@ -209,21 +228,176 @@ test('a handler that is no longer in the client is attached again, and the next 
   const harness = makeHarness();
   await harness.listener.startTelegramListener(USER_ID, harness.client);
   const firstHandler = harness.entry().handler;
+  const firstEditHandler = harness.entry().editHandler;
+  assert.notEqual(firstHandler, firstEditHandler, 'two callbacks, which is what makes each half detachable - see the removal test below');
   // Attaching twice must not double-register: a second handler on the same client means a second row
   // for one message.
   await harness.listener.startTelegramListener(USER_ID, harness.client);
-  assert.equal(harness.client.listEventHandlers().length, 1, 'one handler per client');
-  assert.equal(harness.entry().handler, firstHandler, 'and the first one is kept');
+  assert.deepEqual(builderNames(harness.client), ['EditedMessage', 'NewMessage'], 'one pair per event, two events, nothing registered twice');
+  assert.equal(harness.entry().handler, firstHandler, 'and the first ones are kept');
 
   // Now simulate what a disconnect looks like to the bookkeeping: our flag still says attached.
   harness.client._eventBuilders = [];
   assert.equal(harness.listener.handlerIsLive(harness.client, firstHandler), false, 'the flag is a lie, and the handler list is the truth');
   await harness.listener.startTelegramListener(USER_ID, harness.client);
-  assert.equal(harness.client.listEventHandlers().length, 1, 're-attached, once');
+  assert.deepEqual(builderNames(harness.client), ['EditedMessage', 'NewMessage'], 're-attached, one pair each');
   assert.notEqual(harness.entry().handler, firstHandler, 'on the client that is actually connected');
+  assert.notEqual(harness.entry().editHandler, firstEditHandler, 'and the edit handler came back with it, because a session that only hears posts is not a session');
 
   await dispatch(harness, new Api.UpdateNewChannelMessage({ message: channelMessage({ id: 99 }), pts: 17, seq: 0 }));
   assert.equal(harness.saved.length, 1, 'and messages flow again');
+});
+
+test('a lost edit handler is re-armed on its own, and that costs no replay', async () => {
+  const harness = makeHarness();
+  await harness.listener.startTelegramListener(USER_ID, harness.client);
+  const before = { handler: harness.entry().handler, editHandler: harness.entry().editHandler, attachedAt: harness.entry().attachedAt, pairs: builderNames(harness.client).join('+') };
+  harness.client._eventBuilders = harness.client._eventBuilders.filter((pair) => pair[1] !== before.editHandler);
+  assert.deepEqual(builderNames(harness.client), ['NewMessage'], 'posts are still being heard, so every flag the product has says healthy');
+  assert.equal(harness.listener.streamHealth(USER_ID).listening, true, 'including the one the watchdog acts on');
+  assert.equal(harness.listener.streamHealth(USER_ID).editsAttached, false, 'and the gap has a name, which is the only way anyone finds it later');
+
+  await harness.listener.startTelegramListener(USER_ID, harness.client);
+  assert.deepEqual(builderNames(harness.client), ['EditedMessage', 'NewMessage'], 'the missing half is back');
+  assert.equal(harness.entry().handler, before.handler, 'the post handler was never touched, so no message can be captured twice');
+  assert.notEqual(harness.entry().editHandler, before.editHandler, 'the edit handler is a fresh one, on the client that is connected');
+  /* The half-rearm must not look like a reconnect. `attachedAt` is the window the "we were listening and a message
+     came through" check compares against, and `needsCatchUp` is the licence to re-read the channel; moving either
+     because an edit subscription was retaken would make every edit re-arm cost a history fetch. */
+  /* Re-arming one half is not a reconnect: the session keeps its identity, its clock and its place in the
+     heartbeat. But it was deaf for a while, and the deafness has a shape - posts came through, corrections did
+     not - so re-reading the window is exactly the recovery, and it is licensed for that reason alone.
+     `attachedAt` is what the replay measures the gap from, and `needsCatchUp` is the licence; a full rebuild would
+     have reset both, paid for the same history read, and re-captured the posts that were never lost. */
+  assert.equal(harness.entry().attachedAt, before.attachedAt, 'the listening window is the same one, so the replay covers the gap and not the connection');
+  assert.equal(harness.entry().needsCatchUp, true, 'and the gap the half-detach left is queued for the channel read that closes it');
+  const logs = harness.logs.filter((entry) => /edit handler/.test(entry.message));
+  assert.deepEqual(logs.map((entry) => entry.message), ['Telegram edit handler re-attached'], 'it says which half it fixed');
+
+  await dispatch(harness, new Api.UpdateEditChannelMessage({ message: channelMessage({ id: 77, text: 'GOLD SELL NOW, entry to follow' }), pts: 21, seq: 0 }));
+  assert.equal(harness.saved.length, 1, 'and corrections flow again');
+});
+
+test('detaching either half leaves the other one, because the library removes by callback as well as by filter', () => {
+  const harness = makeHarness();
+  harness.listener.startTelegramListener(USER_ID, harness.client);
+  const { handler, editHandler } = harness.entry();
+
+  telegramAdapter.removeMessageHandler(harness.client, handler, telegramAdapter.createMessageEventFilter());
+  assert.deepEqual(builderNames(harness.client), ['EditedMessage'], 'the posts went, the edits stayed');
+  telegramAdapter.removeEditHandler(harness.client, editHandler, telegramAdapter.createEditEventFilter());
+  assert.deepEqual(builderNames(harness.client), [], 'and either half can be put down on its own');
+
+  /* The shape this design refuses, run against the real library rather than described in a comment: one callback
+   * registered under two filters is *one* subscription as far as `removeEventHandler` is concerned, because its
+   * predicate keeps only pairs that match neither half. Capture used to detach the post handler on every re-attach
+   * and on every disconnect - so a single shared callback would have quietly taken the edit subscription with it,
+   * once per reconnect, and nothing in the product would have noticed. */
+  const shared = () => {};
+  harness.client.addEventHandler(shared, telegramAdapter.createMessageEventFilter());
+  harness.client.addEventHandler(shared, telegramAdapter.createEditEventFilter());
+  assert.equal(harness.client.listEventHandlers().length, 2, 'both pairs exist');
+  harness.client.removeEventHandler(shared, telegramAdapter.createMessageEventFilter());
+  assert.equal(harness.client.listEventHandlers().length, 0, 'and removing one filter takes the other with it');
+});
+
+/* ------------------------------------------------------------------ the edited post, end to end ------------------------------------------------------
+
+   A correction is the same object travelling the same road as a new post: an update on the socket, the library's
+   own dispatcher, the builders that decide who claims it, and then a row. What is different is only what happens
+   at the end of that road, so these tests stop at the boundary - they prove which handler fired, what the text
+   and the ids that reached storage were, and that the same message did not also arrive as a second capture. The
+   merge and the decision it feeds are `test/signal-edit.test.js`, driven through the real parser.
+
+   ------------------------------------------------------------------------------------------------------------------------------------------------------ */
+
+test('an edited channel post reaches capture once, as an edit, with the corrected text', async () => {
+  const harness = makeHarness();
+  await harness.listener.startTelegramListener(USER_ID, harness.client);
+  const edited = 'GOLD SELL\nEntry: 3300\nSL: 3280\nTP: 3350';
+  /* The post is dated 12:59:00 by the fixture and the harness clock stands at 13:00:00, so a correction stamped
+     12:59:40 is 20 seconds late on the edit and 60 on the original. Two different numbers is the point: a delay
+     measured from the send time would say 60000 here, so this is the assertion that proves `editDate` is read.
+     `channelMessage` takes the stamp in milliseconds and divides, because seconds is what the library stores. */
+  const editedAtMs = Date.parse('2026-10-23T12:59:40.000Z');
+
+  await dispatch(harness, new Api.UpdateEditChannelMessage({
+    message: channelMessage({ id: 77, text: edited, editDate: editedAtMs }),
+    pts: 40, seq: 0,
+  }));
+
+  assert.equal(harness.saved.length, 1, 'one save for one edit - `NewMessage` does not also claim an edit update, so the row is not written twice');
+  assert.equal(harness.saved[0].message, edited, 'the text is the corrected one, not the text the post had at first');
+  assert.deepEqual(harness.saved[0].channel, {
+    source: 'telegram', channelId: STORED_CHANNEL_ID, title: CHANNEL_TITLE, telegramMessageId: 77, replayed: false,
+    // `sentAt` is still 12:59:00: the post was written then, and an edit does not make a stale signal fresh. The
+    // delay is the other number, and it is what tells the watchdog when the correction itself landed.
+    sentAt: '2026-10-23T12:59:00.000Z', delayMs: 20_000, edited: true, editedAt: Math.floor(editedAtMs / 1000),
+  });
+  assert.equal(harness.entry().stats.edits, 1, 'the arrival is counted, whatever the row ends up doing with it');
+  assert.equal(harness.entry().stats.seen, 1, 'and it counts as traffic on the stream, because an edit is proof the socket is delivering');
+  assert.ok(harness.logs.some((entry) => entry.message === 'Telegram message re-read after an edit'), 'the log names it as a re-read, not as a capture');
+});
+
+test('a new post is still a new post, and an edit does not ride into the capture payload with it', async () => {
+  const harness = makeHarness();
+  await harness.listener.startTelegramListener(USER_ID, harness.client);
+  await dispatch(harness, new Api.UpdateNewChannelMessage({ message: channelMessage({ id: 88 }), pts: 41, seq: 0 }));
+  assert.equal(harness.saved.length, 1);
+  assert.equal('edited' in harness.saved[0].channel, false, 'the key is absent rather than false, because the capture payload is asserted property for property and an edit is a different ask');
+  assert.equal(harness.entry().stats.edits, 0, 'and the edit counter did not move for a post');
+});
+
+test('the private-chat edit shape reaches the handler too, and the channel rule still decides', async () => {
+  const harness = makeHarness();
+  await harness.listener.startTelegramListener(USER_ID, harness.client);
+  // `UpdateEditMessage` (not the channel variant) is the other half of what the library claims to build on, and
+  // an unmonitored chat is a decision, not a silence: the same `NOT_MONITORED` a new post would have got.
+  const peerMessage = new Api.Message({ id: 5, peerId: new Api.PeerUser({ userId: 999n }), date: Math.floor(clock_of() / 1000), message: 'GOLD BUY 3300', out: false, mentioned: false, mediaUnstable: false, mediaUnread: false, unread: false, post: false, editDate: Math.floor(clock_of() / 1000) });
+  await dispatch(harness, new Api.UpdateEditMessage({ message: peerMessage, pts: 1, seq: 0 }));
+  assert.equal(harness.saved.length, 0, 'a chat this workspace does not monitor is not stored');
+  assert.equal(harness.entry().stats.ignored, 1, 'and the reason is counted, not swallowed');
+  assert.ok(harness.logs.some((entry) => /not monitored/.test(entry.message)), 'with a line that says which one it was');
+  assert.equal(harness.entry().stats.edits, 1, 'counted as an edit even so - the counter describes the stream');
+});
+
+test('a post edited while this instance was deaf is applied by the catch-up that finds it', async () => {
+  // The row exists, the text in the channel does not match it, and no `MessageEdited` ever arrived: the update was
+  // sent to a connection that did not exist yet. Replaying the message without this branch stores nothing and
+  // leaves the row describing a message nobody can any longer read.
+  const harness = makeHarness({
+    knownMessageIds: [77],
+    knownText: 'GOLD SELL NOW',
+    storedRow: { id: 'row-1', status: 'unparsed', message: 'GOLD SELL NOW', execution_ready: false },
+  });
+  await harness.listener.startTelegramListener(USER_ID, harness.client);
+  const client = harness.client;
+  // The entity handle is a network call on a client that has no connection, so it is answered here like the other
+  // replay tests answer it. Without this the read never comes back and the test hangs instead of failing.
+  client.getEntity = async () => ({ id: 1 });
+  client.getMessages = async () => [channelMessage({ id: 77, text: 'GOLD SELL\nEntry: 3300\nSL: 3280\nTP: 3350', editDate: Date.parse('2026-10-23T13:00:30.000Z') })];
+  const entry = harness.entry();
+  entry.channelId = STORED_CHANNEL_ID;
+  entry.needsCatchUp = true;
+  entry.attachedAt = new Date(Date.parse('2026-10-23T12:00:00.000Z')).toISOString();
+  await harness.listener.runCatchUp(USER_ID);
+  assert.equal(harness.saved.length, 1, 'the replay did not skip it as already captured');
+  assert.equal(harness.saved[0].channel.edited, true, 'and it went to the writer as the edit it is');
+  assert.equal(harness.saved[0].channel.replayed, true, 'still a replay, because it is one, which is what keeps it behind live traffic at the reader');
+});
+
+test('a replay of unchanged text stays the duplicate it was', async () => {
+  const harness = makeHarness({ knownMessageIds: [77], knownText: SIGNAL_TEXT });
+  await harness.listener.startTelegramListener(USER_ID, harness.client);
+  const client = harness.client;
+  client.getEntity = async () => ({ id: 1 });
+  client.getMessages = async () => [channelMessage({ id: 77 })];
+  const entry = harness.entry();
+  entry.channelId = STORED_CHANNEL_ID;
+  entry.needsCatchUp = true;
+  entry.attachedAt = new Date(Date.parse('2026-10-23T12:00:00.000Z')).toISOString();
+  await harness.listener.runCatchUp(USER_ID);
+  assert.equal(harness.saved.length, 0, 'a row that already holds this exact text is not written again, and is not treated as an edit');
 });
 
 test('catch-up after a wake stores what the workspace missed, oldest first, and never twice', async () => {
