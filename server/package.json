@@ -8,7 +8,8 @@
     "start": "node index.js",
     "dev": "node --watch index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run typecheck && node --test",
+    "typecheck:strict": "tsc -p tsconfig.strict.json --noEmit",
+    "test": "npm run typecheck && npm run typecheck:strict && node --test",
     "backfill:signals": "node scripts/backfill-signal-parse.js"
   },
   "dependencies": {
@@ -26,6 +27,9 @@
     "socket.io": "^4.6.1",
     "telegram": "^2.19.10"
   },
+  "optionalDependencies": {
+    "@mtcute/node": "0.32.7"
+  },
   "engines": {
     "node": ">=22.0.0"
   },
@@ -36,6 +40,7 @@
     "moment": "2.31.0"
   },
   "devDependencies": {
+    "@mtcute/core": "0.32.7",
     "@types/node": "^22.20.5",
     "typescript": "^5.9.3"
   }
