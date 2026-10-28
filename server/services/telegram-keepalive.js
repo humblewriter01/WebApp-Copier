@@ -1,7 +1,9 @@
 /**
  * The provider's keep-alive noise, counted instead of printed.
  *
- * `Error: TIMEOUT` from `telegram/client/updates.js` is GramJS's own ping loop giving up on a pong. It is
+ * `Error: TIMEOUT` from `telegram/client/updates.js` is GramJS's own ping loop giving up on a pong, and
+ * `Error('Ping timeout of Ns expired')` from `teleproto/network/session/Session.js` is the same event in the
+ * fork. Either one is what this file exists for. It is
  * worth understanding before it is worth silencing, so here is what that file actually does (2.26.22): every
  * `PING_INTERVAL` (9 s) it sends `PingDelayDisconnect` through `timeout(ping, PING_TIMEOUT)` - a 10 s race it
  * implements itself, with `PING_FAIL_ATTEMPTS` (3) goes at `PING_FAIL_INTERVAL` (100 ms) - and the catch around
@@ -50,28 +52,62 @@ export const KEEP_ALIVE_MARK_TTL_MS = 1_000;
  * it is reacting to; one longer would let a genuinely dead socket sit unrepaired for minutes.
  */
 export const KEEP_ALIVE_FLAP_GRACE_MS = 60_000;
-/** The only error this file will ever hide: GramJS's own ping race, at the frame that throws it. */
-const KEEP_ALIVE_THROW_SITE = /(?:^|[/\\])telegram[/\\]client[/\\]updates\.js/;
+/** GramJS's keep-alive timeout: the message it writes and the file that writes it. */
+const GRAMJS_THROW_SITE = /(?:^|[/\\])telegram[/\\]client[/\\]updates\.js/;
+/** The fork's, which lives in its session layer and carries the elapsed seconds in the text. */
+const TELEPROTO_THROW_SITE = /(?:^|[/\\])teleproto[/\\]network[/\\]session[/\\]Session\.js/;
+const TELEPROTO_TIMEOUT_MESSAGE = /^(?:ping|read) timeout of \d+(?:\.\d+)?s expired$/i;
+
+/** The message and the first frames of a thrown thing, in the shape both matchers need. */
+function errorShape(error) {
+  if (!error || (typeof error !== 'object' && typeof error !== 'string')) return null;
+  const message = String(typeof error === 'object' ? (error.message ?? error.errorMessage ?? '') : error).trim();
+  const stack = typeof error === 'object' ? String(error.stack || '') : '';
+  if (!stack) return message === 'TIMEOUT' ? { message, frames: [] } : null;
+  const frames = stack.split('\n');
+  const header = /^Error\b/.test(frames[0] || '') ? 1 : 0;
+  return { message, frames: frames.slice(header, header + 2) };
+}
 
 /**
- * Is this the library's keep-alive timeout? True only for the message GramJS writes and the file that writes it.
+ * Is this the library's keep-alive timeout?
+ *
+ * Two vocabularies, because two drivers can raise it, and each half is exported separately so a future re-swap
+ * cannot quietly lose one of them: `telegram-adapter.test.js` pins the GramJS matcher's exact behaviour, and this
+ * file's own test pins both.
  *
  * The first stack frame is the throw site; later frames say only who was on the call stack when it happened, and
  * for us that is the library's dispatcher roughly as often as it is the library's own code.
  */
 export function isProviderKeepAliveTimeout(error) {
-  if (!error || (typeof error !== 'object' && typeof error !== 'string')) return false;
-  const message = String(typeof error === 'object' ? (error.message ?? error.errorMessage ?? '') : error).trim();
-  if (message.toUpperCase() !== 'TIMEOUT') return false;
-  const stack = typeof error === 'object' ? String(error.stack || '') : '';
-  if (!stack) return false;
-  const frames = stack.split('\n');
-  const header = /^Error\b/.test(frames[0] || '') ? 1 : 0;
-  const firstFrame = frames[header] || '';
-  const secondFrame = frames[header + 1] || '';
+  return isGramjsKeepAliveTimeout(error) || isTeleprotoKeepAliveTimeout(error);
+}
+
+/** The GramJS half, unchanged in behaviour from the day it was written: `Error: TIMEOUT`, from its update loop. */
+export function isGramjsKeepAliveTimeout(error) {
+  const shape = errorShape(error);
+  if (!shape || shape.message.toUpperCase() !== 'TIMEOUT') return false;
+  const [firstFrame = '', secondFrame = ''] = shape.frames;
   // `timeout()` is called inline in `_updateLoop`, so the frame we want is one of the first two - and neither of
   // them is ever a frame of ours, which is the property the whole filter rests on.
-  return KEEP_ALIVE_THROW_SITE.test(firstFrame) || (KEEP_ALIVE_THROW_SITE.test(secondFrame) && /at (timeout|attempts)\b/.test(firstFrame));
+  return GRAMJS_THROW_SITE.test(firstFrame) || (GRAMJS_THROW_SITE.test(secondFrame) && /at (timeout|attempts)\b/.test(firstFrame));
+}
+
+/**
+ * The teleproto half: `Ping timeout of Ns expired` / `Read timeout of Ns expired`, raised by its session layer
+ * when `link.close('lost', error)` fires.
+ *
+ * Only the message is recognised as strictly as GramJS's, because the fork's error travels a different number of
+ * hops (it is created inside `Session.js` and surfaces through the connection), and a matcher that insisted on one
+ * exact frame would stop suppressing after a refactor we do not control - which is a log-noise regression, the
+ * mild failure. The stack is still required to be the library's own, because a future dependency that happens to
+ * write the same sentence must not be able to make this service hide a real fault.
+ */
+export function isTeleprotoKeepAliveTimeout(error) {
+  const shape = errorShape(error);
+  if (!shape || !TELEPROTO_TIMEOUT_MESSAGE.test(shape.message)) return false;
+  const frames = shape.frames.length ? shape.frames : String(error?.stack || '').split('\n').slice(1, 5);
+  return frames.some((frame) => TELEPROTO_THROW_SITE.test(frame) || /[/\\]teleproto[/\\]/.test(frame));
 }
 
 /**

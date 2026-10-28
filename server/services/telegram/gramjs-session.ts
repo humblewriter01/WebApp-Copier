@@ -1,22 +1,22 @@
 /**
  * The GramJS `StringSession`, read and written by hand.
  *
- * Why this file exists at all: the plan is to run a second MTProto driver beside the first one, and the
- * credential that driver needs is already in our database - one string per user, written by
- * `telegram/sessions/StringSession.js` in `telegram@2.26.22`, saved by `client.session.save()` and re-loaded on
- * every boot. A migration that cannot carry that string across loses every signed-in workspace the moment it is
- * enabled, and no test would notice until a human re-entered a phone code.
+ * Why this file exists at all: `TELEGRAM_DRIVER` can point the process at `teleproto`, the maintained fork of the
+ * archived `telegram` package, and the credential both drivers use is already in our database - one string per
+ * user, written by `telegram/sessions/StringSession.js` in `telegram@2.26.22`, saved by `client.session.save()`
+ * and re-loaded on every boot. A swap that cannot carry that string across loses every signed-in workspace the
+ * moment it is enabled, and no test would notice until a human re-entered a phone code.
  *
- * Why it is written by hand: `@mtcute/node@0.32.7` has no GramJS converter in it - `grep -rli gramjs` over the
- * installed package returns nothing - and its own session helpers (`readStringSession`, `writeStringSession`, in
- * `core/highlevel/utils/string-session.js`) are not reachable through any path the package's `exports` map
- * allows, so "call their converter" is not an option and "read their format" is not either. What *is* reachable
- * is the raw material: a 256-byte auth key, a datacenter id, a host and a port. That is exactly what this module
- * produces, and it is why the module stops there rather than inventing a target format.
+ * Why it is written by hand: the fork's documentation *says* its `StringSession` reads the legacy format, and a
+ * promise in a README is not evidence about bytes. So this module is a third reader that belongs to neither
+ * library, and the test feeds it strings produced by each of them and requires all three to agree on the datacenter
+ * id, the host, the port and the 256-byte key. If the fork ever changes its encoding, that test is what says so -
+ * not a support ticket from a workspace that had to sign in again.
  *
  * The layout is not a guess and not a memory. It is read out of the installed GramJS source, which is the only
- * authority that matters, and `test/mtcute-gramjs-session.test.js` re-proves it by encoding a session with the
- * real class and decoding it here, and the other way round. Two details in that source look like bugs and are
+ * authority that matters, and `test/telegram-session-bridge.test.js` re-proves it by encoding a session with the
+ * real class and decoding it here, and the other way round, and then again against the fork. Two details in that
+ * source look like bugs and are
  * load-bearing anyway:
  *
  *  - A session whose base64 body is exactly 352 characters is parsed by the *Telethon* layout instead: four raw
@@ -218,9 +218,9 @@ export function encodeGramjsSession(session: DriverSessionSeed | GramjsSession):
 }
 
 /**
- * The seed a second driver is handed: the same key, the same datacenter, the same endpoint, in the names our own
- * code uses. Deliberately *not* a session string in the other library's format - see the header for why, and
- * `services/telegram/mtcute-adapter.ts` for what remains to be proven before a client is constructed with it.
+ * The four fields a second driver needs, in the names our own code uses rather than the library's. Nothing builds
+ * a client out of this today - the fork's `StringSession` takes the original string - which is why the function
+ * exists for the test that proves the two formats describe one login, and not for the runtime path.
  */
 export function toDriverSessionSeed(session: GramjsSession): DriverSessionSeed {
     return { dcId: session.dcId, host: session.serverAddress, port: session.port, authKey: session.authKey };
@@ -262,75 +262,4 @@ export function describeGramjsSession(value: string | null | undefined): GramjsS
         const code = error instanceof GramjsSessionError ? error.code : 'TRUNCATED';
         return { ...base, present: true, error: code };
     }
-}
-
-/* ------------------------------------------------------------------------- *
- *  the other driver's seed format
- * ------------------------------------------------------------------------- */
-
-/**
- * One endpoint, in the shape the other driver's own session helpers take it (`BasicDcOption`).
- *
- * This is a copy of a type we do not import. `@mtcute/core` is a devDependency here on purpose - the runtime
- * never loads it, so nothing in this file may depend on it being installed - which means the shape has to be
- * restated and a test has to keep the two in step (`test/mtcute-seam-contract.test.js` reads the installed
- * declarations and diffs them against this interface).
- */
-export interface MtcuteBasicDcOption {
-    readonly ipAddress: string;
-    readonly port: number;
-    readonly id: number;
-    readonly ipv6?: boolean;
-    readonly mediaOnly?: boolean;
-    readonly testMode?: boolean;
-}
-
-/** `DcOptions`: the pair a connection starts from. */
-export interface MtcuteDcOptions {
-    readonly main: MtcuteBasicDcOption;
-    readonly media: MtcuteBasicDcOption;
-}
-
-/** `InputStringSessionData`: what `client.start({ session })` and `client.importSession` accept. */
-export interface MtcuteInputStringSessionData {
-    readonly primaryDcs?: MtcuteDcOptions;
-    readonly testMode?: boolean;
-    readonly self?: { readonly userId: string; readonly isBot: boolean } | null;
-    readonly authKey: Uint8Array;
-}
-
-/**
- * GramJS's four fields, in the other driver's own words.
- *
- * `readStringSession` in `@mtcute/core/utils.js` takes `string | InputStringSessionData`, and for the object
- * form its whole body is a normalisation: version 3, `primaryDcs` or the platform default, `self` or null, and
- * the key. So this function is not a guess at a private format - it fills the fields of a public one, and the
- * test feeds the result through the real function and through `writeStringSession` to prove the key survives
- * the TL round-trip byte for byte.
- *
- * Two things are decided here rather than passed through, and both are in the caller's interest to know:
- *
- *  - `main` and `media` are the **same object**. `writeStringSession` tests `data.primaryDcs.media !==
- *    data.primaryDcs.main` - reference equality, not value equality - and sets a "there is a second endpoint"
- *    flag when they differ. GramJS sessions carry one endpoint, so a copy for `media` would be a lie that
- *    changes the bytes; sharing the object is the honest encoding, and it is also what the reader does when the
- *    flag is absent.
- *  - `testMode` is left out entirely. A GramJS session string holds no test-mode flag, and `importSession`
- *    throws when a test-mode session meets a non-test client, so inventing either answer here could only be a
- *    guess. Absent means `false` downstream, which is what every account in this database is.
- *  - `self` is `null`. The old format keeps no user id, so the identity has to come from the first `getMe`,
- *    which is a fact about the migration worth stating in the type rather than discovering in a log.
- */
-export function toMtcuteInputSessionData(seed: DriverSessionSeed): MtcuteInputStringSessionData {
-    const host = seed.host;
-    if (!host) throw new GramjsSessionError('BAD_ADDRESS', 'a session with no host cannot become a DC option, which is a host and a port');
-    const dc: MtcuteBasicDcOption = {
-        ipAddress: host,
-        port: seed.port,
-        id: seed.dcId,
-        // The library passes `address` straight to a TCP connect, so a DNS name is as good as a literal, and
-        // this flag only tells the transport family to expect a v6 literal.
-        ...(host.includes(':') ? { ipv6: true } : {}),
-    };
-    return { primaryDcs: { main: dc, media: dc }, self: null, authKey: seed.authKey };
 }

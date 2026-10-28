@@ -112,7 +112,7 @@ test('and into the build that produces the deployment', () => {
 });
 
 test('the scan reaches into subdirectories, which is the promise the first test makes', () => {
-  for (const expected of ['services/telegram/gramjs-session.ts', 'services/telegram/postgres-storage.ts', 'services/telegram/storage-schema.ts', 'services/telegram/mtcute-adapter.ts', 'services/telegram-driver.js']) {
+  for (const expected of ['services/telegram/gramjs-session.ts', 'services/telegram/teleproto-adapter.ts', 'services/telegram-driver.js']) {
     assert.equal(appSources.includes(expected), true, `${expected} is inside the gate`);
   }
   assert.equal(appSources.some((file) => file.includes('/test/')), false, 'and it does not wander into the tests, which the config excludes on purpose');
