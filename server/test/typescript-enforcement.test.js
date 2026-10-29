@@ -23,6 +23,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SERVER = fileURLToPath(new URL('..', import.meta.url));
+const ROOT = join(SERVER, '..');
 /* Walked rather than listed, because the server grew its first subdirectory with the TypeScript island, and a
    one-level `readdirSync` would have read a directory as if it were a source file. The recursion is the
    interesting half: "a new directory is inside the gate the day it is created" is only true if the scan descends
@@ -156,6 +157,43 @@ test('the runtime that would load the strict files is written down, not assumed'
   for (const rel of ['index.js', 'db.js', 'services/telegram-listener.js', 'services/telegram-auth.js']) {
     assert.equal(new RegExp(`from ['"]\./.*\.ts['"]`).test(read(rel)), false, `${rel} has no static import of a .ts file, so it runs on a runtime that cannot strip types`);
   }
+});
+
+test('the runtime the blueprint installs is the runtime the manifests promise, on both services', () => {
+  /* The floor in `engines.node` is a promise, not an installer: nothing in this repo turns it into an error
+     (there is no `engine-strict` and no `.npmrc`), so an image on an older Node warns and starts anyway. The
+     version Render actually installs is the `NODE_VERSION` env var in the blueprint. Two places, one fact, and
+     both services - which is exactly the pair that drifts, because a build that passes locally says nothing about
+     what the deploy host pulled. So the pin runs in both directions: the installed version must satisfy the
+     promised floor, the two services must name the same version, and the two floors must be the same string. */
+  const yaml = readFileSync(join(ROOT, 'render.yaml'), 'utf8');
+  const blocks = yaml.split(/\n  - type: /).slice(1);
+  const blockFor = (rootDir) => {
+    const block = blocks.find((b) => new RegExp(`rootDir: ${rootDir}$`, 'm').test(b));
+    assert.ok(block, `the ${rootDir} service is still in the blueprint, so this test cannot pass by its subject disappearing`);
+    return block;
+  };
+  const installedNode = (rootDir) => {
+    const pinned = /- key: NODE_VERSION\s*\n\s*value: "?([\d.]+)"?\s*$/m.exec(blockFor(rootDir));
+    assert.ok(pinned, `the ${rootDir} service pins NODE_VERSION, so its runtime is not Render's default`);
+    return pinned[1];
+  };
+  const promisedFloor = (dir) => {
+    const engines = JSON.parse(readFileSync(join(ROOT, dir, 'package.json'), 'utf8')).engines.node;
+    const exact = /^(?:>=|>)\s*(\d+)\.(\d+)\.(\d+)$/.exec(engines.trim());
+    assert.ok(exact, `${dir}/package.json declares an exact floor (">=major.minor.patch"), got ${engines}`);
+    return exact.slice(1).map(Number);
+  };
+  const atOrAbove = (version, floor) => version.every((part, i) => part >= floor[i]);
+
+  for (const dir of ['server', 'client']) {
+    const installed = installedNode(dir).split('.').map(Number);
+    assert.equal(installed.length, 3, `${dir}: an exact patch version, so "22" cannot satisfy a floor of 22.23.4`);
+    assert.ok(atOrAbove(installed, promisedFloor(dir)), `${dir} installs Node ${installed.join('.')}, which must satisfy its declared floor`);
+  }
+  assert.equal(installedNode('server'), installedNode('client'), 'both services run the same runtime, so one is not patched while the other floats');
+  assert.equal(JSON.parse(read('package.json')).engines.node, JSON.parse(readFileSync(join(ROOT, 'client', 'package.json'), 'utf8')).engines.node, 'and both manifests promise the same floor');
+  assert.ok(atOrAbove(installedNode('server').split('.').map(Number), [22, 23, 4]), 'the pinned version is at least the patched runtime, not merely some 22.x');
 });
 
 test('every options-bag typedef is applied to the parameter it describes', () => {
