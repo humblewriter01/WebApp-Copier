@@ -329,7 +329,7 @@ test('a live message is never dropped without saying where it went', () => {
   }
   // and the counters survive into the status route, so "is it even listening?" has an answer
   const statusRoute = section(index, "app.get('/api/telegram/status'", 'async function persistTelegramLoginAttempt');
-  assert.match(index, /void resumeTelegramSessions\(\{ reason: 'boot' \}\)/, 'sessions are re-armed at boot, without waiting for someone to open the dashboard');
+  assert.match(index, /void telegramSweepGuard\.run\(\(\) => resumeTelegramSessions\(\{ reason: 'boot' \}\)\)/, 'sessions are re-armed at boot, without waiting for someone to open the dashboard - and inside the sweep guard, because the boot pass is still running when the interval first fires on a host with many workspaces, and two passes rebuilding the same sessions is what orphaned clients')
   assert.match(statusRoute, /listening: Boolean\(telegramAdapter\.connectedFlag\(entry\?\.client\) && entry\.handler && telegramCapture\.handlerIsLive\(entry\.client, entry\.handler\)\)/, 'listening is read from GramJS\'s handler list, not from a flag of ours');
   assert.match(statusRoute, /messagesSeen|signalsSaved/, 'the panel can tell a silent listener from a quiet channel');
   assert.match(statusRoute, /await startTelegramListener\(req\.userId, entry\.client\)/, 'a connected client with no live handler is attached on the spot');
@@ -582,11 +582,21 @@ test('the sweep asks the channel what it said, and the heartbeat is what asks th
   const restore = section(index, 'async function restoreTelegramClient(', AFTER_RESTORE);
   assert.equal(restore.includes('resumeTelegramSessions'), false,
     'and the slice really does stop at the next declaration, so these pins bound the function they name');
-  const restoreEarly = section(index, 'async function restoreTelegramClient(', 'if (current?.client && !telegramAdapter.isConnected(current.client)) {');
+  /* The slice is named for the function that contains the work, which since the leak fix is `rebuildTelegramClient`:
+     `restoreTelegramClient` is the latch around it, pinned on its own below. A pin left on the wrapper would have
+     bound nothing at all, which is the failure mode this file already documents twice. */
+  const restoreEarly = section(index, 'async function rebuildTelegramClient(', 'if (current?.client && !telegramAdapter.isConnected(current.client)) {');
   assert.match(restoreEarly, /const mustRebuild = force === true \|\| escalate === true;/, 'the watchdog escalates, the operator forces, and either one rebuilds');
   assert.match(restoreEarly, /if \(!mustRebuild && telegramAdapter\.isConnected\(current\?\.client\) && current\.handler && telegramCapture\.handlerIsLive/, 'the shortcut is gated on that flag, not on good intentions');
-  assert.match(restore, /if \(current\?\.client && \(!telegramAdapter\.isConnected\(current\.client\) \|\| mustRebuild\)\) await telegramAdapter\.disconnect\(current\.client\)\.catch\(\(\) => \{\}\);/,
+  assert.match(restore, /if \(current\?\.client && \(!telegramAdapter\.isConnected\(current\.client\) \|\| mustRebuild\)\) \{\s*await telegramAdapter\.disconnect\(current\.client\)\.catch\(\(\) => \{\}\);/,
     'a rebuilt session disconnects the client it replaces, connected or not');
+  assert.match(restore, /disconnect\(current\.client\)\.catch\(\(\) => \{\}\);[\s\S]{0,240}telegramKeepAlive\.release\(current\.client\);/, /* the gap is a comment, and a pin that forbade comments between two statements would be a pin on formatting */
+    'and the keep-alive guard is told the same thing, so a record of a client this process no longer owns does not outlive it');
+  const restoreLatch = section(index, 'async function restoreTelegramClient(', 'async function rebuildTelegramClient(');
+  assert.match(restoreLatch, /telegramRestoreFlight\.run\(userId, \(\) => rebuildTelegramClient\(/,
+    'two passes may both want this workspace rebuilt, and only one of them may build a client');
+  assert.match(restoreLatch, /return telegramClients\.get\(userId\)\?\.client \|\| null;/,
+    'and the loser reports what the map holds instead of a second client, which is what makes skipping safe for a caller that is only reporting status');
   assert.match(restore, /await telegramCapture\.resyncUpdateState\(current\.client, \{ userId, reason: `\$\{reason\}:reconnected` \}\);/,
     'a socket that came back has its state reconciled before the handler is re-attached');
   assert.match(restore, /await telegramCapture\.resyncUpdateState\(client, \{ userId, reason: `\$\{reason\}:new-session`, force: mustRebuild \}\);/,
@@ -729,7 +739,8 @@ test('a deaf session is saved by the minute, and an unrecoverable one is ended b
   const sweep = section(index, 'const telegramSweep = setInterval', 'telegramSweep.unref');
   assert.match(sweep, /resumeTelegramSessions\(\{ reason: 'sweep' \}\)[\s\S]{0,120}rearmTelegramListeners\(\)[\s\S]{0,120}checkTelegramStreams/,
     'in one pass, in that order: resume, re-arm and replay, then the staggered gap check - which is why the flag does not need a second scheduler to mean anything');
-  assert.match(sweep, /\}, 60 \* 1000\);/, 'and the pass is a minute: that is the bound on how late a deaf session’s signals are, and it is a delay rather than a loss only because this line exists');
+  assert.match(index, /const TELEGRAM_SWEEP_INTERVAL_MS = 60_000;/, 'the pass is still a minute, spelled once and named, so the guard around it can measure against it');
+  assert.match(sweep, /\}, TELEGRAM_SWEEP_INTERVAL_MS\);/, 'and the pass is a minute: that is the bound on how late a deaf session’s signals are, and it is a delay rather than a loss only because this line exists');
 
   // The last rung of the ladder: the listener holds the evidence, the server owns the consequence.
   const ctor = section(index, 'const telegramCapture = createTelegramListener({', '\nconst startTelegramListener =');

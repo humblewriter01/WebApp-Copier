@@ -23,6 +23,7 @@ import { entryRangeBounds, readExpirySetting, readSlippageSetting, ORDER_TYPES }
 import { readDashboardSignals } from './services/dashboard-signals.js';
 import { HEARTBEAT_INTERVAL_MS, createTelegramListener, isValidWorkspaceId } from './services/telegram-listener.js';
 import { createTelegramKeepAliveGuard, createUnhandledRejectionGuard, isProviderKeepAliveTimeout } from './services/telegram-keepalive.js';
+import { createPassGuard, createSingleFlight } from './services/single-flight.js';
 import { createMetaApiTradingAdapter } from './services/metaapi-trading.js';
 import { createExecutionEngine, PLATFORM_PAUSE_MESSAGE } from './services/execution-engine.js';
 import { createExecutionWorker } from './services/execution-worker.js';
@@ -709,6 +710,7 @@ const telegramCapture = createTelegramListener({
     });
     const entry = telegramClients.get(userId);
     if (telegramAdapter.canDisconnect(entry?.client)) await telegramAdapter.disconnect(entry.client).catch(() => {});
+    telegramKeepAlive.release(entry?.client);
     telegramClients.delete(userId);
     log('warn', 'Telegram session left for the user to sign in again', {
       userId, reason, pts: details?.pts ?? null, gap: details?.gap ?? null, strikes: details?.strikes ?? null, error: details?.error ?? null,
@@ -781,7 +783,87 @@ function telegramCaptureTransport({ wss = null } = {}) {
  * flag in the database is inherited from the old one.
  */
 
+/** The interval the listener re-arm sweep runs on, named once so the guard's overrun threshold cannot disagree. */
+const TELEGRAM_SWEEP_INTERVAL_MS = 60_000;
+
+/* One rebuild per workspace, and one pass per sweep, for the length of the pass.
+ *
+ * This is the fix for the orphaned-client leak, and the reason it is a latch rather than a check: two passes that
+ * both decide a session must be rebuilt each construct a `TelegramClient`, each `await` a connect (which is real
+ * network time, seconds per workspace), and each then write `telegramClients`. The later write wins the map, and
+ * the loser keeps its socket open, its update loop running, and its receive buffers live, referenced by nothing
+ * that could ever close it. Under a host whose network is slow enough that a 60-second pass takes 90, that is one
+ * orphan per workspace per minute.
+ *
+ * `staleAfterMs` is what keeps the latch from becoming the outage: a rebuild wedged on a socket that never answers
+ * must not be able to lock a workspace out of ever being restored again, so after five minutes the next arrival
+ * takes the key and the wedged call's completion is discarded by token. */
+const telegramRestoreFlight = createSingleFlight({
+  onContention: (userId, info) => log('debug', 'Telegram rebuild already running for this workspace', { userId, runningForMs: info.elapsedMs }),
+  onTakeover: (userId, info) => log('warn', 'Telegram rebuild lock taken over from a wedged attempt', { userId, heldForMs: info.elapsedMs }),
+  onFinished: (userId, info) => { if (info.ok && info.elapsedMs > TELEGRAM_SWEEP_INTERVAL_MS) log('warn', 'Telegram rebuild outlived the sweep interval', { userId, elapsedMs: info.elapsedMs, intervalMs: TELEGRAM_SWEEP_INTERVAL_MS }); },
+});
+
+const telegramSweepGuard = createPassGuard({
+  name: 'telegram-sweep',
+  overrunAfterMs: TELEGRAM_SWEEP_INTERVAL_MS,
+  onSkip: (info) => log('info', 'Telegram sweep skipped: the previous pass is still running', { pass: info.name, runningForMs: info.runningForMs }),
+  onOverrun: (info) => log('warn', 'Telegram sweep took longer than its interval, so overlapping passes are being refused', { pass: info.name, elapsedMs: info.elapsedMs, thresholdMs: info.thresholdMs }),
+});
+
+const telegramBeatGuard = createPassGuard({
+  name: 'telegram-heartbeat',
+  overrunAfterMs: HEARTBEAT_INTERVAL_MS,
+  onSkip: (info) => log('info', 'Telegram heartbeat skipped: the previous beat is still running', { pass: info.name, runningForMs: info.runningForMs }),
+  onOverrun: (info) => log('warn', 'Telegram heartbeat took longer than its interval', { pass: info.name, elapsedMs: info.elapsedMs, thresholdMs: info.thresholdMs }),
+});
+
+/** The previous beat's numbers, so one line can say "climbing" instead of making a human compare two lines. */
+let lastMemorySample = null;
+
+/** The counters worth reading when the memory graph is climbing, in the order they explain each other. */
+function memorySample() {
+  const usage = process.memoryUsage();
+  const mb = (bytes) => Math.round((bytes / 1024 / 1024) * 10) / 10;
+  const sample = {
+    heapUsedMb: mb(usage.heapUsed),
+    externalMb: mb(usage.external || 0),
+    arrayBuffersMb: mb(usage.arrayBuffers || 0),
+    rssMb: mb(usage.rss),
+    /* `external` and `arrayBuffers` are not in `heapUsed`: an MTProto socket leak shows up there and nowhere
+       else, which is why a memory line that logs only the heap can look flat while the process is dying. Render
+       caps the container on RSS, so RSS is the number the alert was actually fired on. */
+    telegramClients: telegramClients.size,
+    telegramLogins: telegramLogins.size,
+    keepAliveGuardedClients: telegramKeepAlive.stats().clients,
+    rebuildsInFlight: telegramRestoreFlight.size(),
+  };
+  const previous = lastMemorySample;
+  lastMemorySample = sample;
+  return previous ? { ...sample, heapDeltaMb: Math.round((sample.heapUsedMb - previous.heapUsedMb) * 10) / 10, rssDeltaMb: Math.round((sample.rssMb - previous.rssMb) * 10) / 10 } : sample;
+}
+
+/**
+ * Bring one workspace's session up, one attempt at a time.
+ *
+ * The wrapper is the whole of the concurrency control; `rebuildTelegramClient` below is the work itself and is
+ * not called from anywhere else, which is what makes "only one rebuild can be in flight" a property of the file
+ * rather than a habit of its callers.
+ */
 async function restoreTelegramClient(userId, { reason = 'restore', force = false, escalate = false } = {}) {
+  const outcome = await telegramRestoreFlight.run(userId, () => rebuildTelegramClient(userId, { reason, force, escalate }));
+  if (!outcome.ran) {
+    /* Another pass is already rebuilding this workspace, and this one leaves with whatever the map holds right
+       now - possibly the old client, possibly null. That is deliberately not an error: every caller here is a
+       sweep or a watchdog that will run again, and a rebuild that returns the previous client is a rebuild that
+       reports "not yet", which is what the status route already knows how to show. */
+    return telegramClients.get(userId)?.client || null;
+  }
+  if (outcome.error) throw outcome.error;
+  return outcome.value;
+}
+
+async function rebuildTelegramClient(userId, { reason = 'restore', force = false, escalate = false } = {}) {
   const current = telegramClients.get(userId);
   /* Two reasons to step past the "already listening" shortcut, and they are different asks. `escalate` is the
      watchdog's: the socket is up and the handler is attached, and the stream is still deaf, so the session itself
@@ -807,7 +889,12 @@ async function restoreTelegramClient(userId, { reason = 'restore', force = false
   // Whatever half-connected object was here is dropped before a new one replaces it, so a wake does
   // not leave a second authorized session polling with the same StringSession - and so an escalated rebuild of a
   // session that still looks fine does not leave the deaf one attached and receiving.
-  if (current?.client && (!telegramAdapter.isConnected(current.client) || mustRebuild)) await telegramAdapter.disconnect(current.client).catch(() => {});
+  if (current?.client && (!telegramAdapter.isConnected(current.client) || mustRebuild)) {
+    await telegramAdapter.disconnect(current.client).catch(() => {});
+    // The keep-alive guard keeps one record per client it has ever seen; a client that has just been disconnected
+    // is never going to time out again, so its record is dropped here rather than left for the backstop sweep.
+    telegramKeepAlive.release(current.client);
+  }
   const { rows } = await pool.query('SELECT telegram_session FROM users WHERE id=$1', [userId]);
   if (!rows[0]?.telegram_session) {
     if (current) telegramClients.delete(userId);
@@ -844,6 +931,19 @@ async function restoreTelegramClient(userId, { reason = 'restore', force = false
      session that has none, and closes a real gap with a difference request instead of waiting for a push that will
      never come. */
   await telegramCapture.resyncUpdateState(client, { userId, reason: `${reason}:new-session`, force: mustRebuild });
+  /* The compare-and-swap, and it is here rather than at the top of the function because this is the first moment
+     at which our client is finished: somebody else may have restored this workspace while we were connecting, and
+     if they did, *theirs* is the one in the map and ours is the orphan. Disconnecting before discarding is the
+     whole point - an authorized GramJS client with a live socket does not stop because nothing points at it.
+     The per-workspace latch above makes this branch unreachable in the ordinary case, which is why it logs at
+     warn when it is not: it means a path reached a rebuild that did not come through here. */
+  const holder = telegramClients.get(userId);
+  if (holder && holder !== current) {
+    log('warn', 'Telegram rebuild lost the race and is discarding its own client', { userId, reason, heldSince: holder.attachedAt || null });
+    await telegramAdapter.disconnect(client).catch(() => {});
+    telegramKeepAlive.release(client);
+    return holder.client;
+  }
   telegramClients.set(userId, { client, handler: null, stats: telegramCapture.EMPTY_STATS() });
   telegramCapture.resetStreamBaseline(userId);
   await startTelegramListener(userId, client);
@@ -928,12 +1028,31 @@ async function checkTelegramStreams({ reason = 'sweep' } = {}) {
  * the exact failure this exists to prevent, so nothing here is allowed to propagate.
  */
 async function beatTelegramStreams({ reason = 'interval' } = {}) {
-  try {
-    return await telegramCapture.beatUpdateStreams({ reason });
-  } catch (error) {
-    log('warn', 'Telegram heartbeat cycle failed', { reason, error: `${error?.message || error}`.slice(0, 200) });
-    return null;
-  }
+  const outcome = await telegramBeatGuard.run(async () => {
+    try {
+      return await telegramCapture.beatUpdateStreams({ reason });
+    } catch (error) {
+      log('warn', 'Telegram heartbeat cycle failed', { reason, error: `${error?.message || error}`.slice(0, 200) });
+      return null;
+    }
+  });
+  /* Every beat, on purpose, whether or not any session is connected. A memory curve you can read needs a fixed
+     sample interval, and the failure this line exists for - clients accumulating in `telegramClients` while RSS
+     climbs - is only visible against a clock. The numbers are also the only way to tell a heap leak from a
+     socket leak without attaching a profiler to production. */
+  memorySampleLine(reason, outcome);
+  return outcome.ran ? outcome.value : null;
+}
+
+function memorySampleLine(reason, outcome) {
+  const sample = memorySample();
+  const guard = telegramKeepAlive.stats();
+  log(sample.telegramClients > sample.telegramLogins && sample.heapDeltaMb !== undefined && sample.heapDeltaMb > 8 ? 'warn' : 'info', 'Telegram heartbeat memory', {
+    reason,
+    ...sample,
+    beatSkipped: outcome.ran === false,
+    suppressedTimeouts: guard.count,
+  });
 }
 
 /**
@@ -3437,7 +3556,11 @@ async function beginRuntime() {
   // The listener is re-armed in the background, after the port is open: a workspace with a stored
   // session must be listening whether or not anyone opens the dashboard, and a Telegram handshake
   // must never be able to hold up the first request the host is woken for.
-  void resumeTelegramSessions({ reason: 'boot' }).catch((error) => log('warn', 'Telegram session sweep failed', { error: error.message }));
+  /* The boot pass and the 60-second sweep share one guard, which is the pair that can actually overlap: boot
+     restores every workspace serially, so on a host with many sessions it is still working long after the first
+     tick of the interval, and before this the two passes each rebuilt every workspace they found not listening. */
+  void telegramSweepGuard.run(() => resumeTelegramSessions({ reason: 'boot' }))
+    .catch((error) => log('warn', 'Telegram session sweep failed', { error: error.message }));
   /* The keep-alive, on its own faster clock than everything else here.
 
      This is the part that keeps the connection *existing* rather than the part that notices it died: an idle
@@ -3451,11 +3574,12 @@ async function beginRuntime() {
   }, HEARTBEAT_INTERVAL_MS);
   telegramHeartbeat.unref?.();
   const telegramSweep = setInterval(() => {
-    void resumeTelegramSessions({ reason: 'sweep' })
-      .then(() => rearmTelegramListeners())
-      .then(() => checkTelegramStreams({ reason: 'sweep' }))
-      .catch((error) => log('warn', 'Telegram listener sweep failed', { error: error.message }));
-  }, 60 * 1000);
+    void telegramSweepGuard.run(async () => {
+      await resumeTelegramSessions({ reason: 'sweep' });
+      await rearmTelegramListeners();
+      await checkTelegramStreams({ reason: 'sweep' });
+    }).catch((error) => log('warn', 'Telegram listener sweep failed', { error: error.message }));
+  }, TELEGRAM_SWEEP_INTERVAL_MS);
   telegramSweep.unref?.();
 }
 

@@ -47,6 +47,17 @@ import { KEEP_ALIVE_FLAP_GRACE_MS } from './telegram-keepalive.js';
 
 /** How many recent messages one channel is asked for when a session comes back. */
 export const CATCH_UP_LIMIT = 25;
+
+/**
+ * How many monitored channels one catch-up page reads, and how many pages a single pass is allowed.
+ *
+ * The product caps a workspace at a handful of channels by plan, so this is not a performance setting - it is the
+ * reason a policy mistake in `plan-limits` cannot turn into a pass that holds ten thousand rows and their parsed
+ * messages in memory while it works through them. The page bound is what stops a paging loop from becoming the new
+ * unbounded thing.
+ */
+export const CATCH_UP_CHANNEL_LIMIT = 50;
+export const CATCH_UP_CHANNEL_PAGES = 20;
 /**
  * Never poll Telegram for history more often than this, per user.
  *
@@ -271,6 +282,7 @@ export function isValidWorkspaceId(value) {
  * @property {ServiceLogger} [log] - `log(level, sentence, facts)`; absent means silent, not `console`
  * @property {() => number} [now] - milliseconds, injected so a test can move the clock instead of waiting on it
  * @property {number} [catchUpLimit] - how many recent messages a replay is allowed to read
+ * @property {number} [catchUpChannelLimit] - how many monitored channels one page of the listing reads
  * @property {number} [catchUpCooldownMs] - how long before the same session is replayed again
  * @property {number} [catchUpBudgetMs] - how long one replay may take before it is left for the next cycle
  * @property {number} [silenceSuspectMs] - how long a listening session may be silent before it is worth asking about
@@ -295,7 +307,7 @@ export function isValidWorkspaceId(value) {
 /* `Partial`, because the whole bag defaults to `{}` and the first line of the body is the check that decides
    whether the three required members arrived: the type says "anything you do pass has to be shaped right", and
    the `throw` says "and these three you may not leave out". */
-export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>} */ { clients, pool, log = () => {}, saveSignal, now = () => Date.now(), catchUpLimit = CATCH_UP_LIMIT, catchUpCooldownMs = CATCH_UP_COOLDOWN_MS, catchUpBudgetMs = CATCH_UP_BUDGET_MS, silenceSuspectMs = SILENCE_SUSPECT_MS, probeDeadlineMs = STREAM_PROBE_DEADLINE_MS, gapCatchUpMs = GAP_CATCH_UP_MS, gapCatchUpSpreadMs = GAP_CATCH_UP_SPREAD_MS, heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS, ptsStallBeats = PTS_STALL_BEATS, rebuildCooldownMs = STREAM_REBUILD_COOLDOWN_MS,
+export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>} */ { clients, pool, log = () => {}, saveSignal, now = () => Date.now(), catchUpLimit = CATCH_UP_LIMIT, catchUpChannelLimit = CATCH_UP_CHANNEL_LIMIT, catchUpCooldownMs = CATCH_UP_COOLDOWN_MS, catchUpBudgetMs = CATCH_UP_BUDGET_MS, silenceSuspectMs = SILENCE_SUSPECT_MS, probeDeadlineMs = STREAM_PROBE_DEADLINE_MS, gapCatchUpMs = GAP_CATCH_UP_MS, gapCatchUpSpreadMs = GAP_CATCH_UP_SPREAD_MS, heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS, ptsStallBeats = PTS_STALL_BEATS, rebuildCooldownMs = STREAM_REBUILD_COOLDOWN_MS,
   differenceMaxSteps = DIFFERENCE_MAX_STEPS, differenceBudgetMs = DIFFERENCE_BUDGET_MS, floodWaitMs = FLOOD_BACKOFF_MS,
   ptsGapStrikes = PTS_GAP_STRIKES, gapReauthWindowMs = PTS_GAP_REAUTH_WINDOW_MS, transportFlap = null, keepAliveFlapGraceMs = KEEP_ALIVE_FLAP_GRACE_MS, onDeadStream = null, onSessionUnrecoverable = null } = {}) {
   if (!clients || !pool || !saveSignal) throw new Error('createTelegramListener requires clients, pool and saveSignal');
@@ -1172,20 +1184,31 @@ export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>}
        costume. Re-arming that half alone resets nothing: `attachedAt` and `needsCatchUp` belong to the post
        handler, and a replay triggered by an edit re-arm would re-read the channel for no reason at all. */
     if (postsLive) {
+      /* Detach the edit half by the reference we hold before putting a new one on, even though `editsLive` is
+         already false. False only means "*this* callback is not registered"; it does not mean the client has no
+         edit handler. A client whose entry was replaced carries no `editHandler` at all, so an edit pair left on
+         it from that earlier life is invisible here - and adding a second would make every edit on that channel
+         arrive twice forever, on a session that looks healthy enough that nothing will ever rebuild it. */
+      if (current.editHandler && telegramAdapter.canRemoveMessageHandler(target)) {
+        try { telegramAdapter.removeEditHandler(target, current.editHandler, telegramAdapter.createEditEventFilter()); } catch { /* already gone */ }
+      }
       attachEditHandler(target, current, userId);
-      log('info', 'Telegram edit handler re-attached', { userId });
+      log('info', 'Telegram edit handler re-attached', { userId, registeredPairs: countRegisteredPairs(target) });
       return current;
     }
-    if (current.handler && telegramAdapter.canRemoveMessageHandler(target)) {
-      try { telegramAdapter.removeMessageHandler(target, current.handler, telegramAdapter.createMessageEventFilter()); } catch { /* the old client is gone */ }
-    }
-    if (current.editHandler && telegramAdapter.canRemoveMessageHandler(target)) {
-      try { telegramAdapter.removeEditHandler(target, current.editHandler, telegramAdapter.createEditEventFilter()); } catch { /* the old client is gone */ }
-    }
+    /* Removal is driven by the library's own list rather than by the two callbacks this file happens to remember,
+       which is the difference between "we intend one handler pair per session" and "we hope our bookkeeping
+       survived". Each pair is removed with *its own* builder and *its own* callback, both taken from the list, so
+       the match is against the identity the library compares rather than an equivalent instance built here. */
+    const cleared = clearRegisteredHandlers(target);
     const handler = (event) => ingestMessage(userId, event?.message, event);
     telegramAdapter.addMessageHandler(target, handler, telegramAdapter.createMessageEventFilter());
     current.handler = handler;
     attachEditHandler(target, current, userId);
+    const registered = countRegisteredPairs(target);
+    if (registered > 2) {
+      log('warn', 'Telegram capture handlers are duplicated on a live client', { userId, registeredPairs: registered, cleared, expectedPairs: 2 });
+    }
     if (!current.stats) current.stats = EMPTY_STATS();
     /* Every re-attach asks what was missed, whatever the statistics say. This used to be conditioned on
        "we have never seen a message on this session", which is the only case where the flag was obviously
@@ -1208,6 +1231,39 @@ export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>}
       .then((outcome) => { if (outcome && outcome.action && outcome.action !== 'in-sync') log('debug', 'Telegram update state seeded on attach', { userId, action: outcome.action }); })
       .catch((error) => log('warn', 'Telegram update state could not be seeded', { userId, error: `${error?.message || error}`.slice(0, 160) }));
     return current;
+  }
+
+  /**
+   * How many `[builder, callback]` pairs the library currently holds for this client.
+   *
+   * Read-only, and deliberately tolerant: a client whose internals have changed shape reports zero instead of
+   * throwing, because this number feeds a log line and a warning, and a capture path that throws while reporting
+   * on a session is a capture path that loses the session.
+   */
+  function countRegisteredPairs(client) {
+    if (!telegramAdapter.canListEventHandlers(client)) return 0;
+    try { return (telegramAdapter.listEventHandlers(client) || []).length; } catch { return 0; }
+  }
+
+  /**
+   * Take every handler off this client, whatever our bookkeeping says about it.
+   *
+   * Returns how many pairs were removed. `startTelegramListener` calls this instead of removing only the two
+   * handlers it remembers, so a handler attached by a path it has no record of cannot survive into the new
+   * session and double-ingest. Removing more than was asked for costs nothing here: nothing in this application
+   * registers a Telegram handler except the two halves of capture, and both are attached again on the next line.
+   */
+  function clearRegisteredHandlers(client) {
+    if (!telegramAdapter.canListEventHandlers(client) || !telegramAdapter.canRemoveMessageHandler(client)) return 0;
+    let pairs = [];
+    try { pairs = telegramAdapter.listEventHandlers(client) || []; } catch { return 0; }
+    let removed = 0;
+    for (const pair of pairs) {
+      const [builder, handler] = Array.isArray(pair) ? pair : [pair?.builder ?? pair, pair?.handler];
+      if (typeof handler !== 'function') continue;
+      try { telegramAdapter.removeMessageHandler(client, handler, builder); removed += 1; } catch { /* detached by an earlier pair in the same list */ }
+    }
+    return removed;
   }
 
   /**
@@ -1265,10 +1321,24 @@ export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>}
     const listeningSince = current.attachedAt ? Date.parse(current.attachedAt) : 0;
     let fresh = 0;
     current.needsCatchUp = false;
-    const { rows: channels } = await pool.query(
-      'SELECT channel_id AS "channelId",title,username FROM channels WHERE user_id=$1 AND enabled=TRUE ORDER BY created_at DESC',
-      [userId],
-    );
+    const channels = [];
+    for (let page = 0; page < CATCH_UP_CHANNEL_PAGES; page += 1) {
+      const { rows } = await pool.query(
+        `SELECT channel_id AS "channelId",title,username FROM channels WHERE user_id=$1 AND enabled=TRUE
+         ORDER BY created_at DESC, channel_id DESC LIMIT $2 OFFSET $3`,
+        [userId, catchUpChannelLimit, page * catchUpChannelLimit],
+      );
+      channels.push(...rows);
+      if (rows.length < catchUpChannelLimit) break;
+      if (now() - startedAt >= catchUpBudgetMs) {
+        /* Out of budget while still listing. The flag is what the next cycle reads, and the page bound above is
+           what makes "leave the rest for the next run" true rather than a wish: without it, a large list is read
+           in one query and the budget only starts mattering after all of it has been held. */
+        current.needsCatchUp = true;
+        log('warn', 'Telegram catch-up ran out of budget while listing channels', { userId, listed: channels.length, page: page + 1 });
+        break;
+      }
+    }
     if (!channels.length) return { ran: true, reason: 'NO_CHANNELS', stored: 0 };
     for (const channel of channels) {
       if (now() - startedAt >= catchUpBudgetMs) {
