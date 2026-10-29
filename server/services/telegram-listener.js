@@ -1103,8 +1103,14 @@ export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>}
       if (!text) {
         // A photo, a poll, a pin, a join notice: nothing to parse, and saying so is what makes
         // "no new signals" an answer rather than a mystery.
+        //
+        // `delayMs` rides along because two different facts produce this one line and only one of them is benign:
+        // a number means the post was merely late, while null means the update carried no date at all - the same
+        // missing clock that makes a captured signal un-ageable, and the case `execution-engine.js` now refuses.
+        // Without it, a replay of media-only updates is indistinguishable from a stream of undated ones, which is
+        // the difference between "nothing to read" and "nothing to trust" for every message after this one.
         stats.ignored += 1;
-        log('info', 'Telegram message carried no text to read', { userId, chatId, service: isTelegramServiceMessage(message), replayed });
+        log('info', 'Telegram message carried no text to read', { userId, chatId, service: isTelegramServiceMessage(message), replayed, delayMs: stats.lastDelayMs });
         return { stored: false, reason: 'NO_TEXT' };
       }
       const variants = telegramPeerIdVariants(chatId);

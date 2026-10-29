@@ -1570,3 +1570,44 @@ test('the verdict hands over the id the client is keyed by, untouched', async ()
   assert.equal(typeof declared[0].userId, 'string', 'and what it fires with is the map key the app holds, as text');
   assert.equal(declared[0].userId, USER_ID, 'the same value, character for character - nothing here coerces, pads or rewrites it');
 });
+
+/* ----------------------------------------------------------------------------------- the undated replay --------------------------------------------------
+
+   A deploy restarts the session, and Telegram answers the reconnect with everything after the stored `pts` - in
+   the production log that prompted this file, three days of it. Most of those updates are media or service
+   messages, and every one of them is reported by the same line: "carried no text to read". That line used to be
+   the end of the information, which left an unanswerable question in the middle of it - were these posts merely
+   old, or did the update arrive without a date at all? The second case is the one that matters, because a
+   captured message with no send time has no age, and the execution engine has to refuse it rather than measure it
+   from the moment we happened to store it. `delayMs` on this line is what makes the two distinguishable after the
+   fact, on a line that is emitted whether or not anything was stored.
+ */
+test('a message with nothing to read says whether it had a date to be late by', async () => {
+  const harness = makeHarness();
+  harness.listener.startTelegramListener(USER_ID, harness.client);
+  harness.advance(10 * 60_000);
+
+  // Dated, and ten minutes stale by the harness clock: late, but a perfectly normal media post.
+  await dispatch(harness, new Api.UpdateNewChannelMessage({ message: channelMessage({ id: 900, text: '' }), pts: 40, seq: 0 }));
+  // No `date` on the update at all - the shape a channel post loses its timestamp in, and the only one with no age.
+  const undated = new Api.Message({
+    id: 901,
+    peerId: new Api.PeerChannel({ channelId: BigInt(BARE_CHANNEL_ID) }),
+    message: '',
+    out: false, mentioned: false, mediaUnstable: false, mediaUnread: false, unread: false, post: false,
+  });
+  await dispatch(harness, new Api.UpdateNewChannelMessage({ message: undated, pts: 41, seq: 0 }));
+
+  const lines = harness.logs.filter((entry) => entry.message === 'Telegram message carried no text to read');
+  assert.equal(lines.length, 2, 'both are reported, and neither is stored');
+  assert.deepEqual(lines.map((entry) => entry.meta.reason), [undefined, undefined], 'the line carries no verdict beyond what it says');
+  assert.equal(lines[0].meta.delayMs, 660_000, 'the dated one carries the measured lateness');
+  assert.equal(lines[1].meta.delayMs, null, 'the undated one carries null, which is the whole distinction');
+
+  // And the two are separable from the surrounding lines, not just from each other: only a *measured* lateness
+  // may raise the late warn, so `delayMs: null` with no late warn is the signature of a missing clock.
+  const late = harness.logs.filter((entry) => entry.message === 'Telegram update arrived late');
+  assert.equal(late.length, 1, 'one late warn, for the message that was actually proved late');
+  assert.equal(late[0].meta.delayMs, 660_000);
+  assert.equal(late[0].meta.replayed, false, 'and it says so on a live delivery, since the flag is what makes the pair readable');
+});
