@@ -16,6 +16,9 @@ import { signalStatusForJobStatus } from './signal-outcome.js';
 import { FRIENDLY_NOTES, friendlySignalNote } from './signal-wording.js';
 
 const MAX_SIGNAL_AGE_MS = 120_000;
+/* A row with no posting time cannot be aged at all, which is a different fact from "it is old", so it gets its
+   own sentence: the trader has to be able to tell "we refused to guess" from "the market moved on". */
+export const NO_POSTING_TIME_MESSAGE = 'This signal arrived without a posting time, so it was not executed.';
 const UTC_DAY_MS = 24 * 60 * 60 * 1000;
 
 function utcDate(now) {
@@ -603,6 +606,7 @@ export function createExecutionEngine(/** @type {ExecutionEngineDeps} */ { pool,
       const { rows } = await pool.query(
         `SELECT ej.id AS job_id,ej.user_id,ej.status AS job_status,ej.attempt_count AS "attemptCount",ej.expires_at,
                 s.id AS signal_id,s.source,COALESCE(s.sent_at, s.created_at) AS signal_created_at,s.symbol,s.side,s.entry_price,s.stop_loss,s.take_profit,
+                (s.sent_at IS NULL AND s.source = 'telegram') AS "sentAtMissing",
                 s.execution_ready,s.parse_error,s.needs_review,s.stop_loss_pips,s.take_profit_pips,
                 s.order_type AS "orderType",s.order_type_stated AS "orderTypeStated",s.is_scalping AS "isScalping",
                 st.auto_trading_enabled,st.lot_size_mode,st.fixed_lot_size,st.risk_percent,st.max_open_positions,
@@ -648,6 +652,14 @@ export function createExecutionEngine(/** @type {ExecutionEngineDeps} */ { pool,
          that was briefly deaf and then caught up has a row written seconds ago describing a price from minutes
          ago, and the two-minute bound exists precisely so that price is not traded: ageing it from `created_at`
          would hand a five-minute-late entry to a live market and call it fresh. */
+      /* The bound below can only be measured against a posting time, and `sent_at` is nullable on purpose: the
+         capture never invents one from the wall clock, because a fabricated send time would defeat the column.
+         The COALESCE above is there for rows written before that column existed, whose `created_at` genuinely is
+         the moment the signal arrived. A Telegram capture with no send time is the opposite case - the row was
+         written seconds ago and describes a post of unknown age - which is exactly what this bound exists to
+         refuse. So the missing clock is decided here, before a token is resolved and before a quote is asked. */
+      if (item.sentAtMissing === true) return stop(job, 'expired', NO_POSTING_TIME_MESSAGE);
+
       const createdAt = new Date(item.signal_created_at).getTime();
       if (!Number.isFinite(createdAt) || now() - createdAt > MAX_SIGNAL_AGE_MS || now() < createdAt - 30_000) return stop(job, 'expired', 'This signal was too old to execute safely.');
       if (!item.execution_account_id || item.execution_account_id !== item.metaapi_account_id) return stop(job, 'skipped', 'Select an owned connected trading account in Execution Settings.');
