@@ -124,8 +124,45 @@ export function isTeleprotoKeepAliveTimeout(error) {
  * @property {number} [markTtlMs]
  */
 export function createTelegramKeepAliveGuard(/** @type {TelegramKeepAliveGuardDeps} */ { log = () => {}, now = () => Date.now(), summaryEveryMs = KEEP_ALIVE_SUMMARY_MS, markTtlMs = KEEP_ALIVE_MARK_TTL_MS } = {}) {
+  /* One record per client, and the reason all three structures exist is the leak this file used to have.
+   *
+   * `states` used to be a plain `Set` of records that nothing ever removed: `byClient` was a `WeakMap`, so the
+   * client could be collected, while `states` kept its record - and every count in it - forever. On a service
+   * that rebuilds sessions, that is one permanent entry per reconnect per login attempt, and the fleet loop in
+   * `report()` had to walk the whole growing set to answer "how many clients flapped in this window".
+   *
+   * Now: `states` holds entries that carry a `WeakRef` to their client, `byState` is the reverse index the
+   * explicit release needs, and `prune()` is called on attach (never inside `report`, so a line being written is
+   * never affected by whether the garbage collector happened to run first). Three mechanisms, in order of how much
+   * they can be trusted: `release(client)` at the place a client is discarded is exact and deterministic; the
+   * WeakRef sweep reclaims what nobody released as soon as the collector has run; and
+   * `MAX_GUARDED_CLIENTS` bounds the set absolutely, evicting the oldest records when a fleet is bigger than the
+   * cap, which is the one mechanism that works even if the first two are forgotten and needs no GC. */
   const states = new Set();
+  /** @type {WeakMap<object, any>} */
   const byClient = new WeakMap();
+  /** @type {Map<any, object>} record -> entry, so `release` does not have to scan. */
+  const byState = new Map();
+  /** Records older than this, with a client already collected, are dropped by the backstop even at the cap. */
+  const PRUNE_AFTER_IDLE_MS = Math.max(summaryEveryMs * 4, KEEP_ALIVE_MARK_TTL_MS);
+  const MAX_GUARDED_CLIENTS = 512;
+
+  /** Drop records whose client is gone and has been quiet for a full reporting window. */
+  function prune({ ignoreIdle = false } = {}) {
+    const at = now();
+    let dropped = 0;
+    for (const entry of states) {
+      const alive = entry.clientRef?.deref?.() !== undefined;
+      if (alive) continue;
+      const idleFor = at - Math.max(entry.attachedAt, entry.state.lastAt || 0);
+      if (!ignoreIdle && idleFor <= PRUNE_AFTER_IDLE_MS) continue;
+      states.delete(entry);
+      byState.delete(entry.state);
+      if (entry.client) byClient.delete(entry.client);
+      dropped += 1;
+    }
+    return dropped;
+  }
   // Everything the process-level handler recognises lands here: there is no client to attribute it to, but there
   // is still a fact worth counting, and a count is the difference between "we hid it" and "we hid it, N times".
   const orphan = { userId: null, count: 0, firstAt: null, lastAt: null, windowAt: 0, pending: null };
@@ -138,6 +175,11 @@ export function createTelegramKeepAliveGuard(/** @type {TelegramKeepAliveGuardDe
   }
 
   function report(state, at) {
+    /* Nothing is pruned here, and that is a deliberate choice rather than an oversight. `affectedClients` counts
+       records that timed out inside this window, and a record belonging to a client that has been disconnected
+       cannot gain a new timeout, so a stale record cannot inflate the number - while a prune that depended on
+       whether the collector had already run would make a log line, and the test that pins it, depend on GC
+       timing. Pruning happens on attach, where the cost is paid once per new client instead of once per line. */
     // The first one is always said out loud and then at most one per window per client: enough that a fleet-wide
     // ping problem is visible in the first five minutes of it, quiet enough that it is never the reason a real
     // line got scrolled past - and a summary that only arrived after a full window had passed would be a summary
@@ -153,7 +195,7 @@ export function createTelegramKeepAliveGuard(/** @type {TelegramKeepAliveGuardDe
     const windowStart = at - summaryEveryMs;
     let affectedClients = 0;
     for (const other of states) {
-      if (other.lastAt !== null && other.lastAt >= windowStart) affectedClients += 1;
+      if (other.state.lastAt !== null && other.state.lastAt >= windowStart) affectedClients += 1;
     }
     log('warn', 'Telegram keep-alive timeouts suppressed', {
       userId: state.userId,
@@ -195,7 +237,28 @@ export function createTelegramKeepAliveGuard(/** @type {TelegramKeepAliveGuardDe
     const existing = byClient.get(client);
     if (existing) return existing;
     const state = makeState(userId === null ? null : (Number(userId) || String(userId)));
-    states.add(state);
+    // Prune before measuring the cap, so a fleet of live clients is never truncated by records of dead ones.
+    let dropped = prune();
+    if (states.size >= MAX_GUARDED_CLIENTS) {
+      /* Past the cap, records go even if their client is still alive, oldest first. The alternative is a set whose
+         size is "every client this process ever made", and the thing being protected is exactly that. What the
+         eviction costs is narrow and worth saying precisely: a client whose record is dropped loses its noise
+         suppression and its flap counter, so the next timeout prints a stack trace and the watchdog's
+         "is the provider already reconnecting this one" answer says no. Neither loses a message. */
+      dropped += prune({ ignoreIdle: true });
+      while (states.size >= MAX_GUARDED_CLIENTS && states.size > 0) {
+        const oldest = states.values().next().value;
+        if (!oldest) break;
+        states.delete(oldest);
+        byState.delete(oldest.state);
+        if (oldest.client) byClient.delete(oldest.client);
+        dropped += 1;
+      }
+      log('warn', 'Telegram keep-alive guard discarded idle records at its cap', { guarded: states.size, dropped, cap: MAX_GUARDED_CLIENTS });
+    }
+    const entry = { state, client, clientRef: new WeakRef(client), attachedAt: now() };
+    states.add(entry);
+    byState.set(state, entry);
     byClient.set(client, state);
     try {
       const logger = telegramAdapter.clientLogger(client);
@@ -224,6 +287,22 @@ export function createTelegramKeepAliveGuard(/** @type {TelegramKeepAliveGuardDe
     return state;
   }
 
+  /**
+   * Forget the client a caller has just disconnected.
+   *
+   * The WeakRef sweep would get there eventually, and this is not a replacement for it - it is what makes the
+   * common case exact rather than eventual, and it is safe to call with a client the guard never saw.
+   */
+  function release(client) {
+    if (!client || typeof client !== 'object') return false;
+    const state = byClient.get(client);
+    if (!state) return false;
+    const entry = byState.get(state);
+    if (entry) { states.delete(entry); byState.delete(state); }
+    byClient.delete(client);
+    return true;
+  }
+
   /** Count a recognised timeout that arrived with no client to attribute it to (the process-level path). */
   function observe(error) {
     return note(error, orphan);
@@ -239,14 +318,15 @@ export function createTelegramKeepAliveGuard(/** @type {TelegramKeepAliveGuardDe
   function stats() {
     let count = orphan.count;
     let lastAt = orphan.lastAt;
-    for (const state of states) {
+    for (const entry of states) {
+      const state = entry.state;
       count += state.count;
       if (state.lastAt !== null && (lastAt === null || state.lastAt > lastAt)) lastAt = state.lastAt;
     }
     return { count, lastAt, clients: states.size };
   }
 
-  return { attach, note, observe, flapFor, stats, isProviderKeepAliveTimeout };
+  return { attach, note, observe, flapFor, stats, release, guardedCount: () => states.size, isProviderKeepAliveTimeout };
 }
 
 /**

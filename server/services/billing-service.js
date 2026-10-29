@@ -101,6 +101,10 @@ function currencyForRenewal(renewal, snapshot) {
  * @property {Function} [now]
  * @property {Function} [random]
  */
+/** Rows per page and pages per run, for the expiry sweep: `batchSize * pages` subscriptions in one call. */
+const EXPIRY_BATCH_SIZE = 100;
+const EXPIRY_BATCH_PAGES = 20;
+
 export function createBillingService(/** @type {BillingServiceDeps} */ {
   pool,
   flutterwave,
@@ -873,37 +877,69 @@ async function quote(/** @type {QuoteInput} */ { planKey, promoCode, currency = 
     }
   }
 
-  /** Downgrades subscriptions whose paid period has ended. Safe to run repeatedly. */
+  /**
+   * Downgrades subscriptions whose paid period has ended. Safe to run repeatedly.
+   *
+   * Batched, and the batching is the fix rather than a tuning knob. The listing query was cross-tenant with no
+   * bound of any kind - `SELECT s.user_id FROM subscriptions … WHERE current_period_end <= NOW()` - so its memory
+   * was "everyone whose billing has lapsed", materialised in one pass, once an hour, on a 512 MB container that is
+   * also holding every Telegram session. `LIMIT` plus a keyset cursor on the user id means one batch in memory at a
+   * time, and the cursor is why a batch that *fails* cannot wedge the sweep: the next page starts after the last id
+   * we looked at whether or not its rows changed underneath us, so progress does not depend on the UPDATE landing.
+   */
   async function expireDueSubscriptions() {
-    const { rows } = await pool.query(
-      `SELECT s.user_id FROM subscriptions s JOIN users u ON u.id=s.user_id
-       WHERE s.current_period_end IS NOT NULL AND s.current_period_end <= NOW()
-         AND (s.status IN ('active','non_renewing','past_due') OR u.subscription_status IN ('active','non_renewing','past_due'))
-       GROUP BY s.user_id`,
-    );
     const expired = [];
-    for (const row of rows) {
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
-        await client.query(
-          "UPDATE subscriptions SET status='canceled',updated_at=NOW() WHERE user_id=$1 AND current_period_end <= NOW()",
-          [row.user_id],
-        );
-        await client.query(
-          "UPDATE users SET subscription_status='free',subscription_plan='free',plan_limits=$2 WHERE id=$1",
-          [row.user_id, JSON.stringify(FREE_PLAN.limits)],
-        );
-        await client.query('COMMIT');
-        expired.push(row.user_id);
-      } catch (error) {
-        await client.query('ROLLBACK').catch(() => {});
-        log('warn', 'Subscription expiry failed', { userId: row.user_id, code: error.code || 'SUBSCRIPTION_EXPIRY_FAILED' });
-      } finally {
-        client.release();
+    let afterId = '';
+    let pages = 0;
+    let sawMore = false;
+    for (; pages < EXPIRY_BATCH_PAGES; pages += 1) {
+      const { rows } = await pool.query(
+        `SELECT s.user_id FROM subscriptions s JOIN users u ON u.id=s.user_id
+         WHERE s.current_period_end IS NOT NULL AND s.current_period_end <= NOW()
+           AND (s.status IN ('active','non_renewing','past_due') OR u.subscription_status IN ('active','non_renewing','past_due'))
+           AND s.user_id::text > $1
+         GROUP BY s.user_id ORDER BY s.user_id::text LIMIT $2`,
+        [afterId, EXPIRY_BATCH_SIZE + 1],
+      );
+      /* One row more than the batch is asked for, so a page that comes back exactly full is the only page that
+         needs a successor - which is a fact about the result rather than a second query. The short-page exit
+         belongs *after* the batch has been worked through; written before it, the sweep skipped the only page of
+         rows on every run smaller than the batch, which is to say on every run the product actually does. The
+         test fake is what caught it: a fake answers a query without reading its parameters, so it hands the same
+         two rows back on every page, and a loop that exits only on "no rows" would spend all twenty pages on one
+         account whose downgrade had already thrown. */
+      sawMore = rows.length > EXPIRY_BATCH_SIZE;
+      const batch = rows.slice(0, EXPIRY_BATCH_SIZE);
+      afterId = String(batch[batch.length - 1]?.user_id ?? afterId);
+      for (const row of batch) {
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          await client.query(
+            "UPDATE subscriptions SET status='canceled',updated_at=NOW() WHERE user_id=$1 AND current_period_end <= NOW()",
+            [row.user_id],
+          );
+          await client.query(
+            "UPDATE users SET subscription_status='free',subscription_plan='free',plan_limits=$2 WHERE id=$1",
+            [row.user_id, JSON.stringify(FREE_PLAN.limits)],
+          );
+          await client.query('COMMIT');
+          expired.push(row.user_id);
+        } catch (error) {
+          await client.query('ROLLBACK').catch(() => {});
+          log('warn', 'Subscription expiry failed', { userId: row.user_id, code: error.code || 'SUBSCRIPTION_EXPIRY_FAILED' });
+        } finally {
+          client.release();
+        }
       }
+      if (!sawMore) break;
     }
-    if (expired.length) log('info', 'Expired subscriptions downgraded', { count: expired.length });
+    if (expired.length) log('info', 'Expired subscriptions downgraded', { count: expired.length, pages: pages + 1 });
+    /* Not a failure and not a completion either: the sweep stopped at its page bound with rows still matching, so
+       the rest wait for the next hour. Saying so is the difference between a queue that drains slowly and a queue
+       nobody knows exists - and the bound stays, because an unbounded drain loop on an hourly timer is how a
+       long database outage turns into a permanently busy process. */
+    if (sawMore) log('warn', 'Subscription expiry sweep stopped at its batch bound with work remaining', { pages, batchSize: EXPIRY_BATCH_SIZE, deferred: true });
     return expired;
   }
 
