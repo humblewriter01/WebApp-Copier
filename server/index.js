@@ -666,7 +666,8 @@ async function saveSignal(userId, message, channel = {}) {
  */
 /* Every client this process owns gets the same guard, and it has to be attached before `connect()` because that
    is where GramJS starts the update loop whose ping race produces the noise. What it does is narrow: it
-   recognises one error (`TIMEOUT`, thrown by `client/updates.js` itself), counts it per client, and answers the
+   recognises the provider's own keep-alive timeout - `TIMEOUT` from `client/updates.js` on GramJS, and
+   `Ping`/`Read timeout of Ns expired` from `network/session/Session.js` on teleproto - counts it per client, and answers the
    library's own logging gate "no" for that one print. Everything else the library logs - and everything our
    handlers throw while the library is on the call stack, which is the failure mode a stack-substring filter
    would have eaten - goes to the log untouched. */

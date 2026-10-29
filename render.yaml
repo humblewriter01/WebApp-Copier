@@ -9,7 +9,7 @@ services:
     rootDir: server
     # `npm run typecheck` is in the build, not only in the test script: the deploy is the one moment a type
     # error can be stopped before it starts serving, and the blueprint is what makes it run with no CI to forget.
-    buildCommand: npm ci && npm run typecheck
+    buildCommand: npm ci && npm run typecheck && npm run typecheck:strict
     startCommand: npm start
     healthCheckPath: /health
     envVars:

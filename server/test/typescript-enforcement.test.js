@@ -23,7 +23,20 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SERVER = fileURLToPath(new URL('..', import.meta.url));
-const appSources = ['index.js', 'db.js', ...readdirSync(join(SERVER, 'services')).map((f) => `services/${f}`)];
+/* Walked rather than listed, because the server grew its first subdirectory with the TypeScript island, and a
+   one-level `readdirSync` would have read a directory as if it were a source file. The recursion is the
+   interesting half: "a new directory is inside the gate the day it is created" is only true if the scan descends
+   into it, and a flat list is how a subdirectory becomes a place to put things nobody checks. */
+function walk(relative) {
+  const found = [];
+  for (const entry of readdirSync(join(SERVER, relative), { withFileTypes: true })) {
+    const child = `${relative}/${entry.name}`;
+    if (entry.isDirectory()) found.push(...walk(child));
+    else found.push(child);
+  }
+  return found;
+}
+const appSources = ['index.js', 'db.js', ...walk('services')];
 const read = (rel) => readFileSync(join(SERVER, rel), 'utf8');
 /**
  * `tsconfig.json` is JSON-with-comments, and a naive comment strip eats the glob in `include`: a double-star,
@@ -52,7 +65,14 @@ const pkg = JSON.parse(read('package.json'));
 const declarations = read('types/app.d.ts');
 
 test('the typecheck covers every source the server runs, and only those', () => {
-  assert.deepEqual(config.include, ['**/*.js', '**/*.d.ts'], 'a new directory is inside the gate the day it is created, not whenever someone remembers to add it');
+  assert.deepEqual(config.include, ['**/*.js', '**/*.ts', '**/*.d.ts'], 'a new directory is inside the gate the day it is created, not whenever someone remembers to add it');
+  // The TypeScript pattern in the array above is not the strict project sneaking into the permissive one. It is
+  // what lets checkJs resolve the dynamic import of a strict file in the driver switch: without the island in
+  // the program, that specifier is an unresolved module, and a type-checker that errors on a path Node reads
+  // happily is a gate that lies. The files are checked twice, permissively from here and strictly from
+  // tsconfig.strict.json, and the second one is what they are held to. A glob is spelled out rather than
+  // quoted below for a reason: star-slash closes a comment, and it has already broken this file once.
+  assert.equal(config.compilerOptions.allowImportingTsExtensions, true, 'and a `.ts` specifier in a JavaScript file is legal, because that is how a runtime that strips types loads a strict file');
   assert.deepEqual(config.exclude, ['node_modules', 'test'], 'the dependencies are skipLibCheck territory and the tests are deliberately outside: their fixtures are duck-typed shapes that are meant to be wrong in instructive ways');
   const jsOnDisk = readdirSync(SERVER).filter((f) => f.endsWith('.js'));
   assert.ok(jsOnDisk.includes('index.js') && jsOnDisk.includes('db.js'), 'the two roots that hold the routes and the schema');
@@ -89,6 +109,44 @@ test('and into the build that produces the deployment', () => {
   assert.match(build, /npm run typecheck/, 'then refuse to build what will not typecheck, which is the only moment a deploy can be stopped before it starts');
   const client = services.find((block) => /rootDir: client/.test(block));
   assert.ok(!/typecheck/.test((client.match(/buildCommand:\s*(.+)/) || [])[1] || ''), 'the client is not wired yet, and this test says so rather than letting that look like coverage');
+});
+
+test('the scan reaches into subdirectories, which is the promise the first test makes', () => {
+  for (const expected of ['services/telegram/gramjs-session.ts', 'services/telegram/teleproto-adapter.ts', 'services/telegram-driver.js']) {
+    assert.equal(appSources.includes(expected), true, `${expected} is inside the gate`);
+  }
+  assert.equal(appSources.some((file) => file.includes('/test/')), false, 'and it does not wander into the tests, which the config excludes on purpose');
+});
+
+test('the strict project exists, is separate, and is chained into everything that already runs', () => {
+  const strict = JSON.parse(stripJsonComments(read('tsconfig.strict.json')));
+  assert.equal(strict.extends, './tsconfig.json', 'it inherits the module resolution and the types, so the two projects cannot drift on where `import` points');
+  assert.equal(strict.compilerOptions.strict, true, 'and turns the whole set on, which is the point of having it');
+  assert.equal(strict.compilerOptions.noUncheckedIndexedAccess, true, 'including the option that makes `rows[0]` a value that has to be proved to exist');
+  assert.equal(strict.compilerOptions.allowJs, false, 'and does not reach back into the JavaScript tree: a strict project that swallows 20,000 legacy lines is a project nobody can turn on');
+  assert.ok(Array.isArray(strict.include) && strict.include.length === 1, 'one include pattern, so the island is a directory and not a list someone forgets to extend');
+
+  assert.match(pkg.scripts['typecheck:strict'], /tsc -p tsconfig\.strict\.json --noEmit/, 'a named script, so no one types the project flag from memory');
+  const chain = pkg.scripts.test;
+  assert.match(chain, /npm run typecheck && npm run typecheck:strict && node --test/, 'the permissive check, then the strict one, then the suite, in one command - chained rather than run separately, because two scripts is two chances to forget one');
+  const yaml = readFileSync(join(SERVER, '..', 'render.yaml'), 'utf8');
+  const build = (yaml.split(/\n  - type: /).slice(1).find((block) => /rootDir: server/.test(block)).match(/buildCommand:\s*(.+)/) || [])[1];
+  assert.match(build, /npm run typecheck && npm run typecheck:strict/, 'and the build that produces a deployment refuses to build what will not pass both');
+});
+
+test('the runtime that would load the strict files is written down, not assumed', () => {
+  /* The island is loaded by importing a `.ts` path, which a Node process can only do if it strips types. That is
+     not true of every Node 22: it is on by default from 22.18. So `engines.node` is deliberately still `>=22`,
+     because nothing in the running application reaches a `.ts` file today - the driver switch is not wired, and
+     `test/telegram-driver-switch.test.js` pins that. The day the switch goes live, this line is the one that has
+     to change together with it, and it should not be able to change by itself. */
+  assert.match(pkg.engines.node, /^>=22/, 'the floor the app has always declared');
+  assert.equal(pkg.engines.node.includes('22.18'), false, 'and not yet the type-stripping floor, because the files are not loaded at runtime');
+  const island = readdirSync(join(SERVER, 'services/telegram')).filter((f) => f.endsWith('.ts'));
+  assert.ok(island.length >= 1, 'the island exists');
+  for (const rel of ['index.js', 'db.js', 'services/telegram-listener.js', 'services/telegram-auth.js']) {
+    assert.equal(new RegExp(`from ['"]\./.*\.ts['"]`).test(read(rel)), false, `${rel} has no static import of a .ts file, so it runs on a runtime that cannot strip types`);
+  }
 });
 
 test('every options-bag typedef is applied to the parameter it describes', () => {
