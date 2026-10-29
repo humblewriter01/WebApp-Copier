@@ -15,6 +15,12 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      # `engines.node` is only a promise: npm warns and installs anyway (no `engine-strict` in this repo), so a
+      # Render image on an older Node would have satisfied the manifest and still served the vulnerability. The
+      # version Render installs is written here, and `server/test/typescript-enforcement.test.js` fails if this
+      # line and the floor in the two package.json files ever disagree.
+      - key: NODE_VERSION
+        value: "22.23.4"
       - key: DATABASE_URL
         sync: false
       - key: JWT_SECRET
@@ -102,3 +108,8 @@ services:
         value: https://vphckospghbeezvwpjwp.supabase.co
       - key: VITE_SUPABASE_PUBLISHABLE_KEY
         value: sb_publishable_KzOiEouPTpCA9xx0mudKHw_kQMncouM
+      # Pinned for the build, not the runtime: a static service runs Vite on this Node and serves no Node
+      # process, so nothing here is exposed to the advisory. It moves with the API because a repo where only one
+      # service names its runtime is a repo where the other one silently floats.
+      - key: NODE_VERSION
+        value: "22.23.4"

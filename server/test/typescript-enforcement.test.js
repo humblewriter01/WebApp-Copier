@@ -23,6 +23,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SERVER = fileURLToPath(new URL('..', import.meta.url));
+const ROOT = join(SERVER, '..');
 /* Walked rather than listed, because the server grew its first subdirectory with the TypeScript island, and a
    one-level `readdirSync` would have read a directory as if it were a source file. The recursion is the
    interesting half: "a new directory is inside the gate the day it is created" is only true if the scan descends
@@ -136,17 +137,63 @@ test('the strict project exists, is separate, and is chained into everything tha
 
 test('the runtime that would load the strict files is written down, not assumed', () => {
   /* The island is loaded by importing a `.ts` path, which a Node process can only do if it strips types. That is
-     not true of every Node 22: it is on by default from 22.18. So `engines.node` is deliberately still `>=22`,
-     because nothing in the running application reaches a `.ts` file today - the driver switch is not wired, and
-     `test/telegram-driver-switch.test.js` pins that. The day the switch goes live, this line is the one that has
-     to change together with it, and it should not be able to change by itself. */
+     not true of every Node 22: it is on by default from 22.18. So `engines.node` was written as the bare `>=22`
+     floor while nothing in the running application reached a `.ts` file - the driver switch is not wired, and
+     `test/telegram-driver-switch.test.js` pins that. It is now `>=22.23.4` for a different reason: the October
+     2026 Node security release, which is the minimum this service is allowed to run on. Both reasons are pinned
+     below, because neither is allowed to drift away on its own. */
   assert.match(pkg.engines.node, /^>=22/, 'the floor the app has always declared');
-  assert.equal(pkg.engines.node.includes('22.18'), false, 'and not yet the type-stripping floor, because the files are not loaded at runtime');
+  assert.equal(pkg.engines.node.includes('22.18'), false, 'and not the type-stripping floor pinned as such - the floor moved for the security release, not to opt into `--experimental-strip-types`');
+  /* The security floor. `>=22.23.4` is the first 22.x carrying nodejs/node v22.23.4 (2026-10-21): the Brotli
+     decoder fix (CVE-2026-111497), the TLS/permission/crypto fixes, and the root-certificate + OpenSSL 3.5.9
+     refresh. Written as a comparison rather than a string match so `>=22.23.4`, `>22.23.4` and `^22.23.4` all
+     read as satisfied, and a range that would accept a vulnerable runtime does not. */
+  const minimum = /\d+\.\d+\.\d+/.exec(String(pkg.engines.node));
+  assert.ok(minimum, 'the declared floor is an exact version, not just a major');
+  const atOrAbove = (wanted) => minimum[0].split('.').map(Number).every((part, i) => part >= wanted[i]);
+  assert.ok(atOrAbove([22, 23, 4]), `the runtime must be at least the patched 22.23.4, got ${minimum[0]}`);
   const island = readdirSync(join(SERVER, 'services/telegram')).filter((f) => f.endsWith('.ts'));
   assert.ok(island.length >= 1, 'the island exists');
   for (const rel of ['index.js', 'db.js', 'services/telegram-listener.js', 'services/telegram-auth.js']) {
     assert.equal(new RegExp(`from ['"]\./.*\.ts['"]`).test(read(rel)), false, `${rel} has no static import of a .ts file, so it runs on a runtime that cannot strip types`);
   }
+});
+
+test('the runtime the blueprint installs is the runtime the manifests promise, on both services', () => {
+  /* The floor in `engines.node` is a promise, not an installer: nothing in this repo turns it into an error
+     (there is no `engine-strict` and no `.npmrc`), so an image on an older Node warns and starts anyway. The
+     version Render actually installs is the `NODE_VERSION` env var in the blueprint. Two places, one fact, and
+     both services - which is exactly the pair that drifts, because a build that passes locally says nothing about
+     what the deploy host pulled. So the pin runs in both directions: the installed version must satisfy the
+     promised floor, the two services must name the same version, and the two floors must be the same string. */
+  const yaml = readFileSync(join(ROOT, 'render.yaml'), 'utf8');
+  const blocks = yaml.split(/\n  - type: /).slice(1);
+  const blockFor = (rootDir) => {
+    const block = blocks.find((b) => new RegExp(`rootDir: ${rootDir}$`, 'm').test(b));
+    assert.ok(block, `the ${rootDir} service is still in the blueprint, so this test cannot pass by its subject disappearing`);
+    return block;
+  };
+  const installedNode = (rootDir) => {
+    const pinned = /- key: NODE_VERSION\s*\n\s*value: "?([\d.]+)"?\s*$/m.exec(blockFor(rootDir));
+    assert.ok(pinned, `the ${rootDir} service pins NODE_VERSION, so its runtime is not Render's default`);
+    return pinned[1];
+  };
+  const promisedFloor = (dir) => {
+    const engines = JSON.parse(readFileSync(join(ROOT, dir, 'package.json'), 'utf8')).engines.node;
+    const exact = /^(?:>=|>)\s*(\d+)\.(\d+)\.(\d+)$/.exec(engines.trim());
+    assert.ok(exact, `${dir}/package.json declares an exact floor (">=major.minor.patch"), got ${engines}`);
+    return exact.slice(1).map(Number);
+  };
+  const atOrAbove = (version, floor) => version.every((part, i) => part >= floor[i]);
+
+  for (const dir of ['server', 'client']) {
+    const installed = installedNode(dir).split('.').map(Number);
+    assert.equal(installed.length, 3, `${dir}: an exact patch version, so "22" cannot satisfy a floor of 22.23.4`);
+    assert.ok(atOrAbove(installed, promisedFloor(dir)), `${dir} installs Node ${installed.join('.')}, which must satisfy its declared floor`);
+  }
+  assert.equal(installedNode('server'), installedNode('client'), 'both services run the same runtime, so one is not patched while the other floats');
+  assert.equal(JSON.parse(read('package.json')).engines.node, JSON.parse(readFileSync(join(ROOT, 'client', 'package.json'), 'utf8')).engines.node, 'and both manifests promise the same floor');
+  assert.ok(atOrAbove(installedNode('server').split('.').map(Number), [22, 23, 4]), 'the pinned version is at least the patched runtime, not merely some 22.x');
 });
 
 test('every options-bag typedef is applied to the parameter it describes', () => {
