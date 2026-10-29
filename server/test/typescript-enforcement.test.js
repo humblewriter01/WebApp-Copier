@@ -136,12 +136,21 @@ test('the strict project exists, is separate, and is chained into everything tha
 
 test('the runtime that would load the strict files is written down, not assumed', () => {
   /* The island is loaded by importing a `.ts` path, which a Node process can only do if it strips types. That is
-     not true of every Node 22: it is on by default from 22.18. So `engines.node` is deliberately still `>=22`,
-     because nothing in the running application reaches a `.ts` file today - the driver switch is not wired, and
-     `test/telegram-driver-switch.test.js` pins that. The day the switch goes live, this line is the one that has
-     to change together with it, and it should not be able to change by itself. */
+     not true of every Node 22: it is on by default from 22.18. So `engines.node` was written as the bare `>=22`
+     floor while nothing in the running application reached a `.ts` file - the driver switch is not wired, and
+     `test/telegram-driver-switch.test.js` pins that. It is now `>=22.23.4` for a different reason: the October
+     2026 Node security release, which is the minimum this service is allowed to run on. Both reasons are pinned
+     below, because neither is allowed to drift away on its own. */
   assert.match(pkg.engines.node, /^>=22/, 'the floor the app has always declared');
-  assert.equal(pkg.engines.node.includes('22.18'), false, 'and not yet the type-stripping floor, because the files are not loaded at runtime');
+  assert.equal(pkg.engines.node.includes('22.18'), false, 'and not the type-stripping floor pinned as such - the floor moved for the security release, not to opt into `--experimental-strip-types`');
+  /* The security floor. `>=22.23.4` is the first 22.x carrying nodejs/node v22.23.4 (2026-10-21): the Brotli
+     decoder fix (CVE-2026-111497), the TLS/permission/crypto fixes, and the root-certificate + OpenSSL 3.5.9
+     refresh. Written as a comparison rather than a string match so `>=22.23.4`, `>22.23.4` and `^22.23.4` all
+     read as satisfied, and a range that would accept a vulnerable runtime does not. */
+  const minimum = /\d+\.\d+\.\d+/.exec(String(pkg.engines.node));
+  assert.ok(minimum, 'the declared floor is an exact version, not just a major');
+  const atOrAbove = (wanted) => minimum[0].split('.').map(Number).every((part, i) => part >= wanted[i]);
+  assert.ok(atOrAbove([22, 23, 4]), `the runtime must be at least the patched 22.23.4, got ${minimum[0]}`);
   const island = readdirSync(join(SERVER, 'services/telegram')).filter((f) => f.endsWith('.ts'));
   assert.ok(island.length >= 1, 'the island exists');
   for (const rel of ['index.js', 'db.js', 'services/telegram-listener.js', 'services/telegram-auth.js']) {
