@@ -45,8 +45,21 @@ import * as telegramAdapter from './telegram-adapter.js';
 import { isTelegramServiceMessage, resolveTelegramChatId, telegramMessageText, telegramPeerIdVariants } from './telegram-peer.js';
 import { KEEP_ALIVE_FLAP_GRACE_MS } from './telegram-keepalive.js';
 
-/** How many recent messages one channel is asked for when a session comes back. */
-export const CATCH_UP_LIMIT = 25;
+/**
+ * How many recent messages one channel is asked for when a session comes back.
+ *
+ * 25 for as long as the question was "did we miss anything". It is 15 because of what the fetch costs: a session
+ * that reconnects after four days is handed its whole gap at once, and every message in it is a raw MTProto
+ * payload that has to be parsed before it can be dropped. The number is the ceiling on how many of those exist at
+ * the same moment for one channel, which makes it the only lever here that changes peak RSS rather than how long
+ * the spike lasts.
+ *
+ * It is a window over history, not a queue: `getMessages` returns the newest N and the pass does not page
+ * backwards, so a message older than N was never reachable by this path at 25 either. Lowering it widens the
+ * hole by ten messages per channel per pass and buys the memory back; the trade is recorded here so the next
+ * reader does not "fix" the number back to 25 without the reason.
+ */
+export const CATCH_UP_LIMIT = 15;
 
 /**
  * How many monitored channels one catch-up page reads, and how many pages a single pass is allowed.
@@ -162,13 +175,47 @@ export const GAP_CATCH_UP_SPREAD_MS = 90_000;
 /**
  * How long one catch-up run may spend before it stops and leaves the rest for the next one.
  *
- * A replay is 25 messages times however many channels a workspace monitors, each of them a database write and
- * sometimes a model request. Given no bound, a reconnect could sit in this loop for minutes - not because the
+ * A replay is `CATCH_UP_LIMIT` messages times however many channels a workspace monitors, each of them a
+ * database write and sometimes a model request, and the throttle below puts a floor under how fast that can be
+ * walked. Given no bound, a reconnect could sit in this loop for minutes - not because the
  * event loop was blocked, but because the queue of work it keeps appending to is the same queue live captures
  * are served from. The budget is what makes "catch up on what we missed" finish; a run that stops early leaves
  * the session flagged, so the next sweep resumes it, and messages already stored are never stored twice.
+ *
+ * The budget is deliberately *not* raised to make room for the throttle. A pass that sleeps 250 ms per message
+ * and 1 s per channel reaches 20 s after a handful of channels instead of after all fifty, which is the intended
+ * shape: the work spreads across sweeps rather than arriving in one burst, and the flag is what makes spreading
+ * it out cost latency rather than messages.
  */
 export const CATCH_UP_BUDGET_MS = 20_000;
+
+/**
+ * The throttle inside a catch-up: one step per message, one rest between channels.
+ *
+ * A restart on a session that had been away for four days used to hand every monitored channel its whole window
+ * back inside about a second - the production log for it reads `delayMs: 352124637` across a burst of replayed
+ * updates - and the container's RSS went through the free tier's ceiling while it was still inside
+ * `runCatchUpPass`. Parsing a payload and writing its row is microseconds of work; what these two numbers buy is
+ * *rate*. A processed message's buffers become unreachable as soon as the loop moves past it, and a pass that
+ * allocates fifteen payloads per channel with a second between channels gives the incremental collector room to
+ * reclaim them in the gaps instead of after the heap has already grown past what the kernel allows.
+ *
+ * `yieldToEventLoop` above each message stays as well, and it is a different promise: that one is about *fairness*
+ * - a live capture must not be served behind another row of the replay - while these are about pressure. Removing
+ * the yield to "save" a timer would put the latency back into the path that exists to remove it.
+ */
+export const CATCH_UP_MESSAGE_GAP_MS = 250;
+export const CATCH_UP_CHANNEL_GAP_MS = 1_000;
+/**
+ * How much of one pass may be spent waiting, and therefore how many channels a throttled pass can reach.
+ *
+ * The ceiling is not politeness, it is the difference between a pass that resumes and a pass that stalls the
+ * thing that runs it: `rearmTelegramListeners` and the gap sweep both *await* `runCatchUp` inside
+ * `telegramSweepGuard`, whose `run()` refuses an overlapping pass, so a replay allowed to sleep for four minutes
+ * across fifty channels would keep the next sweeps from running at all - the re-arm, the deaf-session check, all
+ * of it. Stopping is cheap and already correct: the session stays flagged and the next cycle continues.
+ */
+export const CATCH_UP_MAX_SLEEP_MS = 30_000;
 
 /** A Telegram counter as a plain number: BigInt in some builds, a `Date` for `date`, `null` when absent. */
 function updateCounter(value) {
@@ -285,6 +332,9 @@ export function isValidWorkspaceId(value) {
  * @property {number} [catchUpChannelLimit] - how many monitored channels one page of the listing reads
  * @property {number} [catchUpCooldownMs] - how long before the same session is replayed again
  * @property {number} [catchUpBudgetMs] - how long one replay may take before it is left for the next cycle
+ * @property {(ms: number) => Promise<void>} [catchUpSleep] - the throttle's timer. Injected for the same reason
+ *   `now` is: the pattern of pauses is what the tests have to be able to read, and a suite that waited through
+ *   real ones would be a suite someone shortens by deleting the assertions.
  * @property {number} [silenceSuspectMs] - how long a listening session may be silent before it is worth asking about
  * @property {number} [probeDeadlineMs] - how long a stream probe waits for the answer that decides deaf or not
  * @property {number} [gapCatchUpMs] - the gap that turns a reconciliation into a replay
@@ -307,7 +357,9 @@ export function isValidWorkspaceId(value) {
 /* `Partial`, because the whole bag defaults to `{}` and the first line of the body is the check that decides
    whether the three required members arrived: the type says "anything you do pass has to be shaped right", and
    the `throw` says "and these three you may not leave out". */
-export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>} */ { clients, pool, log = () => {}, saveSignal, now = () => Date.now(), catchUpLimit = CATCH_UP_LIMIT, catchUpChannelLimit = CATCH_UP_CHANNEL_LIMIT, catchUpCooldownMs = CATCH_UP_COOLDOWN_MS, catchUpBudgetMs = CATCH_UP_BUDGET_MS, silenceSuspectMs = SILENCE_SUSPECT_MS, probeDeadlineMs = STREAM_PROBE_DEADLINE_MS, gapCatchUpMs = GAP_CATCH_UP_MS, gapCatchUpSpreadMs = GAP_CATCH_UP_SPREAD_MS, heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS, ptsStallBeats = PTS_STALL_BEATS, rebuildCooldownMs = STREAM_REBUILD_COOLDOWN_MS,
+export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>} */ { clients, pool, log = () => {}, saveSignal, now = () => Date.now(), catchUpLimit = CATCH_UP_LIMIT, catchUpChannelLimit = CATCH_UP_CHANNEL_LIMIT, catchUpCooldownMs = CATCH_UP_COOLDOWN_MS, catchUpBudgetMs = CATCH_UP_BUDGET_MS,
+    catchUpSleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
+    silenceSuspectMs = SILENCE_SUSPECT_MS, probeDeadlineMs = STREAM_PROBE_DEADLINE_MS, gapCatchUpMs = GAP_CATCH_UP_MS, gapCatchUpSpreadMs = GAP_CATCH_UP_SPREAD_MS, heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS, ptsStallBeats = PTS_STALL_BEATS, rebuildCooldownMs = STREAM_REBUILD_COOLDOWN_MS,
   differenceMaxSteps = DIFFERENCE_MAX_STEPS, differenceBudgetMs = DIFFERENCE_BUDGET_MS, floodWaitMs = FLOOD_BACKOFF_MS,
   ptsGapStrikes = PTS_GAP_STRIKES, gapReauthWindowMs = PTS_GAP_REAUTH_WINDOW_MS, transportFlap = null, keepAliveFlapGraceMs = KEEP_ALIVE_FLAP_GRACE_MS, onDeadStream = null, onSessionUnrecoverable = null } = {}) {
   if (!clients || !pool || !saveSignal) throw new Error('createTelegramListener requires clients, pool and saveSignal');
@@ -1319,6 +1371,25 @@ export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>}
 
   async function runCatchUpPass(userId, current, startedAt) {
     let stored = 0;
+    // How long this pass spent *waiting*, so the log can tell a throttled pass apart from a stalled one - the two
+    // look identical to anyone reading only the duration.
+    let sleptMs = 0;
+    /* The budget is spent on work, not on waiting: `now() - startedAt` alone would let a pass that only re-walked
+       already-captured channels - a fetch and a dedupe each, with 3.5 s of throttle between them - burn its whole
+       budget before reaching the tail, and then burn it again next cycle, forever. A budget that excludes the
+       pauses makes the re-walk cost what it costs today, while `CATCH_UP_MAX_SLEEP_MS` still bounds how long the
+       pass can be held by the sweep that awaited it. */
+    const outOfWorkBudget = () => now() - startedAt - sleptMs >= catchUpBudgetMs;
+    /* Waiting is measured, never assumed. `catchUpSleep` is injectable for the tests, and a timer that returns at
+       once must not be booked as 250 ms of waiting - that would credit the pass with time it did not spend and
+       take the same amount off its work budget, which is how a bound silently becomes a loophole in both
+       directions. */
+    const rest = async (gapMs) => {
+      const before = now();
+      await catchUpSleep(gapMs);
+      sleptMs += Math.max(0, now() - before);
+    };
+    const outOfSleepBudget = (gapMs) => sleptMs + gapMs > CATCH_UP_MAX_SLEEP_MS;
     /* A replay that turns up a message posted *after* this handler went on is not a recovery, it is a
        confession: the channel spoke while we were listening and the push never arrived. That is the one thing
        the silence clock cannot tell us - a workspace with two monitored channels keeps `lastAt` fresh on the
@@ -1336,7 +1407,7 @@ export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>}
       );
       channels.push(...rows);
       if (rows.length < catchUpChannelLimit) break;
-      if (now() - startedAt >= catchUpBudgetMs) {
+      if (outOfWorkBudget()) {
         /* Out of budget while still listing. The flag is what the next cycle reads, and the page bound above is
            what makes "leave the rest for the next run" true rather than a wish: without it, a large list is read
            in one query and the budget only starts mattering after all of it has been held. */
@@ -1346,12 +1417,22 @@ export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>}
       }
     }
     if (!channels.length) return { ran: true, reason: 'NO_CHANNELS', stored: 0 };
-    for (const channel of channels) {
-      if (now() - startedAt >= catchUpBudgetMs) {
-        // Out of budget: the remaining channels keep their claim on the next run.
+    for (const [channelIndex, channel] of channels.entries()) {
+      if (outOfWorkBudget()) {
+        // Out of work budget: the remaining channels keep their claim on the next run.
         current.needsCatchUp = true;
-        return { ran: true, reason: 'BUDGET', stored, fresh, partial: true };
+        return { ran: true, reason: 'BUDGET', stored, fresh, sleptMs, budgetHit: 'work', partial: true };
       }
+      if (outOfSleepBudget(channelIndex > 0 ? CATCH_UP_CHANNEL_GAP_MS : 0)) {
+        // Out of *waiting* budget. Not throttled away into a burst: the pass stops, keeps its claim, and the next
+        // sweep carries on from here, which is the whole reason a bound like this can be honest.
+        current.needsCatchUp = true;
+        log('info', 'Telegram catch-up stopped at its waiting budget', { userId, stored, fresh, sleptMs, channels: channels.length });
+        return { ran: true, reason: 'BUDGET', stored, fresh, sleptMs, budgetHit: 'sleep', partial: true };
+      }
+      /* The rest between channels, and never before the first one: the pass has already earned its place in the
+         queue, and a pause that follows nothing spends budget on a channel this run will not reach. */
+      if (channelIndex > 0) await rest(CATCH_UP_CHANNEL_GAP_MS);
       const handles = [];
       if (channel.username) handles.push(channel.username);
       const numeric = String(channel.channelId || '').replace(/^-100/, '');
@@ -1368,16 +1449,17 @@ export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>}
       }
       if (!messages.length) continue;
       // Oldest first, so the rows land in the order the channel wrote them.
-      for (const message of [...messages].reverse()) {
+      const replay = [...messages].reverse();
+      for (const [index, message] of replay.entries()) {
         /* One event-loop turn per message. Without this the replay is a chain of 25 promises that never
            yields, and every live update that arrives during it is served after another row of the replay -
            which is exactly the latency this whole path is meant to remove. `setImmediate` puts the next
            message at the back of the check queue instead of the front of the microtask one. */
         await yieldToEventLoop();
-        if (now() - startedAt >= catchUpBudgetMs) {
+        if (outOfWorkBudget()) {
           current.needsCatchUp = true;
-          if (stored) log('info', 'Telegram catch-up stopped at its budget', { userId, stored, fresh });
-          return { ran: true, reason: 'BUDGET', stored, fresh, partial: true };
+          if (stored) log('info', 'Telegram catch-up stopped at its budget', { userId, stored, fresh, sleptMs, budgetHit: 'work' });
+          return { ran: true, reason: 'BUDGET', stored, fresh, sleptMs, budgetHit: 'work', partial: true };
         }
         const result = await ingestMessage(userId, message, { message }, { replayed: true });
         if (result.stored) {
@@ -1385,16 +1467,20 @@ export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>}
           const sentAtMs = Number(message?.date) * 1000;
           if (listeningSince && Number.isFinite(sentAtMs) && sentAtMs > listeningSince) fresh += 1;
         }
+        /* After the work, not before it, and not after the last message of the channel: the pause exists to keep
+           the payloads of *this* message from being alive while the next one is fetched, and one after a channel's
+           final row would throttle nothing but the budget. */
+        if (index + 1 < replay.length && !outOfSleepBudget(CATCH_UP_MESSAGE_GAP_MS)) await rest(CATCH_UP_MESSAGE_GAP_MS);
       }
     }
-    if (stored) log('info', 'Telegram catch-up stored missed messages', { userId, stored, fresh });
+    if (stored) log('info', 'Telegram catch-up stored missed messages', { userId, stored, fresh, sleptMs });
     if (fresh) {
       log('warn', 'Telegram replay found messages posted while the handler was attached', { userId, fresh, sinceAttachMs: Math.max(0, now() - listeningSince) });
       /* Escalated, because there is a handler attached and a socket that answers: a reconnect that returns the
          same connected client would rebuild nothing and simply agree that the session is fine. */
       requestStreamRebuild(userId, 'message-missed-while-listening', { escalate: true });
     }
-    return { ran: true, reason: 'DONE', stored, fresh };
+    return { ran: true, reason: 'DONE', stored, fresh, sleptMs };
   }
 
   /** What every user's session looks like right now, for the admin diagnostics only. */
