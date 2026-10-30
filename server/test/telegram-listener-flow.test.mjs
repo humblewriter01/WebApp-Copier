@@ -22,7 +22,7 @@ import { _handleUpdate } from 'telegram/client/updates.js';
 import { NewMessage } from 'telegram/events/index.js';
 import { EditedMessage } from 'telegram/events/EditedMessage.js';
 import * as telegramAdapter from '../services/telegram-adapter.js';
-import { CATCH_UP_COOLDOWN_MS, HEARTBEAT_INTERVAL_MS, STREAM_REBUILD_COOLDOWN_MS, GAP_CATCH_UP_MS, GAP_CATCH_UP_SPREAD_MS, SILENCE_SUSPECT_MS, createTelegramListener, isValidWorkspaceId, normalizeUpdateState, readUpdateState, UPDATE_STATE_KEY } from '../services/telegram-listener.js';
+import { CATCH_UP_COOLDOWN_MS, CATCH_UP_LIMIT, CATCH_UP_MESSAGE_GAP_MS, CATCH_UP_CHANNEL_GAP_MS, CATCH_UP_MAX_SLEEP_MS, HEARTBEAT_INTERVAL_MS, STREAM_REBUILD_COOLDOWN_MS, GAP_CATCH_UP_MS, GAP_CATCH_UP_SPREAD_MS, SILENCE_SUSPECT_MS, createTelegramListener, isValidWorkspaceId, normalizeUpdateState, readUpdateState, UPDATE_STATE_KEY } from '../services/telegram-listener.js';
 import { telegramPeerIdVariants, telegramMessageText } from '../services/telegram-peer.js';
 
 const USER_ID = '5036a3d3-0671-4cbf-9728-e5e3bf1eea9b';
@@ -476,11 +476,13 @@ test('the reader finds a body in every field this library puts one in', () => {
  * tests are the contract the reconnect path has to keep: one replay per user, a bounded run that resumes,
  * and a live message that is never made to wait behind a replay of older ones.
  */
-function makeReplayHarness({ messages, catchUpBudgetMs, onStored, getMessages, catchUpCooldownMs = 0 } = {}) {
-  const pool = makePool();
+function makeReplayHarness({ messages, catchUpBudgetMs, onStored, getMessages, catchUpCooldownMs = 0, channels, advanceOnSleep = false } = {}) {
+  const pool = makePool(channels ? { channels } : {});
   const clients = new Map();
   const saved = [];
+  const sleeps = [];
   let clock = Date.parse('2026-10-23T13:00:00.000Z');
+  const advance = (ms) => { clock += ms; };
   const listener = createTelegramListener({
     clients,
     pool,
@@ -494,6 +496,14 @@ function makeReplayHarness({ messages, catchUpBudgetMs, onStored, getMessages, c
     now: () => clock,
     catchUpBudgetMs,
     catchUpCooldownMs,
+    /* The throttle is a pattern to be read, not a duration to be sat through. Recording the requested gaps says
+       where the pauses went, and `advanceOnSleep` moves the fake clock by them, which is the only way
+       "waiting must not eat the work budget" can be tested rather than asserted. A suite that slept for real
+       would be a suite someone shortens by deleting these assertions. */
+    catchUpSleep: async (ms) => {
+      sleeps.push(ms);
+      if (advanceOnSleep) advance(ms);
+    },
   });
   const client = {
     connected: true,
@@ -501,7 +511,7 @@ function makeReplayHarness({ messages, catchUpBudgetMs, onStored, getMessages, c
     getMessages: getMessages || (async () => messages.map((id) => channelMessage({ id, decorated: false }))),
   };
   clients.set(USER_ID, { client, handler: () => {}, stats: listener.EMPTY_STATS() });
-  return { pool, clients, listener, saved, entry: () => clients.get(USER_ID), advance: (ms) => { clock += ms; } };
+  return { pool, clients, listener, saved, sleeps, entry: () => clients.get(USER_ID), advance };
 }
 
 test('a catch-up that runs out of its budget stops, keeps its claim, and finishes on the next pass', async () => {
@@ -596,8 +606,14 @@ test('a live message is stored between two replayed ones, not after the whole wi
 
 test('the replay gives the loop back once per message, and says why in the line that does it', () => {
   const listenerSource = readFileSync(new URL('../services/telegram-listener.js', import.meta.url), 'utf8');
-  const loop = listenerSource.slice(listenerSource.indexOf('for (const message of [...messages].reverse())'));
+  /* The anchor is the loop header, so it moves when the loop does: the header now binds a named array because the
+     throttle has to know which message is last. Re-pointing it is the maintenance; deleting the window test would
+     be the mistake, because "the yield is inside the replay loop" is the property, and it is now also pinned by
+     order - the yield has to come before the read, not merely near it. */
+  const loop = listenerSource.slice(listenerSource.indexOf('for (const [index, message] of replay.entries())'));
   assert.ok(loop.length > 80, 'the replay loop is where the yield has to be');
+  assert.ok(loop.indexOf('await yieldToEventLoop();') < loop.indexOf('await ingestMessage('),
+    'the loop is handed back before each message is read, so a throttle added after the read cannot quietly move it');
   assert.match(loop.slice(0, 900), /await yieldToEventLoop\(\);/, 'one turn of the event loop between messages');
   assert.match(listenerSource, /const yieldToEventLoop = \(\) => new Promise\(\(resolve\) => setImmediate\(resolve\)\);/, 'queued in the check phase, which is where an update from Telegram lands - a microtask would cut in front of it');
 });
@@ -1610,4 +1626,134 @@ test('a message with nothing to read says whether it had a date to be late by', 
   assert.equal(late.length, 1, 'one late warn, for the message that was actually proved late');
   assert.equal(late[0].meta.delayMs, 660_000);
   assert.equal(late[0].meta.replayed, false, 'and it says so on a live delivery, since the flag is what makes the pair readable');
+});
+
+/* ------------------------------------------------------------------ the throttle: what a replay may cost, and how long it may take ---
+
+   A restart on a session that had been away for days used to hand every monitored channel its whole window back
+   inside about a second, and the container's RSS went through the free tier's ceiling while it was still inside
+   `runCatchUpPass`. Three numbers answer that - fifteen payloads per channel, 250 ms between them, 1 s between
+   channels - and a fourth bounds the bound: 30 s of waiting per pass, because `rearmTelegramListeners` and the gap
+   sweep both *await* the replay inside a pass guard that refuses overlapping passes.
+
+   What these tests therefore have to prove is not "it is slower". It is that the throttle costs **nothing**: the
+   same rows, in the same order, once each - and that a pass stopped by its own waiting leaves its claim behind so
+   the next sweep finishes the job instead of starting the same walk over.
+ */
+test('the catch-up ceiling is fifteen payloads per channel, and the fetch is the thing that asks for them', async () => {
+  assert.equal(CATCH_UP_LIMIT, 15, 'the window is what allocates, so the window is the number that had to move');
+  const listenerSource = readFileSync(new URL('../services/telegram-listener.js', import.meta.url), 'utf8');
+  assert.match(listenerSource, /getMessages\(current\.client, entity, \{ limit: catchUpLimit \}\)/,
+    'the ceiling reaches the request itself - a slice taken after the fetch would still have paid for every payload');
+  const asked = [];
+  const harness = makeReplayHarness({
+    getMessages: async (...args) => {
+      const options = args.find((entry) => entry && typeof entry.limit === 'number');
+      asked.push(options ? options.limit : null);
+      return [1, 2, 3].map((id) => channelMessage({ id, decorated: false }));
+    },
+  });
+  await harness.listener.runCatchUp(USER_ID);
+  assert.deepEqual(asked, [15], 'Telegram is asked for fifteen, not for everything and then trimmed');
+});
+
+test('the replay pauses between messages and between channels, never after the last of either', async () => {
+  const harness = makeReplayHarness({
+    channels: [{ channelId: STORED_CHANNEL_ID, title: 'First' }, { channelId: '-1001111111111', title: 'Second' }],
+    // The clock moves with the pauses: `sleptMs` reports what the pass observed, not what it asked for.
+    advanceOnSleep: true,
+    getMessages: (() => {
+      let fetches = 0;
+      return async () => {
+        const base = 100 + fetches * 10;
+        fetches += 1;
+        return [1, 2, 3].map((id) => channelMessage({ id: base + id, decorated: false }));
+      };
+    })(),
+  });
+  const outcome = await harness.listener.runCatchUp(USER_ID);
+  assert.deepEqual(harness.sleeps, [250, 250, 1000, 250, 250],
+    'two rests inside a channel of three, one between the channels, and nothing trailing - a sleep after a channel\'s last row throttles nothing but the budget');
+  assert.equal(CATCH_UP_MESSAGE_GAP_MS, 250);
+  assert.equal(CATCH_UP_CHANNEL_GAP_MS, 1_000);
+  assert.equal(outcome.sleptMs, 2_000, 'the pass reports its own waiting, so a throttled run is distinguishable from a stalled one in the log');
+  assert.equal(outcome.reason, 'DONE');
+  assert.equal(harness.saved.length, 6, 'six messages across two channels, all stored: the pace changed, the coverage did not');
+  const listenerSource = readFileSync(new URL('../services/telegram-listener.js', import.meta.url), 'utf8');
+  /* One call site, not two: both pauses go through `rest`, which is what makes "the timer is measured, not
+     assumed" true for the channel gap as well as the message gap. And the timer exists nowhere else in the file -
+     declared once, defaulted once, awaited once - which is the same guarantee from the other direction: no live
+     path can acquire a sleep by accretion. */
+  assert.equal((listenerSource.match(/await catchUpSleep\(/g) || []).length, 1, 'exactly one place spends the timer');
+  assert.equal((listenerSource.match(/catchUpSleep\s*\(/g) || []).length, 1,
+    'one call expression in the whole file, inside `rest`: the typedef, the default and the prose may mention it as often as they like, but only `rest` may wait');
+  assert.ok(listenerSource.indexOf('await rest(CATCH_UP_CHANNEL_GAP_MS)') > listenerSource.indexOf('async function runCatchUpPass'),
+    'both rests are inside the replay pass');
+  assert.ok(listenerSource.indexOf('await rest(CATCH_UP_MESSAGE_GAP_MS)') > listenerSource.indexOf('async function runCatchUpPass'));
+  assert.equal(/await catchUpSleep/.test(listenerSource.slice(0, listenerSource.indexOf('async function runCatchUpPass'))), false,
+    'nothing above the replay waits');
+});
+
+test('waiting is not work: a pass whose entire cost is pausing still finishes the channel list', async () => {
+  /* The budget is a bound on *work*. Measure it against elapsed time instead and a workspace with a handful of
+     monitored channels spends it on sleeps alone, stores nothing new next cycle because the first channels are
+     already captured, and never reaches the tail - a throttle that quietly turns into lost history. */
+  const channels = [
+    { channelId: STORED_CHANNEL_ID, title: 'First' },
+    { channelId: '-1001111111111', title: 'Second' },
+    { channelId: '-1002222222222', title: 'Third' },
+    { channelId: '-1003333333333', title: 'Fourth' },
+  ];
+  const seenIds = [];
+  let fetches = 0;
+  const harness = makeReplayHarness({
+    channels,
+    advanceOnSleep: true,
+    // An absurd work budget: one millisecond. Only a pass that does not charge its sleeps to the budget can
+    // survive this, and the assertion that matters is that it does.
+    catchUpBudgetMs: 1,
+    getMessages: async () => {
+      const base = 100 + fetches * 10;
+      fetches += 1;
+      // Newest first, because that is the order Telegram hands history over and the pass reverses it.
+      const ids = [2, 1].map((offset) => base + offset);
+      seenIds.push(base + 1, base + 2);
+      return ids.map((id) => channelMessage({ id, decorated: false }));
+    },
+  });
+  const outcome = await harness.listener.runCatchUp(USER_ID);
+  assert.equal(harness.sleeps.length, 7, 'four channels of two messages: three channel rests and four message rests');
+  assert.equal(outcome.reason, 'DONE', 'and the list was walked to the end on a one-millisecond work budget');
+  assert.equal(outcome.budgetHit, undefined, 'it did not stop early, so there is no early-stop to report');
+  assert.equal(outcome.stored, 8, 'every message reached, none lost to the throttle');
+  assert.deepEqual(harness.saved.map((entry) => entry.channel.telegramMessageId), seenIds, 'in the order fetched, oldest first within a channel');
+  assert.equal(new Set(harness.saved.map((entry) => entry.channel.telegramMessageId)).size, 8, 'and exactly once each');
+  assert.equal(outcome.sleptMs, 4_000, 'the whole pass was waiting, none of it charged as work');
+});
+
+test('the waiting budget stops a pass rather than letting it outlive the sweep that awaits it', async () => {
+  const channels = Array.from({ length: 8 }, (unused, index) => ({
+    channelId: index === 0 ? STORED_CHANNEL_ID : `-100${String(1111111111 + index)}`,
+    title: `Channel ${index + 1}`,
+  }));
+  let fetches = 0;
+  const harness = makeReplayHarness({
+    channels,
+    advanceOnSleep: true,
+    catchUpBudgetMs: 600_000,
+    getMessages: async () => {
+      const base = 1000 + fetches * 100;
+      fetches += 1;
+      return Array.from({ length: CATCH_UP_LIMIT }, (unused, offset) => channelMessage({ id: base + offset, decorated: false }));
+    },
+  });
+  const outcome = await harness.listener.runCatchUp(USER_ID);
+  assert.equal(outcome.reason, 'BUDGET', 'eight channels at fifteen messages cannot be walked inside thirty seconds of waiting, and the pass says so');
+  assert.equal(outcome.budgetHit, 'sleep', 'naming which budget bit is what tells an operator a throttle worked from an operator reading it as a stall');
+  assert.ok(outcome.sleptMs <= CATCH_UP_MAX_SLEEP_MS, `the pass never sleeps past its ceiling (slept ${outcome.sleptMs})`);
+  assert.equal(harness.entry().needsCatchUp, true, 'it keeps its claim, because "stopped" has to mean "resumed"');
+  assert.ok(outcome.stored > 0 && outcome.stored < 8 * CATCH_UP_LIMIT, 'progress was made, and it was less than everything');
+  const stored = harness.saved.map((entry) => entry.channel.telegramMessageId);
+  assert.equal(new Set(stored).size, stored.length, 'and what it stored it stored once');
+  assert.equal(outcome.partial, true);
 });

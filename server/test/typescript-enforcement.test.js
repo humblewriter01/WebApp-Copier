@@ -196,6 +196,31 @@ test('the runtime the blueprint installs is the runtime the manifests promise, o
   assert.ok(atOrAbove(installedNode('server').split('.').map(Number), [22, 23, 4]), 'the pinned version is at least the patched runtime, not merely some 22.x');
 });
 
+test('the heap the runtime may grow into is pinned on the service that runs Node, and only on that one', () => {
+  /* The other half of the same failure this file exists for. `engines.node` and `NODE_VERSION` decide *which*
+     Node runs; neither decides how much memory it may take before the kernel takes the container, which is how
+     this service dies - an OOM kill leaves no error in the application log at all, only a restart. A heap cap is
+     the safety net, and it is only worth writing down if something stops it from drifting: an omitted flag is
+     silent, a typo like 400000 is fatal, and a cap that leaves no room for what is not old space (the MTProto
+     buffers, the external strings) turns a slow climb into a fast kill. */
+  const yaml = readFileSync(join(ROOT, 'render.yaml'), 'utf8');
+  const blocks = yaml.split(/\n  - type: /).slice(1);
+  const blockFor = (rootDir) => {
+    const block = blocks.find((b) => new RegExp(`rootDir: ${rootDir}$`, 'm').test(b));
+    assert.ok(block, `the ${rootDir} service is still in the blueprint`);
+    return block;
+  };
+  const nodeOptions = (rootDir) => {
+    const pinned = /- key: NODE_OPTIONS\s*\n\s*value: "?([^"\n]+)"?\s*$/m.exec(blockFor(rootDir));
+    return pinned ? pinned[1].trim() : null;
+  };
+  assert.equal(nodeOptions('client'), null, 'the static service gets no heap flag - it builds a bundle and runs no Node process for anyone');
+  const cap = /^--max-old-space-size=(\d+)$/.exec(String(nodeOptions('server') || ''));
+  assert.ok(cap, `the API service caps old space with exactly that one flag, got ${JSON.stringify(nodeOptions('server'))}`);
+  const megabytes = Number(cap[1]);
+  assert.ok(megabytes >= 128 && megabytes < 512, `the cap has to sit under the 512 MB the tier enforces and above what the app idles at, got ${megabytes} MB`);
+});
+
 test('every options-bag typedef is applied to the parameter it describes', () => {
   /* A `@typedef` in a doc block that the signature never references is worse than no typedef: it reads like a
      contract while the checker goes back to inferring the parameter from its own defaults, which is the failure

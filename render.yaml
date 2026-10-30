@@ -21,6 +21,13 @@ services:
       # line and the floor in the two package.json files ever disagree.
       - key: NODE_VERSION
         value: "22.23.4"
+      # The free tier kills the container at 512 MB of RSS, and an OOM kill is a restart with no error message in
+      # the application log. Capping old space makes V8 collect before the kernel notices instead of after. This
+      # is the safety net, not the fix: it covers the JS heap only, while the MTProto payloads that produced the
+      # spike live in `external`/`arrayBuffers`, which is why `CATCH_UP_MESSAGE_GAP_MS` in the listener is the
+      # load-bearing half. `server/test/typescript-enforcement.test.js` pins that both say what they must.
+      - key: NODE_OPTIONS
+        value: "--max-old-space-size=400"
       - key: DATABASE_URL
         sync: false
       - key: JWT_SECRET

@@ -266,6 +266,12 @@ test('the catch-up channel listing is bounded per page and keeps paging while pa
     catchUpLimit: 3,
     // The cooldown is a protection for the live service, not for a test that wants to see one pass run.
     catchUpCooldownMs: 0,
+    // Same reasoning for the throttle's timer: this file asks whether two passes can overlap and whether a page
+    // bound is honoured, and it has to be able to answer that in milliseconds. Where the pauses go is pinned in
+    // `test/telegram-listener-flow.test.mjs`, against a recorder that reads the gaps rather than waiting on them.
+    // Left to the real `setTimeout`, this one test spent 119 s asleep - and a suite that slow is a suite someone
+    // shortens by deleting a file.
+    catchUpSleep: async () => {},
   });
   const result = await listener.runCatchUp('u1');
   assert.equal(result.ran, true);
