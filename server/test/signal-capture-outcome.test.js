@@ -676,6 +676,27 @@ test('the keep-alive noise is counted at the client that produced it, and the pr
   assert.match(index, /telegramKeepAlive\.attach\(client, \{ userId \}\);\n\s*await telegramAdapter\.connect\(client\);/,
     'attached before `connect()`, because that is where the update loop starts - after it would miss the first flap, which is the one that happens during a rebuild');
 
+  /* The same rule for the clients a user signs in with, and the reason they need saying out loud is that nothing
+     else enforces it: a workspace whose socket is healthy is never passed through `restoreTelegramClient` again,
+     so a client adopted by `finishTelegramLogin` kept whatever guard it had - which, for a login client, was
+     none. Its ping timeouts printed raw and counted nothing, which is the half of the prod report no counter
+     could explain. The invariant belongs to the client, so it is checked at every construction site instead of
+     at the one that happened to be wrong. */
+  const builds = [...index.matchAll(/(?:const|let)\s+(\w+)\s*=\s*telegramAdapter\.createClient\(/g)];
+  assert.equal(builds.length, 3, 'a rebuild, the pending-login restore, and the code request - the fallback build is the same `client` variable and is pinned above');
+  for (const build of builds) {
+    let tail = index.slice(build.index, build.index + 2000);
+    const boundary = tail.search(/\n(?:async )?function |\napp\.(?:get|post|put|delete)\(/);
+    if (boundary > -1) tail = tail.slice(0, boundary);
+    const attachAt = tail.indexOf(`telegramKeepAlive.attach(${build[1]}`);
+    const connectAt = tail.indexOf(`telegramAdapter.connect(${build[1]})`);
+    assert.notEqual(attachAt, -1, `the client built at offset ${build.index} is never guarded, so its keep-alive noise reaches the printer and its count reaches nobody`);
+    assert.ok(connectAt === -1 || attachAt < connectAt, `and ${build[1]} is guarded before it connects, because \`connect()\` is where the update loop starts`);
+  }
+  const discardSection = section(index, 'async function discardTelegramLoginAttempt(', "app.post('/api/telegram/request-code'");
+  assert.match(discardSection, /await telegramAdapter\.disconnect\(attempt\.client\)\.catch\(\(\) => \{\}\);[\s\S]{0,240}telegramKeepAlive\.release\(attempt\?\.client\);/,
+    'and a login client that is thrown away takes its record with it, because nothing else in this file will ever hold that client and `guardedClients` is a number someone reads');
+
   // The process-level filter exists for the process, not for the log: it must never become a general silencer.
   const filter = section(index, "process.on('unhandledRejection'", "process.on('SIGTERM'");
   assert.match(filter, /isNoise: isProviderKeepAliveTimeout/, 'it recognises exactly one error, by its message and the frame that throws it');

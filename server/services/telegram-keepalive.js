@@ -19,6 +19,11 @@
  *    disappears is the print, not the fact. The counts reach the heartbeat summary, the fleet panel and one
  *    rate-limited log line per window, which is what makes it safe to suppress at all: an operator who wants to
  *    know that the ping loop is unhappy can still ask, and one who does not will not read it four hundred times.
+ *    The fleet total is therefore a counter incremented at the moment of the fact, never a sum taken over
+ *    `states` afterwards: a record leaves that set whenever a caller releases it or the backstop prunes it, while
+ *    the closure `attach` installed on the client keeps counting into the state object it captured. Production
+ *    showed what the sum did about that - `count: 1081` beside `suppressedTotal: 0`, eleven hours of one
+ *    workspace's flapping invisible to the panel - so "since boot" is now implemented as literally that.
  * 2. **"From the telegram package" is not a usable filter.** Our capture path is *called by* the library -
  *    `saveSignal` runs inside `_dispatchUpdate`, whose frames are in that stack - so a predicate written as
  *    "stack contains node_modules/telegram" would also swallow a dead Postgres pool, a parser bug, and every
@@ -26,10 +31,18 @@
  *    not create. So the test is the exact message GramJS builds *and* the exact frame that builds it - the
  *    **first** frame, the throw site - which our own errors never have.
  *
- * The suppression itself goes through the seam the library already offers rather than through `console`: the
- * catch calls `_errorHandler` and *then* asks `_log.canSend(ERROR)` before printing, so a per-client logger that
- * answers that one question "no" for one marked error silences the noise for that client only, leaves
- * `info`/`warn`/`debug` behaviour untouched, and never touches a global that other code logs through.
+ * The suppression itself goes through the seam the library already offers rather than through `console`: in
+ * 2.26.22 `client/updates.js:202-206` catches the ping race, does `await client._errorHandler(err)`, and only
+ * then asks `if (client._log.canSend(LogLevel.ERROR)) console.error(err)`. So a per-client logger that answers
+ * that one question "no" for one marked error silences the noise for that client only, leaves `info`/`warn`/
+ * `debug` behaviour untouched, and never touches a global that other code logs through.
+ *
+ * The mark belongs to one question, and the library asks that same method for every line it writes
+ * (`extensions/Logger.js:_log` calls `this.canSend(level)` before printing anything, and `network/MTProtoSender.js`
+ * logs `warn "Connection closed while receiving data"` from the receive loop - the same dying socket, a different
+ * line). Since the print is separated from the handler by an `await`, an unrelated question can land in that gap;
+ * if it were allowed to spend the mark, the raw stack would go out the door. Hence: only an `error`-level question
+ * consumes the mark, and it consumes exactly one print.
  */
 
 import * as telegramAdapter from './telegram-adapter.js';
@@ -166,6 +179,11 @@ export function createTelegramKeepAliveGuard(/** @type {TelegramKeepAliveGuardDe
   // Everything the process-level handler recognises lands here: there is no client to attribute it to, but there
   // is still a fact worth counting, and a count is the difference between "we hid it" and "we hid it, N times".
   const orphan = { userId: null, count: 0, firstAt: null, lastAt: null, windowAt: 0, pending: null };
+  /* The fleet total, and the reason it is a counter rather than a sum over `states` is the sentence in rule 1: a
+     client's record can be released or pruned while the handler `attach` installed on that client goes on
+     counting into the state it captured. `release()` must stay free to forget a record - that is the leak fix -
+     and the fleet fact must stay free to survive it, which only a monotone counter at this level gives you. */
+  const fleet = { count: 0, lastAt: null };
   const GUARD_FLAG = '_sdbKeepAliveGuard';
 
   function makeState(userId = null) {
@@ -197,6 +215,11 @@ export function createTelegramKeepAliveGuard(/** @type {TelegramKeepAliveGuardDe
     for (const other of states) {
       if (other.state.lastAt !== null && other.state.lastAt >= windowStart) affectedClients += 1;
     }
+    /* ...and the walk only sees records that are still attached. The client writing this line has, by
+       definition, timed out inside this window, so when its record has already been released or pruned it would
+       otherwise be reported as zero affected clients next to a non-zero count - the contradiction production
+       showed. Membership in the registry is the question, so `byState` answers it rather than the loop guessing. */
+    if (!byState.has(state) && state.lastAt !== null && state.lastAt >= windowStart) affectedClients += 1;
     log('warn', 'Telegram keep-alive timeouts suppressed', {
       userId: state.userId,
       count: state.count,
@@ -224,6 +247,12 @@ export function createTelegramKeepAliveGuard(/** @type {TelegramKeepAliveGuardDe
     state.windowCount += 1;
     if (state.firstAt === null) state.firstAt = at;
     state.lastAt = at;
+    /* The same increment, at the level nothing can detach: `state.count` answers "how bad is this workspace",
+       which is a per-record question, and `fleet` answers "how much has this process swallowed", which is the
+       question the panel and the heartbeat ask. Counting it here rather than adding the records up in `stats()`
+       is what makes the two unable to disagree about whether something was counted at all. */
+    fleet.count += 1;
+    if (fleet.lastAt === null || at > fleet.lastAt) fleet.lastAt = at;
     report(state, at);
     // `flapFor` is how the watchdog learns about this moment - the same record, read on purpose rather than
     // pushed on the way past, so a beat that is about to tear a session down can ask whether the provider has
@@ -267,12 +296,17 @@ export function createTelegramKeepAliveGuard(/** @type {TelegramKeepAliveGuardDe
         logger[GUARD_FLAG] = true;
         telegramAdapter.patchLoggerGate(logger, (level) => {
           const pending = state.pending;
-          // Consume on read: the mark is for the error that was just offered to `_errorHandler`, one print, no more.
-          if (pending !== null && level === 'error' && now() - pending <= markTtlMs) {
+          /* Consume on read, and only on the read this mark was earned for: the mark is for the error that was
+             just offered to `_errorHandler`, one print, no more. An `error`-level question spends it whether or
+             not it is fresh - a stale mark must not survive to hide somebody else's print - and any other level
+             is the library asking about one of its own lines, which is answered and left alone. Clearing on
+             every question is what used to leak the stack: `updates.js` awaits the handler before it asks, so one
+             `info` or `warn` line scheduled in that microtask was enough to spend the mark on a print that was
+             never the timeout. */
+          if (level === 'error' && pending !== null) {
             state.pending = null;
-            return false;
+            if (now() - pending <= markTtlMs) return false;
           }
-          if (pending !== null) state.pending = null;
           return Boolean(canSend(level));
         });
       }
@@ -315,15 +349,15 @@ export function createTelegramKeepAliveGuard(/** @type {TelegramKeepAliveGuardDe
     return { at: state.lastAt || 0, count: state.count };
   }
 
+  /**
+   * What the process has swallowed since boot, for the heartbeat line, the summary line and the fleet panel.
+   *
+   * Nothing here is derived from `states`, on purpose: the set is the registry of who is guarded *right now*, and
+   * a number that describes work already done must not move when the bookkeeping for a client ends. `clients` is
+   * the one field that legitimately shrinks, and it is named for the registry rather than for the traffic.
+   */
   function stats() {
-    let count = orphan.count;
-    let lastAt = orphan.lastAt;
-    for (const entry of states) {
-      const state = entry.state;
-      count += state.count;
-      if (state.lastAt !== null && (lastAt === null || state.lastAt > lastAt)) lastAt = state.lastAt;
-    }
-    return { count, lastAt, clients: states.size };
+    return { count: fleet.count, lastAt: fleet.lastAt, clients: states.size };
   }
 
   return { attach, note, observe, flapFor, stats, release, guardedCount: () => states.size, isProviderKeepAliveTimeout };

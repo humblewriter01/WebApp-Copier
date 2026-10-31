@@ -3252,6 +3252,7 @@ async function loadTelegramLoginAttempt(userId) {
   const inMemory = telegramLogins.get(userId);
   if (inMemory && inMemory.expiresAt > Date.now()) return inMemory;
   if (inMemory?.client) await telegramAdapter.disconnect(inMemory.client).catch(() => {});
+  telegramKeepAlive.release(inMemory?.client);
   telegramLogins.delete(userId);
 
   const { rows } = await pool.query(
@@ -3278,9 +3279,18 @@ async function loadTelegramLoginAttempt(userId) {
   }
   const apiId = Number(process.env.API_ID);
   const client = telegramAdapter.createClient({ sessionString: state.stringSession, apiId, apiHash: process.env.API_HASH, options: telegramAdapter.loginTransportOptions() });
+  /* Guarded before it connects, exactly like the two capture clients, for the same reason and with the same
+     narrow scope: `TelegramClient.js:1090` starts `_updateLoop` *inside* `connect()` - on the failed-connect
+     branch as well as the good one - so a client that is only on screen for a code prompt still owns a ping loop
+     that can print `Error: TIMEOUT` once every nine seconds to `console.error`, un-JSON-wrapped, for as long as
+     the attempt lives. `attach` only counts that noise and answers the client's own logging gate for it; the
+     handler GramJS hands it (`onError`) is not used by the sign-in flow, whose `onError` is a `signInWithPassword`
+     argument (`client/auth.js:97`) and never reaches `client._errorHandler`. */
+  telegramKeepAlive.attach(client, { userId });
   try { await telegramAdapter.connect(client); }
   catch (error) {
     await telegramAdapter.disconnect(client).catch(() => {});
+    telegramKeepAlive.release(client);
     throw error;
   }
   const attempt = { client, phoneNumber: state.phoneNumber, phoneCodeHash: state.phoneCodeHash, expiresAt };
@@ -3305,6 +3315,9 @@ async function loadTelegramLoginAttemptOrRespond(userId, res) {
 async function discardTelegramLoginAttempt(userId, attempt = telegramLogins.get(userId)) {
   telegramLogins.delete(userId);
   if (attempt?.client) await telegramAdapter.disconnect(attempt.client).catch(() => {});
+  // The record goes with the client it describes, here and nowhere later: nothing else in this file will ever
+  // hold this client again, so leaving it would make `guardedClients` climb one per abandoned login.
+  telegramKeepAlive.release(attempt?.client);
   await pool.query('DELETE FROM telegram_login_attempts WHERE user_id=$1', [userId]);
 }
 
@@ -3318,6 +3331,9 @@ app.post('/api/telegram/request-code', authenticate, asyncRoute(async (req, res)
   if (!/^\+[1-9]\d{7,14}$/.test(phoneNumber)) return fail(res, 400, 'Use an international phone number, such as +15551234567.');
 
   const client = telegramAdapter.createClient({ sessionString: '', apiId, apiHash: process.env.API_HASH, options: telegramAdapter.loginTransportOptions() });
+  // Same rule as the restore path above, where the reason is written out: `connect()` starts the update loop, so
+  // the guard has to be on the client before it, and this client can be waiting for a phone for five minutes.
+  telegramKeepAlive.attach(client, { userId: req.userId });
   let sentToTelegram = false;
   try {
     await telegramAdapter.connect(client);
@@ -3331,11 +3347,15 @@ app.post('/api/telegram/request-code', authenticate, asyncRoute(async (req, res)
     const attempt = { client, phoneNumber, phoneCodeHash: sent.phoneCodeHash, expiresAt: Date.now() + 5 * 60_000 };
     await persistTelegramLoginAttempt(req.userId, attempt);
     const previous = telegramLogins.get(req.userId);
-    if (previous?.client && previous.client !== client) await telegramAdapter.disconnect(previous.client).catch(() => {});
+    if (previous?.client && previous.client !== client) {
+      await telegramAdapter.disconnect(previous.client).catch(() => {});
+      telegramKeepAlive.release(previous.client);
+    }
     telegramLogins.set(req.userId, attempt);
     return res.json({ ok: true, message: 'Telegram sent a login code. Enter the newest code here to continue.' });
   } catch (error) {
     await telegramAdapter.disconnect(client).catch(() => {});
+    telegramKeepAlive.release(client);
     if (sentToTelegram && !getTelegramErrorCode(error)) {
       log('error', 'Pending Telegram login could not be stored', { userId: req.userId, errorType: error?.constructor?.name || 'Error' });
       return fail(res, 500, 'Telegram sent a code, but the secure login state could not be saved. Request a new code and try again.');

@@ -177,7 +177,7 @@ test('the occupancy set is the same rule without a promise, for work already ser
  * 3. The keep-alive guard's own records, which used to be permanent.
  * ---------------------------------------------------------------------------------------------
  */
-test('a disconnected client stops being counted by the keep-alive guard', () => {
+test('a disconnected client stops being guarded, and what it swallowed stays counted', () => {
   const logs = [];
   const guard = createTelegramKeepAliveGuard({ log: (level, message) => logs.push({ level, message }), now: () => 1_000 });
   const live = { _log: { canSend: () => true } };
@@ -189,10 +189,18 @@ test('a disconnected client stops being counted by the keep-alive guard', () => 
   assert.equal(guard.stats().count, 1, 'the timeout is counted while the client is ours');
   assert.equal(guard.release(live), true, 'and releasing the exact client that was dropped is a real answer, not a no-op');
   assert.equal(guard.guardedCount(), 0, 'the record goes with it, so a service that rebuilds 500 sessions does not carry 500 records');
-  assert.equal(guard.stats().count, 0, 'including its counts, which describe a client that no longer exists');
+  /* The fleet total, on the other hand, does not go with it. `stats()` used to add the records up, which made the
+     panel's "timeouts swallowed since boot" a function of who was still attached - so a release subtracted real
+     work from the total, and a client whose update loop outlived its record (the prod case: `count: 1081`,
+     `suppressedTotal: 0`) was invisible forever. The leak this file exists to prevent is the *set* growing, not
+     the arithmetic remembering. */
+  assert.equal(guard.stats().count, 1, 'the record is bounded, the fact is not un-counted');
+  guard.note(keepAliveTimeout(), state);
+  assert.equal(guard.stats().count, 2, 'including timeouts earned after the record was dropped, because the handler the guard installed is still on the client and the counter is not attached to the registry');
+  assert.equal(guard.flapFor(live).count, 0, 'the watchdog can no longer be told this phantom flapped');
+  assert.equal(guard.stats().clients, 0, 'and the registry is still empty, which is the half of the fix that must not regress');
   assert.equal(guard.release(live), false, 'releasing twice is safe, because disconnect paths run more than once by design');
   assert.equal(guard.release(null), false, 'and releasing a client the guard never saw is not an error, because the caller is a catch block');
-  assert.equal(guard.flapFor(live).count, 0, 'the watchdog can no longer be told this phantom flapped');
 });
 
 test('the cap makes unbounded growth impossible even if a drop path forgets to release', () => {

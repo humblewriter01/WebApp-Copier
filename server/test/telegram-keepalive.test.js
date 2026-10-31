@@ -172,6 +172,86 @@ test('the line carries a rate and a fleet dimension, not just a number since boo
     'the lifetime total keeps climbing while the window total restarts, which is the only pair that can say "this is getting worse"');
 });
 
+test('a released record keeps feeding the fleet total, because the total is not a sum over the registry', () => {
+  /* The prod line this reproduces, verbatim in shape: `{"count":1081,"affectedClients":0,"guardedClients":2,
+     "suppressedTotal":0}`. `count` came from a client's own record; `suppressedTotal` came from adding the
+     records up; and the record had been released while the client kept its update loop running, so eleven hours
+     of timeouts reached the panel as zero. `release()` is correct - it is the leak fix - and so is the count.
+     The only thing that was wrong is that one was derived from the other. */
+  let clock = 1_000;
+  const logs = [];
+  const guard = createTelegramKeepAliveGuard({
+    log: (level, message, meta) => logs.push({ level, message, meta }),
+    now: () => clock,
+    summaryEveryMs: 60_000,
+  });
+  const client = { _log: { canSend: () => true }, set onError(handler) { this._errorHandler = async (error) => { await handler(error); }; } };
+  const state = guard.attach(client, { userId: 'zombie' });
+  for (let i = 0; i < 3; i += 1) { clock += 9_000; guard.note(keepAliveTimeout(), state); }
+  assert.equal(state.count, 3);
+  assert.equal(guard.stats().count, 3, 'while the record is attached the client and the fleet agree');
+
+  assert.equal(guard.release(client), true);
+  assert.equal(guard.guardedCount(), 0, 'the registry lets go, which is the leak fix and must not regress');
+  // ...and the library, still holding the handler `attach` installed, goes on timing out.
+  for (let i = 0; i < 4; i += 1) { clock += 9_000; guard.note(keepAliveTimeout(), state); }
+  assert.equal(state.count, 7, 'the per-client record still knows, because `note` is handed it directly');
+  assert.equal(guard.stats().count, 7, 'and so does the fleet: the counter is incremented where the fact happens');
+  assert.equal(guard.flapFor(client).count, 0, 'the watchdog asks by client, and a released client is not the watchdog\'s business - pinned so the asymmetry is written down, not discovered');
+
+  clock += 60_000;
+  guard.note(keepAliveTimeout(), state);
+  const line = logs[logs.length - 1].meta;
+  assert.deepEqual(
+    { count: line.count, windowCount: line.windowCount, guardedClients: line.guardedClients, affectedClients: line.affectedClients, suppressedTotal: line.suppressedTotal },
+    { count: 8, windowCount: 7, guardedClients: 0, affectedClients: 1, suppressedTotal: 8 },
+    'a client that is no longer in the registry is still an affected client: `affectedClients: 0` beside `count: 1081` was the second half of the same contradiction, and both numbers now come from the counting rather than from who is attached');
+  assert.ok(line.suppressedTotal >= line.count, 'the invariant: a client is a subset of the fleet, always, whatever the bookkeeping did');
+});
+
+test('the mark belongs to the print it was earned for, so one of the library\'s own lines cannot spend it', async () => {
+  const prints = [];
+  const ask = (level) => ['error', 'warn', 'info', 'debug'].indexOf(level) <= 2;   // a stock Logger at `info`
+  const client = {
+    _log: {
+      canSend: (level) => ask(level),
+      warn(message) { if (this.canSend('warn')) prints.push(`line:${message}`); },
+      info(message) { if (this.canSend('info')) prints.push(`line:${message}`); },
+    },
+    // `telegramBaseClient.js:355` is the setter GramJS gives `onError`: our handler runs inside an `async`
+    // wrapper, so the print in `updates.js` resumes one microtask after the mark was set. That gap is the whole
+    // question, because a flapping client writes log lines from its receive loop in it.
+    set onError(handler) { this._errorHandler = async (error) => { await handler(error); }; },
+  };
+  let clock = 1_000;
+  const guard = createTelegramKeepAliveGuard({ now: () => clock });
+  const state = guard.attach(client, { userId: 4 });
+  const printIfAllowed = async (error, gap) => {
+    if (client._errorHandler) await client._errorHandler(error);                 // updates.js:202-204
+    if (gap) await gap();                                                         // MTProtoSender.js:385 `this._log.warn(...)`
+    if (client._log.canSend('error')) prints.push(`stack:${error.message}`);      // updates.js:205-206
+  };
+
+  await printIfAllowed(keepAliveTimeout(), async () => { client._log.warn('Connection closed while receiving data'); });
+  assert.deepEqual(prints, ['line:Connection closed while receiving data'],
+    'the library keeps its own line and loses only the timeout stack: an unrelated `warn` question used to be answered by spending the mark, which is what let the raw stack out');
+  assert.equal(state.count, 1, 'and the timeout is still counted, because counting never depended on the gate');
+  assert.equal(client._log.canSend('error'), true, 'one mark, one print: the gate is open again straight after, so a suppression cannot become a mute for that client');
+
+  await printIfAllowed(ourOwnTimeoutInsideTheLibrary());
+  assert.deepEqual(prints.slice(1), ['stack:TIMEOUT'], 'saveSignal still reaches the printer: an error of ours, caught by the library while its stack was on the call stack, is never hidden - `note` clears the mark for anything it does not recognise, before the gate is ever asked');
+
+  /* The seatbelt still expires, and TTL is what bounds a mark nobody consumed rather than a second way to lose
+     the suppression. The first half is the level check, the second is the clock. */
+  guard.note(keepAliveTimeout(), state);
+  assert.equal(client._log.canSend('info'), true, 'a question about an `info` line is answered and leaves the mark standing');
+  clock += 5_000;
+  assert.equal(client._log.canSend('error'), true, 'a mark older than `KEEP_ALIVE_MARK_TTL_MS` is dropped, not honoured');
+  assert.equal(state.pending, null, 'and dropped properly, so it cannot be spent by the next error instead');
+  await printIfAllowed(ourOwnTimeoutInsideTheLibrary());
+  assert.equal(prints.filter((entry) => entry.startsWith('stack:')).length, 2, 'which is the point: the error that arrives after an expired mark is printed');
+});
+
 test('a timeout with no client to attribute it to is still counted, because the count is the point', () => {
   const logs = [];
   const guard = createTelegramKeepAliveGuard({ log: (level, message, meta) => logs.push({ level, message, meta }), now: () => 10_000 });
