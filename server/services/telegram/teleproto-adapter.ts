@@ -122,6 +122,19 @@ export function disconnect(client: TelegramClient): Promise<void> {
     return client.disconnect();
 }
 
+/**
+ * End a client for good: `destroy()` is the only call that sets `_destroyed`, which is what `client/updates.js`'s
+ * `while (!client._destroyed)` loop checks. `disconnect()` closes the senders and leaves the loop running, so a
+ * client dropped with it keeps pinging a dead socket for the life of the process - see the same function in
+ * `../telegram-adapter.js`, where the arithmetic is spelled out. The fork's `TelegramBaseClient` has the same
+ * `destroy()` at the same place in the chain, which is what keeps the rollback honest: one seam, two drivers.
+ */
+export function destroyClient(client: Partial<TelegramClient> | null | undefined): Promise<void> {
+    if (typeof client?.destroy === 'function') return client.destroy();
+    if (typeof client?.disconnect === 'function') return client.disconnect();
+    return Promise.resolve();
+}
+
 /** Can this client be torn down at all? Checked before the call, so a half-built object never throws here. */
 export function canDisconnect(client: Partial<TelegramClient> | null | undefined): boolean {
     return Boolean(client?.disconnect);

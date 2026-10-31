@@ -709,7 +709,7 @@ const telegramCapture = createTelegramListener({
       log('warn', 'Telegram re-auth marking could not be saved', { userId, reason, error: error.message });
     });
     const entry = telegramClients.get(userId);
-    if (telegramAdapter.canDisconnect(entry?.client)) await telegramAdapter.disconnect(entry.client).catch(() => {});
+    if (telegramAdapter.canDisconnect(entry?.client)) await telegramAdapter.destroyClient(entry.client).catch(() => {});
     telegramKeepAlive.release(entry?.client);
     telegramClients.delete(userId);
     log('warn', 'Telegram session left for the user to sign in again', {
@@ -886,13 +886,18 @@ async function rebuildTelegramClient(userId, { reason = 'restore', force = false
       return current.client;
     }
   }
-  // Whatever half-connected object was here is dropped before a new one replaces it, so a wake does
-  // not leave a second authorized session polling with the same StringSession - and so an escalated rebuild of a
-  // session that still looks fine does not leave the deaf one attached and receiving.
+  /* Whatever half-connected object was here is dropped before a new one replaces it, so a wake does
+     not leave a second authorized session polling with the same StringSession - and so an escalated rebuild of a
+     session that still looks fine does not leave the deaf one attached and receiving. "Dropped" has to mean
+     *ended*: `disconnect()` closes the senders without setting `_destroyed`, while `_updateLoop` runs
+     `while (!client._destroyed)` (`client/updates.js:166`), so a merely disconnected client goes on pinging a
+     closed sender once a `PING_INTERVAL` and times out `PING_FAIL_ATTEMPTS` times per cycle - the 39-second
+     cadence the keep-alive summary was counting (1081 timeouts in 11h45m) for a session this process had already
+     forgotten. */
   if (current?.client && (!telegramAdapter.isConnected(current.client) || mustRebuild)) {
-    await telegramAdapter.disconnect(current.client).catch(() => {});
-    // The keep-alive guard keeps one record per client it has ever seen; a client that has just been disconnected
-    // is never going to time out again, so its record is dropped here rather than left for the backstop sweep.
+    await telegramAdapter.destroyClient(current.client).catch(() => {});
+    // The keep-alive guard keeps one record per client it has ever seen; a client this process has just ended is
+    // never going to time out again, so its record is dropped here rather than left for the backstop sweep.
     telegramKeepAlive.release(current.client);
   }
   const { rows } = await pool.query('SELECT telegram_session FROM users WHERE id=$1', [userId]);
@@ -911,7 +916,10 @@ async function rebuildTelegramClient(userId, { reason = 'restore', force = false
     if (!transport.wss) throw error;
     // The experiment is allowed to fail; capture is not allowed to be the thing that pays for it.
     log('warn', 'Telegram WSS transport could not connect; reconnecting over the default transport', { userId, error: `${error?.message || error}`.slice(0, 160) });
-    await telegramAdapter.disconnect(client).catch(() => {});
+    await telegramAdapter.destroyClient(client).catch(() => {});
+    // The client that just failed is being thrown away, so its guard record goes with it: nothing else will ever
+    // hold this object, and `guardedClients` is the number an operator reads on the summary line.
+    telegramKeepAlive.release(client);
     // The same tuned options over the plain port - restating them here is how a retry path ends up with the
     // settings the primary one stopped having three releases ago.
     client = telegramAdapter.createClient({ sessionString, apiId: Number(process.env.API_ID), apiHash: process.env.API_HASH, options: telegramCaptureTransport({ wss: false }).options });
@@ -919,7 +927,7 @@ async function rebuildTelegramClient(userId, { reason = 'restore', force = false
     await telegramAdapter.connect(client);
   }
   if (!(await telegramAdapter.checkAuthorization(client))) {
-    await telegramAdapter.disconnect(client).catch(() => {});
+    await telegramAdapter.destroyClient(client).catch(() => {});
     await pool.query('UPDATE users SET telegram_connected=FALSE,telegram_session=NULL WHERE id=$1', [userId]);
     telegramClients.delete(userId);
     log('warn', 'Telegram session is no longer authorized', { userId, reason });
@@ -940,7 +948,7 @@ async function rebuildTelegramClient(userId, { reason = 'restore', force = false
   const holder = telegramClients.get(userId);
   if (holder && holder !== current) {
     log('warn', 'Telegram rebuild lost the race and is discarding its own client', { userId, reason, heldSince: holder.attachedAt || null });
-    await telegramAdapter.disconnect(client).catch(() => {});
+    await telegramAdapter.destroyClient(client).catch(() => {});
     telegramKeepAlive.release(client);
     return holder.client;
   }
@@ -1448,7 +1456,7 @@ app.delete('/api/auth/account', authenticate, asyncRoute(async (req, res) => {
 
   for (const map of [telegramClients, telegramLogins]) {
     const entry = map.get(user.id);
-    if (entry?.client) await telegramAdapter.disconnect(entry.client).catch(() => {});
+    if (entry?.client) await telegramAdapter.destroyClient(entry.client).catch(() => {});
     map.delete(user.id);
   }
   io.in(`user:${user.id}`).disconnectSockets(true);
@@ -3251,7 +3259,8 @@ async function persistTelegramLoginAttempt(userId, attempt) {
 async function loadTelegramLoginAttempt(userId) {
   const inMemory = telegramLogins.get(userId);
   if (inMemory && inMemory.expiresAt > Date.now()) return inMemory;
-  if (inMemory?.client) await telegramAdapter.disconnect(inMemory.client).catch(() => {});
+  if (inMemory?.client) await telegramAdapter.destroyClient(inMemory.client).catch(() => {});
+  telegramKeepAlive.release(inMemory?.client);
   telegramLogins.delete(userId);
 
   const { rows } = await pool.query(
@@ -3278,9 +3287,18 @@ async function loadTelegramLoginAttempt(userId) {
   }
   const apiId = Number(process.env.API_ID);
   const client = telegramAdapter.createClient({ sessionString: state.stringSession, apiId, apiHash: process.env.API_HASH, options: telegramAdapter.loginTransportOptions() });
+  /* Guarded before it connects, exactly like the two capture clients, for the same reason and with the same
+     narrow scope: `TelegramClient.js:1090` starts `_updateLoop` *inside* `connect()` - on the failed-connect
+     branch as well as the good one - so a client that is only on screen for a code prompt still owns a ping loop
+     that can print `Error: TIMEOUT` once every nine seconds to `console.error`, un-JSON-wrapped, for as long as
+     the attempt lives. `attach` only counts that noise and answers the client's own logging gate for it; the
+     handler GramJS hands it (`onError`) is not used by the sign-in flow, whose `onError` is a `signInWithPassword`
+     argument (`client/auth.js:97`) and never reaches `client._errorHandler`. */
+  telegramKeepAlive.attach(client, { userId });
   try { await telegramAdapter.connect(client); }
   catch (error) {
-    await telegramAdapter.disconnect(client).catch(() => {});
+    await telegramAdapter.destroyClient(client).catch(() => {});
+    telegramKeepAlive.release(client);
     throw error;
   }
   const attempt = { client, phoneNumber: state.phoneNumber, phoneCodeHash: state.phoneCodeHash, expiresAt };
@@ -3304,7 +3322,14 @@ async function loadTelegramLoginAttemptOrRespond(userId, res) {
 
 async function discardTelegramLoginAttempt(userId, attempt = telegramLogins.get(userId)) {
   telegramLogins.delete(userId);
-  if (attempt?.client) await telegramAdapter.disconnect(attempt.client).catch(() => {});
+  /* `finishTelegramLogin` hands `attempt.client` to `telegramClients` before the listener is attached, so a
+     failure in between can land here with the same object already in service. `destroy()` clears `_eventBuilders`
+     as well as closing the sender, which would deafen a workspace to buy a cleanup - so the ownership check is
+     the guard, not the `?.`. */
+  if (attempt?.client && telegramClients.get(userId)?.client !== attempt.client) await telegramAdapter.destroyClient(attempt.client).catch(() => {});
+  // The record goes with the client it describes, here and nowhere later: nothing else in this file will ever
+  // hold this client again, so leaving it would make `guardedClients` climb one per abandoned login.
+  telegramKeepAlive.release(attempt?.client);
   await pool.query('DELETE FROM telegram_login_attempts WHERE user_id=$1', [userId]);
 }
 
@@ -3318,6 +3343,9 @@ app.post('/api/telegram/request-code', authenticate, asyncRoute(async (req, res)
   if (!/^\+[1-9]\d{7,14}$/.test(phoneNumber)) return fail(res, 400, 'Use an international phone number, such as +15551234567.');
 
   const client = telegramAdapter.createClient({ sessionString: '', apiId, apiHash: process.env.API_HASH, options: telegramAdapter.loginTransportOptions() });
+  // Same rule as the restore path above, where the reason is written out: `connect()` starts the update loop, so
+  // the guard has to be on the client before it, and this client can be waiting for a phone for five minutes.
+  telegramKeepAlive.attach(client, { userId: req.userId });
   let sentToTelegram = false;
   try {
     await telegramAdapter.connect(client);
@@ -3331,11 +3359,15 @@ app.post('/api/telegram/request-code', authenticate, asyncRoute(async (req, res)
     const attempt = { client, phoneNumber, phoneCodeHash: sent.phoneCodeHash, expiresAt: Date.now() + 5 * 60_000 };
     await persistTelegramLoginAttempt(req.userId, attempt);
     const previous = telegramLogins.get(req.userId);
-    if (previous?.client && previous.client !== client) await telegramAdapter.disconnect(previous.client).catch(() => {});
+    if (previous?.client && previous.client !== client) {
+      await telegramAdapter.destroyClient(previous.client).catch(() => {});
+      telegramKeepAlive.release(previous.client);
+    }
     telegramLogins.set(req.userId, attempt);
     return res.json({ ok: true, message: 'Telegram sent a login code. Enter the newest code here to continue.' });
   } catch (error) {
-    await telegramAdapter.disconnect(client).catch(() => {});
+    await telegramAdapter.destroyClient(client).catch(() => {});
+    telegramKeepAlive.release(client);
     if (sentToTelegram && !getTelegramErrorCode(error)) {
       log('error', 'Pending Telegram login could not be stored', { userId: req.userId, errorType: error?.constructor?.name || 'Error' });
       return fail(res, 500, 'Telegram sent a code, but the secure login state could not be saved. Request a new code and try again.');
@@ -3440,9 +3472,9 @@ app.get('/api/telegram/chats', authenticate, asyncRoute(async (req, res) => {
 }));
 app.post('/api/telegram/disconnect', authenticate, asyncRoute(async (req, res) => {
   const current = telegramClients.get(req.userId);
-  if (current?.client) await telegramAdapter.disconnect(current.client).catch(() => {});
+  if (current?.client) await telegramAdapter.destroyClient(current.client).catch(() => {});
   const login = telegramLogins.get(req.userId);
-  if (login?.client) await telegramAdapter.disconnect(login.client).catch(() => {});
+  if (login?.client) await telegramAdapter.destroyClient(login.client).catch(() => {});
   telegramClients.delete(req.userId);
   telegramLogins.delete(req.userId);
   await pool.query('DELETE FROM telegram_login_attempts WHERE user_id=$1', [req.userId]);
@@ -3645,8 +3677,8 @@ async function shutdown() {
   });
   await executionWorker.stop();
   await serverClosed;
-  for (const entry of telegramClients.values()) await telegramAdapter.disconnect(entry.client).catch(() => {});
-  for (const entry of telegramLogins.values()) await telegramAdapter.disconnect(entry.client).catch(() => {});
+  for (const entry of telegramClients.values()) await telegramAdapter.destroyClient(entry.client).catch(() => {});
+  for (const entry of telegramLogins.values()) await telegramAdapter.destroyClient(entry.client).catch(() => {});
   await tradingAdapter.close().catch(() => {});
   await pool.end().catch(() => {});
   process.exit(0);

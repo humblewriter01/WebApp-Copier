@@ -588,10 +588,16 @@ test('the sweep asks the channel what it said, and the heartbeat is what asks th
   const restoreEarly = section(index, 'async function rebuildTelegramClient(', 'if (current?.client && !telegramAdapter.isConnected(current.client)) {');
   assert.match(restoreEarly, /const mustRebuild = force === true \|\| escalate === true;/, 'the watchdog escalates, the operator forces, and either one rebuilds');
   assert.match(restoreEarly, /if \(!mustRebuild && telegramAdapter\.isConnected\(current\?\.client\) && current\.handler && telegramCapture\.handlerIsLive/, 'the shortcut is gated on that flag, not on good intentions');
-  assert.match(restore, /if \(current\?\.client && \(!telegramAdapter\.isConnected\(current\.client\) \|\| mustRebuild\)\) \{\s*await telegramAdapter\.disconnect\(current\.client\)\.catch\(\(\) => \{\}\);/,
-    'a rebuilt session disconnects the client it replaces, connected or not');
-  assert.match(restore, /disconnect\(current\.client\)\.catch\(\(\) => \{\}\);[\s\S]{0,240}telegramKeepAlive\.release\(current\.client\);/, /* the gap is a comment, and a pin that forbade comments between two statements would be a pin on formatting */
+  assert.match(restore, /if \(current\?\.client && \(!telegramAdapter\.isConnected\(current\.client\) \|\| mustRebuild\)\) \{\s*await telegramAdapter\.destroyClient\(current\.client\)\.catch\(\(\) => \{\}\);/,
+    'a rebuilt session ENDS the client it replaces, connected or not: `disconnect()` leaves the update loop running against a closed sender, which is where a released record got 1081 timeouts nobody summed');
+  assert.match(restore, /destroyClient\(current\.client\)\.catch\(\(\) => \{\}\);[\s\S]{0,240}telegramKeepAlive\.release\(current\.client\);/, /* the gap is a comment, and a pin that forbade comments between two statements would be a pin on formatting */
     'and the keep-alive guard is told the same thing, so a record of a client this process no longer owns does not outlive it');
+  /* The other half of that decision, and the only half that could have gone wrong: `destroy()` also clears
+     `_eventBuilders`, so it is right on a client nothing will use again and destructive on one being handed back.
+     The reconnect-in-place branch is that branch, and it has to stay free of the word. */
+  const reuseBranch = section(index, 'if (current?.client && !telegramAdapter.isConnected(current.client)) {', 'return current.client;');
+  assert.equal(reuseBranch.includes('destroyClient('), false,
+    'a session that came back on its own is reconnected, resynced and returned - never destroyed, because a destroyed client has no handlers left to be live');
   const restoreLatch = section(index, 'async function restoreTelegramClient(', 'async function rebuildTelegramClient(');
   assert.match(restoreLatch, /telegramRestoreFlight\.run\(userId, \(\) => rebuildTelegramClient\(/,
     'two passes may both want this workspace rebuilt, and only one of them may build a client');
@@ -675,6 +681,27 @@ test('the keep-alive noise is counted at the client that produced it, and the pr
     'and each one is guarded before it connects, on the fallback as well as on the transport the operator asked for');
   assert.match(index, /telegramKeepAlive\.attach\(client, \{ userId \}\);\n\s*await telegramAdapter\.connect\(client\);/,
     'attached before `connect()`, because that is where the update loop starts - after it would miss the first flap, which is the one that happens during a rebuild');
+
+  /* The same rule for the clients a user signs in with, and the reason they need saying out loud is that nothing
+     else enforces it: a workspace whose socket is healthy is never passed through `restoreTelegramClient` again,
+     so a client adopted by `finishTelegramLogin` kept whatever guard it had - which, for a login client, was
+     none. Its ping timeouts printed raw and counted nothing, which is the half of the prod report no counter
+     could explain. The invariant belongs to the client, so it is checked at every construction site instead of
+     at the one that happened to be wrong. */
+  const builds = [...index.matchAll(/(?:const|let)\s+(\w+)\s*=\s*telegramAdapter\.createClient\(/g)];
+  assert.equal(builds.length, 3, 'a rebuild, the pending-login restore, and the code request - the fallback build is the same `client` variable and is pinned above');
+  for (const build of builds) {
+    let tail = index.slice(build.index, build.index + 2000);
+    const boundary = tail.search(/\n(?:async )?function |\napp\.(?:get|post|put|delete)\(/);
+    if (boundary > -1) tail = tail.slice(0, boundary);
+    const attachAt = tail.indexOf(`telegramKeepAlive.attach(${build[1]}`);
+    const connectAt = tail.indexOf(`telegramAdapter.connect(${build[1]})`);
+    assert.notEqual(attachAt, -1, `the client built at offset ${build.index} is never guarded, so its keep-alive noise reaches the printer and its count reaches nobody`);
+    assert.ok(connectAt === -1 || attachAt < connectAt, `and ${build[1]} is guarded before it connects, because \`connect()\` is where the update loop starts`);
+  }
+  const discardSection = section(index, 'async function discardTelegramLoginAttempt(', "app.post('/api/telegram/request-code'");
+  assert.match(discardSection, /telegramClients\.get\(userId\)\?\.client !== attempt\.client\) await telegramAdapter\.destroyClient\(attempt\.client\)\.catch\(\(\) => \{\}\);[\s\S]{0,240}telegramKeepAlive\.release\(attempt\?\.client\);/,
+    'and a login client that is thrown away takes its record with it - only while nothing has adopted it, because `finishTelegramLogin` puts the same object into `telegramClients` before the listener is attached, and tearing that one down would deafen a workspace to buy a cleanup');
 
   // The process-level filter exists for the process, not for the log: it must never become a general silencer.
   const filter = section(index, "process.on('unhandledRejection'", "process.on('SIGTERM'");

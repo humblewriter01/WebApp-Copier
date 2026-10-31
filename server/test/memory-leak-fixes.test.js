@@ -177,7 +177,7 @@ test('the occupancy set is the same rule without a promise, for work already ser
  * 3. The keep-alive guard's own records, which used to be permanent.
  * ---------------------------------------------------------------------------------------------
  */
-test('a disconnected client stops being counted by the keep-alive guard', () => {
+test('a disconnected client stops being guarded, and what it swallowed stays counted', () => {
   const logs = [];
   const guard = createTelegramKeepAliveGuard({ log: (level, message) => logs.push({ level, message }), now: () => 1_000 });
   const live = { _log: { canSend: () => true } };
@@ -189,10 +189,18 @@ test('a disconnected client stops being counted by the keep-alive guard', () => 
   assert.equal(guard.stats().count, 1, 'the timeout is counted while the client is ours');
   assert.equal(guard.release(live), true, 'and releasing the exact client that was dropped is a real answer, not a no-op');
   assert.equal(guard.guardedCount(), 0, 'the record goes with it, so a service that rebuilds 500 sessions does not carry 500 records');
-  assert.equal(guard.stats().count, 0, 'including its counts, which describe a client that no longer exists');
+  /* The fleet total, on the other hand, does not go with it. `stats()` used to add the records up, which made the
+     panel's "timeouts swallowed since boot" a function of who was still attached - so a release subtracted real
+     work from the total, and a client whose update loop outlived its record (the prod case: `count: 1081`,
+     `suppressedTotal: 0`) was invisible forever. The leak this file exists to prevent is the *set* growing, not
+     the arithmetic remembering. */
+  assert.equal(guard.stats().count, 1, 'the record is bounded, the fact is not un-counted');
+  guard.note(keepAliveTimeout(), state);
+  assert.equal(guard.stats().count, 2, 'including timeouts earned after the record was dropped, because the handler the guard installed is still on the client and the counter is not attached to the registry');
+  assert.equal(guard.flapFor(live).count, 0, 'the watchdog can no longer be told this phantom flapped');
+  assert.equal(guard.stats().clients, 0, 'and the registry is still empty, which is the half of the fix that must not regress');
   assert.equal(guard.release(live), false, 'releasing twice is safe, because disconnect paths run more than once by design');
   assert.equal(guard.release(null), false, 'and releasing a client the guard never saw is not an error, because the caller is a catch block');
-  assert.equal(guard.flapFor(live).count, 0, 'the watchdog can no longer be told this phantom flapped');
 });
 
 test('the cap makes unbounded growth impossible even if a drop path forgets to release', () => {
@@ -301,7 +309,7 @@ test('every rebuild goes through the latch, and a lost race disconnects its own 
 
   const cas = body.slice(body.indexOf('const holder = telegramClients.get(userId);'), body.indexOf('const holder = telegramClients.get(userId);') + 620);
   assert.match(cas, /if \(holder && holder !== current\)/, 'the map is compared against what this pass read, at the moment it writes');
-  assert.match(cas, /await telegramAdapter\.disconnect\(client\)/, 'and the losing client is disconnected before it is dropped - an authorized GramJS client does not stop because nothing points at it');
+  assert.match(cas, /await telegramAdapter\.destroyClient\(client\)/, 'and the losing client is ENDED before it is dropped - an authorized GramJS client does not stop because nothing points at it, and `disconnect()` is not what stops it: the loop lives on until `_destroyed` is set');
   assert.match(cas, /telegramKeepAlive\.release\(client\)/, 'with its guard record released alongside it');
   assert.match(cas, /log\('warn'/, 'and it is a warning, not a debug line: reaching this branch at all means something bypassed the latch');
 });
@@ -336,11 +344,28 @@ test('both timers are guarded, on a named interval, and the beat reports memory 
   for (const field of fields) assert.equal(redacted.includes(field), false, `${field} is not a name the log line silently drops`);
 });
 
-test('the guard is released at every place a client is dropped', () => {
+test('a dropped client is ended, not merely disconnected, and its guard record goes with it', () => {
   const body = code(boot);
   const releases = (body.match(/telegramKeepAlive\.release\(/g) || []).length;
-  const disconnects = (body.match(/await telegramAdapter\.disconnect\(/g) || []).length;
-  assert.ok(releases >= 3, `a release sits beside each of the drop paths this fix touches (${releases} releases, ${disconnects} disconnect sites overall)`);
-  assert.match(body, /await telegramAdapter\.disconnect\(current\.client\)[\s\S]{0,120}telegramKeepAlive\.release\(current\.client\)/, 'the rebuild path releases the client it just disconnected');
+  /* Why `disconnect()` is not a teardown, in the library's own words (2.26.22): `telegramBaseClient.js:158-178`
+     closes the senders and never touches `_destroyed`, while `client/updates.js:166` runs
+     `while (!client._destroyed) { await sleep(PING_INTERVAL) ... }`. So every client this process "dropped" kept a
+     9-second ping loop against a closed sender for the life of the process, timing out `PING_FAIL_ATTEMPTS` x
+     `PING_TIMEOUT` on every cycle - one `Error: TIMEOUT` every 39 seconds, forever, per abandoned session. That
+     loop is what the keep-alive summary was counting (1081 timeouts in 11h45m = one per 39.1 s), and it is what a
+     released record went on accumulating after `release()` had already forgotten it. `destroy()` is the only call
+     in the public surface that sets the flag, so "drop the client" has to mean that word. */
+  const bare = (body.match(/telegramAdapter\.disconnect\(/g) || []).length;
+  assert.equal(bare, 0, `no drop path may stop at disconnect() - ${bare} of them do, and each one is a permanent timer`);
+  const ended = (body.match(/telegramAdapter\.destroyClient\(/g) || []).length;
+  assert.ok(ended >= 15, `every discard path ends its client (${ended} of them)`);
+  assert.ok(releases >= 3, `a release sits beside each of the drop paths (${releases} releases)`);
+  assert.match(body, /await telegramAdapter\.destroyClient\(current\.client\)[\s\S]{0,240}telegramKeepAlive\.release\(current\.client\)/, 'the rebuild path releases the client it just ended');
   assert.match(body, /telegramKeepAlive\.release\(entry\?\.client\)[\s\S]{0,80}telegramClients\.delete\(userId\)/, 'and so does the unrecoverable path, before the map entry goes');
+  /* The one branch that keeps its client must keep it *listening*: `destroy()` clears `_eventBuilders` as a side
+     effect, so applying it to a reused session would trade a stack trace for a deaf workspace. */
+  const from = body.indexOf('if (current?.client && !telegramAdapter.isConnected(current.client)) {');
+  const to = body.indexOf('return current.client;', from);
+  assert.ok(from > -1 && to > from + 80, 'the reconnect-in-place branch is really there for this pin to bound');
+  assert.equal(body.slice(from, to).includes('destroyClient('), false, 'the reconnect-in-place path destroys nothing');
 });

@@ -108,6 +108,7 @@ const NEEDLES = {
   'client.connected': /client\?\.connected === true[\s\S]*?client\?\.connected\)/,
   'client.connect()': /return client\.connect\(\);/,
   'client.disconnect()': /return client\.disconnect\(\);/,
+  'client.destroy()': /return client\.destroy\(\);/,
   'client.checkAuthorization()': /return client\.checkAuthorization\(\);/,
   'client.session.save()': /return client\.session\.save\(\);/,
   'client.invoke()': /return client\.invoke\(request\);/,
@@ -139,7 +140,7 @@ const NEEDLES = {
  * adding a touchpoint, which is the point.
  */
 const ALLOWED_MEMBERS = new Set([
-  'client.connect', 'client.disconnect', 'client.connected', 'client.checkAuthorization', 'client.session',
+  'client.connect', 'client.disconnect', 'client.destroy', 'client.connected', 'client.checkAuthorization', 'client.session',
   'client.invoke', 'client.getMe', 'client.sendCode', 'client.signInWithPassword', 'client.getDialogs',
   'client.getEntity', 'client.getMessages', 'client.addEventHandler', 'client.removeEventHandler',
   'client.listEventHandlers', 'client._log', 'client.onError', 'client.constructor',
@@ -155,8 +156,10 @@ test('the touchpoint list is the whole seam, in both directions', () => {
   assert.equal(Array.isArray(listed), true, 'the inventory is data, not a comment');
   /* 36 from the seam itself, plus the two an edited post needed: constructing the library's edit filter, and the
    * deep import that filter has to come through (the barrel does not export it - see the version pin below, which
-   * is what makes that a checked fact rather than a memory). Argued for in the PR that added them, as promised. */
-  assert.equal(listed.length, 38, 'the count the refactor was scoped on; a new touchpoint must be argued for, not slipped in');
+   * is what makes that a checked fact rather than a memory). Argued for in the PR that added them, as promised.
+   * And one more since: `client.destroy()`, argued for in the PR that added it, because `disconnect()` is provably
+   * not a teardown - it never sets the flag the library's own update loop tests. */
+  assert.equal(listed.length, 39, 'the count the refactor was scoped on; a new touchpoint must be argued for, not slipped in');
   assert.equal(new Set(listed).size, listed.length, 'nothing is listed twice, which would make the count a fiction');
   assert.deepEqual(Object.isFrozen(listed), true, 'the seam cannot be extended by pushing onto the list at runtime');
 
@@ -310,6 +313,26 @@ test('the connected flag keeps the two meanings it had, and they are not interch
   assert.equal(telegramAdapter.connectedFlag({ connected: 1 }), true);
   assert.equal(telegramAdapter.connectedFlag({ connected: false }), false);
   assert.equal(telegramAdapter.connectedFlag(null), false);
+});
+
+test('destroyClient ends the update loop, and a client without the seam is still closed', async () => {
+  const calls = [];
+  const both = {
+    destroy: () => { calls.push('destroy'); return Promise.resolve(); },
+    disconnect: () => { calls.push('disconnect'); return Promise.resolve(); },
+  };
+  await telegramAdapter.destroyClient(both);
+  assert.deepEqual(calls, ['destroy'], '`destroy()` wins wherever it exists: it is the only public call that sets `_destroyed`, which is what `client/updates.js`\'s `while (!client._destroyed)` tests, while `disconnect()` closes the senders and leaves the loop pinging them');
+  calls.length = 0;
+  await telegramAdapter.destroyClient({ disconnect: () => { calls.push('disconnect'); return Promise.resolve(); } });
+  assert.deepEqual(calls, ['disconnect'], 'a client without it is closed as well as it can be, so a package that has not got the method costs the app a stack trace and not a session');
+  await telegramAdapter.destroyClient({});
+  await telegramAdapter.destroyClient(null);
+  assert.equal(calls.length, 1, 'a client with neither method is nothing to tear down, not a TypeError, and nothing else gets called');
+  let threw = false;
+  try { telegramAdapter.destroyClient(undefined).catch(() => {}); } catch { threw = true; }
+  assert.equal(threw, false, 'and it never throws synchronously, because every caller is a cleanup path written as `await ...catch(() => {})`, where a synchronous throw would walk straight past the catch');
+  assert.equal(typeof TelegramClient.prototype.destroy, 'function', 'the seam is on the real class, not just on the fakes above');
 });
 
 test('the keep-alive guard reaches the library through three names and no more', () => {
