@@ -44,6 +44,7 @@ function recorder() {
     sentinel,
     connect: method('connect'),
     disconnect: method('disconnect'),
+    destroy: method('destroy'),
     checkAuthorization: method('checkAuthorization'),
     invoke: method('invoke'),
     getMe: method('getMe'),
@@ -65,6 +66,7 @@ function recorder() {
 const FORWARDS = [
   ['connect', (adapter, client) => adapter.connect(client), 'connect', []],
   ['disconnect', (adapter, client) => adapter.disconnect(client), 'disconnect', []],
+  ['destroyClient', (adapter, client) => adapter.destroyClient(client), 'destroy', []],
   ['checkAuthorization', (adapter, client) => adapter.checkAuthorization(client), 'checkAuthorization', []],
   ['exportSessionString', (adapter, client) => adapter.exportSessionString(client), 'session.save', []],
   ['invoke', (adapter, client) => adapter.invoke(client, { _: 'a.request' }), 'invoke', [{ _: 'a.request' }]],

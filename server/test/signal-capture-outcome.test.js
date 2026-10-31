@@ -588,10 +588,16 @@ test('the sweep asks the channel what it said, and the heartbeat is what asks th
   const restoreEarly = section(index, 'async function rebuildTelegramClient(', 'if (current?.client && !telegramAdapter.isConnected(current.client)) {');
   assert.match(restoreEarly, /const mustRebuild = force === true \|\| escalate === true;/, 'the watchdog escalates, the operator forces, and either one rebuilds');
   assert.match(restoreEarly, /if \(!mustRebuild && telegramAdapter\.isConnected\(current\?\.client\) && current\.handler && telegramCapture\.handlerIsLive/, 'the shortcut is gated on that flag, not on good intentions');
-  assert.match(restore, /if \(current\?\.client && \(!telegramAdapter\.isConnected\(current\.client\) \|\| mustRebuild\)\) \{\s*await telegramAdapter\.disconnect\(current\.client\)\.catch\(\(\) => \{\}\);/,
-    'a rebuilt session disconnects the client it replaces, connected or not');
-  assert.match(restore, /disconnect\(current\.client\)\.catch\(\(\) => \{\}\);[\s\S]{0,240}telegramKeepAlive\.release\(current\.client\);/, /* the gap is a comment, and a pin that forbade comments between two statements would be a pin on formatting */
+  assert.match(restore, /if \(current\?\.client && \(!telegramAdapter\.isConnected\(current\.client\) \|\| mustRebuild\)\) \{\s*await telegramAdapter\.destroyClient\(current\.client\)\.catch\(\(\) => \{\}\);/,
+    'a rebuilt session ENDS the client it replaces, connected or not: `disconnect()` leaves the update loop running against a closed sender, which is where a released record got 1081 timeouts nobody summed');
+  assert.match(restore, /destroyClient\(current\.client\)\.catch\(\(\) => \{\}\);[\s\S]{0,240}telegramKeepAlive\.release\(current\.client\);/, /* the gap is a comment, and a pin that forbade comments between two statements would be a pin on formatting */
     'and the keep-alive guard is told the same thing, so a record of a client this process no longer owns does not outlive it');
+  /* The other half of that decision, and the only half that could have gone wrong: `destroy()` also clears
+     `_eventBuilders`, so it is right on a client nothing will use again and destructive on one being handed back.
+     The reconnect-in-place branch is that branch, and it has to stay free of the word. */
+  const reuseBranch = section(index, 'if (current?.client && !telegramAdapter.isConnected(current.client)) {', 'return current.client;');
+  assert.equal(reuseBranch.includes('destroyClient('), false,
+    'a session that came back on its own is reconnected, resynced and returned - never destroyed, because a destroyed client has no handlers left to be live');
   const restoreLatch = section(index, 'async function restoreTelegramClient(', 'async function rebuildTelegramClient(');
   assert.match(restoreLatch, /telegramRestoreFlight\.run\(userId, \(\) => rebuildTelegramClient\(/,
     'two passes may both want this workspace rebuilt, and only one of them may build a client');
@@ -694,8 +700,8 @@ test('the keep-alive noise is counted at the client that produced it, and the pr
     assert.ok(connectAt === -1 || attachAt < connectAt, `and ${build[1]} is guarded before it connects, because \`connect()\` is where the update loop starts`);
   }
   const discardSection = section(index, 'async function discardTelegramLoginAttempt(', "app.post('/api/telegram/request-code'");
-  assert.match(discardSection, /await telegramAdapter\.disconnect\(attempt\.client\)\.catch\(\(\) => \{\}\);[\s\S]{0,240}telegramKeepAlive\.release\(attempt\?\.client\);/,
-    'and a login client that is thrown away takes its record with it, because nothing else in this file will ever hold that client and `guardedClients` is a number someone reads');
+  assert.match(discardSection, /telegramClients\.get\(userId\)\?\.client !== attempt\.client\) await telegramAdapter\.destroyClient\(attempt\.client\)\.catch\(\(\) => \{\}\);[\s\S]{0,240}telegramKeepAlive\.release\(attempt\?\.client\);/,
+    'and a login client that is thrown away takes its record with it - only while nothing has adopted it, because `finishTelegramLogin` puts the same object into `telegramClients` before the listener is attached, and tearing that one down would deafen a workspace to buy a cleanup');
 
   // The process-level filter exists for the process, not for the log: it must never become a general silencer.
   const filter = section(index, "process.on('unhandledRejection'", "process.on('SIGTERM'");

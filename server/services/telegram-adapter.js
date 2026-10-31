@@ -67,6 +67,7 @@ export const TELEGRAM_TOUCHPOINTS = Object.freeze([
   'client.connected',
   'client.connect()',
   'client.disconnect()',
+  'client.destroy()',
   'client.checkAuthorization()',
   'client.session.save()',
   'client.invoke()',
@@ -184,6 +185,31 @@ export function connect(client) {
 
 export function disconnect(client) {
   return client.disconnect();
+}
+
+/**
+ * End a client for good, and mean it: stop its update loop, then close the sender.
+ *
+ * `disconnect()` alone does not end anything, and this is the line the whole function exists for. In 2.26.22
+ * `disconnect()` (`telegramBaseClient.js:158-178`) closes the senders and never touches `_destroyed`, while
+ * `_updateLoop` runs `while (!client._destroyed)` (`client/updates.js:166`) - so a client dropped with
+ * `disconnect()` keeps sending a `PingDelayDisconnect` every `PING_INTERVAL` (9 s) into a closed sender for the
+ * remaining life of the process, timing out three attempts (`PING_FAIL_ATTEMPTS` x `PING_TIMEOUT`) before it does,
+ * which is one stack trace per 39 seconds per abandoned session. The library's own cadence is the evidence: the
+ * keep-alive summary's production numbers were 1081 timeouts over 11h45m, one per 39.1 s.
+ *
+ * `destroy()` is the only public call that sets the flag (`telegramBaseClient.js:190-192`), it calls
+ * `disconnect()` itself, and it also clears `_eventBuilders` - which is precisely why this is exported as a
+ * separate operation rather than folded into `disconnect`: a client the app intends to keep listening with must
+ * never be destroyed, and the difference between the two is a single word at the call site.
+ *
+ * Never throws synchronously, whatever it is handed: every caller is a cleanup path that has already decided a
+ * failed teardown is not worth an exception.
+ */
+export function destroyClient(client) {
+  if (typeof client?.destroy === 'function') return client.destroy();
+  if (typeof client?.disconnect === 'function') return client.disconnect();
+  return Promise.resolve();
 }
 
 /** Can this client be torn down at all? Checked before the call, so a half-built object never throws here. */
