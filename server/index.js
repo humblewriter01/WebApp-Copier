@@ -24,6 +24,7 @@ import { readDashboardSignals } from './services/dashboard-signals.js';
 import { HEARTBEAT_INTERVAL_MS, createTelegramListener, isValidWorkspaceId } from './services/telegram-listener.js';
 import { createTelegramKeepAliveGuard, createUnhandledRejectionGuard, isProviderKeepAliveTimeout } from './services/telegram-keepalive.js';
 import { createPassGuard, createSingleFlight } from './services/single-flight.js';
+import { createTelegramReconnectPolicy } from './services/telegram-reconnect.js';
 import { createMetaApiTradingAdapter } from './services/metaapi-trading.js';
 import { createExecutionEngine, PLATFORM_PAUSE_MESSAGE } from './services/execution-engine.js';
 import { createExecutionWorker } from './services/execution-worker.js';
@@ -811,6 +812,17 @@ const telegramSweepGuard = createPassGuard({
   onOverrun: (info) => log('warn', 'Telegram sweep took longer than its interval, so overlapping passes are being refused', { pass: info.name, elapsedMs: info.elapsedMs, thresholdMs: info.thresholdMs }),
 });
 
+/*
+ * How a rebuild attempt is read, as distinct from how it is performed. The flight above is what turns two
+ * simultaneous clicks into one rebuild; this is what stops the refused click from describing the other one's work
+ * as its own. `isConnected` is the adapter's predicate - the same one `/api/telegram/status` and the sweep read -
+ * so a client cannot be "live" to the panel and "not live" to the answer an operator is given.
+ */
+const telegramReconnect = createTelegramReconnectPolicy({
+  clients: telegramClients,
+  isConnected: (client) => telegramAdapter.isConnected(client),
+});
+
 const telegramBeatGuard = createPassGuard({
   name: 'telegram-heartbeat',
   overrunAfterMs: HEARTBEAT_INTERVAL_MS,
@@ -844,23 +856,39 @@ function memorySample() {
 }
 
 /**
- * Bring one workspace's session up, one attempt at a time.
+ * Bring one workspace's session up, one attempt at a time, and report what this attempt - not the other one -
+ * actually did.
  *
  * The wrapper is the whole of the concurrency control; `rebuildTelegramClient` below is the work itself and is
  * not called from anywhere else, which is what makes "only one rebuild can be in flight" a property of the file
  * rather than a habit of its callers.
+ *
+ * `strict: true` is what an answering caller passes. A sweep that runs again in sixty seconds can take whatever
+ * the map holds and say nothing; a response to a human cannot, because during a rebuild "whatever the map holds"
+ * is the client the winning pass has already ended. Before that flag existed, a second and third click on the
+ * admin panel's reconnect button were answered with `ok` and an audit row claiming a manual reconnect, over a
+ * socket that had been destroyed by the click that refused them.
  */
-async function restoreTelegramClient(userId, { reason = 'restore', force = false, escalate = false } = {}) {
+async function restoreTelegramClient(userId, { reason = 'restore', force = false, escalate = false, strict = false } = {}) {
   const outcome = await telegramRestoreFlight.run(userId, () => rebuildTelegramClient(userId, { reason, force, escalate }));
-  if (!outcome.ran) {
-    /* Another pass is already rebuilding this workspace, and this one leaves with whatever the map holds right
-       now - possibly the old client, possibly null. That is deliberately not an error: every caller here is a
-       sweep or a watchdog that will run again, and a rebuild that returns the previous client is a rebuild that
-       reports "not yet", which is what the status route already knows how to show. */
-    return telegramClients.get(userId)?.client || null;
+  const state = telegramReconnect.classify(outcome, telegramClients.get(userId)?.client || null);
+  if (state.status === telegramReconnect.IN_FLIGHT) {
+    /* Another pass is rebuilding this workspace and this one built nothing. For a strict caller that is a refusal
+       and is answered as one; for everyone else it stays the "not yet" the status route already knows how to
+       show, with the same value it used to return and the same silence. */
+    if (strict) throw telegramReconnect.busyError(state.waitedForMs);
+    return state.client;
   }
-  if (outcome.error) throw outcome.error;
-  return outcome.value;
+  if (state.status === telegramReconnect.FAILED) throw state.error;
+  if (state.status === telegramReconnect.UNAVAILABLE) {
+    /* A rebuild that handed back an object with no live socket has not connected anything. It used to be returned
+       as a success to every caller, which is how "Telegram connected" reached a screen while nothing was
+       capturing; now it is a failure for the human who asked and a null for the sweep, which will try again. */
+    log('warn', 'Telegram rebuild finished without a live socket', { userId, reason, strict: strict === true });
+    if (strict) throw telegramReconnect.unavailableError();
+    return null;
+  }
+  return state.client;
 }
 
 async function rebuildTelegramClient(userId, { reason = 'restore', force = false, escalate = false } = {}) {
@@ -899,6 +927,14 @@ async function rebuildTelegramClient(userId, { reason = 'restore', force = false
     // The keep-alive guard keeps one record per client it has ever seen; a client this process has just ended is
     // never going to time out again, so its record is dropped here rather than left for the backstop sweep.
     telegramKeepAlive.release(current.client);
+    /* And the workspace map stops pointing at it in the same breath, because the window between ending a client
+       and installing its replacement is filled with reads, connects and a resync - and every caller that arrives
+       in that window is handed this entry. An ended client in the map is a dead socket reported as connected,
+       which is the whole of the bug: `forget` is identity-guarded, so a pass that is no longer the one holding the
+       slot leaves whatever a newer pass installed alone. */
+    if (!telegramReconnect.forget(userId, current)) {
+      log('info', 'Telegram rebuild left a replaced entry in place', { userId, reason });
+    }
   }
   const { rows } = await pool.query('SELECT telegram_session FROM users WHERE id=$1', [userId]);
   if (!rows[0]?.telegram_session) {
@@ -1077,8 +1113,20 @@ function memorySampleLine(reason, outcome) {
 async function forceTelegramReconnect(userId, { reason = 'manual-reconnect', actorId = null, actorEmail = null } = {}) {
   let client;
   try {
-    client = await restoreTelegramClient(userId, { reason, force: true });
+    client = await restoreTelegramClient(userId, { reason, force: true, strict: true });
   } catch (error) {
+    /* Two answers are not failures of the reconnect and must not be dressed as one, because they tell the operator
+       opposite things to do: "one is already running" means stop pressing, and "no live socket" means the button
+       did rebuild something and the transport is the problem. Both are rethrown as they are, so the route can give
+       each its own status code instead of a wrapped 502 that reads like a rejected handshake. */
+    if (telegramReconnect.isBusy(error)) {
+      log('info', 'Telegram forced reconnect refused: one is already running for this workspace', { userId, actorId, reason, waitedForMs: error.waitedForMs });
+      throw error;
+    }
+    if (telegramReconnect.isUnavailable(error)) {
+      log('warn', 'Telegram forced reconnect ended without a live socket', { userId, actorId, reason });
+      throw error;
+    }
     log('warn', 'Telegram forced reconnect failed', { userId, actorId, reason, error: `${error?.message || error}`.slice(0, 200) });
     const failure = new Error('Telegram did not accept the new connection.');
     failure.telegramReconnectFailed = true;
@@ -2967,6 +3015,11 @@ app.post('/api/admin/users/:id/telegram/reconnect', authenticate, requireAdmin, 
     res.set('Cache-Control', 'no-store').json({ ok: true, ...result });
   } catch (error) {
     if (error.telegramNoSession) return fail(res, 409, `${error.message} The phone number has to sign in again from the workspace settings first.`);
+    // A refused click is a 409 and not a green banner: the work the operator asked for is running, and the only
+    // honest instruction is to wait for it. `retryWhenUnanswered` in the panel means a double press is one
+    // request with two answers, which is the pair this branch exists to keep apart.
+    if (telegramReconnect.isBusy(error)) return fail(res, 409, `${error.message} The one already running will replay the backlog by itself, so there is nothing to press again yet.`);
+    if (telegramReconnect.isUnavailable(error)) return fail(res, 503, `${error.message} The heartbeat keeps retrying on its own minute clock; the button is not needed.`);
     return fail(res, 502, `${error.message} Try again in a minute - if it keeps failing, the stored session has to be re-authorised.`);
   }
 }));

@@ -601,8 +601,16 @@ test('the sweep asks the channel what it said, and the heartbeat is what asks th
   const restoreLatch = section(index, 'async function restoreTelegramClient(', 'async function rebuildTelegramClient(');
   assert.match(restoreLatch, /telegramRestoreFlight\.run\(userId, \(\) => rebuildTelegramClient\(/,
     'two passes may both want this workspace rebuilt, and only one of them may build a client');
-  assert.match(restoreLatch, /return telegramClients\.get\(userId\)\?\.client \|\| null;/,
-    'and the loser reports what the map holds instead of a second client, which is what makes skipping safe for a caller that is only reporting status');
+  /* Re-pointed, not loosened: this used to pin the literal "hand back whatever the map holds" return, which was
+     safe for a sweep and was the exact line that let a refused admin click report somebody else's rebuild as its
+     own success. The invariant the wording described is still pinned, and so is the part that was missing - a
+     refusal has to be distinguishable, and a caller that is answering a human has to treat it as a refusal. */
+  assert.match(restoreLatch, /const state = telegramReconnect\.classify\(outcome, telegramClients\.get\(userId\)\?\.client \|\| null\);/,
+    'the loser reads its own outcome through the policy, so what the map holds is reported as what it is: a held client, not a completed rebuild');
+  assert.match(restoreLatch, /if \(state\.status === telegramReconnect\.IN_FLIGHT\) \{/,
+    'and the refusal is its own status rather than a value that can be mistaken for one');
+  assert.match(restoreLatch, /if \(strict\) throw telegramReconnect\.busyError\(state\.waitedForMs\);/,
+    'a strict caller - the admin route - is refused out loud, which is what makes skipping safe for the caller that is only reporting status without lying to the one that is not');
   assert.match(restore, /await telegramCapture\.resyncUpdateState\(current\.client, \{ userId, reason: `\$\{reason\}:reconnected` \}\);/,
     'a socket that came back has its state reconciled before the handler is re-attached');
   assert.match(restore, /await telegramCapture\.resyncUpdateState\(client, \{ userId, reason: `\$\{reason\}:new-session`, force: mustRebuild \}\);/,
@@ -724,7 +732,8 @@ test('an operator can rebuild a deaf session by hand, and that is the one path a
   assert.match(route, /fail\(res, 502, `\$\{error\.message\} Try again in a minute/, 'and a refused handshake says what to do, in minutes, not in stack frames');
 
   const helper = section(index, 'async function forceTelegramReconnect(', '\n/** Re-attach anything in memory');
-  assert.match(helper, /restoreTelegramClient\(userId, \{ reason, force: true \}\)/, 'the bypass is one call deep and named');
+  assert.match(helper, /restoreTelegramClient\(userId, \{ reason, force: true, strict: true \}\)/,
+    'the bypass is one call deep and named, and the answering caller is strict, because a click that was refused by the latch may not be answered as a reconnect');
   assert.match(helper, /action: 'telegram\.reconnectForced'/, 'the audit trail gets its own action, because "who rebuilt this" is the first question after a rebuild that fixed something');
   assert.match(helper, /actorId,\n\s*actorEmail,/, 'both halves of the actor are recorded');
   assert.match(helper, /const caughtUp = Number\(outcome\?\.stored\) \|\| 0;\n\s*const fresh = Number\(outcome\?\.fresh\) \|\| 0;/,
