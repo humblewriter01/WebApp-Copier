@@ -1,6 +1,7 @@
 /** Public overview and pricing for Signal Desk. */
 import React, { useEffect, useState } from 'react';
 import { request } from '../lib/api.js';
+import BrokerAccessNote from './BrokerAccessNote.jsx';
 
 const DEFAULT_PRICING = [
   { key: 'free', name: 'Free', amount: 0, currency: 'USD', prices: { USD: 0, NGN: 0 }, interval: 'monthly', description: 'Explore signal capture and review.' },
@@ -20,6 +21,7 @@ const STEPS = [
   ['The order goes to your broker', 'Once enabled, the order is executed on your MT4 or MT5 account within your limits.'],
 ];
 const FAQS = [
+  ['Can you withdraw my funds?', 'No. We use trade-only access. We can place and close trades on your behalf, but we do not have withdrawal permissions. You can disconnect your account at any time.'],
   ['Does this work with my broker?', 'Yes. Signal Desk works with any MT4 or MT5 broker.'],
   ['Do I need a VPS?', 'No. Signal Desk runs in the cloud, so you do not need to maintain a VPS.'],
   ['Does it give trading advice?', 'No. Signal Desk is an execution tool, not an adviser. You choose your signals and control your risk.'],
@@ -110,7 +112,7 @@ export default function Landing({ onEnterAuth = () => {}, installPrompt = null, 
     </section>
     <section className="landing-how" aria-labelledby="landing-how-title">
       <div className="landing-section-heading"><p className="eyebrow">A CLEAR PATH FROM SIGNAL TO EXECUTION</p><h2 id="landing-how-title">How it works</h2></div>
-      <div className="landing-steps">{STEPS.map(([title, body], index) => <article className="landing-step" key={title}><span className="landing-step-no">0{index + 1}</span><h3>{title}</h3><p>{body}</p></article>)}</div>
+      <div className="landing-steps">{STEPS.map(([title, body], index) => <article className="landing-step" key={title}><span className="landing-step-no">0{index + 1}</span><h3>{title}</h3>{index === 2 ? <BrokerAccessNote className="broker-access-note-landing" /> : <p>{body}</p>}</article>)}</div>
     </section>
     <section className="landing-guardrails">
       <h2>What it will not do</h2>

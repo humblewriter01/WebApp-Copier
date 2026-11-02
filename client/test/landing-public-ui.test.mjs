@@ -86,6 +86,20 @@ test('the hero explicitly promises channel-scoped read-only access and no passwo
   await unmount();
 });
 
+test('the broker step gives the trade-only reassurance and the FAQ answers withdrawal concerns', async () => {
+  const { host, unmount } = await mount();
+  const brokerStep = host.querySelector('.landing-step:nth-child(3)');
+  const note = brokerStep.querySelector('.broker-access-note-landing');
+  assert.equal(text(note), 'Broker access is trade-only. We can place and close trades, but we can never withdraw funds. Disconnect anytime.');
+  assert.ok(note.querySelector('svg[aria-hidden="true"]'), 'the shield-and-lock icon is decorative and paired with readable copy');
+  assert.equal(text(brokerStep.querySelector('h3')), 'The order goes to your broker');
+
+  const faq = [...host.querySelectorAll('.landing-faq-item')].find((item) => text(item.querySelector('h3')) === 'Can you withdraw my funds?');
+  assert.ok(faq, 'the withdrawal question is directly findable in the FAQ');
+  assert.equal(text(faq.querySelector('p')), 'No. We use trade-only access. We can place and close trades on your behalf, but we do not have withdrawal permissions. You can disconnect your account at any time.');
+  await unmount();
+});
+
 test('the workspace is shown, and labelled as a picture', async () => {
   const { host, unmount } = await mount();
   const demo = host.querySelector('.landing-demo');

@@ -99,6 +99,15 @@ async function mount(settings = NEW_WORKSPACE) {
   };
 }
 
+test('the connected-account selector in settings repeats the broker permission boundary', async () => {
+  const view = await mount();
+  const note = view.host.querySelector('.broker-access-note-compact');
+  assert.ok(note, 'the connected broker is accompanied by reassurance');
+  assert.equal(note.textContent.replace(/\s+/g, ' ').trim(), 'Broker access is trade-only. We can place and close trades, but we can never withdraw funds. Disconnect anytime.');
+  assert.ok(note.querySelector('svg[aria-hidden="true"]'), 'a shield-and-lock icon accompanies the compact reassurance');
+  await view.unmount();
+});
+
 test('the click that would arm live execution asks first and writes nothing', async () => {
   const view = await mount();
   await view.clickSwitch();

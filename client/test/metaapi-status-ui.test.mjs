@@ -138,6 +138,18 @@ test('a confirmed "ready" renders the create form beside the accounts panel', ()
   assert.equal(html.includes('skeleton'), false, 'nothing is loading once the answer is known');
 });
 
+test('the connect form and connected-accounts dashboard both show trade-only access', () => {
+  const html = renderPanel(stateFor({ available: true }));
+  const reassurance = 'Broker access is trade-only. We can place and close trades, but we can never withdraw funds. Disconnect anytime.';
+  const formStart = html.indexOf('<form');
+  const formEnd = html.indexOf('</form>', formStart);
+  const form = html.slice(formStart, formEnd);
+  assert.ok(form.indexOf('Create secure setup link') < form.indexOf(reassurance), 'reassurance sits immediately below the submit control');
+  const accountsPanel = html.slice(html.indexOf('id="metaapi-accounts-title"'));
+  assert.ok(accountsPanel.includes(reassurance), 'the dashboard repeats the promise beside connected-account management and unlink/delete actions');
+  assert.equal((html.match(/Broker access is trade-only\./g) || []).length, 2, 'one reassurance belongs to each broker-account surface');
+});
+
 test('an unreachable status is admitted as such and offers a retry', () => {
   const html = renderPanel(failed('Service Unavailable'));
   assert.match(html, /Status unavailable/);
@@ -161,6 +173,24 @@ test('an unwired panel fails safe into the pending state', () => {
 });
 
 /* --------------------------------------------------------------------- the source rules */
+
+test('a source scan keeps the can-never-withdraw promise in UI component files', () => {
+  const uiFiles = [];
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (/\.jsx?$/.test(entry.name)) uiFiles.push({ file: full, source: readFileSync(full, 'utf8') });
+    }
+  };
+  walk(path.join(srcDir, 'components'));
+  const matching = uiFiles.filter(({ source }) => /can never withdraw/i.test(source));
+  assert.ok(matching.length > 0, 'the literal “can never withdraw” promise must remain in shipped UI source');
+  assert.ok(matching.every(({ file }) => /\.jsx?$/.test(file)), 'the promise is in rendered UI components, not only a test or stylesheet');
+  for (const component of ['Landing.jsx', 'MetaApiPanel.jsx', 'AdvancedSettings.jsx']) {
+    assert.match(readFileSync(path.join(srcDir, 'components', component), 'utf8'), /BrokerAccessNote/, `${component} wires the shared copy into its relevant broker surface`);
+  }
+});
 
 test('the provisioning endpoint is fetched in exactly one module', () => {
   assert.equal(METAAPI_PROVISIONING_STATUS_ENDPOINT, '/api/metaapi/provisioning-status');
