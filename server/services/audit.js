@@ -57,6 +57,15 @@ export const AUDIT_ACTIONS = Object.freeze({
   'audit.clear': 'Admin audit log cleared',
   'announcement.purgeHistory': 'Retired banners deleted',
   'user.suspend.refused': 'Suspension request refused',
+  /* The three Telegram session controls an administrator can press by hand. Each route built a complete, correct
+     payload and was refused here, at the end of a mutation that had already landed - which is what a closed list is
+     for, and why the log line says "could not be built" rather than "did not happen". The reconnect's audit row is
+     the only record of *who* forced a session and what the backlog replay found, so a missing key here is a hole in
+     the trail rather than a cosmetic one; `test/audit-contract.test.js` now refuses to let a dispatched key be
+     absent from this list. */
+  'telegram.reconnectForced': 'Telegram session reconnected by hand',
+  'telegram.sessionPaused': 'Telegram session paused',
+  'telegram.sessionResumed': 'Telegram session resumed',
 });
 
 const MAX_SUMMARY = 400;
