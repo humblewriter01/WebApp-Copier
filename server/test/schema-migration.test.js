@@ -66,6 +66,14 @@ test('the columns this app ships are each their own statement', () => {
   for (const needle of [
     'execution_jobs ADD COLUMN IF NOT EXISTS next_attempt_at',
     'metaapi_accounts ADD COLUMN IF NOT EXISTS execution_note ',
+    // The three pause columns, one statement each. They are `IF NOT EXISTS` and they are separate statements
+    // because a single `ALTER TABLE ... ADD COLUMN a, ADD COLUMN b` on a table that already has one of them is
+    // the statement that fails the whole migration on an existing database - and because the comment above them
+    // explains linked-vs-paused, which a splitter that treats `--` prose as a statement would turn into a syntax
+    // error on every boot.
+    'users ADD COLUMN IF NOT EXISTS telegram_paused BOOLEAN NOT NULL DEFAULT FALSE',
+    'users ADD COLUMN IF NOT EXISTS telegram_paused_at TIMESTAMPTZ',
+    'users ADD COLUMN IF NOT EXISTS telegram_pause_reason TEXT',
     'execution_jobs_backoff_idx',
   ]) {
     assert.equal(find(needle).length, 1, `${needle} appears exactly once, as one statement`);

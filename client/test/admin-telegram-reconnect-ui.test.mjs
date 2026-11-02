@@ -21,8 +21,24 @@ const handler = panel.slice(panel.indexOf('const reconnectTelegram = async (user
 assert.ok(handler.length > 400, 'the handler is in the panel, next to the other per-user actions it belongs with');
 
 test('the reconnect is offered only where there is a session to reconnect', () => {
-  assert.match(panel, /\{user\.telegramConnected && !isSelf \? <button[^>]*onClick=\{\(\) => reconnectTelegram\(user\)\}/,
-    'the button is conditional on the account actually having a linked session, and never offered on the administrator themself');
+  assert.match(panel, /\{user\.telegramConnected && !isSelf \? \(user\.telegramPaused/,
+    'the Telegram controls are one expression conditioned on the account having a linked session, and never offered on the administrator themself');
+
+  /* One control per state, which is the part a test can actually check: the paused branch may hold Resume and
+     nothing else, because a Reconnect sitting beside a pause invites the one press the server is written to
+     refuse, and a Pause beside a paused row would be a button whose whole job is to write a row that is already
+     there. Sliced rather than matched, because the two branches are JSX and a regex over JSX is a pin on
+     formatting - these three asserts are on which handler each branch reaches, which is the behaviour. */
+  const controls = panel.slice(panel.indexOf('{user.telegramConnected && !isSelf ? (user.telegramPaused'), panel.indexOf('</>) : null}'));
+  assert.ok(controls.length > 200, 'the conditional really holds both branches, and the slice found them');
+  const pausedBranch = controls.slice(0, controls.indexOf(' : <>'));
+  const liveBranch = controls.slice(controls.indexOf(' : <>'));
+  assert.ok(pausedBranch.includes('resumeTelegram(user)'), 'a paused row offers Resume');
+  assert.equal(pausedBranch.includes('reconnectTelegram(user)'), false, 'and not Reconnect');
+  assert.equal(pausedBranch.includes('pauseTelegram(user)'), false, 'and not a second Pause');
+  assert.ok(liveBranch.includes('pauseTelegram(user)') && liveBranch.includes('reconnectTelegram(user)'), 'a linked, unpaused row offers Pause beside the Reconnect it already had');
+  assert.equal(liveBranch.includes('resumeTelegram(user)'), false, 'and no Resume, because there is no pause to lift');
+  assert.match(panel, /Telegram paused · capturing is stopped, the session is still linked/, 'the row says the pause out loud, because "linked" without it reads as "capturing"');
   assert.match(panel, /disabled=\{busy\}/, 'and it is disabled while that row has any write in flight, so a double click cannot start two reconnects');
   assert.match(panel, /Reconnect Telegram/, 'named for what it does, in the row it acts on');
   assert.match(panel, /title="Drop the Telegram connection, sign back in with the stored session, and replay what the channels posted while it was down"/,

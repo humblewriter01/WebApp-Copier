@@ -439,6 +439,47 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     }
   };
 
+  /*
+   * Pause and resume, whose whole job is to be honest about one thing: a pause is not a sign-out. The notice says
+   * the session stays linked because that is the question an operator is usually being asked when they press the
+   * button, and a refusal from the server ("that workspace has no linked session") is a real answer rather than a
+   * failure to retry, so it lands on the error line instead of being swallowed. Resume is the reconnect it reuses
+   * verbatim, `retryWhenUnanswered` and all: the pause is lifted the moment the request lands, and a second press
+   * because a rebuild was already running would lift nothing twice.
+   */
+  const pauseTelegram = async (user) => {
+    setBusyUser(user.id);
+    setError('');
+    setNotice('');
+    try {
+      const result = await request(`/api/admin/users/${user.id}/telegram/pause`, token, { method: 'POST', body: { reason: 'admin-manual' } });
+      setNotice(result?.notice || `${user.name}'s Telegram session is paused. The session stays linked, so resuming is a reconnect and not a sign-in.`);
+      await loadUsers();
+    } catch (pauseError) {
+      setError(pauseError.message);
+    } finally {
+      setBusyUser('');
+    }
+  };
+
+  const resumeTelegram = async (user) => {
+    setBusyUser(user.id);
+    setError('');
+    setNotice('');
+    try {
+      const result = await request(`/api/admin/users/${user.id}/telegram/resume`, token, { method: 'POST', body: { reason: 'admin-resume' }, retryWhenUnanswered: true });
+      const caughtUp = Number(result?.caughtUp) || 0;
+      setNotice(`${user.name}'s Telegram session is resumed. ${caughtUp
+        ? `It replayed ${caughtUp} missed message(s) from the pause window.`
+        : 'Nothing was waiting in the channels, which on a quiet channel is the normal answer.'}`);
+      await loadUsers();
+    } catch (resumeError) {
+      setError(resumeError.message);
+    } finally {
+      setBusyUser('');
+    }
+  };
+
   const changeRole = (user, role) => {
     if (role === user.role) return;
     void updateUser(user.id, { role }, role === 'admin' ? `${user.name} is now an administrator.` : `${user.name} is now a standard user.`);
@@ -916,6 +957,9 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
                       {user.telegramConnected
                         ? <small className="admin-reason">Telegram linked · {user.monitorCount ? `${user.monitorCount} monitored channel${user.monitorCount === 1 ? '' : 's'}` : 'no channel monitored yet'}</small>
                         : null}
+                    {/* Read off the same row the buttons act on: a paused workspace is linked, and an operator who
+                        cannot see the pause would read "linked" as "capturing" and wonder why nothing is arriving. */}
+                    {user.telegramPaused ? <small className="admin-reason">Telegram paused · capturing is stopped, the session is still linked</small> : null}
                     </td>
                     <td data-label="Role">
                       <select
@@ -943,7 +987,15 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
                           : <button type="button" className="button button-danger button-small" disabled={busy} onClick={() => startSuspension(user)}>Suspend</button>}
                         <button type="button" className="button button-secondary button-small" disabled={busy || isSelf} onClick={() => (supporting ? closeSupportAccessForm() : openSupportAccess(user))}>Impersonate</button>
                         <button type="button" className="button button-secondary button-small" disabled={busy} onClick={() => (adjusting ? cancelAdjustment() : openAdjustment(user))}>Adjust plan</button>
-                        {user.telegramConnected && !isSelf ? <button type="button" className="button button-secondary button-small" disabled={busy} onClick={() => reconnectTelegram(user)} title="Drop the Telegram connection, sign back in with the stored session, and replay what the channels posted while it was down">{busy ? 'Working…' : 'Reconnect Telegram'}</button> : null}
+                        {/* One Telegram control per state, never two that contradict each other. While a session
+                            is paused the only honest button is the one that un-pauses it - a "Reconnect" sitting
+                            beside a pause invites exactly the press the server is written to refuse. */}
+                        {user.telegramConnected && !isSelf ? (user.telegramPaused
+                          ? <button type="button" className="button button-secondary button-small" disabled={busy} onClick={() => resumeTelegram(user)} title="Lift the pause and reconnect with the stored session - the trader does not have to sign in again">{busy ? 'Working…' : 'Resume Telegram'}</button>
+                          : <>
+                            <button type="button" className="button button-secondary button-small" disabled={busy} onClick={() => pauseTelegram(user)} title="Stop capturing and release the live socket. The stored session is left in place, so the trader stays signed in.">Pause Telegram</button>
+                            <button type="button" className="button button-secondary button-small" disabled={busy} onClick={() => reconnectTelegram(user)} title="Drop the Telegram connection, sign back in with the stored session, and replay what the channels posted while it was down">{busy ? 'Working…' : 'Reconnect Telegram'}</button>
+                          </>) : null}
                       </div>
                     </td>
                   </tr>;

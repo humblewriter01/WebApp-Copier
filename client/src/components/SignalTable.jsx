@@ -1,5 +1,5 @@
 import React from 'react';
-import { LISTENER_NOT_ATTACHED_MESSAGE, useTelegramStatus, WAITING_FOR_MESSAGES_MESSAGE } from './TelegramStatus.jsx';
+import { LISTENER_NOT_ATTACHED_MESSAGE, PAUSED_MESSAGE, useTelegramStatus, WAITING_FOR_MESSAGES_MESSAGE } from './TelegramStatus.jsx';
 import { entryZoneView, signalBadges, signalOutcomeView } from '../lib/signal-outcome.js';
 import { DASHBOARD_SIGNAL_LIMIT, summarizeSignalMessage } from '../lib/signal-summary.js';
 
@@ -20,6 +20,12 @@ export function signalEmptyState({ view, channelCount = 0 } = {}) {
   }
   if (key === 'unavailable') {
     return { tone: 'pending', title: 'Telegram is temporarily unavailable', message: view.detail || 'Telegram sign-in is temporarily unavailable. Please try again later.', action: null };
+  }
+  /* Ahead of `connected`, and for the same reason the state machine puts it first: the server has just said this
+     session is not reading anything, and the sentences below - "waiting for signals", "signed in, not yet reading" -
+     are all promises about messages that will not come. A paused workspace's empty list says it is paused. */
+  if (key === 'paused') {
+    return { tone: 'pending', title: 'Signal copying is paused', message: view?.detail || PAUSED_MESSAGE, action: null };
   }
   if (key === 'connected') {
     return Number(channelCount) > 0

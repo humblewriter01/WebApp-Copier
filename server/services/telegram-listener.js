@@ -347,6 +347,9 @@ export function isValidWorkspaceId(value) {
  * @property {number} [floodWaitMs] - the default wait when the provider asks for one without saying how long
  * @property {number} [ptsGapStrikes] - beats of an unclosable gap before the workspace is asked to sign in
  * @property {number} [gapReauthWindowMs] - the window those strikes have to fall inside
+ * @property {(userId: string) => boolean} [isPaused] - the pause gate: true means this workspace's session was
+ *   stopped on purpose, so a live update still being handled is declined rather than stored and a backlog read that
+ *   was queued before the socket was taken away is not started after it
  * @property {(client: any) => any} [transportFlap] - what the provider's own ping loop last did to this client
  * @property {number} [keepAliveFlapGraceMs] - how recent a flap has to be to excuse one failed beat
  * @property {(userId: string, reason: string, options?: { force?: boolean, escalate?: boolean }) => any} [onDeadStream] -
@@ -361,7 +364,13 @@ export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>}
     catchUpSleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
     silenceSuspectMs = SILENCE_SUSPECT_MS, probeDeadlineMs = STREAM_PROBE_DEADLINE_MS, gapCatchUpMs = GAP_CATCH_UP_MS, gapCatchUpSpreadMs = GAP_CATCH_UP_SPREAD_MS, heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS, ptsStallBeats = PTS_STALL_BEATS, rebuildCooldownMs = STREAM_REBUILD_COOLDOWN_MS,
   differenceMaxSteps = DIFFERENCE_MAX_STEPS, differenceBudgetMs = DIFFERENCE_BUDGET_MS, floodWaitMs = FLOOD_BACKOFF_MS,
-  ptsGapStrikes = PTS_GAP_STRIKES, gapReauthWindowMs = PTS_GAP_REAUTH_WINDOW_MS, transportFlap = null, keepAliveFlapGraceMs = KEEP_ALIVE_FLAP_GRACE_MS, onDeadStream = null, onSessionUnrecoverable = null } = {}) {
+  ptsGapStrikes = PTS_GAP_STRIKES, gapReauthWindowMs = PTS_GAP_REAUTH_WINDOW_MS, transportFlap = null, keepAliveFlapGraceMs = KEEP_ALIVE_FLAP_GRACE_MS, onDeadStream = null, onSessionUnrecoverable = null,
+  /* Whether this workspace has been paused on purpose. Default false, because the listener is built and tested
+     without the pause policy in the room; supplied in production, because a paused session is deliberately dead and
+     must not be counted, replayed, or stored. `ingestMessage` and `runCatchUp` are the two places a paused
+     workspace can still do work after its client is gone - an update already unwinding, and a backlog read that
+     started a moment earlier - and both are answered here rather than by leaving the caller to notice. */
+  isPaused = () => false } = {}) {
   if (!clients || !pool || !saveSignal) throw new Error('createTelegramListener requires clients, pool and saveSignal');
   const startedAt = new Date();
   const catchUpRuns = new Map();
@@ -1113,6 +1122,9 @@ export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>}
      it, so "it was captured" means the same thing in production and in the replay - and so does the edit
      path, which is the same question asked about a post this workspace already stored. */
   async function ingestMessage(userId, message, event, { replayed = false, edited = false } = {}) {
+    // Checked before a single counter moves: a paused workspace is not a deaf one, and recording its last
+    // in-flight message as traffic would put a number on the panel that describes a session nobody is holding.
+    if (isPaused(userId)) return { stored: false, reason: 'PAUSED' };
     const stats = statsFor(userId) || EMPTY_STATS();
     const entry = entryFor(userId);
     if (entry) entry.stats = stats;
@@ -1355,6 +1367,10 @@ export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>}
        coordinated with each other. Whichever arrives second gives up immediately; the flag stays set, so the
        work is not lost, only deferred. */
     if (catchUpInFlight.has(String(userId))) return { ran: false, reason: 'IN_FLIGHT', stored: 0 };
+    /* A backlog read is the one piece of work that can outlive its own client: it was queued by the reconnect that
+       ended it, and it holds the client it started with. For a paused workspace that replay is not a repair, so it
+       is declined here - `needsCatchUp` stays set, which is what lets the resume pick the same work up. */
+    if (isPaused(userId)) return { ran: false, reason: 'PAUSED', stored: 0 };
     const lastRun = catchUpRuns.get(String(userId)) || 0;
     if (now() - lastRun < catchUpCooldownMs) return { ran: false, reason: 'COOLDOWN', stored: 0 };
     catchUpInFlight.add(String(userId));

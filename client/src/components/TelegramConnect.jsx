@@ -235,6 +235,17 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
       </> : view.key === 'unavailable' ? <>
         <p className="muted">{view.detail}</p>
         <div className="button-row"><button className="button button-secondary" type="button" onClick={() => refresh()}>Try again</button></div>
+      </> : view.key === 'paused' ? <>
+        {/* Ahead of the connect form, which is the whole point of this branch. A paused session is linked: its phone
+            number is authorised, its channel list is saved, and the form below would ask for a code and then
+            replace the session string the pause was designed to leave alone. So the page says what is true, offers
+            a re-check, and stops - the two ways out are a plan and a person, and neither of them is this form. */}
+        <p className="muted" role="status" aria-live="polite">{view.detail}</p>
+        <p className="field-help">Your channels, your saved signals and your Telegram sign-in stay exactly as they are - only new messages are on hold.</p>
+        <div className="button-row">
+          <button className="button button-secondary" type="button" onClick={() => refresh()}>Check again</button>
+          <button className="button button-danger" type="button" disabled={busy} onClick={disconnect}>{busy ? 'Disconnecting…' : 'Disconnect Telegram'}</button>
+        </div>
       </> : connected ? <>
         <p className="muted">Your sign-in is protected. Only the groups and channels you choose are monitored.</p>
         <div className="button-row">
