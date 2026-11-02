@@ -9,10 +9,10 @@ const DEFAULT_PRICING = [
   { key: 'premium', name: 'Premium', amount: 99, currency: 'USD', prices: { USD: 99, NGN: 150000 }, interval: 'monthly', description: 'Higher limits for multiple accounts and busy channels.' },
 ];
 const SAMPLE_SIGNALS = [
-  { id: 'xau', symbol: 'XAUUSD', side: 'SELL', entry: '2 612.50', stop: '2 622.00', target: '2 592.00', state: 'Executed', detail: '0.10 lots · 2 s after the post' },
-  { id: 'eur', symbol: 'EURUSD', side: 'BUY', entry: '1.0842', stop: '1.0812', target: '1.0902', state: 'Held for review', detail: 'no price in the message, so nothing was sent' },
+  { id: 'eur-market', type: 'market', symbol: 'EURUSD', order: 'BUY EURUSD @ Market', stop: '1.0812', target: '1.0902', state: 'Executed', detail: 'Filled at 1.0845 · 0.4s after the post' },
+  { id: 'us30-review', type: 'review', symbol: 'US30', order: 'SELL US30 @ 34,250.00', stop: '34,400.00', target: '34,000.00', state: 'Held for review', detail: 'Waiting for price to enter zone. Nothing sent yet.' },
 ];
-const SAMPLE_POSITION = { symbol: 'XAUUSD', side: 'SELL', volume: '0.10', open: '2 612.50', stop: '2 622.00', target: '2 592.00', result: '−48.20 USD' };
+const SAMPLE_POSITION = { symbol: 'EURUSD', side: 'BUY', volume: '0.10', open: '1.0845', stop: '1.0812', target: '1.0902', result: '+12.50 USD' };
 const SAMPLE_RISK = [['Risk per trade', '1 %'], ['Open positions at once', '3'], ['Daily loss limit', '5 %'], ['Stop loss required', 'Yes'], ['Take profit required', 'Yes']];
 const STEPS = [
   ['Point it at your channels', 'Connect Telegram and choose the channels whose signals you want Signal Desk to monitor.'],
@@ -29,9 +29,21 @@ function MockDashboard() {
   return <div className="landing-demo" aria-hidden="false">
     <div className="landing-demo-bar"><span className="landing-demo-title">Signal Desk · workspace</span><span className="landing-demo-tag">Sample data, not a live account</span></div>
     <div className="landing-demo-row landing-demo-switch"><span className="landing-demo-label">Auto-Trading</span><span className="landing-switch" data-on="false"><span className="landing-switch-knob" /></span><span className="landing-demo-note">Off until you turn it on. Turning it on asks you to confirm what that means.</span></div>
-    <div className="landing-demo-signals">{SAMPLE_SIGNALS.map((signal) => <div className="landing-signal" key={signal.id}><span className={`landing-side landing-side-${signal.side.toLowerCase()}`}>{signal.side}</span><span className="landing-symbol">{signal.symbol}<small>{signal.entry} · SL {signal.stop} · TP {signal.target}</small></span><span className="landing-state">{signal.state}<small>{signal.detail}</small></span></div>)}</div>
+    <div className="landing-demo-signals">{SAMPLE_SIGNALS.map((signal) => <article className={`landing-signal landing-signal-${signal.type}`} key={signal.id}>
+      <div className="landing-signal-main">
+        <span className="landing-symbol"><strong>{signal.order}</strong><small> · SL {signal.stop} · TP {signal.target}</small></span>
+        <span className={`landing-signal-badge landing-signal-badge-${signal.type}`}>
+          {signal.type === 'market' && <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.2 8.2 3.1 3.1 6.5-6.6" /></svg>}
+          {signal.type === 'market' ? 'EXECUTED' : 'PENDING'}
+        </span>
+      </div>
+      <div className={`landing-signal-detail landing-signal-detail-${signal.type}`}>
+        {signal.type === 'review' && <strong>{signal.state}</strong>}
+        <span>{signal.detail}</span>
+      </div>
+    </article>)}</div>
     <div className="landing-demo-grid">
-      <div className="landing-panel"><h4>Open position</h4><dl className="landing-pairs"><div><dt>Instrument</dt><dd>{SAMPLE_POSITION.symbol} · {SAMPLE_POSITION.side}</dd></div><div><dt>Volume</dt><dd>{SAMPLE_POSITION.volume}</dd></div><div><dt>Entry</dt><dd>{SAMPLE_POSITION.open}</dd></div><div><dt>Stop / target</dt><dd>{SAMPLE_POSITION.stop} · {SAMPLE_POSITION.target}</dd></div><div><dt>Result so far</dt><dd>{SAMPLE_POSITION.result}</dd></div></dl></div>
+      <div className="landing-panel"><h4>Open position</h4><dl className="landing-pairs"><div><dt>Instrument</dt><dd>{SAMPLE_POSITION.symbol} · {SAMPLE_POSITION.side}</dd></div><div><dt>Volume</dt><dd>{SAMPLE_POSITION.volume}</dd></div><div><dt>Fill price</dt><dd>{SAMPLE_POSITION.open}</dd></div><div><dt>Stop / target</dt><dd>{SAMPLE_POSITION.stop} · {SAMPLE_POSITION.target}</dd></div><div><dt>Result so far</dt><dd className="landing-positive-result">{SAMPLE_POSITION.result}</dd></div></dl></div>
       <div className="landing-panel"><h4>Your limits</h4><dl className="landing-pairs">{SAMPLE_RISK.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl></div>
     </div>
     <p className="landing-demo-foot">Nothing in this picture is connected to anything. No broker, no money, no channel.</p>
@@ -91,8 +103,8 @@ export default function Landing({ onEnterAuth = () => {}, installPrompt = null, 
         <h1>The signal arrived in your channel. The order is already at the broker.</h1>
         <p className="landing-lede">Signal Desk watches the Telegram channels you point it at, reads the signal in each message, and places the order on your own trading account inside your own limits - while you are away from the screen, in a meeting, or on the other side of a chart you were not watching.</p>
         <div className="landing-cta"><button type="button" className="button button-primary" onClick={() => onEnterAuth('register')}>Get Started Free</button><button type="button" className="button button-secondary" onClick={() => onEnterAuth('login')}>Log in</button></div>
+        <p className="landing-fine landing-security-note"><svg className="landing-lock-icon" viewBox="0 0 16 16" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5" /><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" /></svg><span>Read-only Telegram access. Signal Desk can only read the specific channels you pick. No passwords required.</span></p>
         <div className="landing-trust-bar" aria-label="Platform highlights"><span>Executions in &lt;1s</span><i>•</i><span>MT4 &amp; MT5 Supported</span><i>•</i><span>Cloud-based — No VPS</span></div>
-        <p className="landing-fine">Set up takes a workspace, a Telegram session and a trading account.</p>
       </div>
       <MockDashboard />
     </section>
