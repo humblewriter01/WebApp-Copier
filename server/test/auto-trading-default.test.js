@@ -103,4 +103,6 @@ test('the read fallback agrees with the column, and the increase is still refuse
   assert.doesNotMatch(indexSource, /autoTradingEnabled: true[,}]/, 'and no read path defaults upward - that fallback is the contradiction this file exists to close');
   assert.match(indexSource, /if \(autoTradingEnabled\) \{[\s\S]{0,400}Confirm the live-trading warning before Auto-Trading is turned on\. Nothing has been changed\./,
     'the server still makes the confirmation mandatory for an increase, which is the gate a new workspace now reaches on its first switch upward');
+  assert.match(indexSource, /Auto-Trading is off by default for new workspaces; review your Risk Settings and confirm the live-trading warning before turning it on\./,
+    'the dashboard status message agrees with the safe default and explicit-confirmation flow');
 });

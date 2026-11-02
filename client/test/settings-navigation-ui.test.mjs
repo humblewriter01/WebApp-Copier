@@ -117,6 +117,7 @@ test('a support session sees the workspace but cannot change its account', () =>
 
 const resetModule = readSource('lib', 'password-reset.js');
 const appSource = readSource('App.jsx');
+const authSource = readSource('components', 'AuthScreen.jsx');
 const profileSource = readSource('components', 'ProfileSettings.jsx');
 
 test('both surfaces ask for the reset email through the same helper', () => {
@@ -126,7 +127,7 @@ test('both surfaces ask for the reset email through the same helper', () => {
     assert.equal(calls <= 1, true, `${file} does not get its own copy of the reset call`);
   }
   assert.equal(resetModule.includes('client.auth.resetPasswordForEmail'), true, 'the one copy is in the helper');
-  assert.match(appSource, /await sendPasswordResetEmail\(form\.email\)/, 'the sign-in screen uses it');
+  assert.match(authSource, /await sendPasswordResetEmail\(form\.email\)/, 'the sign-in screen uses it');
   assert.match(profileSource, /await sendPasswordResetEmail\(email\)/, 'and so does Profile');
   assert.match(profileSource, /PASSWORD_RESET_SENT/, 'the sentence after sending is the same sentence the sign-in screen shows');
 });
