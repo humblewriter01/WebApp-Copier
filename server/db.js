@@ -155,6 +155,7 @@ const SCHEMA_SQL = `
     );
     ALTER TABLE metaapi_accounts ADD COLUMN IF NOT EXISTS server TEXT;
     ALTER TABLE metaapi_accounts ADD COLUMN IF NOT EXISTS managed_by_app BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE metaapi_accounts ADD COLUMN IF NOT EXISTS encrypted_api_token TEXT;
     ALTER TABLE signals ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'legacy';
     ALTER TABLE signals ADD COLUMN IF NOT EXISTS telegram_message_id TEXT;
     ALTER TABLE signals ADD COLUMN IF NOT EXISTS execution_ready BOOLEAN NOT NULL DEFAULT FALSE;

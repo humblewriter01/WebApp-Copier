@@ -66,6 +66,7 @@ test('the columns this app ships are each their own statement', () => {
   for (const needle of [
     'execution_jobs ADD COLUMN IF NOT EXISTS next_attempt_at',
     'metaapi_accounts ADD COLUMN IF NOT EXISTS execution_note ',
+    'metaapi_accounts ADD COLUMN IF NOT EXISTS encrypted_api_token TEXT',
     // The three pause columns, one statement each. They are `IF NOT EXISTS` and they are separate statements
     // because a single `ALTER TABLE ... ADD COLUMN a, ADD COLUMN b` on a table that already has one of them is
     // the statement that fails the whole migration on an existing database - and because the comment above them

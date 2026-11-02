@@ -172,11 +172,33 @@ test('returns funding-related provider errors verbatim with a funding classifica
       metaApiRequest('server-token', '/users/current/accounts'),
       (error) => error.metaApiStatus === 402
         && error.metaApiErrorType === 'funding'
+        && error.metaApiRawResponse.includes('Insufficient balance. Please deposit funds before creating another account.')
+        && error.metaApiRawResponse.includes('E_INSUFFICIENT_FUNDS')
         && error.userMessage.includes('HTTP 402')
         && error.userMessage.includes('E_INSUFFICIENT_FUNDS')
         && error.userMessage.includes('Insufficient balance. Please deposit funds before creating another account.')
         && !error.userMessage.includes('Bad Request'),
     );
+  } finally { restoreGlobals(); }
+});
+
+test('retains structured provider diagnostics for logs while redacting the supplied token', async () => {
+  process.env.META_API_URL = 'https://metaapi.example.test';
+  const token = 'custom_metaapi_token_0123456789';
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    message: `Funding blocked for account ${token}`,
+    details: { code: 'E_FUNDING_REQUIRED', api_token: token, accountId: 'acct-safe', reason: 'deposit needed' },
+  }), { status: 403 });
+  try {
+    await assert.rejects(metaApiRequest(token, '/users/current/accounts'), (error) => {
+      assert.equal(error.metaApiStatus, 403);
+      assert.match(error.metaApiRawResponse, /E_FUNDING_REQUIRED/);
+      assert.match(error.metaApiRawResponse, /acct-safe/);
+      assert.match(error.metaApiRawResponse, /deposit needed/);
+      assert.equal(error.metaApiRawResponse.includes(token), false, 'the raw diagnostic cannot leak the BYO token');
+      assert.match(error.metaApiRawResponse, /api_token.*redacted/);
+      return true;
+    });
   } finally { restoreGlobals(); }
 });
 
