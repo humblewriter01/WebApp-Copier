@@ -61,6 +61,9 @@ import { KEEP_ALIVE_FLAP_GRACE_MS } from './telegram-keepalive.js';
  */
 export const CATCH_UP_LIMIT = 15;
 
+/** Historical Telegram updates older than this sync window are ignored before any storage or socket work. */
+export const MAX_HISTORY_SYNC_MS = 15 * 60 * 1000;
+
 /**
  * How many monitored channels one catch-up page reads, and how many pages a single pass is allowed.
  *
@@ -1125,6 +1128,17 @@ export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>}
     // Checked before a single counter moves: a paused workspace is not a deaf one, and recording its last
     // in-flight message as traffic would put a number on the panel that describes a session nobody is holding.
     if (isPaused(userId)) return { stored: false, reason: 'PAUSED' };
+    const arrivedAt = now();
+    // A newly connected MTProto session can deliver its historical difference in a burst. Ignore old posts
+    // before touching counters, querying monitored channels, writing a row, or reaching saveSignal's socket emit.
+    // Use editDate when Telegram provides one so a current correction to an old post remains a real-time update,
+    // including when the correction is discovered during catch-up before the stored text comparison marks it edited.
+    const historyStampMs = Number(message?.editDate ?? message?.date) * 1000;
+    const historyDelayMs = Number.isFinite(historyStampMs) && historyStampMs > 0 ? Math.max(0, arrivedAt - historyStampMs) : null;
+    if (historyDelayMs !== null && historyDelayMs > MAX_HISTORY_SYNC_MS) {
+      log('debug', 'Historical message ignored', { userId, messageId: message?.id ?? null, delayMs: historyDelayMs, replayed: replayed === true, edited: edited === true });
+      return { stored: false, reason: 'HISTORICAL' };
+    }
     const stats = statsFor(userId) || EMPTY_STATS();
     const entry = entryFor(userId);
     if (entry) entry.stats = stats;
@@ -1135,7 +1149,6 @@ export function createTelegramListener(/** @type {Partial<TelegramListenerDeps>}
       // tell a stream of edits from a socket that had stopped delivering them.
       if (edited) stats.edits = (stats.edits || 0) + 1;
       const chatId = resolveTelegramChatId(message, event);
-      const arrivedAt = now();
       stats.lastAt = new Date(arrivedAt).toISOString();
       stats.lastChatId = chatId || null;
       stats.lastMessageId = message?.id ?? null;
