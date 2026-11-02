@@ -227,7 +227,7 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
         {sourceNote.action === 'choose' && onOpenTelegram ? <button type="button" className="text-button" onClick={onOpenTelegram}>Choose channels</button> : null}
         {sourceNote.action === 'connect' && onOpenTelegram && view.showConnectCallToAction ? <button type="button" className="text-button" onClick={onOpenTelegram}>Connect Telegram</button> : null}
       </div> : null}
-      <div className="note-box">Adding an account does not place a trade by itself, but Auto-Trading is ON by default for new workspaces: once a deployed account is selected, new eligible signals may place orders. Turn it off in Advanced Settings to stop that. MetaAPI usage limits or charges may apply.</div>
+      <div className="note-box">Adding an account does not place a trade by itself. Auto-Trading is OFF by default for new workspaces, and you must explicitly confirm the live-trading warning before it can place new orders. Review your Risk Settings and turn Auto-Trading off at any time. MetaAPI usage limits or charges may apply.</div>
     </section>
 
     <section className="panel" aria-labelledby="metaapi-accounts-title">

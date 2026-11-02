@@ -53,6 +53,7 @@ const { default: Landing } = await import(pathToFileURL(outfile).href);
 
 const landingSource = readFileSync(path.join(srcDir, 'components', 'Landing.jsx'), 'utf8');
 const appSource = readFileSync(path.join(srcDir, 'App.jsx'), 'utf8');
+const authSource = readFileSync(path.join(srcDir, 'components', 'AuthScreen.jsx'), 'utf8');
 const cssSource = readFileSync(path.join(srcDir, 'styles.css'), 'utf8');
 
 async function mount(props = {}) {
@@ -120,7 +121,7 @@ test('Get Started and Log in open their named auth flows, with recovery kept ins
   await act(async () => { buttonNamed(host, 'Log in').click(); });
   assert.deepEqual(entered, ['register', 'login'], 'Log in opens sign-in');
   assert.equal(buttonNamed(host, 'Forgotten a password?'), undefined, 'password recovery is not promoted on the public landing page');
-  assert.match(appSource, /Forgot Password\?/i, 'the password recovery link remains in the actual login form');
+  assert.match(authSource, /Forgot Password\?/i, 'the password recovery link remains in the actual login form');
   await unmount();
 });
 

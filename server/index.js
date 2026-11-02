@@ -1626,7 +1626,7 @@ app.get('/api/dashboard', authenticate, asyncRoute(async (req, res) => {
     signalsLastCaptureAt: dashboardSignals.lastCaptureAt,
     settings: settings.rows[0] || { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 5, dailyLossLimit: 5, autoTradingEnabled: false },
     subscription: { status: subscription.rows[0]?.status || null, plan: subscription.rows[0]?.plan || null },
-    trading: { liveExecutionEnabled: autoTradingRuntimeEnabled, autoTradingEnabled: settings.rows[0]?.autoTradingEnabled === true, message: autoTradingRuntimeEnabled ? 'Auto-Trading starts on for new workspaces; review the live-trading warning and turn it off in Advanced Settings whenever you want.' : 'Automatic execution is unavailable right now. Signals can still be reviewed.' },
+    trading: { liveExecutionEnabled: autoTradingRuntimeEnabled, autoTradingEnabled: settings.rows[0]?.autoTradingEnabled === true, message: autoTradingRuntimeEnabled ? 'Auto-Trading is off by default for new workspaces; review your Risk Settings and confirm the live-trading warning before turning it on.' : 'Automatic execution is unavailable right now. Signals can still be reviewed.' },
   });
 }));
 
