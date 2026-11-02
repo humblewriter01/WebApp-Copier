@@ -4,7 +4,7 @@
  * The toggle is the only part of the two-currency work a trader ever sees, so it is tested the way the rest of
  * this directory tests a component: the pure helpers are called, the rendered markup is asserted where a
  * component renders from props, and the copy that only appears after a fetch is pinned to the source it comes
- * from. Three things must stay true no matter what the API sends: naira is the default, the price shown and the
+ * from. Three things must stay true no matter what the API sends: USD is the fresh-view default, the price shown and the
  * price charged are read from the same per-currency field, and the words that describe the machinery - kobo,
  * `tx_ref`, payload hashes, plan codes - never reach a trader's screen.
  */
@@ -96,26 +96,35 @@ test('naira and dollars are printed as the money they are', () => {
 
 /* ---------------------------------------------------------------------------- the switch ---------------------------------------------------------------------------- */
 
-test('the switch offers both currencies, pressed on naira, with dollars one click away', () => {
-  const html = renderToStaticMarkup(React.createElement(CurrencyToggle, { value: 'NGN', available: ['NGN', 'USD'] }));
+test('the switch defaults to USD and keeps NGN one click away', () => {
+  const html = renderToStaticMarkup(React.createElement(CurrencyToggle, { available: ['NGN', 'USD'] }));
   assert.match(html, /aria-label="Price currency"/);
-  assert.match(html, /class="billing-currency-button active"[^>]*aria-pressed="true"[^>]*>NGN</, 'naira is the default view');
-  assert.match(html, /aria-pressed="false"[^>]*>USD</);
+  assert.match(html, /class="billing-currency-button active"[^>]*aria-pressed="true"[^>]*>USD</, 'USD is the default view');
+  assert.match(html, /aria-pressed="false"[^>]*>NGN</);
   assert.equal((html.match(/billing-currency-button/g) || []).length, 2, 'exactly two choices, no dropdown to open');
 });
 
+test('the billing toggle can still be manually changed to NGN', () => {
+  let selected = 'USD';
+  const toggle = CurrencyToggle({ value: selected, available: ['NGN', 'USD'], onChange: (code) => { selected = code; } });
+  const ngnButton = toggle.props.children.find((button) => button.key === 'NGN');
+  assert.ok(ngnButton);
+  ngnButton.props.onClick();
+  assert.equal(selected, 'NGN');
+});
+
 test('a currency with no price is shown, disabled, and titled honestly', () => {
-  const html = renderToStaticMarkup(React.createElement(CurrencyToggle, { value: 'NGN', available: ['NGN'] }));
-  const usd = html.slice(html.lastIndexOf('<button', html.indexOf('>USD<')), html.indexOf('>USD<'));
-  assert.match(usd, /disabled=""/, 'it is visible and unpressable, which reads as "not yet", not as "broken"');
-  assert.match(usd, /aria-pressed="false"/);
-  assert.match(usd, /Not offered in this currency yet/);
-  const naira = html.slice(html.lastIndexOf('<button', html.indexOf('>NGN<')), html.indexOf('>NGN<'));
-  assert.doesNotMatch(naira, /disabled=""/);
-  assert.match(naira, /Show prices in naira/, 'the currency that is available still explains what pressing it does');
+  const html = renderToStaticMarkup(React.createElement(CurrencyToggle, { value: 'USD', available: ['USD'] }));
+  const ngn = html.slice(html.lastIndexOf('<button', html.indexOf('>NGN<')), html.indexOf('>NGN<'));
+  assert.match(ngn, /disabled=""/, 'it is visible and unpressable, which reads as "not yet", not as "broken"');
+  assert.match(ngn, /aria-pressed="false"/);
+  assert.match(ngn, /Not offered in this currency yet/);
+  const dollar = html.slice(html.lastIndexOf('<button', html.indexOf('>USD<')), html.indexOf('>USD<'));
+  assert.doesNotMatch(dollar, /disabled=""/);
+  assert.match(dollar, /Show prices in US dollars/, 'the currency that is available still explains what pressing it does');
 
   // A workspace that publishes one currency has nothing to switch between, and does not pretend otherwise.
-  assert.equal(CurrencyToggle({ value: 'NGN', options: ['NGN'], available: ['NGN'] }), null, 'one option is not a choice');
+  assert.equal(CurrencyToggle({ value: 'USD', options: ['USD'], available: ['USD'] }), null, 'one option is not a choice');
 });
 
 /* --------------------------------------------------------------------- what the provider is told ---------------------------------------------------------------------- */
@@ -250,7 +259,7 @@ test('the rendered currency control speaks in prices, not in payment rails', () 
 test('the billing page sends the currency it is showing and says nothing about the machinery', () => {
   assert.match(sources.billing, /body: \{ plan: planKey, currency, promoCode/, 'the checkout request carries the picked currency');
   assert.match(sources.billing, /&currency=\$\{encodeURIComponent\(quotedCurrency\)\}/, 'and so does the promo quote');
-  assert.match(sources.billing, /const \[currency, setCurrency\] = useState\('NGN'\)/, 'naira first, before anything has loaded');
+  assert.match(sources.billing, /const \[currency, setCurrency\] = useState\('USD'\)/, 'USD is selected in a fresh billing session');
   assert.match(sources.billing, /priceFor\(plan, payCurrency\)/, 'a card is priced in the picked currency');
   assert.match(sources.billing, /Not sold in \{payCurrency\}/, 'and says so plainly when there is no price in it');
   assert.match(sources.billing, /unpriced \? `Unavailable in \$\{payCurrency\}`/, 'the button explains why it cannot be pressed');
