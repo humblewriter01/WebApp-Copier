@@ -1,6 +1,7 @@
 import React from 'react';
 import RiskWarningModal, { needsRiskAcknowledgement, RISK_REMINDER, RISK_WARNING_COPY } from './RiskWarningModal.jsx';
 import SettingsSection from './SettingsSection.jsx';
+import BrokerAccessNote from './BrokerAccessNote.jsx';
 import { autoTradingBannerView } from '../lib/platform-view.js';
 // The order outcomes list is a trader's screen too: a rejected order's raw answer - a retcode, a provider body,
 // the endpoint that timed out - is written by the engine into `trades.error_message`, and belongs in the log.
@@ -244,7 +245,7 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
               </option>)}
             </select>
           </label>
-          {!connectedAccounts.length && <p className="field-help">Connect and select a deployed MT4/MT5 account before any orders can be placed. Signals are not executed until an owned account is selected.</p>}
+          {connectedAccounts.length > 0 ? <BrokerAccessNote className="broker-access-note-compact" /> : <p className="field-help">Connect and select a deployed MT4/MT5 account before any orders can be placed. Signals are not executed until an owned account is selected.</p>}
 
           <div className="execution-section-heading">
             <h4>Lot Size</h4>

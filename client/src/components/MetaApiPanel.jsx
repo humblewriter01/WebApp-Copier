@@ -3,6 +3,7 @@ import { request } from '../lib/api.js';
 import { useTelegramStatus } from './TelegramStatus.jsx';
 import { friendlySignalNote } from '../lib/user-note.js';
 import { MetaApiStatusPill, useMetaApiStatus } from './MetaApiStatus.jsx';
+import BrokerAccessNote from './BrokerAccessNote.jsx';
 // Provisioning writes a sentence for this field and the runtime sometimes writes what the SDK threw at it; only
 // the first kind was written for a trader, so both go through the filter that tells them apart.
 
@@ -207,8 +208,9 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
         <label htmlFor="metaapi-server">Broker server
           <input id="metaapi-server" value={form.server} onChange={(event) => setForm({ ...form, server: event.target.value })} placeholder="Server name shown by your broker" maxLength={160} autoComplete="off" required />
         </label>
-        <small className="field-help">Use the exact server name shown by your broker. For monitoring, choose an investor/read-only password on MetaAPI if your broker offers one.</small>
+        <small className="field-help">Use the exact server name from your broker. If offered, an investor/read-only password is suitable for monitoring.</small>
         <button className="button button-primary" type="submit" disabled={busy || loading || !form.name.trim() || !form.server.trim()}>{busy ? 'Preparing secure setup…' : 'Create secure setup link'}</button>
+        <BrokerAccessNote />
       </form> : setup.key === 'unavailable' ? <div className="empty-state compact-empty"><strong>Account setup is not available yet</strong><span>Please ask the workspace owner to finish setting up account connections.</span></div> : <div className="setup-pending" aria-busy={setup.key === 'checking'}>
         <span className="skeleton skeleton-block" aria-hidden="true" />
         <span className="skeleton skeleton-block short" aria-hidden="true" />
@@ -235,6 +237,7 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
         <div><p className="eyebrow">TRADING ACCOUNTS</p><h2 id="metaapi-accounts-title">Connected trading accounts</h2></div>
         <button type="button" className="button button-secondary button-small" disabled={busy || loading} onClick={refresh}>{loading ? 'Loading…' : 'Refresh'}</button>
       </div>
+      <BrokerAccessNote />
       {setupLink && <div className="secure-link-card" role="status">
         <strong>Finish setup on MetaAPI</strong>
         <p>The secure link is valid for seven days. Your broker password is entered on MetaAPI, not stored by Signal Desk.</p>
