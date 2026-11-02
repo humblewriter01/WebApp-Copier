@@ -322,7 +322,8 @@ function toIso(value) {
 
 export const CAPTURE_STATE_SELECT = `SELECT
   (SELECT count(*) FROM users WHERE telegram_connected=TRUE)::int AS connected_users,
-  (SELECT count(*) FROM users WHERE telegram_connected=TRUE AND telegram_session IS NOT NULL)::int AS restorable_sessions,
+  (SELECT count(*) FROM users WHERE telegram_connected=TRUE AND telegram_session IS NOT NULL AND telegram_paused=FALSE)::int AS restorable_sessions,
+  (SELECT count(*) FROM users WHERE telegram_paused=TRUE)::int AS paused_users,
   (SELECT count(*) FROM channels WHERE enabled=TRUE)::int AS monitored_channels,
   (SELECT max(created_at) FROM signals) AS last_signal_at`;
 
@@ -330,6 +331,7 @@ export function mapCaptureState(row = {}) {
   return {
     connectedUsers: Number(row.connected_users ?? 0),
     restorableSessions: Number(row.restorable_sessions ?? 0),
+    pausedUsers: Number(row.paused_users ?? 0),
     monitoredChannels: Number(row.monitored_channels ?? 0),
     lastSignalAt: toIso(row.last_signal_at),
   };

@@ -339,7 +339,11 @@ test('both timers are guarded, on a named interval, and the beat reports memory 
      on the whole function, because the prose beside it legitimately contains some of these words - a comment
      about an MTProto session is not a field named `session`. */
   const fields = [...sample.matchAll(/^\s{4}([A-Za-z][\w$]*):/gm)].map((match) => match[1]);
-  assert.deepEqual(fields, ['heapUsedMb', 'externalMb', 'arrayBuffersMb', 'rssMb', 'telegramClients', 'telegramLogins', 'keepAliveGuardedClients', 'rebuildsInFlight'], 'the sample is these eight numbers, in order, and no more');
+  /* `telegramPaused` sits beside `telegramClients` because the pair is the whole diagnosis: the first is how many
+     sockets this process is holding, the second is how many it has been *told* not to hold. A pause that freed
+     nothing shows up here as those two numbers refusing to converge, which is the fact an operator needs and
+     cannot get from the heap curve. */
+  assert.deepEqual(fields, ['heapUsedMb', 'externalMb', 'arrayBuffersMb', 'rssMb', 'telegramClients', 'telegramLogins', 'keepAliveGuardedClients', 'telegramPaused', 'rebuildsInFlight'], 'the sample is these nine numbers, in order, and no more');
   const redacted = ['phoneNumber', 'token', 'apiToken', 'metaApiToken', 'session', 'password'];
   for (const field of fields) assert.equal(redacted.includes(field), false, `${field} is not a name the log line silently drops`);
 });

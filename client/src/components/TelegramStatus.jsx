@@ -21,6 +21,24 @@ export const WAITING_FOR_MESSAGES_MESSAGE = 'Telegram is connected. Waiting for 
  * not keeping, and this state is exactly the one that hid a dropped-message defect for so long: the
  * panel re-attaches the handler when the status is read, so the message names the moment, not a fault.
  */
+/*
+ * The two sentences a paused session is allowed to say, and the reason they are two. A pause caused by idleness is
+ * a policy the account can end by upgrading, so the sentence names that way out; a pause caused by support is a
+ * decision about this specific account, and telling its owner to upgrade would be selling them their own release.
+ * The server sends the cause and never a sentence, because the cause is data and the sentence is this file's job.
+ */
+export const PAUSED_IDLE_MESSAGE = 'Your Telegram connection is paused due to inactivity. Upgrade to a paid plan or contact support to resume live signal copying.';
+export const PAUSED_BY_SUPPORT_MESSAGE = 'Your Telegram connection was paused by support. Contact support to have it resumed when you need live signal copying again.';
+/** The fallback for a pause whose cause the row does not record - true of every pause, and a guess at none of them. */
+export const PAUSED_MESSAGE = 'Your Telegram connection is paused, so new messages are not being copied. Contact support to have it resumed.';
+
+/** The sentence for one pause, chosen by its cause and by nothing else. */
+export function pausedCopy(reason) {
+  if (reason === 'idle-free-plan') return PAUSED_IDLE_MESSAGE;
+  if (reason === 'admin-manual') return PAUSED_BY_SUPPORT_MESSAGE;
+  return PAUSED_MESSAGE;
+}
+
 export const LISTENER_NOT_ATTACHED_MESSAGE = 'Telegram is signed in, but this session is not receiving messages yet. Open this page again and the next message will be captured.';
 
 const UNKNOWN_STATE = Object.freeze({
@@ -29,6 +47,11 @@ const UNKNOWN_STATE = Object.freeze({
   configured: null,
   // Whether the event handler is attached, as the server last said. Unknown, not false, until it says.
   listening: null,
+  /* A paused session is a third thing - neither connected nor disconnected - and it arrives as its own field
+     rather than as `connected: false`, because the server has just said the account is still linked. Folding the
+     two together is what would send a paused trader to the sign-in screen. */
+  paused: false,
+  pauseReason: null,
   message: null,
   error: null,
   stale: false,
@@ -55,12 +78,17 @@ export function telegramStatusReducer(state = UNKNOWN_STATE, action = {}) {
         message: typeof result.message === 'string' ? result.message : null,
         // Only the endpoint may say whether the listener is attached; a local sign-in flow cannot.
         listening: typeof result.listening === 'boolean' ? result.listening : null,
+        /* The same rule as `listening` for the endpoint's answer, and the opposite one for a local flow: a sign-in
+           or a sign-out has genuinely changed the session, so it drops the pause notice rather than leaving one
+           nobody can dismiss. Only the next poll restores it, and the next poll is the truth. */
+        paused: typeof result.paused === 'boolean' ? result.paused : false,
+        pauseReason: typeof result.pauseReason === 'string' ? result.pauseReason : null,
       }, action);
     }
     case 'reject':
       return statusFailed(state, action);
     case 'mark-disconnected':
-      return statusSettled({ ...state, connected: false, listening: null }, action);
+      return statusSettled({ ...state, connected: false, listening: null, paused: false, pauseReason: null }, action);
     case 'reset':
       return UNKNOWN_STATE;
     default:
@@ -75,8 +103,14 @@ export function telegramStatusReducer(state = UNKNOWN_STATE, action = {}) {
  * not possible right now.
  */
 export function telegramConnectionView(state = UNKNOWN_STATE) {
-  const { connected, configured, error, message, stale, checkedAt, listening } = state;
+  const { connected, configured, error, message, stale, checkedAt, listening, paused, pauseReason } = state;
   const base = { connected: connected === true, configured, stale: Boolean(stale), checkedAt: checkedAt || null };
+  /* First branch, ahead of every other one, including `connected`. A pause that arrived beside a stale `connected:
+     true` is still a pause - the server ends the socket and the two answers cross on the wire - and a surface that
+     rendered "connected, waiting for messages" over it would be promising copying that has been switched off. */
+  if (paused === true) {
+    return { ...base, connected: false, key: 'paused', known: true, paused: true, showConnectCallToAction: false, label: 'Telegram paused', tone: 'pending', listening: false, detail: pausedCopy(pauseReason) };
+  }
   if (connected === null) {
     return error
       ? { ...base, key: 'unreachable', known: false, showConnectCallToAction: false, label: 'Status unavailable', tone: 'pending', detail: 'Telegram status could not be checked right now.' }
@@ -151,6 +185,7 @@ export function monitoringLabel({ view, channelCount = 0 } = {}) {
   if (view.key === 'disconnected') return { key: 'disconnected', text: 'Telegram not connected', live: false };
   if (view.key === 'unavailable') return { key: 'unavailable', text: 'Telegram unavailable', live: false };
   if (view.key === 'unreachable') return { key: 'unreachable', text: 'Status unavailable', live: false };
+  if (view.key === 'paused') return { key: 'paused', text: 'Signal copying paused', live: false };
   if (!Number(channelCount)) return { key: 'no-channels', text: 'No channels selected', live: false };
   /*
    * `listening === false` is the one state the server can prove and the pill could previously

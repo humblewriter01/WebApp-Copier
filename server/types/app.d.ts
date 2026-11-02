@@ -105,6 +105,12 @@ interface Error {
   telegramReconnectFailed?: boolean;
   /** Set when there was no stored session to reconnect at all, which is a different answer to the user than a failed attempt. */
   telegramNoSession?: boolean;
+  /** Set by the pause control when the workspace had no *linked* session for a pause to apply to: nothing was written, so the operator's answer is 409 rather than a green "paused". */
+  telegramPauseNoSession?: boolean;
+  /** Set when a resume lifted the flag but the reconnect refused: the workspace is un-paused and the sweep owns the retry, which is not the same failure as a pause that never happened. */
+  telegramResumeReconnectFailed?: boolean;
+  /** Set by the pause gate on a restore that refused to run, so the caller can answer "resume it first" instead of wrapping it as a transport failure. */
+  telegramSessionPaused?: boolean;
   /** Set by the Telegram transport on a flood wait: how long to wait, and what was being sent. Read by `floodBackoffMs` in `telegram-listener.js`. */
   seconds?: number;
   capture?: unknown;

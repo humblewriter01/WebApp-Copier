@@ -25,6 +25,7 @@ import { HEARTBEAT_INTERVAL_MS, createTelegramListener, isValidWorkspaceId } fro
 import { createTelegramKeepAliveGuard, createUnhandledRejectionGuard, isProviderKeepAliveTimeout } from './services/telegram-keepalive.js';
 import { createPassGuard, createSingleFlight } from './services/single-flight.js';
 import { createTelegramReconnectPolicy } from './services/telegram-reconnect.js';
+import { createTelegramPauseControl, isValidPauseReason, PAUSE_REASON_ADMIN, PAUSE_REASONS, selectCaptureCandidates } from './services/telegram-pause.js';
 import { createMetaApiTradingAdapter } from './services/metaapi-trading.js';
 import { createExecutionEngine, PLATFORM_PAUSE_MESSAGE } from './services/execution-engine.js';
 import { createExecutionWorker } from './services/execution-worker.js';
@@ -680,6 +681,10 @@ const telegramCapture = createTelegramListener({
   pool,
   log: (level, message, meta) => log(level, message, meta),
   saveSignal: (userId, message, channel) => saveSignal(userId, message, channel),
+  /* Deliberately a question about policy rather than a flag on the entry: the entry is gone by the time a pause is
+     over, and the two pieces of work that can still arrive for a paused workspace - a live update that was already
+     being handled, and a catch-up queued before the socket was taken away - both outlive it. */
+  isPaused: (userId) => telegramPause.isPaused(userId),
   /* The listener decides *when* a stream is not a stream; only this file can rebuild one, because a rebuild is
      a disconnect, a fresh authorized client, a re-attach and a replay. Handing the callback down instead of
      importing it keeps the watchdog testable without a server: a test injects a spy and asserts it fired.
@@ -823,6 +828,26 @@ const telegramReconnect = createTelegramReconnectPolicy({
   isConnected: (client) => telegramAdapter.isConnected(client),
 });
 
+/*
+ * The pause policy, built on the two things a pause has to agree with: the same `forget` the reconnect path uses, so
+ * a pause and a rebuild cannot leave the client map in two different shapes, and the same `restoreTelegramClient`
+ * a resume goes back through, so un-pausing is a reconnect rather than a second, weaker rebuild nobody tested.
+ * `isPaused` is handed to the listener as well: a session that was paused on purpose is a session whose in-flight
+ * work - the update already unwinding, the backlog read already queued - has to be declined, not counted.
+ */
+const telegramPause = createTelegramPauseControl({
+  clients: telegramClients,
+  pool,
+  log: (level, message, meta) => log(level, message, meta),
+  endClient: (client) => telegramAdapter.destroyClient(client),
+  releaseClient: (client) => telegramKeepAlive.release(client),
+  forget: (userId, entry) => telegramReconnect.forget(userId, entry),
+  isLive: (client) => telegramAdapter.isConnected(client),
+  resetBaseline: (userId) => telegramCapture.resetStreamBaseline(userId),
+  restoreClient: (userId, options) => restoreTelegramClient(userId, options),
+  audit: auditLog,
+});
+
 const telegramBeatGuard = createPassGuard({
   name: 'telegram-heartbeat',
   overrunAfterMs: HEARTBEAT_INTERVAL_MS,
@@ -848,6 +873,10 @@ function memorySample() {
     telegramClients: telegramClients.size,
     telegramLogins: telegramLogins.size,
     keepAliveGuardedClients: telegramKeepAlive.stats().clients,
+    /* Beside `telegramClients` and on purpose: the number that explains a heap that will not come down is "how many
+       sockets should this process be holding", and a pause whose memory did not follow it is the failure this line
+       exists to make visible rather than infer from the graph. */
+    telegramPaused: telegramPause.size(),
     rebuildsInFlight: telegramRestoreFlight.size(),
   };
   const previous = lastMemorySample;
@@ -870,7 +899,18 @@ function memorySample() {
  * socket that had been destroyed by the click that refused them.
  */
 async function restoreTelegramClient(userId, { reason = 'restore', force = false, escalate = false, strict = false } = {}) {
-  const outcome = await telegramRestoreFlight.run(userId, () => rebuildTelegramClient(userId, { reason, force, escalate }));
+  /* Every reviver in this file comes through here - the boot pass, the 60-second sweep, the status route's
+     self-heal, the heartbeat's dead-stream callback, a channel switched on, an administrator's button - so this is
+     the one place where "a paused session is not to be brought back" can be made true rather than hoped for. The
+     database read inside `rebuildTelegramClient` stays the authority; this is the cheap refusal that keeps a paused
+     workspace from being entered into the latch sixty times an hour, and the only thing a stale copy of this set
+     can cause is one rebuild that the row check then declines. */
+  if (telegramPause.isPaused(userId)) {
+    log('debug', 'Telegram restore declined for a paused session', { userId, reason });
+    if (strict) throw telegramPause.pausedError();
+    return null;
+  }
+  const outcome = await telegramRestoreFlight.run(userId, () => rebuildTelegramClient(userId, { reason, force, escalate, strict }));
   const state = telegramReconnect.classify(outcome, telegramClients.get(userId)?.client || null);
   if (state.status === telegramReconnect.IN_FLIGHT) {
     /* Another pass is rebuilding this workspace and this one built nothing. For a strict caller that is a refusal
@@ -891,7 +931,7 @@ async function restoreTelegramClient(userId, { reason = 'restore', force = false
   return state.client;
 }
 
-async function rebuildTelegramClient(userId, { reason = 'restore', force = false, escalate = false } = {}) {
+async function rebuildTelegramClient(userId, { reason = 'restore', force = false, escalate = false, strict = false } = {}) {
   const current = telegramClients.get(userId);
   /* Two reasons to step past the "already listening" shortcut, and they are different asks. `escalate` is the
      watchdog's: the socket is up and the handler is attached, and the stream is still deaf, so the session itself
@@ -936,7 +976,18 @@ async function rebuildTelegramClient(userId, { reason = 'restore', force = false
       log('info', 'Telegram rebuild left a replaced entry in place', { userId, reason });
     }
   }
-  const { rows } = await pool.query('SELECT telegram_session FROM users WHERE id=$1', [userId]);
+  const { rows } = await pool.query('SELECT telegram_session,telegram_paused FROM users WHERE id=$1', [userId]);
+  if (rows[0]?.telegram_paused === true) {
+    /* The flag outranks the in-memory gate, and finding it *here* - after the old client was ended, before a new
+       one is built - is what makes the two orders of a pause correct in both directions: a pause that lands while a
+       rebuild is in flight still ends the session (the client we just built is discarded below), and a rebuild that
+       starts before the gate is refreshed still does not produce one. The gate is repaired on the way out, so the
+       next arrival is refused cheaply instead of rediscovering this every time. */
+    telegramPause.markPaused(userId);
+    log('info', 'Telegram rebuild declined for a paused session', { userId, reason });
+    if (strict) throw telegramPause.pausedError();
+    return null;
+  }
   if (!rows[0]?.telegram_session) {
     if (current) telegramClients.delete(userId);
     return null;
@@ -981,6 +1032,17 @@ async function rebuildTelegramClient(userId, { reason = 'restore', force = false
      whole point - an authorized GramJS client with a live socket does not stop because nothing points at it.
      The per-workspace latch above makes this branch unreachable in the ordinary case, which is why it logs at
      warn when it is not: it means a path reached a rebuild that did not come through here. */
+  if (telegramPause.isPaused(userId)) {
+    /* The pause won the race. This pass is holding a finished, authorized client that nobody asked for any more,
+       and installing it would put a live socket back on a workspace an operator - or the free-plan sweep - had
+       just decided was not using one, so the client is ended here, exactly as the lost-race branch below ends its
+       own. `telegram_connected` keeps its value either way: a pause is a decision about this process, not a
+       statement about the session. */
+    log('warn', 'Telegram rebuild discarded its client: the session was paused while it was connecting', { userId, reason });
+    await telegramAdapter.destroyClient(client).catch(() => {});
+    telegramKeepAlive.release(client);
+    return null;
+  }
   const holder = telegramClients.get(userId);
   if (holder && holder !== current) {
     log('warn', 'Telegram rebuild lost the race and is discarding its own client', { userId, reason, heldSince: holder.attachedAt || null });
@@ -1008,17 +1070,24 @@ async function rebuildTelegramClient(userId, { reason = 'restore', force = false
  * Each pass is cheap: an entry already connected with a verified handler costs one boolean check.
  */
 async function resumeTelegramSessions({ reason = 'restore' } = {}) {
-  const { rows } = await pool.query('SELECT id FROM users WHERE telegram_connected=TRUE AND telegram_session IS NOT NULL ORDER BY last_active_at DESC NULLS LAST LIMIT 200');
+  const { rows } = await pool.query('SELECT id,telegram_paused FROM users WHERE telegram_connected=TRUE AND telegram_session IS NOT NULL AND telegram_paused=FALSE ORDER BY last_active_at DESC NULLS LAST LIMIT 200');
+  /* Two exclusions, because they answer two different questions. The query is what keeps a paused workspace out of
+     this pass at all - on a fleet where most accounts are paused that is the difference between a sweep and a
+     stampede. `selectCaptureCandidates` is what catches the one the query cannot: a pause that lands after these
+     rows were read and before this loop reaches their user, which on a sweep that rebuilds serially is a window of
+     minutes, not microseconds. */
+  const candidates = selectCaptureCandidates(rows, { isPaused: (userId) => telegramPause.isPaused(userId) });
   let restored = 0;
-  for (const row of rows) {
+  for (const row of candidates) {
     try {
-      if (await restoreTelegramClient(row.id, { reason })) restored += 1;
+      if (await restoreTelegramClient(row.userId, { reason })) restored += 1;
     } catch (error) {
-      log('warn', 'Telegram listener restore failed', { userId: row.id, error: error.message });
+      log('warn', 'Telegram listener restore failed', { userId: row.userId, error: error.message });
     }
   }
-  if (rows.length) log('info', 'Telegram sessions swept for capture', { reason, wanted: rows.length, restored });
-  return { wanted: rows.length, restored };
+  const skipped = rows.length - candidates.length;
+  if (rows.length) log('info', 'Telegram sessions swept for capture', { reason, wanted: rows.length, restored, skippedPaused: skipped });
+  return { wanted: rows.length, restored, skippedPaused: skipped };
 }
 
 /**
@@ -1119,6 +1188,13 @@ async function forceTelegramReconnect(userId, { reason = 'manual-reconnect', act
        opposite things to do: "one is already running" means stop pressing, and "no live socket" means the button
        did rebuild something and the transport is the problem. Both are rethrown as they are, so the route can give
        each its own status code instead of a wrapped 502 that reads like a rejected handshake. */
+    if (telegramPause.isPausedError(error)) {
+      // "It is paused" is an instruction to press a different button, and the wrapped failure below says the
+      // opposite - that Telegram rejected a connection - which is how a paused account becomes a support ticket
+      // about the transport.
+      log('info', 'Telegram forced reconnect refused: the session is paused', { userId, actorId, reason });
+      throw error;
+    }
     if (telegramReconnect.isBusy(error)) {
       log('info', 'Telegram forced reconnect refused: one is already running for this workspace', { userId, actorId, reason, waitedForMs: error.waitedForMs });
       throw error;
@@ -2128,6 +2204,10 @@ const adminUserColumns = `u.id,u.name,u.email,u.role,u.subscription_status AS "s
   u.last_active_at AS "lastActiveAt",
   (u.supabase_user_id IS NOT NULL) AS "authLinked",
   u.telegram_connected AS "telegramConnected",
+  /* Read by the panel to hide the Reconnect button: without it an operator looking at a paused workspace sees a
+     row that says "not connected" next to a button whose whole job is to connect, and pressing it is the one action
+     the pause exists to refuse. */
+  u.telegram_paused AS "telegramPaused",
   (SELECT COUNT(*)::int FROM channels c WHERE c.user_id=u.id AND c.enabled=TRUE) AS "monitorCount",
 
   (SELECT COUNT(*)::int FROM signals s WHERE s.user_id=u.id) AS "signalCount",
@@ -3024,6 +3104,68 @@ app.post('/api/admin/users/:id/telegram/reconnect', authenticate, requireAdmin, 
   }
 }));
 
+/*
+ * Pause and resume, deliberately two routes rather than one with a flag: the two actions move a socket in opposite
+ * directions, and an audit row that says "updated" would be the record of neither.
+ *
+ * Neither of them writes `telegram_connected`, and that is the design. A pause is a decision about whether this
+ * process holds a live socket for a workspace; it is not a statement that the workspace's session stopped being
+ * authorised. Keeping those two facts in separate columns is what lets a resume be a reconnect instead of a sign-in,
+ * and what keeps a paused trader's channels, history and stored session string waiting for them.
+ */
+app.post('/api/admin/users/:id/telegram/pause', authenticate, requireAdmin, adminRoute('Pausing a Telegram session', async (req, res) => {
+  /* Only the two real reasons are accepted from a human. `telegram_pause_reason` is the value the trader's own
+     dashboard reads to choose its sentence, so a value invented by a caller would silently become "paused due to
+     inactivity" - or "paused by support" - on someone's screen, and the wrong one of those is an apology nobody owes. */
+  const reason = String(req.body?.reason || PAUSE_REASON_ADMIN).trim();
+  if (!isValidPauseReason(reason)) return fail(res, 400, `A pause has to say why. Use ${PAUSE_REASONS.join(' or ')}.`);
+  const target = await pool.query('SELECT id, email FROM users WHERE id=$1', [req.params.id]);
+  if (!target.rows.length) return fail(res, 404, 'No workspace has that id, so there is no Telegram session to pause.');
+  markApplied(req);
+  try {
+    const result = await telegramPause.pauseTelegramSession(target.rows[0].id, { reason, actorId: req.userId, actorEmail: req.userEmail });
+    res.set('Cache-Control', 'no-store').json({
+      ok: true,
+      ...result,
+      notice: result.clientEnded
+        ? 'Stopped: the live socket was ended and the session string left in place, so resuming is a reconnect and not a sign-in.'
+        : 'Stopped. This workspace had no live socket to end; its stored session and its channel list are unchanged.',
+    });
+  } catch (error) {
+    // 409 and not a silent success: a workspace that never linked Telegram has no session to pause, and pretending
+    // otherwise would leave an operator believing a capture pipeline is stopped when there never was one.
+    if (error.telegramPauseNoSession) return fail(res, 409, `${error.message} Linking Telegram is the trader's step, not yours.`);
+    return fail(res, 502, `${error.message} Nothing was changed - the pause is written before the socket is touched, so a failure here leaves the workspace exactly as it was.`);
+  }
+}));
+
+app.post('/api/admin/users/:id/telegram/resume', authenticate, requireAdmin, adminRoute('Resuming a Telegram session', async (req, res) => {
+  const target = await pool.query('SELECT id, email FROM users WHERE id=$1', [req.params.id]);
+  if (!target.rows.length) return fail(res, 404, 'No workspace has that id, so there is no Telegram session to resume.');
+  markApplied(req);
+  try {
+    /* The flag is lifted here and the socket is put back by the reconnect path, which is two calls on purpose: the
+       pause control owns the one fact ("this workspace may be held open again"), and everything about *connecting* -
+       the latch, the rebuild, the backlog replay, the audit of the reconnect itself - stays where it already lives.
+       `reconnect: false` keeps this route from growing a second, weaker version of the rebuild. */
+    const resume = await telegramPause.resumeTelegramSession(target.rows[0].id, { reason: 'admin-resume', actorId: req.userId, actorEmail: req.userEmail, reconnect: false });
+    const result = await forceTelegramReconnect(target.rows[0].id, { reason: 'admin-resume', actorId: req.userId, actorEmail: req.userEmail });
+    res.set('Cache-Control', 'no-store').json({
+      ok: true,
+      ...resume,
+      ...result,
+      notice: resume.cleared
+        ? 'Resumed: the pause is lifted and the session was reconnected.'
+        : 'This workspace was not paused, so the pause had nothing to lift - the reconnect report below is the answer.',
+    });
+  } catch (error) {
+    if (error.telegramNoSession) return fail(res, 409, `${error.message} The pause is lifted, but the phone number has to sign in again from the workspace settings first.`);
+    if (telegramReconnect.isBusy(error)) return fail(res, 409, `${error.message} The pause is lifted; the restore already running will pick this workspace up as it goes.`);
+    if (telegramReconnect.isUnavailable(error)) return fail(res, 503, `${error.message} The pause is lifted and the heartbeat keeps retrying on its own minute clock.`);
+    return fail(res, 502, `${error.message} The pause itself is already lifted - read this workspace's Telegram status before pressing again.`);
+  }
+}));
+
 app.post('/api/admin/users/:id/impersonate', authenticate, requireAdmin, asyncRoute(async (req, res) => {
   const targetId = String(req.params.id || '').trim();
   if (!UUID_PATTERN.test(targetId)) return fail(res, 400, 'Choose a valid user account.');
@@ -3266,10 +3408,15 @@ app.post('/api/announcements/:id/dismiss', authenticate, asyncRoute(async (req, 
 }));
 
 app.get('/api/telegram/status', authenticate, asyncRoute(async (req, res) => {
-  const { rows } = await pool.query('SELECT telegram_connected FROM users WHERE id=$1', [req.userId]);
+  const { rows } = await pool.query('SELECT telegram_connected,telegram_paused,telegram_pause_reason,telegram_paused_at FROM users WHERE id=$1', [req.userId]);
   const configured = Boolean(process.env.API_ID && process.env.API_HASH && process.env.SESSION_ENCRYPTION_KEY);
-  let connected = Boolean(rows[0]?.telegram_connected && telegramAdapter.connectedFlag(telegramClients.get(req.userId)?.client));
-  if (rows[0]?.telegram_connected && !connected && configured) {
+  const paused = rows[0]?.telegram_paused === true;
+  let connected = Boolean(!paused && rows[0]?.telegram_connected && telegramAdapter.connectedFlag(telegramClients.get(req.userId)?.client));
+  /* `!paused` on both lines. This route is a reviver - the self-heal below calls the same restore the sweep calls -
+     and a page load must not be able to undo a pause, least of all as a side effect of asking whether the pause
+     worked. The row is read rather than the gate because this answer goes to a human: it has to say "paused" the
+     moment the pause is saved, not the moment this process notices. */
+  if (rows[0]?.telegram_connected && !connected && configured && !paused) {
     try { connected = Boolean(await restoreTelegramClient(req.userId)); } catch (error) { log('warn', 'Telegram session restore deferred', { userId: req.userId, error: error.message }); }
   }
   const entry = telegramClients.get(req.userId);
@@ -3282,6 +3429,18 @@ app.get('/api/telegram/status', authenticate, asyncRoute(async (req, res) => {
   res.json({
     configured,
     connected,
+    /* `connected: false` means two opposite things to a trader - "sign in again" and "someone stopped this on
+       purpose" - and the pair cannot be told apart from the socket, because a paused workspace has no socket by
+       design. So the reason travels with it: `paused` is what suppresses every call to action, and `pauseReason` is
+       what chooses the sentence. `null` from `pauseReason` is not a missing value to be guessed at, it is a pause
+       written outside this app, and the UI says the one thing that is true of every pause. */
+    /* `&& rows[0]?.telegram_connected` is the presentation rule that goes with the storage rule: a pause belongs
+       to a *linked* session, so a workspace that signed out deliberately sees "not connected" - which is the truth
+       and the one with a working answer - rather than a paused notice for a session it has already discarded. The
+       flag itself stays in the row: a later sign-in does not lift it, and only an administrator or a paid plan does. */
+    paused: paused && rows[0]?.telegram_connected === true,
+    pauseReason: paused ? (rows[0]?.telegram_pause_reason || null) : null,
+    pausedAt: paused ? (rows[0]?.telegram_paused_at || null) : null,
     listening: Boolean(telegramAdapter.connectedFlag(entry?.client) && entry.handler && telegramCapture.handlerIsLive(entry.client, entry.handler)),
     catchUpQueued: entry?.needsCatchUp === true,
     /* Set when the reconciliation ladder ran out of rungs: the stream is not slow, it is finished, and the fix is a
@@ -3510,6 +3669,10 @@ app.post('/api/telegram/verify-password', authenticate, asyncRoute(async (req, r
 }));
 
 app.get('/api/telegram/chats', authenticate, asyncRoute(async (req, res) => {
+  /* The restore below refuses a paused workspace already, but it refuses with `null`, and the only answer this
+     route knows how to give a null is "Connect Telegram first." - which would send a trader to re-authorise a
+     session somebody else paused, and re-authorising is precisely how a pause turns into a lost session string. */
+  if (telegramPause.isPaused(req.userId)) return fail(res, 409, 'Your Telegram session is paused, so there is no live session to read a channel list from. Contact support to have it resumed.');
   const client = await restoreTelegramClient(req.userId);
   if (!client) return fail(res, 409, 'Connect Telegram first.');
   const dialogs = await telegramAdapter.getDialogs(client, { limit: 200 });
@@ -3644,6 +3807,11 @@ async function beginRuntime() {
   /* The boot pass and the 60-second sweep share one guard, which is the pair that can actually overlap: boot
      restores every workspace serially, so on a host with many sessions it is still working long after the first
      tick of the interval, and before this the two passes each rebuilt every workspace they found not listening. */
+  /* Whose sessions this process must not hold is a fact the database already knows and this process does not, so it
+     is read once here, before the pass that would otherwise bring every linked session back - including the ones a
+     previous deploy paused. The sweep's own query excludes them; this is what refuses the callers that do not go
+     through that query, from the first page load to the first beat. */
+  await telegramPause.syncGate({ reason: 'boot' }).catch((error) => log('warn', 'Telegram pause gate could not be read at boot', { error: error.message }));
   void telegramSweepGuard.run(() => resumeTelegramSessions({ reason: 'boot' }))
     .catch((error) => log('warn', 'Telegram session sweep failed', { error: error.message }));
   /* The keep-alive, on its own faster clock than everything else here.
@@ -3663,6 +3831,13 @@ async function beginRuntime() {
       await resumeTelegramSessions({ reason: 'sweep' });
       await rearmTelegramListeners();
       await checkTelegramStreams({ reason: 'sweep' });
+      /* The idle policy and the gate, on the same clock as the passes they govern, because the minute clock is the
+         only loop here that a sleeping free instance resumes on its own. `reconcile` reads the flag list (so a pause
+         written elsewhere is honoured here within a minute), pauses the free workspaces whose thirty days have run
+         out, and lifts a pause the moment its workspace has paid - and the one thing it never does is rebuild a
+         session this pass decided to stop: the sweep above runs before it, so a workspace paused here waits for the
+         *next* pass to be refused, which is why the row check inside the rebuild is the authority. */
+      await telegramPause.reconcile({ reason: 'sweep' });
     }).catch((error) => log('warn', 'Telegram listener sweep failed', { error: error.message }));
   }, TELEGRAM_SWEEP_INTERVAL_MS);
   telegramSweep.unref?.();

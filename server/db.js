@@ -72,6 +72,15 @@ const SCHEMA_SQL = `
     ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_limits JSONB NOT NULL DEFAULT '{}'::jsonb;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS suspension_reason TEXT;
+    /* A paused Telegram session, which is a different fact from a linked one and must never be folded into it.
+       telegram_connected answers "does this account have a session worth resuming" - it gates the resume loop, the
+       login flow and the phone number's re-authorisation, and it stays TRUE while a session is paused, because a
+       pause is not a sign-out. telegram_paused answers "is this process allowed to be holding a socket for it right
+       now". The two other columns exist because a flag without a cause and a time cannot be explained to the person
+       reading the row at 2am, and because the sentence a paused user is shown differs by cause. */
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_paused BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_paused_at TIMESTAMPTZ;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_pause_reason TEXT;
     CREATE TABLE IF NOT EXISTS channels (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
