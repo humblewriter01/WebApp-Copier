@@ -85,7 +85,7 @@ function billingFor({ provider, pool, snapshot, random = 'deadbeef0123' } = {}) 
 const user = { id: '9f0dd7e2-3f6a-4a51-9b52-7d6ca4b0b123', name: 'Trader', email: 'trader@example.test', subscription_status: 'free', subscription_plan: 'free', plan_limits: {} };
 
 /** Every request the workspace makes for a checkout, with the amount the provider will actually charge. */
-async function checkoutFor({ planKey, currency, snapshot, stored = null, promo = null }) {
+async function checkoutFor({ planKey, currency, snapshot, stored = null, promo = null, frontendAmount = undefined }) {
   const provider = flutterwaveDouble();
   const pool = poolDouble([
     ['FROM users WHERE id=$1 LIMIT 1', { rows: [user], rowCount: 1 }],
@@ -94,11 +94,17 @@ async function checkoutFor({ planKey, currency, snapshot, stored = null, promo =
     ...(stored ? [['FROM plans p LEFT JOIN users u', { rows: stored, rowCount: 1 }]] : []),
     ...(promo ? [['FROM promo_codes WHERE upper(code)=$1', { rows: [promo], rowCount: 1 }]] : []),
   ]);
-  const checkout = await billingFor({ provider, pool, snapshot }).initialize({ userId: user.id, planKey, currency, promoCode: promo ? promo.code : undefined });
+  const checkout = await billingFor({ provider, pool, snapshot }).initialize({ userId: user.id, planKey, currency, promoCode: promo ? promo.code : undefined, amount: frontendAmount });
   return { provider, pool, checkout };
 }
 
 /* --------------------------------------------------------------- the amounts Flutterwave is told --------------------------------------------------------------- */
+
+test('a forged frontend amount cannot change the database-priced checkout', async () => {
+  const { provider, checkout } = await checkoutFor({ planKey: 'pro', currency: 'NGN', frontendAmount: 1 });
+  assert.equal(provider.last().body.amount, '105000', 'Flutterwave receives the catalogue/database price, not the browser value');
+  assert.equal(checkout.amountMinor, 10_500_000);
+});
 
 test('a naira checkout is sent in naira: Starter 60000, Pro 105000, Premium 150000', async () => {
   const expected = { starter: '60000', pro: '105000', premium: '150000' };

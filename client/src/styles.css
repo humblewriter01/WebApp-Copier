@@ -672,3 +672,47 @@ button,input,textarea,select{touch-action:manipulation}
 .landing-foot-actions{display:flex;flex-wrap:wrap;gap:11px;margin-top:20px}
 @media(max-width:940px){.landing-hero{grid-template-columns:minmax(0,1fr);gap:26px}.landing-shell{padding-top:88px}}
 @media(max-width:620px){.landing-demo-grid{grid-template-columns:minmax(0,1fr)}.landing-signal{grid-template-columns:auto minmax(0,1fr)}.landing-state{grid-column:1/-1;justify-items:start;text-align:left}.landing-cta .button,.landing-foot-actions .button{flex:1 1 auto;text-align:center}}
+
+/* Institutional landing-page refinements */
+.landing-shell{position:relative;isolation:isolate;background:radial-gradient(ellipse 68% 34% at 50% 0%,#2dc8a51c 0%,transparent 74%),radial-gradient(circle at 15% 0,#1e3855 0,#101b2d 55%,#0c1422 100%)}
+.landing-hero{position:relative}
+.landing-trust-bar{display:flex;flex-wrap:wrap;align-items:center;gap:11px 15px;margin-top:21px;padding:13px 15px;border:1px solid #ffffff1b;border-radius:13px;background:#ffffff09;color:#d5e3ec;font-size:12px;font-weight:700;letter-spacing:.01em}
+.landing-trust-bar i,.landing-guarantee-bar i{font-style:normal;color:#63d7bb}
+.landing-fine{margin-top:12px}
+.landing-how,.landing-pricing,.landing-faq{max-width:1140px;margin:64px auto 0}
+.landing-section-heading{text-align:center;margin:0 auto 22px;max-width:660px}
+.landing-section-heading .eyebrow{margin:0 0 7px;font-size:10px;font-weight:800;letter-spacing:.13em}
+.landing-section-heading h2{margin:0;color:#fff;font-size:clamp(23px,3vw,32px);letter-spacing:-.55px;line-height:1.2}
+.landing-section-heading>p:last-child{margin:10px 0 0;color:#9fb0c6;font-size:14px;line-height:1.6}
+.landing-steps{margin:0;grid-template-columns:repeat(3,minmax(0,1fr))}
+.landing-step{min-height:155px;transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease;background:linear-gradient(145deg,#ffffff12,#ffffff07)}
+.landing-step:hover{transform:translateY(-2px);box-shadow:0 14px 32px #02081245;border-color:#63d7bb66}
+.landing-step h3{font-size:17px;line-height:1.35}
+.landing-guardrails{margin-top:54px;background:linear-gradient(135deg,#102238d9,#0b1424ba)}
+.landing-guardrails h2{font-size:23px;line-height:1.3}
+.landing-guard-grid strong{font-size:15px;line-height:1.5}
+.landing-guard-grid p{line-height:1.72}
+.landing-pricing{margin-top:58px}
+.landing-guarantee-bar{display:flex;justify-content:center;align-items:center;flex-wrap:wrap;gap:8px 15px;margin:0 0 30px;padding:13px 16px;border:1px solid #63d7bb38;border-radius:12px;background:linear-gradient(100deg,#1b8e7c1c,#ffffff08);color:#dcebe9;font-size:12px;font-weight:700;text-align:center}
+.landing-pricing-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+.landing-price-card{position:relative;display:flex;flex-direction:column;min-width:0;padding:21px 18px 18px;border:1px solid #ffffff20;border-radius:18px;background:linear-gradient(145deg,#ffffff13,#ffffff08 60%,#63d7bb09);box-shadow:0 12px 30px #030b1720;backdrop-filter:blur(10px);transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease}
+.landing-price-card:hover{transform:translateY(-2px);box-shadow:0 20px 42px #030b1755;border-color:#63d7bb78}
+.landing-price-featured{border-color:#63d7bb88;background:linear-gradient(145deg,#1e806a35,#ffffff0e 60%,#63d7bb16)}
+.landing-price-card h3{margin:0;color:#fff;font-size:18px;letter-spacing:-.2px}
+.landing-price-description{min-height:42px;margin:7px 0 14px;color:#9fb0c6;font-size:12px;line-height:1.55}
+.landing-price{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px;margin:0 0 18px;color:#fff}
+.landing-price strong{font-size:clamp(22px,2.4vw,29px);letter-spacing:-.7px;line-height:1.2}
+.landing-price span{color:#98a9bd;font-size:11px}
+.landing-price-card .button{width:100%;margin-top:auto;min-height:42px}
+.landing-popular{position:absolute;top:-10px;right:14px;padding:4px 8px;border-radius:99px;background:#63d7bb;color:#09241f;font-size:9px;font-weight:900;letter-spacing:.08em}
+.landing-faq-list{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:13px}
+.landing-faq-item{padding:18px;border:1px solid #ffffff18;border-radius:15px;background:#ffffff09}
+.landing-faq-item h3{margin:0 0 7px;color:#fff;font-size:14px;line-height:1.4}
+.landing-faq-item p{margin:0;color:#a9b8cc;font-size:13px;line-height:1.65}
+.landing-footer{display:flex;justify-content:space-between;gap:16px;max-width:1140px;margin:55px auto 0;padding-top:18px;border-top:1px solid #ffffff17;color:#788ba2;font-size:11px}
+.landing-demo{transition:transform .22s ease,box-shadow .22s ease}
+.landing-demo:hover{transform:translateY(-2px);box-shadow:0 36px 88px #030b1777}
+@media(max-width:940px){.landing-pricing-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.landing-steps{grid-template-columns:repeat(3,minmax(0,1fr))}.landing-how,.landing-pricing,.landing-faq{margin-top:48px}}
+@media(max-width:700px){.landing-steps,.landing-faq-list{grid-template-columns:minmax(0,1fr)}.landing-step{min-height:0}.landing-trust-bar{justify-content:center;text-align:center}.landing-footer{margin-top:40px}}
+@media(max-width:480px){.landing-shell{padding-inline:16px}.landing-pricing-grid{grid-template-columns:minmax(0,1fr)}.landing-price-description{min-height:0}.landing-trust-bar{gap:8px 9px;font-size:11px}.landing-guarantee-bar{gap:7px 9px;font-size:11px}.landing-footer{flex-direction:column;gap:6px}}
+@media(prefers-reduced-motion:reduce){.landing-step,.landing-price-card,.landing-demo{transition:none}.landing-step:hover,.landing-price-card:hover,.landing-demo:hover{transform:none}}

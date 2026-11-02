@@ -2091,6 +2091,20 @@ async function enforcePlanLimit(userId, limitKey, countSql) {
   }
 }
 
+app.get('/api/public/pricing', asyncRoute(async (_req, res) => {
+  const snapshot = await pricingStore.snapshot();
+  res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=300').json({
+    currency: snapshot.currency,
+    interval: snapshot.interval,
+    plans: [
+      { key: FREE_PLAN.key, name: FREE_PLAN.name, price: 0, amount: 0, amountMinor: 0, currency: snapshot.currency, interval: snapshot.interval },
+      ...publicPricing(snapshot).map(({ key, name, amount, amountMinor, currency, interval }) => ({
+        key, name, price: amount, amount, amountMinor, currency, interval,
+      })),
+    ],
+  });
+}));
+
 app.get('/api/billing/plans', asyncRoute(async (_req, res) => {
   // Prices are read per request so a price saved in the admin panel is what the
   // visitor sees and pays, with no cache or stale build to wait for. Both currencies
