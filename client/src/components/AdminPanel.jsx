@@ -485,8 +485,8 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     void updateUser(user.id, { role }, role === 'admin' ? `${user.name} is now an administrator.` : `${user.name} is now a standard user.`);
   };
 
-  const startSuspension = (user) => setSuspension({ userId: user.id, name: user.name || user.email, reason: '' });
-  const cancelSuspension = () => setSuspension({ userId: '', name: '', reason: '' });
+  const startSuspension = (user) => { setError(''); setNotice(''); setSuspension({ userId: user.id, name: user.name || user.email, reason: '' }); };
+  const cancelSuspension = () => { setError(''); setSuspension({ userId: '', name: '', reason: '' }); };
   /**
    * Sends exactly the two fields the endpoint writes: a real boolean and the trimmed reason. The
    * reason is required here as well as on the server, because a blank one is the difference between
@@ -619,7 +619,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     setNotice('');
     setSupportFor({ userId: user.id, name: user.name || user.email, reason: '' });
   };
-  const closeSupportAccessForm = () => setSupportFor({ userId: '', name: '', reason: '' });
+  const closeSupportAccessForm = () => { setError(''); setSupportFor({ userId: '', name: '', reason: '' }); };
 
   /* The account is read from the state that opened the dialog, never looked up in `users` again: the
      list can be paged or searched while the dialog is open, and a lookup that missed would silently
@@ -663,7 +663,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
       hasProviderSubscription: user.hasProviderSubscription === true,
     });
   };
-  const cancelAdjustment = () => setAdjustFor(null);
+  const cancelAdjustment = () => { setError(''); setAdjustFor(null); };
 
   const saveAdjustment = async () => {
     const form = adjustFor;
@@ -1139,6 +1139,8 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
             </label>
           </div>
 
+          {error ? <div className="alert alert-error" role="alert">{error}</div> : null}
+          {notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
           <div className="button-row pricing-actions">
             <button className="button button-primary" type="submit" disabled={savingPricing}>{savingPricing ? 'Saving…' : `Save changes${pendingChanges ? ` (${pendingChanges})` : ''}`}</button>
             <button className="button button-secondary" type="button" disabled={syncingPlans || savingPricing} onClick={() => syncPlans(null)}>{syncingPlans ? 'Syncing…' : 'Re-sync every plan and currency with Flutterwave'}</button>
@@ -1180,6 +1182,8 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
               <label>Maximum uses<input type="number" min="1" step="1" value={promoForm.maxUses} onChange={(event) => setPromoForm({ ...promoForm, maxUses: event.target.value })} placeholder="Unlimited" /></label>
               <label>Expires<input type="datetime-local" value={promoForm.expiresAt} onChange={(event) => setPromoForm({ ...promoForm, expiresAt: event.target.value })} /></label>
             </div>
+            {error ? <div className="alert alert-error" role="alert">{error}</div> : null}
+            {notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
             <button className="button button-primary" disabled={savingPromo}>{savingPromo ? 'Creating…' : 'Create promo code'}</button>
           </form>
         </section>
@@ -1264,6 +1268,8 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
           <form className="kill-switch-controls" onSubmit={(event) => { event.preventDefault(); setSwitch(!killSwitch.paused); }}>
             <label htmlFor="kill-switch-reason">Reason (required when pausing; shown to affected workspaces and stored in the audit log)</label>
             <input id="kill-switch-reason" value={switchReason} onChange={(event) => setSwitchReason(event.target.value)} maxLength={300} placeholder="For example: MetaAPI incident MT5-2291 - orders rejected until the broker is healthy" />
+            {error ? <div className="alert alert-error" role="alert">{error}</div> : null}
+            {notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
             <div className="button-row">
               <button type="submit" className={`button ${killSwitch.paused ? 'button-primary' : 'button-danger'}`} disabled={switchBusy || !killSwitch.ready}>
                 {switchBusy ? 'Saving…' : killSwitch.paused ? 'Resume automatic execution' : 'Pause execution for everyone'}
@@ -1378,6 +1384,8 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
               <input type="datetime-local" value={announcementForm.endsAt} onChange={(event) => setAnnouncementForm({ ...announcementForm, endsAt: event.target.value })} />
             </label>
           </div>
+          {error && !announcementEditing.id ? <div className="alert alert-error" role="alert">{error}</div> : null}
+          {notice && !announcementEditing.id ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
           <div className="button-row">
             <button type="submit" className="button button-primary" disabled={savingAnnouncement}>{savingAnnouncement ? 'Publishing…' : 'Publish banner'}</button>
             <button type="button" className="button button-secondary" onClick={() => setAnnouncementForm({ message: '', level: 'info', startsAt: '', endsAt: '' })}>Clear</button>
@@ -1408,6 +1416,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
                 <label>Correct the message
                   <textarea rows="2" value={announcementEditing.message} onChange={(event) => setAnnouncementEditing({ ...announcementEditing, message: event.target.value })} maxLength={500} />
                 </label>
+                {error ? <div className="alert alert-error" role="alert">{error}</div> : null}
                 <div className="button-row">
                   <button type="button" className="button button-primary button-small" onClick={() => saveAnnouncementMessage(item)}>Save</button>
                   <button type="button" className="button button-secondary button-small" onClick={() => setAnnouncementEditing({ id: '', message: '' })}>Cancel</button>
@@ -1532,6 +1541,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
           </label>
           <button type="submit" className="button button-secondary" disabled={signalsBusy}>Recalculate</button>
         </form>
+        {signalError ? <div className="alert alert-error" role="alert">{signalError}</div> : null}
         <p className="muted">A purge deletes every workspace&rsquo;s matching signals at once. A signal that is still queued for execution is dropped along with its pending job, so that order will never be sent. Trades already opened keep their records. This cannot be undone, and it is written to the audit log with the counts it moved.</p>
         <div className="button-row">
           <button type="button" className="button button-danger" disabled={signalsBusy || !purge || !purge.signals} onClick={() => setSignalConfirm({ kind: 'purge' })}>
@@ -1567,6 +1577,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
       confirmLabel="Suspend user"
       tone="danger"
       busy={Boolean(suspension.userId) && busyUser === suspension.userId}
+      error={suspension.userId ? error : ''}
       onCancel={cancelSuspension}
       onSubmit={() => { void confirmSuspension(); }}
     >
@@ -1581,6 +1592,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
       intro={`You will see this workspace exactly as ${supportFor.name || 'this account'} does - signals, settings, accounts, and notices. Their password is never read or changed, nothing here can be written, admin tools stay unavailable, and the session ends by itself in one hour.`}
       confirmLabel="Open support view"
       busy={Boolean(supportFor.userId) && supportBusy === supportFor.userId}
+      error={supportFor.userId ? error : ''}
       onCancel={closeSupportAccessForm}
       onSubmit={() => { void startImpersonation(); }}
     >
@@ -1595,6 +1607,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
       intro={`Currently ${adjustFor?.currentPlan || 'free'} (${adjustFor?.currentStatus || 'free'}), ${adjustFor?.periodEnd ? `paid until ${formatDate(adjustFor.periodEnd)}` : 'no paid period'}. ${adjustFor?.hasProviderSubscription ? 'This workspace renews through Flutterwave, so a payment plan keeps billing on its own schedule until it is cancelled there.' : 'No gateway subscription is attached to this workspace.'}`}
       confirmLabel="Save adjustment"
       busy={Boolean(adjustFor) && busyUser === adjustFor.userId}
+      error={adjustFor ? error : ''}
       onCancel={cancelAdjustment}
       onSubmit={() => { void saveAdjustment(); }}
     >

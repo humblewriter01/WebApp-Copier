@@ -246,10 +246,10 @@ button,input,textarea,select{touch-action:manipulation}
 .admin-table-wrap{overflow-x:auto;border:1px solid #eef1f5;border-radius:10px;background:#fff}
 .admin-table{width:100%;min-width:760px;border-collapse:collapse;font-size:12px}
 .admin-table th{text-align:left;padding:10px 12px;background:#f7f9fb;border-bottom:1px solid #e8ebf0;color:#68778c;font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;white-space:nowrap}
-.admin-table td{padding:12px;border-top:1px solid #f0f2f6;vertical-align:middle;color:#40506a}
+.admin-table td{padding:12px;border-top:1px solid #f0f2f6;vertical-align:middle;color:#40506a;min-width:0;overflow-wrap:break-word;word-break:break-word}
 .admin-table tbody tr:first-child td{border-top:0}
-.admin-table td strong{display:block;color:#1b2a40;font-size:12px;line-height:1.35;overflow-wrap:anywhere}
-.admin-table td small{display:block;margin-top:3px;color:#7b8798;font-size:10px;overflow-wrap:anywhere}
+.admin-table td strong{display:block;color:#1b2a40;font-size:12px;line-height:1.35;overflow-wrap:anywhere;word-break:break-word;min-width:0;max-width:100%}
+.admin-table td small{display:block;margin-top:3px;color:#7b8798;font-size:10px;overflow-wrap:anywhere;word-break:break-word;min-width:0;max-width:100%}
 .admin-table select{min-height:38px;border:1px solid #dce2ea;border-radius:8px;padding:6px 8px;background:#fff;color:#26364d;font-size:11px}
 .admin-row-suspended{background:#fff8f7}
 .admin-reason{color:#b74239}
@@ -264,10 +264,11 @@ button,input,textarea,select{touch-action:manipulation}
   .admin-table,.admin-table tbody,.admin-table tr,.admin-table td{display:block;width:100%}
   .admin-table tr{padding:10px 0;border-top:1px solid #eef1f5}
   .admin-table tr:first-child{border-top:0}
-  .admin-table td{display:flex;align-items:center;gap:10px;padding:5px 12px;border:0}
+  .admin-table td{display:flex;align-items:center;gap:10px;padding:5px 12px;border:0;min-width:0;overflow-wrap:break-word;word-break:break-word}
+  .admin-table td>*{min-width:0;max-width:100%}
   .admin-table td::before{content:attr(data-label);flex:0 0 96px;color:#68778c;font-size:10px;font-weight:700;letter-spacing:.4px;text-transform:uppercase}
-  .admin-table td[data-label="User"]{flex-direction:column;align-items:flex-start;gap:2px}
-  .admin-table td[data-label="User"]::before{flex:none}
+  .admin-table td[data-label="User"],.admin-table td[data-label="Admin"],.admin-table td[data-label="Customer"],.admin-table td[data-label="Workspace"],.admin-table td[data-label="Status"],.admin-table td[data-label="Reference"],.admin-table td[data-label="Plan"],.admin-table td[data-label="What happened"],.admin-table td[data-label="Actions"]{flex-direction:column;align-items:flex-start;gap:4px}
+  .admin-table td[data-label="User"]::before,.admin-table td[data-label="Admin"]::before,.admin-table td[data-label="Customer"]::before,.admin-table td[data-label="Workspace"]::before,.admin-table td[data-label="Status"]::before,.admin-table td[data-label="Reference"]::before,.admin-table td[data-label="Plan"]::before,.admin-table td[data-label="What happened"]::before,.admin-table td[data-label="Actions"]::before{flex:none}
   .admin-table-wrap{overflow-x:visible}
 }
 
@@ -479,13 +480,14 @@ button,input,textarea,select{touch-action:manipulation}
 .announcement-edit textarea { border: 1px solid #dce2ea; border-radius: 8px; padding: 10px 11px; font-size: 12px; }
 
 .audit-panel .admin-search select { border: 1px solid #dce2ea; border-radius: 9px; padding: 10px 11px; font-size: 11px; background: #fff; color: #172338; }
-.audit-summary { margin: 0; font-size: 11px; line-height: 1.55; color: #35445a; overflow-wrap: anywhere; }
+.audit-table td[data-label="What happened"]{min-width:240px}
+.audit-summary{margin:0;font-size:11px;line-height:1.55;color:#35445a;overflow-wrap:anywhere;word-break:break-word;min-width:0;max-width:100%}
 .audit-action-pricing-update,.audit-action-user-suspend,.audit-action-execution-pause { background: #fff0ed; color: #b9574d; }
 .audit-action-subscription-grant,.audit-action-subscription-extend,.audit-action-announcement-publish { background: #eef6fb; color: #486a80; }
 .audit-action-impersonation-start { background: #fff6e6; color: #8a6414; }
-.audit-meta { margin-top: 6px; }
-.audit-meta summary { font-size: 10px; font-weight: 700; color: #1e6878; cursor: pointer; }
-.audit-meta pre { margin: 6px 0 0; padding: 10px 12px; background: #f5f7fa; border-radius: 8px; font-size: 10px; line-height: 1.5; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.audit-meta{margin-top:6px;width:100%;max-width:100%;min-width:0;flex-shrink:0}
+.audit-meta summary{font-size:10px;font-weight:700;color:#1e6878;cursor:pointer}
+.audit-meta pre{margin:6px 0 0;padding:10px 12px;background:#f5f7fa;border:1px solid #e5eaf1;border-radius:8px;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:11px;line-height:1.5;overflow-x:auto;white-space:pre;overflow-wrap:normal;word-break:normal;width:100%;max-width:100%;min-width:0;flex-shrink:0;box-sizing:border-box}
 .execution-paused-notice { border-left: 3px solid #d79a1f; }
 
 @media (max-width: 1050px) {
@@ -758,3 +760,19 @@ button,input,textarea,select{touch-action:manipulation}
 .broker-access-note-compact{margin-top:5px;padding:0;border:0;background:transparent;color:#637286;font-size:10px}
 
 .metaapi-token-toggle{align-self:flex-start;margin-top:2px;font-size:12px}
+
+/* Global text-overflow and flex/grid container safeguards across User Dashboard and Admin Panel */
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+.main-area,.content-area,.panel,.metric-card,.chat-row,.chat-row>div,.form-stack,.form-stack label,.form-row,.form-row>*,.user-mini,.user-mini>div,.pricing-plan-card,.pricing-sync,.pricing-sync-results,.profile-fact,.profile-fact dd{min-width:0}
+.alert,.field-error,.account-execution-note,.execution-error-message,.pricing-sync-detail,.announcement-error,.health-message,.signal-outcome-note,.notice-banner,.toast-message{min-width:0;max-width:100%;overflow-wrap:break-word;word-break:break-word}
+.global-alert{gap:10px}
+.alert-close{flex:0 0 auto}
+.account-row strong,.account-row small,.chat-row small,.metric-card strong,.metric-label,.metric-note,.profile-fact dd,.profile-password-target,.profile-password-target strong,.support-banner span,.support-banner b,.pricing-sync small,.pricing-sync code,.pricing-sync-results p,.pricing-history li,.admin-table td,.admin-table td strong,.admin-table td small,.admin-table td code{min-width:0;max-width:100%;overflow-wrap:break-word;word-break:break-word}
+.account-row strong{white-space:normal}
+.execution-toggle-row span{min-width:0;flex:1 1 auto;overflow-wrap:break-word;word-break:break-word}
+.announcement-row{flex-wrap:wrap}
+@media(max-width:700px){
+  .audit-table td[data-label="What happened"]{min-width:0;width:100%}
+  .pricing-plans,.pricing-price-fields,.pricing-sync-list,.admin-signal-filters{grid-template-columns:minmax(0,1fr)}
+}
+

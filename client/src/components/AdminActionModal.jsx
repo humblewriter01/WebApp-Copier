@@ -37,6 +37,7 @@ export default function AdminActionModal({
   cancelLabel = 'Cancel',
   busy = false,
   tone = 'primary',
+  error = '',
   onCancel,
   onSubmit,
   children,
@@ -93,6 +94,7 @@ export default function AdminActionModal({
         <h3 id={titleId}>{title}</h3>
         {intro ? <p className="admin-action-modal-intro">{intro}</p> : null}
         <div className="admin-action-modal-body">{children}</div>
+        {error ? <div className="alert alert-error" role="alert">{error}</div> : null}
         <div className="modal-actions">
           <button type="button" className="button button-secondary" onClick={() => onCancel?.()} disabled={busy}>{cancelLabel}</button>
           <button type="submit" className={`button ${tone === 'danger' ? 'button-danger' : 'button-primary'}`} disabled={busy}>{busy ? 'Working…' : confirmLabel}</button>

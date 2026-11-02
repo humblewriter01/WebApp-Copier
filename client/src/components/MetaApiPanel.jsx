@@ -74,6 +74,8 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [accountError, setAccountError] = useState('');
+  const [accountNotice, setAccountNotice] = useState('');
   const [inactivity, setInactivity] = useState(null);
 
   const refresh = useCallback(async () => {
@@ -83,13 +85,13 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
     // itself. The provider deduplicates concurrent checks, so mounting alongside its own
     // fetch costs nothing.
     refreshSetup();
-    setError('');
+    setAccountError('');
     try {
       const linked = await request('/api/metaapi/linked-accounts', token);
       setAccounts(linked.accounts || []);
       setInactivity(linked.inactivity || null);
     } catch (requestError) {
-      setError(requestError.message || 'We could not load your trading accounts. Please try again.');
+      setAccountError(requestError.message || 'We could not load your trading accounts. Please try again.');
     } finally {
       setLoading(false);
     }
@@ -102,6 +104,8 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
     setBusy(true);
     setError('');
     setNotice('');
+    setAccountError('');
+    setAccountNotice('');
     setSetupLink(null);
     try {
       const { name, platform, server, metaapi_token: suppliedMetaApiToken } = form;
@@ -130,14 +134,14 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
 
   const createLink = async (account) => {
     setBusy(true);
-    setError('');
-    setNotice('');
+    setAccountError('');
+    setAccountNotice('');
     try {
       const result = await request(`/api/metaapi/provisioned-accounts/${encodeURIComponent(account.metaApiAccountId)}/configuration-link`, token, { method: 'POST', body: {} });
       setSetupLink({ accountId: account.metaApiAccountId, url: result.configurationLink });
-      setNotice('Your secure setup link is ready. It expires after seven days.');
+      setAccountNotice('Your secure setup link is ready. It expires after seven days.');
     } catch (requestError) {
-      setError(requestError.message || 'We could not create a secure setup link. Please try again.');
+      setAccountError(requestError.message || 'We could not create a secure setup link. Please try again.');
     } finally {
       setBusy(false);
     }
@@ -145,14 +149,14 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
 
   const refreshAccount = async (account) => {
     setBusy(true);
-    setError('');
-    setNotice('');
+    setAccountError('');
+    setAccountNotice('');
     try {
       await request(`/api/metaapi/provisioned-accounts/${encodeURIComponent(account.metaApiAccountId)}/refresh`, token, { method: 'POST', body: {} });
       await refresh();
-      setNotice('Trading account status updated.');
+      setAccountNotice('Trading account status updated.');
     } catch (requestError) {
-      setError(requestError.message || 'We could not refresh this trading account. Please try again.');
+      setAccountError(requestError.message || 'We could not refresh this trading account. Please try again.');
     } finally {
       setBusy(false);
     }
@@ -164,22 +168,22 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
       : 'Remove this trading account from Signal Desk? It stays in MetaAPI under your own MetaAPI token, so it is not deleted there.';
     if (!window.confirm(confirmation)) return;
     setBusy(true);
-    setError('');
-    setNotice('');
+    setAccountError('');
+    setAccountNotice('');
     try {
       const result = await request(`/api/metaapi/accounts/${encodeURIComponent(account.metaApiAccountId)}`, token, { method: 'DELETE' });
       if (setupLink?.accountId === account.metaApiAccountId) setSetupLink(null);
       await refresh();
       const cleanup = result?.metaApiCleanup;
       if (cleanup?.failed) {
-        setError('The account was removed from Signal Desk, but MetaAPI could not confirm its deletion. It may still be billed; check your MetaAPI dashboard before trying again.');
+        setAccountError('The account was removed from Signal Desk, but MetaAPI could not confirm its deletion. It may still be billed; check your MetaAPI dashboard before trying again.');
       } else if (cleanup?.skipped) {
-        setNotice('Trading account removed from Signal Desk. It was not deleted from MetaAPI because it is billed to your own MetaAPI token.');
+        setAccountNotice('Trading account removed from Signal Desk. It was not deleted from MetaAPI because it is billed to your own MetaAPI token.');
       } else {
-        setNotice('Trading account deleted from MetaAPI and removed from Signal Desk.');
+        setAccountNotice('Trading account deleted from MetaAPI and removed from Signal Desk.');
       }
     } catch (requestError) {
-      setError(requestError.message || 'We could not remove this trading account. Please try again.');
+      setAccountError(requestError.message || 'We could not remove this trading account. Please try again.');
     } finally {
       setBusy(false);
     }
@@ -223,14 +227,18 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
           </>}
         </div>
         <small className="field-help">Use the exact server name from your broker. If offered, an investor/read-only password is suitable for monitoring.</small>
+        {(error || notice) && <div className={`alert ${error ? 'alert-error' : 'alert-success'}`} role={error ? 'alert' : 'status'} aria-live="polite">{error || notice}</div>}
         <button className="button button-primary" type="submit" disabled={busy || loading || !form.name.trim() || !form.server.trim() || (useOwnMetaApiToken && !form.metaapi_token.trim())}>{busy ? 'Preparing secure setup…' : 'Create secure setup link'}</button>
         <BrokerAccessNote />
-      </form> : setup.key === 'unavailable' ? <div className="empty-state compact-empty"><strong>Account setup is not available yet</strong><span>Please ask the workspace owner to finish setting up account connections.</span></div> : <div className="setup-pending" aria-busy={setup.key === 'checking'}>
-        <span className="skeleton skeleton-block" aria-hidden="true" />
-        <span className="skeleton skeleton-block short" aria-hidden="true" />
-        <span>{setup.key === 'unreachable' ? 'Signal Desk could not confirm whether account setup is available right now.' : 'Checking whether account setup is available…'}</span>
-        {setup.key === 'unreachable' ? <button type="button" className="text-button" onClick={() => { refreshSetup(); }}>Check again</button> : null}
-      </div>}
+      </form> : <>
+        {setup.key === 'unavailable' ? <div className="empty-state compact-empty"><strong>Account setup is not available yet</strong><span>Please ask the workspace owner to finish setting up account connections.</span></div> : <div className="setup-pending" aria-busy={setup.key === 'checking'}>
+          <span className="skeleton skeleton-block" aria-hidden="true" />
+          <span className="skeleton skeleton-block short" aria-hidden="true" />
+          <span>{setup.key === 'unreachable' ? 'Signal Desk could not confirm whether account setup is available right now.' : 'Checking whether account setup is available…'}</span>
+          {setup.key === 'unreachable' ? <button type="button" className="text-button" onClick={() => { refreshSetup(); }}>Check again</button> : null}
+        </div>}
+        {(error || notice) && <div className={`alert ${error ? 'alert-error' : 'alert-success'}`} role={error ? 'alert' : 'status'} aria-live="polite">{error || notice}</div>}
+      </>}
       <p className="field-help account-idle-policy">
         Idle accounts are cleaned up automatically: if nobody signs in or trades for {inactivity?.deletionDays || 30} days, an account created here is deleted from MetaAPI so
         it stops being billed, with a warning here on day {inactivity?.warningDays || 25}. Accounts with an open position are left for you to close, and a paid plan is never
@@ -282,7 +290,7 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
         <ul>{warnings.map((warning) => <li key={warning.id}>{warning.text}</li>)}</ul>
         <p>Log in to Signal Desk or execute a trade to keep the account. Accounts that are removed cannot be recovered, and your broker account itself is not touched.</p>
       </div>}
-      {(error || notice) && <div className={`alert ${error ? 'alert-error' : 'alert-success'}`} role={error ? 'alert' : 'status'} aria-live="polite">{error || notice}</div>}
+      {(accountError || accountNotice) && <div className={`alert ${accountError ? 'alert-error' : 'alert-success'}`} role={accountError ? 'alert' : 'status'} aria-live="polite">{accountError || accountNotice}</div>}
       <p className="field-help account-retention-note">Removing an account you created here deletes it from MetaAPI as well, so provider billing for it stops; your broker account and open positions are untouched. Accounts you added with your own MetaAPI token are only unlinked.</p>
     </section>
   </div>;
