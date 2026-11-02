@@ -13,6 +13,7 @@ import * as telegramAdapter from './services/telegram-adapter.js';
 import { pool, initializeDatabase } from './db.js';
 import { withDeadline } from './services/schema-sql.js';
 import { createMetaApiConfigurationLink, metaApiRequest, toSafeMetaApiAccount } from './services/metaapi.js';
+import { createMetaApiProvisionedAccountHandler, respondWithMetaApiError, shouldDeleteMetaApiAccountOnUnlink } from './services/metaapi-provisioning.js';
 import { getTelegramErrorCode, isTelegramPasswordNeeded, shouldDiscardTelegramLogin, telegramAuthErrorPayload } from './services/telegram-auth.js';
 import { CAPTURE_PARSE_BUDGET_MS, parseSignalTwoLayer } from './services/signal-parse-pipeline.js';
 import { llmConfig, describeLlmConfig, describeLastReaderFailure } from './services/signal-llm.js';
@@ -281,9 +282,20 @@ function getMetaApiProvisioningToken() {
   return process.env.METAAPI_PROVISIONING_TOKEN?.trim() || null;
 }
 
-async function resolveExecutionToken(userId, accountId, managedByApp) {
+async function getMetaApiAccountToken(userId, accountId, managedByApp) {
   if (managedByApp === true) return getMetaApiProvisioningToken();
+  if (accountId) {
+    const { rows } = await pool.query(
+      'SELECT encrypted_api_token FROM metaapi_accounts WHERE user_id=$1 AND metaapi_account_id=$2 LIMIT 1',
+      [userId, accountId],
+    );
+    if (rows[0]?.encrypted_api_token) return decryptSecret(rows[0].encrypted_api_token);
+  }
   return getMetaApiToken(userId);
+}
+
+async function resolveExecutionToken(userId, accountId, managedByApp) {
+  return getMetaApiAccountToken(userId, accountId, managedByApp);
 }
 
 /* ------------------------- platform administration -------------------------
@@ -1761,7 +1773,7 @@ app.get('/api/metaapi/accounts', authenticate, asyncRoute(async (req, res) => {
 app.get('/api/metaapi/linked-accounts', authenticate, asyncRoute(async (req, res) => {
   const { rows } = await pool.query(
     `SELECT ma.id,ma.metaapi_account_id AS "metaApiAccountId",ma.login,ma.name,ma.platform,ma.state,ma.server,
-       ma.managed_by_app AS "managedByApp",ma.created_at AS "createdAt",
+       ma.managed_by_app AS "managedByApp",(ma.encrypted_api_token IS NOT NULL) AS "hasCustomMetaApiToken",ma.created_at AS "createdAt",
        ma.inactivity_status AS "inactivityStatus",ma.inactivity_reason AS "inactivityReason",
        ma.execution_note AS "executionNote",ma.execution_note_at AS "executionNoteAt",
        COALESCE(u.last_active_at,u.last_login,u.created_at) AS "lastActiveAt"
@@ -1785,97 +1797,58 @@ app.get('/api/metaapi/linked-accounts', authenticate, asyncRoute(async (req, res
     },
   });
 }));
-app.post('/api/metaapi/provisioned-accounts', authenticate, asyncRoute(async (req, res) => {
-  const apiToken = getMetaApiProvisioningToken();
-  if (!apiToken) return fail(res, 503, 'Account setup is temporarily unavailable. Please contact the workspace owner.');
-  if (Object.hasOwn(req.body || {}, 'login') || Object.hasOwn(req.body || {}, 'password')) {
-    return fail(res, 400, 'For your security, enter your trading login and password only on the secure MetaAPI page.');
-  }
-  const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
-  const server = typeof req.body?.server === 'string' ? req.body.server.trim() : '';
-  const platform = typeof req.body?.platform === 'string' ? req.body.platform.trim().toLowerCase() : '';
-  if (!name || name.length > 100) return fail(res, 400, 'Enter an account name of 1 to 100 characters.');
-  if (!server || server.length > 160) return fail(res, 400, 'Enter the broker server name shown in your MetaTrader account details.');
-  if (!['mt4', 'mt5'].includes(platform)) return fail(res, 400, 'Choose MetaTrader 4 or MetaTrader 5.');
-  await enforcePlanLimit(req.userId, 'maxTradingAccounts', 'SELECT COUNT(*)::int AS count FROM metaapi_accounts WHERE user_id=$1');
-
-  const accountData = await metaApiRequest(apiToken, '/users/current/accounts', {
-    method: 'POST',
-    body: { name, server, platform, magic: 0 },
-    transactionId: crypto.randomUUID().replaceAll('-', ''),
-    unauthorizedMessage: 'Account setup is temporarily unavailable. Please contact the workspace owner.',
-  });
-  const account = toSafeMetaApiAccount(accountData);
-  if (!account) return fail(res, 502, 'The account could not be added. Please try again.');
-
-  const { rows } = await pool.query(
-    `INSERT INTO metaapi_accounts(user_id,metaapi_account_id,login,name,platform,state,server,managed_by_app)
-     VALUES($1,$2,$3,$4,$5,$6,$7,TRUE)
-     ON CONFLICT(user_id,metaapi_account_id) DO UPDATE SET login=EXCLUDED.login,name=EXCLUDED.name,
-       platform=EXCLUDED.platform,state=EXCLUDED.state,server=EXCLUDED.server,managed_by_app=TRUE
-     RETURNING id,metaapi_account_id AS "metaApiAccountId",login,name,platform,state,server,
-       managed_by_app AS "managedByApp",created_at AS "createdAt"`,
-    [req.userId, account.id, account.login, account.name || name, account.platform || platform, account.state || accountData.state || 'DRAFT', server],
-  );
-
-  let configurationLink = null;
-  let setupError = null;
-  try {
-    configurationLink = await createMetaApiConfigurationLink(apiToken, account.id);
-  } catch (error) {
-    setupError = {
-      message: typeof error.userMessage === 'string' ? error.userMessage : error.message,
-      ...(Number.isInteger(error.metaApiStatus) ? { metaApiStatus: error.metaApiStatus } : {}),
-      ...(typeof error.metaApiErrorCode === 'string' ? { metaApiErrorCode: error.metaApiErrorCode } : {}),
-      ...(typeof error.metaApiErrorType === 'string' ? { metaApiErrorType: error.metaApiErrorType } : {}),
-      ...(typeof error.metaApiNetworkDiagnostic === 'string' ? { metaApiNetworkDiagnostic: error.metaApiNetworkDiagnostic } : {}),
-    };
-    log('warn', 'Secure MetaAPI setup link could not be created', {
-      userId: req.userId,
-      metaApiAccountId: account.id,
-      error: error.message,
-      metaApiStatus: error.metaApiStatus,
-      metaApiErrorCode: error.metaApiErrorCode,
-      metaApiErrorType: error.metaApiErrorType,
-      metaApiNetworkDiagnostic: error.metaApiNetworkDiagnostic,
-    });
-  }
-  res.set('Cache-Control', 'no-store').status(201).json({ account: rows[0], configurationLink, setupError });
-}));
+const provisionMetaApiAccount = createMetaApiProvisionedAccountHandler({
+  pool,
+  getProvisioningToken: getMetaApiProvisioningToken,
+  encryptSecret,
+  enforcePlanLimit,
+  metaApiRequest,
+  createConfigurationLink: createMetaApiConfigurationLink,
+  toSafeAccount: toSafeMetaApiAccount,
+  log,
+});
+app.post('/api/metaapi/provisioned-accounts', authenticate, asyncRoute(provisionMetaApiAccount));
 app.post('/api/metaapi/provisioned-accounts/:accountId/configuration-link', authenticate, asyncRoute(async (req, res) => {
-  const apiToken = getMetaApiProvisioningToken();
-  if (!apiToken) return fail(res, 503, 'Account setup is temporarily unavailable. Please contact the workspace owner.');
   const accountId = String(req.params.accountId || '');
   const { rows } = await pool.query(
-    'SELECT metaapi_account_id FROM metaapi_accounts WHERE user_id=$1 AND metaapi_account_id=$2 AND managed_by_app=TRUE',
+    'SELECT metaapi_account_id,managed_by_app FROM metaapi_accounts WHERE user_id=$1 AND metaapi_account_id=$2',
     [req.userId, accountId],
   );
   if (!rows[0]) return fail(res, 404, 'That account is not available in your workspace.');
-  const configurationLink = await createMetaApiConfigurationLink(apiToken, rows[0].metaapi_account_id);
+  const apiToken = await getMetaApiAccountToken(req.userId, rows[0].metaapi_account_id, rows[0].managed_by_app);
+  if (!apiToken) return fail(res, 503, 'The MetaAPI token for this account is not available. Reconnect your account and try again.');
+  let configurationLink;
+  try { configurationLink = await createMetaApiConfigurationLink(apiToken, rows[0].metaapi_account_id); }
+  catch (error) { return respondWithMetaApiError(res, error, log, { userId: req.userId, operation: 'create-configuration-link', apiToken }); }
   res.set('Cache-Control', 'no-store').json({ configurationLink });
 }));
 app.post('/api/metaapi/provisioned-accounts/:accountId/refresh', authenticate, asyncRoute(async (req, res) => {
-  const apiToken = getMetaApiProvisioningToken();
-  if (!apiToken) return fail(res, 503, 'Account setup is temporarily unavailable. Please contact the workspace owner.');
   const accountId = String(req.params.accountId || '');
   const { rows: ownedAccounts } = await pool.query(
-    `SELECT metaapi_account_id AS "metaApiAccountId",name,platform,server
-     FROM metaapi_accounts WHERE user_id=$1 AND metaapi_account_id=$2 AND managed_by_app=TRUE`,
+    `SELECT metaapi_account_id AS "metaApiAccountId",name,platform,server,managed_by_app AS "managedByApp"
+     FROM metaapi_accounts WHERE user_id=$1 AND metaapi_account_id=$2`,
     [req.userId, accountId],
   );
   const ownedAccount = ownedAccounts[0];
   if (!ownedAccount) return fail(res, 404, 'That account is not available in your workspace.');
+  const apiToken = await getMetaApiAccountToken(req.userId, accountId, ownedAccount.managedByApp);
+  if (!apiToken) return fail(res, 503, 'The MetaAPI token for this account is not available. Reconnect your account and try again.');
 
-  const accountData = await metaApiRequest(apiToken, `/users/current/accounts/${encodeURIComponent(accountId)}`, {
-    unauthorizedMessage: 'Account setup is temporarily unavailable. Please contact the workspace owner.',
-  });
+  let accountData;
+  try {
+    accountData = await metaApiRequest(apiToken, `/users/current/accounts/${encodeURIComponent(accountId)}`, {
+      unauthorizedMessage: 'Account setup is temporarily unavailable. Please contact the workspace owner.',
+    });
+  } catch (error) {
+    return respondWithMetaApiError(res, error, log, { userId: req.userId, operation: 'refresh-account', apiToken });
+  }
   const account = toSafeMetaApiAccount(accountData);
   if (!account || account.id !== accountId) return fail(res, 502, 'We could not refresh this account. Please try again.');
   const { rows } = await pool.query(
     `UPDATE metaapi_accounts SET login=$1,name=$2,platform=$3,state=$4,server=$5
-     WHERE user_id=$6 AND metaapi_account_id=$7 AND managed_by_app=TRUE
+     WHERE user_id=$6 AND metaapi_account_id=$7
      RETURNING id,metaapi_account_id AS "metaApiAccountId",login,name,platform,state,server,
-       managed_by_app AS "managedByApp",created_at AS "createdAt"`,
+       managed_by_app AS "managedByApp",(encrypted_api_token IS NOT NULL) AS "hasCustomMetaApiToken",created_at AS "createdAt"`,
     [account.login, account.name || ownedAccount.name, account.platform || ownedAccount.platform, account.state || 'DRAFT', ownedAccount.server, req.userId, accountId],
   );
   res.set('Cache-Control', 'no-store').json({ account: rows[0] });
@@ -1906,18 +1879,20 @@ app.delete('/api/metaapi/accounts/:accountId', authenticate, asyncRoute(async (r
   const account = rows[0];
   if (!account) return fail(res, 404, 'Linked MetaAPI account not found.');
 
-  // Unlinking also stops provider billing: delete the account from MetaAPI itself,
-  // using the same cleanup path as full account deletion. A provider failure is
-  // logged and reported but never blocks the local unlink.
-  let metaApiCleanup = { total: 1, attempted: 0, deleted: 0, alreadyMissing: 0, failed: 0, skipped: 0, failures: [] };
-  try {
-    metaApiCleanup = await accountCleanup.removeProviderAccounts({
-      accounts: [account],
-      resolveToken: () => getMetaApiProvisioningToken(),
-    });
-    if (metaApiCleanup.failed) log('warn', 'MetaAPI account deletion failed during unlink', { userId: req.userId, accountId });
-  } catch (error) {
-    log('warn', 'MetaAPI account cleanup could not run during unlink', { userId: req.userId, accountId, code: error.code || 'METAAPI_CLEANUP_FAILED' });
+  // Platform-billed accounts are deleted upstream so their charges stop. BYO-token accounts
+  // are only removed from this workspace: touching MetaAPI would disrupt the user's own billing.
+  const shouldDeleteProviderAccount = shouldDeleteMetaApiAccountOnUnlink(account);
+  let metaApiCleanup = { total: 1, attempted: 0, deleted: 0, alreadyMissing: 0, failed: 0, skipped: shouldDeleteProviderAccount ? 0 : 1, failures: [] };
+  if (shouldDeleteProviderAccount) {
+    try {
+      metaApiCleanup = await accountCleanup.removeProviderAccounts({
+        accounts: [account],
+        resolveToken: () => getMetaApiProvisioningToken(),
+      });
+      if (metaApiCleanup.failed) log('warn', 'MetaAPI account deletion failed during unlink', { userId: req.userId, accountId });
+    } catch (error) {
+      log('warn', 'MetaAPI account cleanup could not run during unlink', { userId: req.userId, accountId, code: error.code || 'METAAPI_CLEANUP_FAILED' });
+    }
   }
 
   await pool.query('UPDATE settings SET auto_trading_enabled=FALSE,execution_account_id=NULL,updated_at=NOW() WHERE user_id=$1 AND execution_account_id=$2', [req.userId, accountId]);

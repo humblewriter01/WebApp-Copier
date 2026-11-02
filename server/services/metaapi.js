@@ -58,6 +58,22 @@ function safeProviderMessage(payload, apiToken) {
   return (informative.length ? informative : unique).join(' — ').slice(0, 1000);
 }
 
+function safeRawProviderValue(value, apiToken, key = '') {
+  if (/(?:authorization|auth[-_ ]?token|access[-_ ]?token|api[-_ ]?token|password|passwd|secret|api[-_ ]?key)/i.test(key)) return '[redacted]';
+  if (typeof value === 'string') return safeProviderMessage({ message: value }, apiToken);
+  if (Array.isArray(value)) return value.map((item) => safeRawProviderValue(item, apiToken));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([childKey, childValue]) => [childKey, safeRawProviderValue(childValue, apiToken, childKey)]));
+  }
+  return value;
+}
+
+function safeRawProviderPayload(payload, apiToken) {
+  if (payload === null || payload === undefined) return null;
+  try { return JSON.stringify(safeRawProviderValue(payload, apiToken)).slice(0, 16_000); }
+  catch { return '[unserializable provider response]'; }
+}
+
 function safeNetworkDiagnostics(cause, apiToken) {
   const queue = [cause];
   const seen = new Set();
@@ -133,6 +149,7 @@ function safeMetaApiError(status, payload, unauthorizedMessage, apiToken) {
       : status === 404 ? 404
         : 502;
   error.metaApiStatus = status;
+  error.metaApiRawResponse = safeRawProviderPayload(payload, apiToken);
   if (detail) error.metaApiErrorCode = detail;
   if (fundingIssue) {
     error.metaApiErrorType = 'funding';

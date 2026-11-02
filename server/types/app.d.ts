@@ -91,6 +91,8 @@ interface Error {
   metaApiErrorType?: string;
   /** The transport detail that goes in the operator log and never in a response body. */
   metaApiNetworkDiagnostic?: string;
+  /** The credential-redacted provider response retained for internal provisioning diagnostics only. */
+  metaApiRawResponse?: string | null;
   /** Flutterwave's status for a verification that came back not-successful, kept for the reconciliation job. */
   flutterwaveStatus?: string;
   /** The rate-limit bucket that filled, so a 429 can say which one without re-deriving it. */

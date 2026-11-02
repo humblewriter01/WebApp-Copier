@@ -67,7 +67,8 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
   // its own request was still in flight.
   const { view: setup, refresh: refreshSetup } = useMetaApiStatus();
   const [accounts, setAccounts] = useState([]);
-  const [form, setForm] = useState({ name: '', platform: 'mt5', server: '' });
+  const [form, setForm] = useState({ name: '', platform: 'mt5', server: '', metaapi_token: '' });
+  const [useOwnMetaApiToken, setUseOwnMetaApiToken] = useState(false);
   const [setupLink, setSetupLink] = useState(null);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -103,11 +104,12 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
     setNotice('');
     setSetupLink(null);
     try {
+      const { name, platform, server, metaapi_token: suppliedMetaApiToken } = form;
       const result = await request('/api/metaapi/provisioned-accounts', token, {
         method: 'POST',
-        body: form,
+        body: { name, platform, server, ...(useOwnMetaApiToken ? { metaapi_token: suppliedMetaApiToken } : {}) },
       });
-      setForm((current) => ({ ...current, name: '', server: '' }));
+      setForm((current) => ({ ...current, name: '', server: '', metaapi_token: '' }));
       if (result.configurationLink) {
         setSetupLink({ accountId: result.account.metaApiAccountId, url: result.configurationLink });
       }
@@ -183,10 +185,10 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
     }
   };
 
-  const provisionedAccounts = accounts.filter((account) => account.managedByApp);
+  const provisionedAccounts = accounts.filter((account) => account.managedByApp || account.hasCustomMetaApiToken);
   const warnings = idleWarnings({ accounts, inactivity });
   const sourceNote = telegramSourceNote({ view, channelCount });
-  const previouslyLinkedAccounts = accounts.filter((account) => !account.managedByApp);
+  const previouslyLinkedAccounts = accounts.filter((account) => !account.managedByApp && !account.hasCustomMetaApiToken);
 
   return <div className="panel-grid">
     <section className="panel" aria-labelledby="metaapi-setup-title">
@@ -195,7 +197,11 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
         <MetaApiStatusPill />
       </div>
       <p className="muted">Enter the trading account name, platform, and broker server. You’ll enter your trading login and password on MetaAPI’s secure page—not in Signal Desk.</p>
-      {setup.allowSetupForm ? <form className="form-stack" onSubmit={createAccount} aria-busy={busy}>
+      <button type="button" className="text-button metaapi-token-toggle" aria-expanded={useOwnMetaApiToken} aria-controls="metaapi-own-token-fields" onClick={() => {
+        setForm((current) => ({ ...current, metaapi_token: '' }));
+        setUseOwnMetaApiToken((current) => !current);
+      }}>{useOwnMetaApiToken ? 'Use Signal Desk account access' : 'Advanced: use your own MetaAPI token'}</button>
+      {setup.allowSetupForm || useOwnMetaApiToken ? <form className="form-stack" onSubmit={createAccount} aria-busy={busy}>
         <label htmlFor="metaapi-account-name">Account name
           <input id="metaapi-account-name" value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="My MT5 account" maxLength={100} autoComplete="off" required />
         </label>
@@ -208,8 +214,16 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
         <label htmlFor="metaapi-server">Broker server
           <input id="metaapi-server" value={form.server} onChange={(event) => setForm({ ...form, server: event.target.value })} placeholder="Server name shown by your broker" maxLength={160} autoComplete="off" required />
         </label>
+        <div id="metaapi-own-token-fields" hidden={!useOwnMetaApiToken}>
+          {useOwnMetaApiToken && <>
+            <label htmlFor="metaapi-own-token">Your MetaAPI token
+              <input id="metaapi-own-token" type="password" value={form.metaapi_token} onChange={(event) => setForm({ ...form, metaapi_token: event.target.value })} autoComplete="new-password" maxLength={4096} required />
+            </label>
+            <small className="field-help">Encrypted for this account and used for setup and execution. It is never shown again or written to logs.</small>
+          </>}
+        </div>
         <small className="field-help">Use the exact server name from your broker. If offered, an investor/read-only password is suitable for monitoring.</small>
-        <button className="button button-primary" type="submit" disabled={busy || loading || !form.name.trim() || !form.server.trim()}>{busy ? 'Preparing secure setup…' : 'Create secure setup link'}</button>
+        <button className="button button-primary" type="submit" disabled={busy || loading || !form.name.trim() || !form.server.trim() || (useOwnMetaApiToken && !form.metaapi_token.trim())}>{busy ? 'Preparing secure setup…' : 'Create secure setup link'}</button>
         <BrokerAccessNote />
       </form> : setup.key === 'unavailable' ? <div className="empty-state compact-empty"><strong>Account setup is not available yet</strong><span>Please ask the workspace owner to finish setting up account connections.</span></div> : <div className="setup-pending" aria-busy={setup.key === 'checking'}>
         <span className="skeleton skeleton-block" aria-hidden="true" />
@@ -255,7 +269,7 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
           <div className="account-actions">
             <button type="button" className="button button-secondary button-small" disabled={busy} onClick={() => refreshAccount(account)}>Refresh status</button>
             <button type="button" className="button button-small" disabled={busy} onClick={() => createLink(account)}>New setup link</button>
-            <button type="button" className="icon-button" disabled={busy} onClick={() => removeAccount(account)}>Delete account</button>
+            <button type="button" className="icon-button" disabled={busy} onClick={() => removeAccount(account)}>{account.managedByApp ? 'Delete account' : 'Unlink'}</button>
           </div>
         </div>)}
         {previouslyLinkedAccounts.map((account) => <div className="chat-row account-row" key={account.id}>
