@@ -63,6 +63,21 @@ test('the banner history clear reaches the clear, not the retire-one route', () 
   assert.equal(firstMatch('patch', '/api/admin/announcements/2ea79e0a-9929-4572-9e7a-c09f68b9c0dc')?.path, '/api/admin/announcements/:id');
 });
 
+test('public pricing is reachable without auth and checkout accepts no browser price', () => {
+  const pricing = firstMatch('get', '/api/public/pricing');
+  assert.equal(pricing?.path, '/api/public/pricing');
+  const pricingHandler = index.slice(pricing.at, index.indexOf("app.get('/api/billing/plans'", pricing.at));
+  assert.match(pricingHandler, /pricingStore\.snapshot\(\)/);
+  assert.match(pricingHandler, /publicPricing\(snapshot\)/);
+  assert.doesNotMatch(pricingHandler, /authenticate/);
+
+  const checkout = firstMatch('post', '/api/billing/checkout');
+  const checkoutHandler = index.slice(checkout.at, index.indexOf("app.get('/api/billing/verify'", checkout.at));
+  assert.match(checkoutHandler, /planKey:\s*req\.body\?\.plan/);
+  assert.match(checkoutHandler, /currency:\s*requested/);
+  assert.doesNotMatch(checkoutHandler, /req\.body\?\.amount|amountMinor:\s*req\.body/);
+});
+
 test('the other two admin clears resolve to themselves', () => {
   for (const [verb, path, expected] of [
     ['delete', '/api/admin/health/errors', '/api/admin/health/errors'],

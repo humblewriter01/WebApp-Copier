@@ -1,7 +1,7 @@
 const configuredApiUrl = import.meta.env.VITE_API_URL || '';
 const apiUrl = import.meta.env.PROD && configuredApiUrl.includes('telegram-copier-api.onrender.com')
   ? 'https://telegram-copier-api-l1mj.onrender.com'
-  : configuredApiUrl || (import.meta.env.PROD ? 'https://telegram-copier-api-l1mj.onrender.com' : 'http://localhost:5000');
+  : configuredApiUrl || (import.meta.env.PROD ? 'https://telegram-copier-api-l1mj.onrender.com' : '');
 export const API_URL = apiUrl.replace(/\/$/, '');
 
 import { WAKE_RETRY_DELAY_MS, isUnansweredRequestFailure, withWakeRetry } from './wake-retry.js';

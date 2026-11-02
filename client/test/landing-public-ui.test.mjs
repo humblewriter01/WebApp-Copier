@@ -90,15 +90,14 @@ test('the workspace is shown, and labelled as a picture', async () => {
   await unmount();
 });
 
-test('Login and Get Started are the only ways in, and each opens the door it names', async () => {
+test('Get Started and Log in open their named auth flows, with recovery kept inside login', async () => {
   const { host, entered, unmount } = await mount({ onEnterAuth: (mode) => entered.push(mode) });
-  await act(async () => { buttonNamed(host, 'Create your workspace').click(); });
-  assert.deepEqual(entered, ['register'], 'Get Started goes to the workspace-creation form');
+  await act(async () => { buttonNamed(host, 'Get Started Free').click(); });
+  assert.deepEqual(entered, ['register'], 'Get Started opens workspace creation');
   await act(async () => { buttonNamed(host, 'Log in').click(); });
-  assert.deepEqual(entered, ['register', 'login'], 'Log in goes to the sign-in form');
-  await act(async () => { buttonNamed(host, 'Forgotten a password?').click(); });
-  assert.deepEqual(entered, ['register', 'login', 'forgot'], 'and the one account question this page may answer is a lost password');
-  assert.equal(entered.length, 3, 'three doors, no more');
+  assert.deepEqual(entered, ['register', 'login'], 'Log in opens sign-in');
+  assert.equal(buttonNamed(host, 'Forgotten a password?'), undefined, 'password recovery is not promoted on the public landing page');
+  assert.match(appSource, /Forgot Password\?/i, 'the password recovery link remains in the actual login form');
   await unmount();
 });
 
@@ -111,14 +110,40 @@ test('the install offer is the browser’s, not this page’s invention', async 
   await withPrompt.unmount();
 });
 
-test('the page asks nothing of the visitor and holds nothing back from them', () => {
-  /* A public page that reads a token, calls an endpoint or touches storage is a public page that can fail, be
-     slow, or leak a session into a shared browser. It renders from the constants in its own file or it does not run. */
-  for (const forbidden of ['fetch(', 'request(', 'XMLHttpRequest', 'localStorage', 'sessionStorage', 'signal-token', 'supabase', 'API_URL', 'WebSocket', 'await ']) {
-    assert.ok(!landingSource.includes(forbidden), `the landing view never touches ${forbidden} - it has no reason to and every reason not to`);
+test('the page requests only public prices and never reads visitor credentials or storage', () => {
+  for (const forbidden of ['localStorage', 'sessionStorage', 'signal-token', 'supabase', 'WebSocket']) {
+    assert.ok(!landingSource.includes(forbidden), `the public landing view never touches ${forbidden}`);
   }
-  assert.match(landingSource, /^import React from 'react';$/m, 'React is its only import');
-  assert.doesNotMatch(landingSource, /useState|useEffect|useMemo/, 'no state and no effects, so there is no lifespan to get wrong');
+  assert.match(landingSource, /request\('\/api\/public\/pricing'\)/, 'only the public pricing endpoint is fetched');
+  assert.match(landingSource, /catch\(\(\) => \{\}\)/, 'a pricing outage silently preserves the useful default cards');
+  assert.match(landingSource, /useState\(DEFAULT_PRICING\)/, 'defaults render before the request completes');
+});
+
+test('pricing defaults render on an API failure and live prices replace them on success', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => { throw new Error('offline'); };
+    const fallback = await mount();
+    assert.match(text(fallback.host.querySelector('.landing-pricing')), /₦60,000|₦60,000\.00/, 'Starter has an immediate default price');
+    assert.match(text(fallback.host.querySelector('.landing-pricing')), /₦105,000|₦105,000\.00/, 'Pro has an immediate default price');
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    assert.match(text(fallback.host.querySelector('.landing-pricing')), /₦60,000|₦60,000\.00/, 'failure leaves the defaults in place');
+    await fallback.unmount();
+
+    globalThis.fetch = async () => new Response(JSON.stringify({ currency: 'USD', plans: [
+      { key: 'starter', name: 'Starter', amount: 27, currency: 'USD', interval: 'monthly' },
+      { key: 'pro', name: 'Pro', amount: 44, currency: 'USD', interval: 'monthly' },
+      { key: 'premium', name: 'Premium', amount: 79, currency: 'USD', interval: 'monthly' },
+    ] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    const live = await mount();
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    const prices = text(live.host.querySelector('.landing-pricing'));
+    assert.match(prices, /\$27/);
+    assert.match(prices, /\$44/);
+    assert.match(prices, /\$79/);
+    assert.doesNotMatch(prices, /₦105,000/);
+    await live.unmount();
+  } finally { globalThis.fetch = originalFetch; }
 });
 
 test('the language rule a trader’s notes are held to is held over the marketing copy too', async () => {

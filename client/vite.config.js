@@ -20,6 +20,14 @@ export default defineConfig(({ mode }) => {
   }
 
   return {
+    server: {
+      host: '0.0.0.0',
+      allowedHosts: true,
+      proxy: {
+        '/api': { target: 'http://127.0.0.1:5000', changeOrigin: true },
+        '/socket.io': { target: 'ws://127.0.0.1:5000', ws: true },
+      },
+    },
     build: {
       // Keep the existing behaviour: emit assets under /assets and no source maps.
       sourcemap: false,
