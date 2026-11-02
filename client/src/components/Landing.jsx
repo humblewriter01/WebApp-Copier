@@ -3,10 +3,10 @@ import React, { useEffect, useState } from 'react';
 import { request } from '../lib/api.js';
 
 const DEFAULT_PRICING = [
-  { key: 'free', name: 'Free', amount: 0, currency: 'NGN', interval: 'monthly', description: 'Explore signal capture and review.' },
-  { key: 'starter', name: 'Starter', amount: 60000, currency: 'NGN', interval: 'monthly', description: 'A focused setup for one trading account.' },
-  { key: 'pro', name: 'Pro', amount: 105000, currency: 'NGN', interval: 'monthly', description: 'More accounts and room for active channels.' },
-  { key: 'premium', name: 'Premium', amount: 150000, currency: 'NGN', interval: 'monthly', description: 'Higher limits for multiple accounts and busy channels.' },
+  { key: 'free', name: 'Free', amount: 0, currency: 'USD', prices: { USD: 0, NGN: 0 }, interval: 'monthly', description: 'Explore signal capture and review.' },
+  { key: 'starter', name: 'Starter', amount: 39, currency: 'USD', prices: { USD: 39, NGN: 60000 }, interval: 'monthly', description: 'A focused setup for one trading account.' },
+  { key: 'pro', name: 'Pro', amount: 69, currency: 'USD', prices: { USD: 69, NGN: 105000 }, interval: 'monthly', description: 'More accounts and room for active channels.' },
+  { key: 'premium', name: 'Premium', amount: 99, currency: 'USD', prices: { USD: 99, NGN: 150000 }, interval: 'monthly', description: 'Higher limits for multiple accounts and busy channels.' },
 ];
 const SAMPLE_SIGNALS = [
   { id: 'xau', symbol: 'XAUUSD', side: 'SELL', entry: '2 612.50', stop: '2 622.00', target: '2 592.00', state: 'Executed', detail: '0.10 lots · 2 s after the post' },
@@ -38,18 +38,27 @@ function MockDashboard() {
   </div>;
 }
 
-function formatPrice(plan) {
-  if (plan.amount === null || plan.amount === undefined) return 'Contact us';
-  if (Number(plan.amount) === 0) return 'Free';
+function priceAmount(plan, currency) {
+  const entry = plan.prices?.[currency];
+  if (entry && typeof entry === 'object') return entry.amount ?? (entry.amountMinor == null ? null : Number(entry.amountMinor) / 100);
+  if (entry !== undefined) return entry;
+  return plan.currency === currency ? (plan.amount ?? (plan.amountMinor == null ? null : Number(plan.amountMinor) / 100)) : null;
+}
+
+function formatPrice(plan, currency) {
+  const amount = priceAmount(plan, currency);
+  if (amount === null || amount === undefined) return 'Contact us';
+  if (Number(amount) === 0) return 'Free';
   try {
-    return new Intl.NumberFormat(plan.currency === 'NGN' ? 'en-NG' : 'en-US', { style: 'currency', currency: plan.currency, maximumFractionDigits: 2 }).format(Number(plan.amount));
+    return new Intl.NumberFormat(currency === 'NGN' ? 'en-NG' : 'en-US', { style: 'currency', currency, maximumFractionDigits: 2 }).format(Number(amount));
   } catch {
-    return `${plan.currency || ''} ${Number(plan.amount).toLocaleString()}`.trim();
+    return `${currency} ${Number(amount).toLocaleString()}`.trim();
   }
 }
 
 export default function Landing({ onEnterAuth = () => {}, installPrompt = null, onInstall = () => {} }) {
   const [plans, setPlans] = useState(DEFAULT_PRICING);
+  const [currency, setCurrency] = useState('USD');
 
   useEffect(() => {
     let active = true;
@@ -58,7 +67,16 @@ export default function Landing({ onEnterAuth = () => {}, installPrompt = null, 
       const liveByKey = new Map(payload.plans.map((plan) => [plan.key, plan]));
       const livePlans = DEFAULT_PRICING.map((fallback) => {
         const live = liveByKey.get(fallback.key);
-        return live ? { ...fallback, ...live, amount: live.amount ?? (live.amountMinor == null ? null : live.amountMinor / 100) } : fallback;
+        if (!live) return fallback;
+        const prices = { ...fallback.prices };
+        if (live.prices && typeof live.prices === 'object') {
+          for (const code of ['USD', 'NGN']) {
+            if (Object.prototype.hasOwnProperty.call(live.prices, code)) prices[code] = live.prices[code];
+          }
+        } else if (live.currency && ['USD', 'NGN'].includes(live.currency)) {
+          prices[live.currency] = live.amount ?? (live.amountMinor == null ? null : live.amountMinor / 100);
+        }
+        return { ...fallback, ...live, prices, amount: live.amount ?? (live.amountMinor == null ? null : live.amountMinor / 100) };
       });
       setPlans(livePlans);
     }).catch(() => {});
@@ -95,10 +113,13 @@ export default function Landing({ onEnterAuth = () => {}, installPrompt = null, 
     <section className="landing-pricing" aria-labelledby="landing-pricing-title">
       <div className="landing-guarantee-bar"><span>One-click disconnect</span><i>•</i><span>No hidden fees</span><i>•</i><span>Bank-grade MT5 encryption</span></div>
       <div className="landing-section-heading"><p className="eyebrow">SIMPLE, TRANSPARENT PLANS</p><h2 id="landing-pricing-title">Pricing that scales with you</h2><p>Start free, then choose the capacity that fits your workspace.</p></div>
+      <div className="landing-currency-toggle" role="group" aria-label="Pricing currency">
+        {['USD', 'NGN'].map((code) => <button key={code} type="button" className={currency === code ? 'active' : ''} aria-pressed={currency === code} onClick={() => setCurrency(code)}>{code}</button>)}
+      </div>
       <div className="landing-pricing-grid">{plans.map((plan) => <article className={`landing-price-card${plan.key === 'pro' ? ' landing-price-featured' : ''}`} key={plan.key}>
         {plan.key === 'pro' && <span className="landing-popular">POPULAR</span>}
         <h3>{plan.name}</h3><p className="landing-price-description">{plan.description}</p>
-        <p className="landing-price"><strong>{formatPrice(plan)}</strong>{Number(plan.amount) > 0 && <span> / {{ monthly: 'month', quarterly: 'quarter', annually: 'year', annual: 'year' }[plan.interval] || plan.interval || 'month'}</span>}</p>
+        <p className="landing-price"><strong>{formatPrice(plan, currency)}</strong>{Number(priceAmount(plan, currency)) > 0 && <span> / {{ monthly: 'month', quarterly: 'quarter', annually: 'year', annual: 'year' }[plan.interval] || plan.interval || 'month'}</span>}</p>
         <button type="button" className={`button ${plan.key === 'pro' ? 'button-primary' : 'button-secondary'}`} onClick={() => onEnterAuth('register')}>{plan.key === 'free' ? 'Get Started Free' : 'Choose ' + plan.name}</button>
       </article>)}</div>
     </section>

@@ -119,15 +119,32 @@ test('the page requests only public prices and never reads visitor credentials o
   assert.match(landingSource, /useState\(DEFAULT_PRICING\)/, 'defaults render before the request completes');
 });
 
+test('the landing pricing defaults to USD and the NGN toggle still changes every displayed price', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => { throw new Error('offline'); };
+    const { host, unmount } = await mount();
+    const pricing = host.querySelector('.landing-pricing');
+    assert.match(text(pricing), /\$39/, 'Starter shows its USD fallback immediately');
+    assert.match(text(pricing), /\$69/, 'Pro shows its USD fallback immediately');
+    assert.equal(pricing.querySelector('[aria-label="Pricing currency"] button[aria-pressed="true"]')?.textContent, 'USD');
+    await act(async () => { buttonNamed(host, 'NGN').click(); });
+    assert.equal(pricing.querySelector('[aria-label="Pricing currency"] button[aria-pressed="true"]')?.textContent, 'NGN');
+    assert.match(text(pricing), /₦60,000/, 'the manual switch displays the naira Starter fallback');
+    assert.match(text(pricing), /₦105,000/, 'and the naira Pro fallback');
+    await unmount();
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test('pricing defaults render on an API failure and live prices replace them on success', async () => {
   const originalFetch = globalThis.fetch;
   try {
     globalThis.fetch = async () => { throw new Error('offline'); };
     const fallback = await mount();
-    assert.match(text(fallback.host.querySelector('.landing-pricing')), /₦60,000|₦60,000\.00/, 'Starter has an immediate default price');
-    assert.match(text(fallback.host.querySelector('.landing-pricing')), /₦105,000|₦105,000\.00/, 'Pro has an immediate default price');
+    assert.match(text(fallback.host.querySelector('.landing-pricing')), /\$39/, 'Starter has an immediate USD default price');
+    assert.match(text(fallback.host.querySelector('.landing-pricing')), /\$69/, 'Pro has an immediate USD default price');
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
-    assert.match(text(fallback.host.querySelector('.landing-pricing')), /₦60,000|₦60,000\.00/, 'failure leaves the defaults in place');
+    assert.match(text(fallback.host.querySelector('.landing-pricing')), /\$39/, 'failure leaves the USD defaults in place');
     await fallback.unmount();
 
     globalThis.fetch = async () => new Response(JSON.stringify({ currency: 'USD', plans: [

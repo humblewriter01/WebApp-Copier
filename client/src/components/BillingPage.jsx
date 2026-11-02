@@ -75,7 +75,7 @@ function formatDate(value) {
  * exist and are simply not offered yet, which is a different message from a control that pretends not to be
  * there.
  */
-export function CurrencyToggle({ value = 'NGN', options = ['NGN', 'USD'], available = options, onChange, onSelect } = {}) {
+export function CurrencyToggle({ value = 'USD', options = ['NGN', 'USD'], available = options, onChange, onSelect } = {}) {
   if (options.length < 2) return null;
   return <div className="billing-currency-toggle" role="group" aria-label="Price currency">
     {options.map((code) => {
@@ -105,9 +105,8 @@ function statusLabel(subscription) {
 
 export default function BillingPage({ token }) {
   const [plans, setPlans] = useState([]);
-  // Naira first, always: it is the currency this workspace was built for, and a visitor who never touches the
-  // toggle must see exactly what they saw before dollars existed here.
-  const [currency, setCurrency] = useState('NGN');
+  // Dollars are the default for a fresh billing view; existing explicit selections remain available via the toggle.
+  const [currency, setCurrency] = useState('USD');
   const [data, setData] = useState(null);
   const [promoCode, setPromoCode] = useState('');
   const [quote, setQuote] = useState(null);

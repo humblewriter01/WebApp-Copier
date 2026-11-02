@@ -2097,9 +2097,13 @@ app.get('/api/public/pricing', asyncRoute(async (_req, res) => {
     currency: snapshot.currency,
     interval: snapshot.interval,
     plans: [
-      { key: FREE_PLAN.key, name: FREE_PLAN.name, price: 0, amount: 0, amountMinor: 0, currency: snapshot.currency, interval: snapshot.interval },
-      ...publicPricing(snapshot).map(({ key, name, amount, amountMinor, currency, interval }) => ({
+      { key: FREE_PLAN.key, name: FREE_PLAN.name, price: 0, amount: 0, amountMinor: 0, currency: snapshot.currency, interval: snapshot.interval, prices: { NGN: { amount: 0, amountMinor: 0, currency: 'NGN' }, USD: { amount: 0, amountMinor: 0, currency: 'USD' } } },
+      ...publicPricing(snapshot).map(({ key, name, amount, amountMinor, currency, interval, prices }) => ({
         key, name, price: amount, amount, amountMinor, currency, interval,
+        prices: Object.fromEntries(['NGN', 'USD'].map((code) => {
+          const price = prices?.[code];
+          return [code, { amount: price?.amount ?? null, amountMinor: price?.amountMinor ?? null, currency: code }];
+        })),
       })),
     ],
   });

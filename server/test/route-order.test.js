@@ -69,6 +69,7 @@ test('public pricing is reachable without auth and checkout accepts no browser p
   const pricingHandler = index.slice(pricing.at, index.indexOf("app.get('/api/billing/plans'", pricing.at));
   assert.match(pricingHandler, /pricingStore\.snapshot\(\)/);
   assert.match(pricingHandler, /publicPricing\(snapshot\)/);
+  assert.match(pricingHandler, /Object\.fromEntries\(\['NGN', 'USD'\]/, 'public pricing exposes both currency amounts for the landing-page toggle');
   assert.doesNotMatch(pricingHandler, /authenticate/);
 
   const checkout = firstMatch('post', '/api/billing/checkout');
