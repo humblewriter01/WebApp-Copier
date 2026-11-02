@@ -408,8 +408,13 @@ test('a new workspace starts with 500 and 1000, and an existing one is not hande
   for (const column of ['needs_review', 'parsed_by', 'parse_confidence', 'llm_used', 'stop_loss_pips', 'take_profit_pips']) {
     assert.ok(new RegExp(`ALTER TABLE signals ADD COLUMN IF NOT EXISTS ${column} `).test(schemaSource), `${column} is added to signals`);
   }
-  // The signup insert omits both columns, which is what makes them inherit the new defaults.
-  assert.match(indexSource, /INSERT INTO settings\(user_id\) VALUES\(\$1\)/);
+  /* The signup insert omits both fallback columns, which is what makes them inherit the new defaults - and that is
+     the property, not the old exact-SQL match. The insert now names one column, `auto_trading_enabled`, because the
+     value that decides whether a brand-new workspace may spend money is written rather than inherited. Pinned both
+     ways: the fallback columns stay unnamed below, and the named one says FALSE. See test/auto-trading-default.test.js. */
+  assert.match(indexSource, /INSERT INTO settings\(user_id,auto_trading_enabled\) VALUES\(\$1,FALSE\) ON CONFLICT DO NOTHING/);
+  const signup = /INSERT INTO settings\(user_id,auto_trading_enabled\) VALUES\([^)]*\)/.exec(indexSource)[0];
+  assert.doesNotMatch(signup, /fallback_/, 'the signup insert is the one that must stay thin; the settings upsert names every column, which is its job');
 });
 
 /* --------------------------------------------------------------------- pips, at order time --------------------------------------------------------------------- */

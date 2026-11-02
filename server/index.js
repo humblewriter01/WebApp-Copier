@@ -1405,7 +1405,11 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
   try {
     await dbClient.query('BEGIN');
     const { rows } = await dbClient.query("INSERT INTO users(name,email,password_hash,supabase_user_id,role) VALUES($1,$2,$3,$4,$5) RETURNING id,name,email,role,created_at", [name, email, hash, supabaseUserId, adminAccess.isAdminEmail(email) ? 'admin' : 'user']);
-    await dbClient.query('INSERT INTO settings(user_id) VALUES($1) ON CONFLICT DO NOTHING', [rows[0].id]);
+    // Written, not inherited: this is the one place a settings row comes into existence, and the column default is
+    // the only other thing that could decide it. Auto-trading executes live orders, so the row that a signup
+    // creates says FALSE out loud and the trader has to raise it themselves, through the panel that asks them to
+    // confirm what they are enabling (`RiskWarningModal`, and `PUT /api/settings` refuses an increase without it).
+    await dbClient.query('INSERT INTO settings(user_id,auto_trading_enabled) VALUES($1,FALSE) ON CONFLICT DO NOTHING', [rows[0].id]);
     await dbClient.query('COMMIT');
     const user = publicUser(rows[0]);
     res.status(201).json({ token: issueToken(user, req.body.rememberMe === true), user });
