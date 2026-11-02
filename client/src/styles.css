@@ -722,3 +722,31 @@ button,input,textarea,select{touch-action:manipulation}
 .landing-currency-toggle button:hover:not(.active){background:#ffffff0c;color:#fff}
 .landing-currency-toggle button.active{background:#63d7bb;color:#09241f;box-shadow:0 2px 8px #030b1740}
 .landing-currency-toggle button:focus-visible{outline:2px solid #63d7bb;outline-offset:2px}
+
+.landing-security-note{display:flex;align-items:flex-start;gap:8px;max-width:52ch;color:#98a9bd;font-size:12px;line-height:1.6}
+.landing-lock-icon{width:14px;height:14px;flex:0 0 14px;margin-top:2px;fill:none;stroke:#63d7bb;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+.landing-demo-signals{gap:9px}
+.landing-signal{display:grid;grid-template-columns:minmax(0,1fr);gap:8px;padding:12px 13px;border-left:3px solid transparent;background:#f9fafb}
+.landing-signal-market{border-left-color:#2d9b6c;background:linear-gradient(105deg,#e9f7ef 0,#fff 34%)}
+.landing-signal-review{border-left-color:#d88925;background:linear-gradient(105deg,#fff4e3 0,#fff 34%)}
+.landing-signal-main{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;min-width:0}
+.landing-signal .landing-symbol{min-width:0;gap:3px}
+.landing-signal .landing-symbol strong{font-size:12px;line-height:1.45;color:#172338}
+.landing-signal .landing-symbol small{line-height:1.4}
+.landing-signal-badge{display:inline-flex;align-items:center;justify-content:center;gap:4px;white-space:nowrap;border-radius:999px;padding:5px 8px;font-size:9px;font-weight:900;letter-spacing:.055em}
+.landing-signal-badge-market{background:#dff3e8;color:#16734c}
+.landing-signal-badge-review{background:#fff0d7;color:#a15d10}
+.landing-signal-badge svg{width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.landing-signal-detail{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 7px;padding-left:2px;color:#718096;font-size:10.5px;line-height:1.45}
+.landing-signal-detail-market{color:#317452}
+.landing-signal-detail-review{display:grid;gap:2px;color:#92601d}
+.landing-signal-detail-review strong{font-size:10px;color:#8d5615}
+.landing-signal-review .landing-signal-main{grid-template-columns:minmax(0,1fr)}
+.landing-signal-review .landing-signal-badge{grid-column:1;grid-row:2;justify-self:start}
+.landing-positive-result{color:#188252}
+@media(max-width:620px){
+  .landing-signal-main{grid-template-columns:minmax(0,1fr)}
+  .landing-signal-market .landing-signal-badge{grid-column:1;justify-self:start}
+  .landing-signal-review .landing-signal-badge{grid-column:1;grid-row:2}
+  .landing-signal-detail{padding-left:0}
+}

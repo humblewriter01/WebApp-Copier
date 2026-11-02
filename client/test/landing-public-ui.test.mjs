@@ -76,6 +76,15 @@ test('the first screen explains the product instead of asking for a password', a
   await unmount();
 });
 
+test('the hero explicitly promises channel-scoped read-only access and no passwords', async () => {
+  const { host, unmount } = await mount();
+  const note = host.querySelector('.landing-security-note');
+  assert.equal(text(note), 'Read-only Telegram access. Signal Desk can only read the specific channels you pick. No passwords required.');
+  assert.ok(note.querySelector('.landing-lock-icon[aria-hidden="true"]'), 'a quiet lock icon reinforces the reassurance');
+  assert.doesNotMatch(text(host.querySelector('.landing-hero')), /Telegram session/i, 'the hero no longer implies a personal password or login session');
+  await unmount();
+});
+
 test('the workspace is shown, and labelled as a picture', async () => {
   const { host, unmount } = await mount();
   const demo = host.querySelector('.landing-demo');
@@ -87,6 +96,20 @@ test('the workspace is shown, and labelled as a picture', async () => {
   const armed = demo.querySelector('.landing-switch')?.getAttribute('data-on');
   assert.equal(armed, 'false', 'the sample workspace is drawn with Auto-Trading off');
   assert.match(text(demo.querySelector('.landing-demo-note')), /off until you turn it on/i, 'and the note beside it says so');
+
+  const market = demo.querySelector('.landing-signal-market');
+  const review = demo.querySelector('.landing-signal-review');
+  assert.match(text(market), /BUY EURUSD @ Market · SL 1\.0812 · TP 1\.0902/);
+  assert.match(text(market), /EXECUTED/);
+  assert.match(text(market), /Filled at 1\.0845 · 0\.4s after the post/);
+  assert.match(text(review), /SELL US30 @ 34,250\.00 · SL 34,400\.00 · TP 34,000\.00/);
+  assert.match(text(review), /PENDING/);
+  assert.match(text(review), /Held for review/);
+  assert.match(text(review), /Waiting for price to enter zone\. Nothing sent yet\./);
+  const position = demo.querySelector('.landing-panel');
+  assert.match(text(position), /EURUSD · BUY/);
+  assert.match(text(position), /Fill price\s*1\.0845/);
+  assert.match(text(position), /\+12\.50 USD/);
   await unmount();
 });
 
