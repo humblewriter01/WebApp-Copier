@@ -1405,7 +1405,11 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
   try {
     await dbClient.query('BEGIN');
     const { rows } = await dbClient.query("INSERT INTO users(name,email,password_hash,supabase_user_id,role) VALUES($1,$2,$3,$4,$5) RETURNING id,name,email,role,created_at", [name, email, hash, supabaseUserId, adminAccess.isAdminEmail(email) ? 'admin' : 'user']);
-    await dbClient.query('INSERT INTO settings(user_id) VALUES($1) ON CONFLICT DO NOTHING', [rows[0].id]);
+    // Written, not inherited: this is the one place a settings row comes into existence, and the column default is
+    // the only other thing that could decide it. Auto-trading executes live orders, so the row that a signup
+    // creates says FALSE out loud and the trader has to raise it themselves, through the panel that asks them to
+    // confirm what they are enabling (`RiskWarningModal`, and `PUT /api/settings` refuses an increase without it).
+    await dbClient.query('INSERT INTO settings(user_id,auto_trading_enabled) VALUES($1,FALSE) ON CONFLICT DO NOTHING', [rows[0].id]);
     await dbClient.query('COMMIT');
     const user = publicUser(rows[0]);
     res.status(201).json({ token: issueToken(user, req.body.rememberMe === true), user });
@@ -2352,7 +2356,11 @@ app.patch('/api/admin/users/:id', authenticate, requireAdmin, adminRoute('Updati
     targetType: 'user',
     targetId,
     summary: `${updated.name || 'Account'} <${updated.email || 'unknown'}>: ${changes.join(', ') || 'no visible change'}.`,
-    metadata: { ...update, revokedSupportSessions: revokedSessions || undefined },
+    /* Not `revokedSupportSessions`. `sanitizeAuditMetadata` drops any key whose *name* looks credential-shaped, and
+       "session" is one of its patterns, so the count this route puts in its own response was being written to the
+       audit row and silently removed on the way in. Renaming the key is the fix: the scrubber is a security control
+       and loosening it to let one number through is not. */
+    metadata: { ...update, supportAccessRevoked: revokedSessions || undefined },
   });
   log('info', 'Admin updated user', { actorId: req.userId, targetId, role: update.role, isSuspended: update.isSuspended, changes: changes.join(', ') });
   res.set('Cache-Control', 'no-store').json({ user: updated, ...(revokedSessions ? { notice: `${revokedSessions} support session(s) on that workspace were closed.` } : {}) });
@@ -3201,7 +3209,9 @@ app.post('/api/admin/users/:id/impersonate', authenticate, requireAdmin, asyncRo
     targetType: 'user',
     targetId,
     summary: `Opened a ${session.ttlMinutes}-minute read-only support session on ${target.email}. Reason: ${reason}`,
-    metadata: { sessionId: session.sessionId, reason, expiresAt: session.expiresAt },
+    // `supportAccessId`, not `sessionId`: the scrubber drops the latter and this is the only place the id of the
+    // session that was opened is recorded, because `targetId` here is the workspace, not the access grant.
+    metadata: { supportAccessId: session.sessionId, reason, expiresAt: session.expiresAt },
   });
   log('warn', 'Admin opened a support session', { actorId: req.userId, targetId, sessionId: session.sessionId });
   res.set('Cache-Control', 'no-store').status(201).json({
@@ -3234,7 +3244,7 @@ app.post('/api/admin/support/stop', authenticate, requireAdmin, asyncRoute(async
     targetType: 'support_session',
     targetId: sessionId,
     summary: 'Closed a support session early.',
-    metadata: { sessionId },
+    metadata: { supportAccessId: sessionId },   // renamed for the same reason as above; `targetId` carries it too
   });
   res.set('Cache-Control', 'no-store').json({ ok: true, sessionId });
 }));

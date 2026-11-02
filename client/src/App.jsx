@@ -19,6 +19,7 @@ import { clearSupportSession, readSupportSession, writeSupportSession } from './
 import BillingPage from './components/BillingPage.jsx';
 import BillingCallbackPage from './components/BillingCallbackPage.jsx';
 import UpdatePasswordPage from './components/UpdatePasswordPage.jsx';
+import Landing from './components/Landing.jsx';
 import { navigationItemsForRole } from './navigation.js';
 import { API_URL, request } from './lib/api.js';
 import { connectSignalFeed, createReconciler, dashboardFreshnessNote, mergeSignalRows, FALLBACK_POLL_INTERVAL_MS, LIVE_SWEEP_INTERVAL_MS } from './lib/signal-feed.js';
@@ -28,8 +29,10 @@ import { supabaseReady } from './lib/supabase.js';
 /** How many captured rows the workspace keeps on screen, and the cap a pushed row is merged into. */
 export const SIGNALS_PAGE_LIMIT = 50;
 
-function AuthScreen({ onAuthenticated, installPrompt, onInstall }) {
-  const [mode, setMode] = useState('login');
+function AuthScreen({ onAuthenticated, installPrompt, onInstall, initialMode = 'login', onBackToOverview = null }) {
+  // Which door the visitor came through, so the landing page's "Log in" opens the card on the form
+  // they asked for instead of whatever the default happens to be.
+  const [mode, setMode] = useState(initialMode);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [resetSent, setResetSent] = useState(false);
@@ -54,6 +57,7 @@ function AuthScreen({ onAuthenticated, installPrompt, onInstall }) {
       <p className="eyebrow">{mode === 'forgot' ? 'ACCOUNT RECOVERY' : 'AUTOMATED SIGNAL EXECUTION'}</p>
       <h1>{mode === 'login' ? 'Welcome back' : mode === 'register' ? 'Create your workspace' : resetSent ? 'Check your email' : 'Reset your password'}</h1>
       <p className="muted">{mode === 'forgot' ? 'Enter the email address for your Signal Desk account. If it exists, we will send a secure reset link.' : 'Automate your trading by executing Telegram signals directly to your broker.'}</p>
+      {onBackToOverview && <button type="button" className="landing-link auth-back" onClick={onBackToOverview}>Back to the overview</button>}
       {mode === 'forgot' && resetSent ? <>
         <div className="alert alert-success" role="status">{PASSWORD_RESET_SENT}</div>
         <button type="button" className="button button-secondary button-wide auth-mode-button" onClick={() => changeMode('login')}>Back to sign in</button>
@@ -131,6 +135,10 @@ function App() {
   const [signalDeleting, setSignalDeleting] = useState(false);
   const [accountForm, setAccountForm] = useState({ label: '', broker: '', platform: '', accountReference: '' });
   const [installPrompt, setInstallPrompt] = useState(null);
+  /* null, or the mode an unauthenticated visitor asked for. A visitor who has not signed in is shown the landing
+     view - the product explained, a workspace pictured - and the sign-in card only appears when they ask for it.
+     Which mode they asked for is kept here rather than inside the card, so the two doors stay two doors. */
+  const [authIntent, setAuthIntent] = useState(null);
   const [isMobileViewport, setIsMobileViewport] = useState(() => window.matchMedia('(max-width:700px)').matches);
   const [sidebarVisible, setSidebarVisible] = useState(() => {
     if (window.matchMedia('(max-width:700px)').matches) return false;
@@ -371,7 +379,13 @@ function App() {
     ? <BillingCallbackPage />
     : <AuthScreen onAuthenticated={authenticated} installPrompt={installPrompt} onInstall={installApp} />;
   if (normalizedPath === '/update-password') return <UpdatePasswordPage />;
-  if (!authToken) return <AuthScreen onAuthenticated={authenticated} installPrompt={installPrompt} onInstall={installApp} />;
+  if (!authToken) {
+    if (authIntent) return <AuthScreen onAuthenticated={authenticated} installPrompt={installPrompt} onInstall={installApp} initialMode={authIntent} onBackToOverview={() => setAuthIntent(null)} />;
+    // The whole product used to sit behind a login box, which asked a stranger to sign in to something they had no
+    // way to see. Landing holds no state and sends no request, so the sign-in card is one click away in either
+    // direction, and a workspace that has signed out keeps going straight to it as it always did.
+    return <Landing onEnterAuth={setAuthIntent} installPrompt={installPrompt} onInstall={installApp} />;
+  }
   if (loading) return <main className="loading-shell"><div className="spinner" /><span>Loading your workspace…</span></main>;
   return <TelegramStatusProvider token={authToken}>
     <MetaApiStatusProvider token={authToken}>

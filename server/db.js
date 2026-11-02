@@ -166,8 +166,17 @@ const SCHEMA_SQL = `
      the same idiom as every other comment in this literal, because a backtick ends the string and the service
      dies at boot on a SyntaxError. */
     ALTER TABLE signals ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ;
-    ALTER TABLE settings ADD COLUMN IF NOT EXISTS auto_trading_enabled BOOLEAN NOT NULL DEFAULT TRUE;
-    ALTER TABLE settings ALTER COLUMN auto_trading_enabled SET DEFAULT TRUE;
+    /* A workspace that has never been switched on must not be able to spend money, so the column that decides it
+       defaults to FALSE. Two statements, for two different groups: ADD COLUMN with a default gives a new table (or a
+       first deploy) its off-by-default and is a no-op once the column exists; ALTER COLUMN SET DEFAULT changes only
+       what the next insert inherits, so it rewrites no row and a workspace that was switched on earlier keeps its
+       TRUE. There is deliberately no UPDATE of this column anywhere in this literal: a backfill would either arm
+       every workspace at once or quietly disarm the ones that opted in, and both are the same class of surprise.
+       index.js writes FALSE explicitly at signup too, so a new account never depends on inheriting the safe value
+       from a column default. No backticks in this comment, in the same idiom as every other comment in this
+       literal, because a backtick ends the string and the service dies at boot on a SyntaxError. */
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS auto_trading_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE settings ALTER COLUMN auto_trading_enabled SET DEFAULT FALSE;
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS lot_size_mode TEXT NOT NULL DEFAULT 'fixed';
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS fixed_lot_size NUMERIC NOT NULL DEFAULT 0.01;
     ALTER TABLE settings ADD COLUMN IF NOT EXISTS max_daily_trades INTEGER NOT NULL DEFAULT 10;
