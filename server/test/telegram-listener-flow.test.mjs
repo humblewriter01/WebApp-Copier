@@ -22,7 +22,7 @@ import { _handleUpdate } from 'telegram/client/updates.js';
 import { NewMessage } from 'telegram/events/index.js';
 import { EditedMessage } from 'telegram/events/EditedMessage.js';
 import * as telegramAdapter from '../services/telegram-adapter.js';
-import { CATCH_UP_COOLDOWN_MS, CATCH_UP_LIMIT, CATCH_UP_MESSAGE_GAP_MS, CATCH_UP_CHANNEL_GAP_MS, CATCH_UP_MAX_SLEEP_MS, HEARTBEAT_INTERVAL_MS, STREAM_REBUILD_COOLDOWN_MS, GAP_CATCH_UP_MS, GAP_CATCH_UP_SPREAD_MS, SILENCE_SUSPECT_MS, createTelegramListener, isValidWorkspaceId, normalizeUpdateState, readUpdateState, UPDATE_STATE_KEY } from '../services/telegram-listener.js';
+import { CATCH_UP_COOLDOWN_MS, CATCH_UP_LIMIT, CATCH_UP_MESSAGE_GAP_MS, CATCH_UP_CHANNEL_GAP_MS, CATCH_UP_MAX_SLEEP_MS, HEARTBEAT_INTERVAL_MS, STREAM_REBUILD_COOLDOWN_MS, GAP_CATCH_UP_MS, GAP_CATCH_UP_SPREAD_MS, MAX_HISTORY_SYNC_MS, SILENCE_SUSPECT_MS, createTelegramListener, isValidWorkspaceId, normalizeUpdateState, readUpdateState, UPDATE_STATE_KEY } from '../services/telegram-listener.js';
 import { telegramPeerIdVariants, telegramMessageText } from '../services/telegram-peer.js';
 
 const USER_ID = '5036a3d3-0671-4cbf-9728-e5e3bf1eea9b';
@@ -65,6 +65,7 @@ function makePool({ channels = [{ channelId: STORED_CHANNEL_ID, title: CHANNEL_T
 function makeHarness(options = {}) {
   const pool = makePool(options);
   const saved = [];
+  const saveCalls = [];
   const logs = [];
   const clients = new Map();
   let clock = Date.parse('2026-10-23T13:00:00.000Z');
@@ -73,6 +74,7 @@ function makeHarness(options = {}) {
     pool,
     log: (level, message, meta) => logs.push({ level, message, meta }),
     saveSignal: async (userId, message, channel) => {
+      saveCalls.push({ userId, message, channel });
       if (options.failSave) throw new Error('column "fallback_stop_loss_points" does not exist');
       // A test that wants to hold the replay mid-write - to see what a live update does while the loop is
       // busy with a row - parks here, before the row is recorded as stored.
@@ -94,7 +96,7 @@ function makeHarness(options = {}) {
   client._log = { info() {}, warn() {}, error() {}, debug() {} };
   clients.set(USER_ID, { client, handler: null, stats: listener.EMPTY_STATS() });
   const advance = (ms) => { clock += ms; };
-  return { pool, saved, logs, clients, client, listener, advance, entry: () => clients.get(USER_ID) };
+  return { pool, saved, saveCalls, logs, clients, client, listener, advance, entry: () => clients.get(USER_ID) };
 }
 
 /*
@@ -103,12 +105,12 @@ function makeHarness(options = {}) {
  * failures. A message whose decoration failed used to read as "no text" and be dropped, so the
  * shape under test is deliberately the undecorated one.
  */
-function channelMessage({ id = 77, text = SIGNAL_TEXT, decorated = true, out = false, editDate = undefined } = {}) {
+function channelMessage({ id = 77, text = SIGNAL_TEXT, decorated = true, out = false, date = Math.floor(Date.parse('2026-10-23T12:59:00.000Z') / 1000), editDate = undefined } = {}) {
   const peerId = new Api.PeerChannel({ channelId: BigInt(BARE_CHANNEL_ID) });
   const message = new Api.Message({
     id,
     peerId,
-    date: Math.floor(Date.parse('2026-10-23T12:59:00.000Z') / 1000),
+    date,
     message: text,
     out,
     mentioned: false,
@@ -169,6 +171,46 @@ test('a real GramJS channel update is matched and stored through the real dispat
   assert.ok(captured, 'the capture is written down, so a report can quote it');
   assert.equal(captured.meta.channel, CHANNEL_TITLE);
   assert.deepEqual({ seen: harness.entry().stats.seen, saved: harness.entry().stats.saved, ignored: harness.entry().stats.ignored }, { seen: 1, saved: 1, ignored: 0 });
+});
+
+test('a historical post older than the sync window is dropped before storage, database lookup or socket emission', async () => {
+  assert.equal(MAX_HISTORY_SYNC_MS, 15 * 60 * 1000, 'the history grace period is exactly fifteen minutes');
+  const harness = makeHarness();
+  await harness.listener.startTelegramListener(USER_ID, harness.client);
+  const message = channelMessage({
+    id: 78,
+    date: Math.floor((clock_of() - MAX_HISTORY_SYNC_MS - 1_000) / 1_000),
+  });
+
+  await dispatch(harness, new Api.UpdateNewChannelMessage({ message, pts: 12, seq: 0 }));
+
+  assert.equal(harness.saveCalls.length, 0, 'the only path that writes to the database and emits signal:received is never entered');
+  assert.equal(harness.saved.length, 0);
+  assert.equal(harness.pool.calls.length, 0, 'the historical event does not even query the monitored channels');
+  assert.deepEqual(
+    { seen: harness.entry().stats.seen, saved: harness.entry().stats.saved, ignored: harness.entry().stats.ignored, lastAt: harness.entry().stats.lastAt },
+    { seen: 0, saved: 0, ignored: 0, lastAt: null },
+    'a sync backlog does not masquerade as live activity in workspace stats',
+  );
+  const ignored = harness.logs.filter((entry) => entry.message === 'Historical message ignored');
+  assert.equal(ignored.length, 1);
+  assert.equal(ignored[0].level, 'debug', 'history cut-off logging stays quiet');
+  assert.ok(ignored[0].meta.delayMs > MAX_HISTORY_SYNC_MS);
+  assert.equal(ignored[0].meta.messageId, 78);
+  assert.equal(harness.logs.some((entry) => entry.message === 'Telegram update arrived late'), false, 'the normal late-warning path is bypassed');
+});
+
+test('a real-time post within five seconds passes the history cut-off', async () => {
+  const harness = makeHarness();
+  await harness.listener.startTelegramListener(USER_ID, harness.client);
+  const message = channelMessage({ id: 79, date: Math.floor((clock_of() - 5_000) / 1_000) });
+
+  await dispatch(harness, new Api.UpdateNewChannelMessage({ message, pts: 12, seq: 0 }));
+
+  assert.equal(harness.saved.length, 1);
+  assert.equal(harness.saveCalls.length, 1);
+  assert.equal(harness.saved[0].channel.delayMs, 5_000);
+  assert.equal(harness.logs.some((entry) => entry.message === 'Historical message ignored'), false);
 });
 
 test('the batched shape Telegram pushes for channels is read the same way', async () => {
@@ -375,7 +417,7 @@ test('a post edited while this instance was deaf is applied by the catch-up that
   // The entity handle is a network call on a client that has no connection, so it is answered here like the other
   // replay tests answer it. Without this the read never comes back and the test hangs instead of failing.
   client.getEntity = async () => ({ id: 1 });
-  client.getMessages = async () => [channelMessage({ id: 77, text: 'GOLD SELL\nEntry: 3300\nSL: 3280\nTP: 3350', editDate: Date.parse('2026-10-23T13:00:30.000Z') })];
+  client.getMessages = async () => [channelMessage({ id: 77, text: 'GOLD SELL\nEntry: 3300\nSL: 3280\nTP: 3350', date: Math.floor(Date.parse('2026-10-23T12:00:00.000Z') / 1000), editDate: Date.parse('2026-10-23T13:00:30.000Z') })];
   const entry = harness.entry();
   entry.channelId = STORED_CHANNEL_ID;
   entry.needsCatchUp = true;
@@ -682,8 +724,9 @@ test('a session is suspect on silence alone, and only on silence', async () => {
   assert.equal(health.suspect, true, 'twenty silent minutes while everything claims to be listening is the half-deaf state, and it now has to be asked out loud instead of shown in a panel fifteen minutes later');
   assert.ok(health.catchUpOverdue, 'a session this quiet is also due for the channel to be asked what it has');
 
-  // A message arriving is the cure: the suspicion is a clock, not a latch.
-  await dispatch(harness, new Api.UpdateNewChannelMessage({ message: channelMessage({ id: 501 }), pts: 21, seq: 0 }));
+  // A live message arriving is the cure: the suspicion is a clock, not a latch. Date it at the current
+  // harness time, because the unchanged default fixture is now correctly classified as historical.
+  await dispatch(harness, new Api.UpdateNewChannelMessage({ message: channelMessage({ id: 501, date: Math.floor((clock_of() + 20 * 60_000 - 5_000) / 1_000) }), pts: 21, seq: 0 }));
   const healed = harness.listener.streamHealth(USER_ID);
   assert.equal(healed.suspect, false, 'and it clears the moment the stream speaks again');
   assert.equal(healed.silenceMs, 0);
@@ -931,12 +974,13 @@ test('a replay that finds a message posted while the handler was attached is evi
   const rebuilt = [];
   const clients = new Map();
   const logs = [];
+  const saved = [];
   let clock = Date.parse('2026-10-23T13:00:00.000Z');
   const pool = makePool();
   const listener = createTelegramListener({
     clients, pool, log: (level, message, meta) => logs.push({ level, message, meta }),
     now: () => clock,
-    saveSignal: async () => ({ id: 'signal-1' }),
+    saveSignal: async (...args) => { saved.push(args); return { id: 'signal-1' }; },
     onDeadStream: async (userId, reason) => { rebuilt.push({ userId, reason }); },
   });
   const client = {
@@ -954,17 +998,19 @@ test('a replay that finds a message posted while the handler was attached is evi
   assert.deepEqual(rebuilt, [{ userId: USER_ID, reason: 'message-missed-while-listening' }], 'and asks for a rebuild on the spot');
   assert.ok(logs.some((entry) => entry.message === 'Telegram replay found messages posted while the handler was attached'));
 
-  // The boot case: the same message dated *before* the attach is simply history we were asleep through. The
-  // clock moves past the replay cooldown first, because this is a second, separate recovery and not a retry of
-  // the one above.
+  // The boot case: the same message dated *before* the attach is history we were asleep through. It is now
+  // discarded at ingestion instead of being written as a month-old dashboard row. The clock moves past the
+  // replay cooldown first, because this is a second, separate recovery and not a retry of the one above.
   rebuilt.length = 0;
   clock += 61_000;
   clients.set(USER_ID, { client: { ...client, getMessages: async () => [new Api.Message({ id: 5, peerId: new Api.PeerChannel({ channelId: BigInt(BARE_CHANNEL_ID) }), date: Math.floor((clock - 3_600_000) / 1000), message: SIGNAL_TEXT, out: false, mentioned: false, mediaUnstable: false, mediaUnread: false, unread: false, post: false })] }, handler: () => {}, stats: listener.EMPTY_STATS(), attachedAt: new Date(clock).toISOString() });
   pool.known.clear();
   const second = await listener.runCatchUp(USER_ID);
   await new Promise((resolve) => { setImmediate(resolve); });
-  assert.equal(second.stored, 1, 'the backlog is still stored');
-  assert.equal(second.fresh, 0, 'and it is still called a backlog');
+  assert.equal(second.stored, 0, 'the hour-old post never reaches storage');
+  assert.equal(saved.length, 1, 'the first, fresh replay remains the only database/socket write');
+  assert.equal(second.fresh, 0, 'an old post is not a message missed while the current handler was attached');
+  assert.ok(logs.some((entry) => entry.message === 'Historical message ignored' && entry.meta.messageId === 5));
   assert.equal(rebuilt.length, 0, 'an outage that ended before the attach is not a broken stream');
 });
 
