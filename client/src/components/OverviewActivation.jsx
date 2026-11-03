@@ -4,7 +4,7 @@ import { RISK_REMINDER } from './RiskWarningModal.jsx';
 
 const STATUS_COPY = Object.freeze({
   off: 'Auto-Trading is disabled. Turn it on to execute signals.',
-  pending: 'Connect a broker account to enable execution.',
+  pending: 'Connect an MT4/MT5 account to enable execution.',
   active: 'Auto-Trading is live.',
 });
 
@@ -39,7 +39,7 @@ export function overviewActivationView({
     return {
       ...status,
       headline: 'Your bot is listening.',
-      subtext: 'You have signals waiting. Connect an MT5 account to start executing.',
+      subtext: 'You have signals waiting. Connect an MT4/MT5 account to start executing.',
     };
   }
 
@@ -81,7 +81,7 @@ export function OverviewHeader({ userName = 'trader', activation, loading = fals
 const SETUP_STEPS = [
   { key: 'telegram', label: 'Connect Telegram', action: 'Connect', tab: 'telegram' },
   { key: 'channel', label: 'Select at least one monitored channel', action: 'Choose channels', tab: 'telegram' },
-  { key: 'account', label: 'Connect at least one trading account', action: 'Connect account', tab: 'metaapi' },
+  { key: 'account', label: 'Connect an MT4/MT5 account', action: 'Connect MT4/MT5', tab: 'metaapi' },
 ];
 
 export function SetupChecklist({ telegramConnected: telegramConnectedProp, channelCount = 0, linkedAccounts = [], onNavigate = () => {}, loading = false, unavailable = false }) {

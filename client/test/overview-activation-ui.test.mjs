@@ -41,12 +41,12 @@ const activationFor = (overrides = {}) => overviewActivationView({
   ...overrides,
 });
 
-test('the greeting stays personalized and the no-account header guides the user to connect MT5', () => {
+test('the greeting stays personalized and the no-account header names MT4/MT5', () => {
   const activation = activationFor();
   const html = render(OverviewHeader, { userName: 'Amina Yusuf', activation });
   assert.match(html, /Good to see you, Amina\./, 'the greeting remains personalized and uses the first name');
   assert.match(html, /Your bot is listening\./);
-  assert.match(html, /You have signals waiting\. Connect an MT5 account to start executing\./);
+  assert.match(html, /You have signals waiting\. Connect an MT4\/MT5 account to start executing\./);
   assert.match(cssSource, /\.overview-greeting\{[^}]*color:#8491a3;[^}]*font-size:11px/,
     'the retained greeting is small and muted');
 });
@@ -71,7 +71,7 @@ test('an enabled switch without a connected account renders Pending in amber', (
   assert.match(card, /data-state="pending"/);
   assert.match(card, /data-tone="pending"/);
   assert.match(card, />Pending</);
-  assert.match(card, /Connect a broker account to enable execution\./);
+  assert.match(card, /Connect an MT4\/MT5 account to enable execution\./);
   assert.match(cssSource, /\.overview-execution-pill-pending\{[^}]*color:#8b6417/,
     'Pending uses the amber status style');
 });
@@ -135,7 +135,9 @@ test('the Setup Checklist tracks all three steps and disappears after completion
   assert.match(incomplete, /Setup Checklist/);
   assert.match(incomplete, /Connect Telegram/);
   assert.match(incomplete, /Select at least one monitored channel/);
-  assert.match(incomplete, /Connect at least one trading account/);
+  assert.match(incomplete, /Connect an MT4\/MT5 account/);
+  assert.match(incomplete, /Connect MT4\/MT5<span aria-hidden="true">→<\/span>/);
+  assert.doesNotMatch(incomplete, /trading account/i, 'the activation checklist names the supported platforms directly');
   assert.match(incomplete, /2 of 3 complete/);
   assert.equal((incomplete.match(/data-complete="true"/g) || []).length, 2,
     'Telegram and a selected channel carry completed state');
@@ -150,7 +152,7 @@ test('the Setup Checklist tracks all three steps and disappears after completion
   const completedAccountStep = [...accountConnected.matchAll(/<li class="setup-checklist-step setup-checklist-step-complete" data-complete="true">([\s\S]*?)<\/li>/g)]
     .map((match) => match[1]);
   assert.equal(completedAccountStep.length, 1, 'a linked trading account completes its checklist step');
-  assert.match(completedAccountStep[0], /Connect at least one trading account/);
+  assert.match(completedAccountStep[0], /Connect an MT4\/MT5 account/);
   assert.match(completedAccountStep[0], />✓<\/span>/);
 
   const complete = render(SetupChecklist, {
