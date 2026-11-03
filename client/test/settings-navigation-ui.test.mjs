@@ -26,6 +26,7 @@ await build({
   entryPoints: [
     path.join(srcDir, 'components', 'RiskSettings.jsx'),
     path.join(srcDir, 'components', 'ProfileSettings.jsx'),
+    path.join(srcDir, 'components', 'Sidebar.jsx'),
   ],
   outdir: path.join(here, '.tmp'),
   bundle: true,
@@ -39,11 +40,12 @@ await build({
   outExtension: { '.js': '.mjs' },
   logLevel: 'silent',
 });
-for (const name of ['RiskSettings', 'ProfileSettings']) {
+for (const name of ['RiskSettings', 'ProfileSettings', 'Sidebar']) {
   assert.ok(existsSync(path.join(here, '.tmp', `${name}.mjs`)), `the ${name} bundle was produced`);
 }
 const { default: RiskSettings } = await import(pathToFileURL(path.join(here, '.tmp', 'RiskSettings.mjs')).href);
 const { default: ProfileSettings } = await import(pathToFileURL(path.join(here, '.tmp', 'ProfileSettings.mjs')).href);
+const { default: Sidebar } = await import(pathToFileURL(path.join(here, '.tmp', 'Sidebar.mjs')).href);
 
 const settingsBase = {
   riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 3, dailyLossLimit: 5, maxDailyTrades: 10,
@@ -149,7 +151,7 @@ test('the helper prepares on the API before it asks Supabase, and hands over the
 
 test('every page in the sidebar is a page the app can route to, in the order it is read', () => {
   const keys = navigationItemsForRole('user').map((item) => item.key);
-  assert.deepEqual(keys, ['overview', 'telegram', 'signals', 'accounts', 'settings', 'advanced', 'metaapi', 'billing', 'profile']);
+  assert.deepEqual(keys, ['overview', 'telegram', 'signals', 'settings', 'advanced', 'metaapi', 'billing', 'profile']);
   const labels = Object.fromEntries(navigationItems.map((item) => [item.key, item.label]));
   assert.equal(labels.settings, 'Risk Settings');
   assert.equal(labels.advanced, 'Advanced Settings');
@@ -159,6 +161,18 @@ test('every page in the sidebar is a page the app can route to, in the order it 
   const icons = navigationItems.map((item) => item.iconPath);
   assert.equal(new Set(icons).size, icons.length, 'every page has its own glyph');
   for (const item of navigationItems) assert.ok(item.label && item.iconPath, `${item.key} is fully described`);
+});
+
+test('the sidebar no longer renders the Account Notes link', () => {
+  const sidebar = render(Sidebar, {
+    active: 'overview',
+    onNavigate() {},
+    onSignOut() {},
+    onClose() {},
+    user: { role: 'user', name: 'Amina Yusuf', email: 'amina@example.com' },
+  });
+  assert.doesNotMatch(sidebar, /Account Notes/);
+  assert.match(sidebar, /Trading Accounts/);
 });
 
 test('the new pages have URLs, and the static host is told about them', () => {
