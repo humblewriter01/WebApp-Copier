@@ -133,7 +133,7 @@ export function platformPauseNotice(platformPause) {
     : `Automatic execution is paused by Signal Desk for every workspace. Your own settings are untouched, and new signals are saved for review until the pause is lifted.${reason}`;
 }
 
-export default function AdvancedSettings({ settings, accounts = [], trades = [], runtimeAvailable = false, platformPause = null, subscriptionStatus = null, onChange, onSubmit, onToggle, onOpenRiskSettings = () => {}, onOpenTradingAccounts = () => {}, onOpenPlan = () => {}, saving = false }) {
+export default function AdvancedSettings({ settings, accounts = [], trades = [], runtimeAvailable = false, platformPause = null, subscriptionStatus = null, onChange, onSubmit, onToggle, onOpenRiskSettings = () => {}, onOpenTradingAccounts = () => {}, onOpenPlan = () => {}, saving = false, error = '', notice = '' }) {
   const [riskWarningOpen, setRiskWarningOpen] = React.useState(false);
   const pauseNotice = platformPauseNotice(platformPause);
   // Turning the switch on is the only action here that spends money, so it is the only one that
@@ -400,6 +400,8 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
 
         <p className="field-help">Break-even moves apply to positions Signal Desk opened; your own trades keep their stops.</p>
         <p className="field-help advanced-settings-crosslink">Position size, open-trade limit and daily loss limit live on the <button type="button" className="text-button" onClick={onOpenRiskSettings}>Risk Settings</button> page.</p>
+        {error ? <div className="alert alert-error" role="alert">{error}</div> : null}
+        {notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
         <button className="button button-primary" type="submit" disabled={saving}>{saving ? 'Saving settings…' : 'Save settings'}</button>
       </form>
       <RiskWarningModal

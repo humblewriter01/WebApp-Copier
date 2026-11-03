@@ -267,6 +267,7 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
           </label>
           <small id="telegram-phone-help" className="field-help">Include the country code, for example +15551234567.</small>
           {phone && !isValidPhone(phone) && <small className="field-error" role="alert">Enter a valid international phone number with its country code.</small>}
+          {toast?.tone === 'error' ? <div className="alert alert-error" role="alert">{toast.message}</div> : null}
           <button className="button button-primary" type="submit" disabled={busy || !isValidPhone(phone)}>{busy ? 'Sending…' : 'Send Telegram code'}</button>
         </form> : step === 'code' ? <form className="form-stack telegram-form" onSubmit={verifyCode} aria-busy={busy}>
           <p className="code-destination">Enter the code sent to <strong>{phone}</strong>.</p>
@@ -274,6 +275,7 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
             <input id="telegram-code" type="text" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9 ]{3,10}" maxLength={10} placeholder="Enter the code" value={code} onChange={(event) => setCode(event.target.value)} aria-describedby="telegram-code-help" required />
           </label>
           <small id="telegram-code-help" className="field-help">Enter the numeric code from your Telegram app or SMS.</small>
+          {toast?.tone === 'error' ? <div className="alert alert-error" role="alert">{toast.message}</div> : null}
           <button className="button button-primary" type="submit" disabled={busy || !/^\d{3,10}$/.test(code.replace(/\s/g, ''))}>{busy ? 'Verifying…' : 'Verify code'}</button>
           <button className="text-button change-number" type="button" disabled={busy} onClick={resendCode}>{busy ? 'Sending…' : 'Resend code'}</button>
           <button className="text-button change-number" type="button" disabled={busy} onClick={changeNumber}>Use a different phone number</button>
@@ -283,6 +285,7 @@ export default function TelegramConnect({ token, channels, onRefresh }) {
             <input id="telegram-two-step-password" type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} aria-describedby="telegram-password-help" required />
           </label>
           <small id="telegram-password-help" className="field-help">This password is sent to Telegram to finish signing in and is not saved in this form.</small>
+          {toast?.tone === 'error' ? <div className="alert alert-error" role="alert">{toast.message}</div> : null}
           <button className="button button-primary" type="submit" disabled={busy || !password}>{busy ? 'Verifying…' : 'Verify password'}</button>
           <button className="text-button change-number" type="button" disabled={busy} onClick={changeNumber}>Use a different phone number</button>
         </form>}

@@ -12,7 +12,7 @@ import React from 'react';
  * exactly as they were loaded. One endpoint, one row, two pages - so a save here can never blank what is
  * set there, and the fields below are the only ones this page may change.
  */
-export default function RiskSettings({ settings, onChange, onSubmit, onOpenAdvanced = () => {}, saving = false }) {
+export default function RiskSettings({ settings, onChange, onSubmit, onOpenAdvanced = () => {}, saving = false, error = '', notice = '' }) {
   const set = (key, value) => onChange({ ...settings, [key]: value });
 
   return (
@@ -39,6 +39,8 @@ export default function RiskSettings({ settings, onChange, onSubmit, onOpenAdvan
           <input id="daily-loss-limit" type="number" min="1" max="25" step="0.5" value={settings.dailyLossLimit} onChange={(event) => set('dailyLossLimit', event.target.value)} required />
         </label>
         <p className="field-help">The open-trade limit counts open positions and pending orders; the daily limit counts new broker positions opened in the current UTC day. A position already open keeps its own stop.</p>
+        {error ? <div className="alert alert-error" role="alert">{error}</div> : null}
+        {notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
         <button className="button button-primary" type="submit" disabled={saving}>{saving ? 'Saving risk settings…' : 'Save risk settings'}</button>
       </form>
       <p className="field-help risk-settings-crosslink">Whether an order is sent at all, which account it goes to, and how its stop is protected afterwards are power-user settings, on the <button type="button" className="text-button" onClick={onOpenAdvanced}>Advanced Settings</button> page. The Auto-Trading switch is there too &mdash; this page only changes what a trade risks once it is allowed to happen.</p>
