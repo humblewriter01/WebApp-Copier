@@ -174,6 +174,37 @@ export function signalOutcomeView(signal) {
   return view;
 }
 
+const OVERVIEW_RECHECKABLE_STATES = new Set(['received', 'unexecuted', 'unparsed']);
+
+/**
+ * The Overview's compact Recent Signals list also shows the live execution gate. The full Signals page keeps
+ * the stored outcome; this glance can say what the same eligible Telegram signal is waiting on *now*, using
+ * the switch and linked-account snapshot that drives the Auto-Trading card above it. A real order lifecycle
+ * outcome always wins, so connecting an account never rewrites a past rejection or claims an old signal traded.
+ */
+export function overviewSignalOutcomeView(signal, { autoTradingEnabled = false, linkedAccounts = [] } = {}) {
+  const outcome = signalOutcomeView(signal);
+  const status = String(signal?.status || 'received').toLowerCase();
+  if (signal?.source !== 'telegram'
+    || signal?.executionReady !== true
+    || signal?.needsReview === true
+    || !OVERVIEW_RECHECKABLE_STATES.has(status)) {
+    return outcome;
+  }
+
+  if (autoTradingEnabled !== true) {
+    return { ...outcome, label: 'AUTO-TRADING OFF', tone: 'muted' };
+  }
+
+  const accounts = Array.isArray(linkedAccounts)
+    ? linkedAccounts.filter((account) => account && typeof account === 'object')
+    : [];
+  if (accounts.length === 0) {
+    return { ...outcome, label: 'AWAITING BROKER', tone: 'warn' };
+  }
+  return outcome;
+}
+
 /**
  * The small facts about a captured message that its status does not carry.
  *

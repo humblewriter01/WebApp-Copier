@@ -60,7 +60,7 @@ export function telegramSourceNote({ view, channelCount = 0 } = {}) {
   return null;
 }
 
-export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }) {
+export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram, onAccountsChanged = () => {} }) {
   const { view } = useTelegramStatus();
   // Whether this service can provision accounts is shared, not local: a private copy of it
   // is how the panel came to flash "Unavailable" and swap the form for an explanation while
@@ -121,6 +121,7 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
         setSetupLink({ accountId: result.account.metaApiAccountId, url: result.configurationLink });
       }
       await refresh();
+      await onAccountsChanged();
       if (result.setupError?.message) {
         setError(result.setupError.message);
       } else if (result.configurationLink) {
@@ -159,6 +160,7 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
     try {
       await request(`/api/metaapi/provisioned-accounts/${encodeURIComponent(account.metaApiAccountId)}/refresh`, token, { method: 'POST', body: {} });
       await refresh();
+      await onAccountsChanged();
       setAccountNotice('Trading account status updated.');
     } catch (requestError) {
       setAccountError(requestError.message || 'We could not refresh this trading account. Please try again.');
@@ -180,6 +182,7 @@ export default function MetaApiPanel({ token, channelCount = 0, onOpenTelegram }
       const result = await request(`/api/metaapi/accounts/${encodeURIComponent(account.metaApiAccountId)}`, token, { method: 'DELETE' });
       if (setupLink?.accountId === account.metaApiAccountId) setSetupLink(null);
       await refresh();
+      await onAccountsChanged();
       setActiveAccountId('');
       const cleanup = result?.metaApiCleanup;
       if (cleanup?.failed) {
