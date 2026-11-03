@@ -201,6 +201,48 @@ test('pricing defaults render on an API failure and live prices replace them on 
   } finally { globalThis.fetch = originalFetch; }
 });
 
+test('each pricing card states the plan limits a buyer is actually held to', async () => {
+  // A price alone tells a visitor what a plan costs and nothing about what it allows, so the card has to carry the
+  // same three numbers the authenticated billing page enforces: trading accounts, Telegram channels, daily signals.
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => { throw new Error('offline'); };
+    const { host, unmount } = await mount();
+    const cards = [...host.querySelectorAll('.landing-price-card')];
+    assert.equal(cards.length, 4, 'four plans are shown');
+    const limitsFor = (index) => [...cards[index].querySelectorAll('.landing-price-limits li')].map((node) => text(node));
+    assert.deepEqual(limitsFor(0), ['0 trading accounts', '2 Telegram channels', '50 signals per day']);
+    assert.deepEqual(limitsFor(1), ['1 trading account', '10 Telegram channels', '200 signals per day']);
+    assert.deepEqual(limitsFor(2), ['3 trading accounts', '50 Telegram channels', '500 signals per day']);
+    assert.deepEqual(limitsFor(3), ['5 trading accounts', '100 Telegram channels', '2000 signals per day']);
+    assert.match(text(cards[1]), /10 Telegram channels/, 'the numbers are visible in the card, not only in the source');
+    assert.match(cssSource, /\.landing-price-limits\{/, 'the list is styled rather than left as browser bullets');
+    await unmount();
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('live prices replace the amounts without taking the limits or the toggle with them', async () => {
+  // The limits are static copy; the money is not. A successful pricing fetch must not blank the lists, and the
+  // currency toggle must keep working after it, because that is the mistake a rewrite of this section invites.
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({ currency: 'USD', plans: [
+      { key: 'starter', name: 'Starter', amount: 27, currency: 'USD', interval: 'monthly', prices: { USD: { amount: 27 }, NGN: { amount: 41000 } } },
+    ] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    const { host, unmount } = await mount();
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    const pricing = host.querySelector('.landing-pricing');
+    assert.match(text(pricing), /\$27/, 'the live Starter amount is what renders');
+    assert.doesNotMatch(text(pricing), /\$39/, 'and the fallback amount has been replaced, not appended to');
+    assert.match(text(pricing), /1 trading account10 Telegram channels/, 'the limits survive the live price swap');
+    assert.match(text(pricing), /200 signals per day/);
+    await act(async () => { buttonNamed(host, 'NGN').click(); });
+    assert.match(text(pricing), /₦41,000/, 'the toggle still swaps the live amount into naira');
+    assert.match(text(pricing), /5 trading accounts/, 'and the limits are still there afterwards');
+    await unmount();
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test('the language rule a trader’s notes are held to is held over the marketing copy too', async () => {
   // `user-note-language.test.mjs` keeps an HTTP status, a model name or an endpoint out of anything a person reads.
   // The landing view is read by more people than any panel in the app, so it gets the same rule, applied to the

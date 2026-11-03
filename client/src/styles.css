@@ -708,6 +708,9 @@ button,input,textarea,select{touch-action:manipulation}
 .landing-price{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px;margin:0 0 18px;color:#fff}
 .landing-price strong{font-size:clamp(22px,2.4vw,29px);letter-spacing:-.7px;line-height:1.2}
 .landing-price span{color:#98a9bd;font-size:11px}
+.landing-price-limits{list-style:none;display:flex;flex-direction:column;gap:8px;margin:0 0 18px;padding:0 0 16px;border-bottom:1px solid #ffffff14;color:#c3d2e0;font-size:12px;line-height:1.45}
+.landing-price-limits li{position:relative;padding-left:19px}
+.landing-price-limits li:before{content:'✓';position:absolute;left:0;top:0;color:#63d7bb;font-weight:800}
 .landing-price-card .button{width:100%;margin-top:auto;min-height:42px}
 .landing-popular{position:absolute;top:-10px;right:14px;padding:4px 8px;border-radius:99px;background:#63d7bb;color:#09241f;font-size:9px;font-weight:900;letter-spacing:.08em}
 .landing-faq-list{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:13px}

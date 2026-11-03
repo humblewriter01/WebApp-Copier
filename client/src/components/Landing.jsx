@@ -4,10 +4,10 @@ import { request } from '../lib/api.js';
 import BrokerAccessNote from './BrokerAccessNote.jsx';
 
 const DEFAULT_PRICING = [
-  { key: 'free', name: 'Free', amount: 0, currency: 'USD', prices: { USD: 0, NGN: 0 }, interval: 'monthly', description: 'Explore signal capture and review.' },
-  { key: 'starter', name: 'Starter', amount: 39, currency: 'USD', prices: { USD: 39, NGN: 60000 }, interval: 'monthly', description: 'A focused setup for one trading account.' },
-  { key: 'pro', name: 'Pro', amount: 69, currency: 'USD', prices: { USD: 69, NGN: 105000 }, interval: 'monthly', description: 'More accounts and room for active channels.' },
-  { key: 'premium', name: 'Premium', amount: 99, currency: 'USD', prices: { USD: 99, NGN: 150000 }, interval: 'monthly', description: 'Higher limits for multiple accounts and busy channels.' },
+  { key: 'free', name: 'Free', amount: 0, currency: 'USD', prices: { USD: 0, NGN: 0 }, interval: 'monthly', description: 'Explore signal capture and review.', features: ['0 trading accounts', '2 Telegram channels', '50 signals per day'] },
+  { key: 'starter', name: 'Starter', amount: 39, currency: 'USD', prices: { USD: 39, NGN: 60000 }, interval: 'monthly', description: 'A focused setup for one trading account.', features: ['1 trading account', '10 Telegram channels', '200 signals per day'] },
+  { key: 'pro', name: 'Pro', amount: 69, currency: 'USD', prices: { USD: 69, NGN: 105000 }, interval: 'monthly', description: 'More accounts and room for active channels.', features: ['3 trading accounts', '50 Telegram channels', '500 signals per day'] },
+  { key: 'premium', name: 'Premium', amount: 99, currency: 'USD', prices: { USD: 99, NGN: 150000 }, interval: 'monthly', description: 'Higher limits for multiple accounts and busy channels.', features: ['5 trading accounts', '100 Telegram channels', '2000 signals per day'] },
 ];
 const SAMPLE_SIGNALS = [
   { id: 'eur-market', type: 'market', symbol: 'EURUSD', order: 'BUY EURUSD @ Market', stop: '1.0812', target: '1.0902', state: 'Executed', detail: 'Filled at 1.0845 · 0.4s after the post' },
@@ -90,7 +90,7 @@ export default function Landing({ onEnterAuth = () => {}, installPrompt = null, 
         } else if (live.currency && ['USD', 'NGN'].includes(live.currency)) {
           prices[live.currency] = live.amount ?? (live.amountMinor == null ? null : live.amountMinor / 100);
         }
-        return { ...fallback, ...live, prices, amount: live.amount ?? (live.amountMinor == null ? null : live.amountMinor / 100) };
+        return { ...fallback, ...live, prices, features: fallback.features, amount: live.amount ?? (live.amountMinor == null ? null : live.amountMinor / 100) };
       });
       setPlans(livePlans);
     }).catch(() => {});
@@ -134,6 +134,7 @@ export default function Landing({ onEnterAuth = () => {}, installPrompt = null, 
         {plan.key === 'pro' && <span className="landing-popular">POPULAR</span>}
         <h3>{plan.name}</h3><p className="landing-price-description">{plan.description}</p>
         <p className="landing-price"><strong>{formatPrice(plan, currency)}</strong>{Number(priceAmount(plan, currency)) > 0 && <span> / {{ monthly: 'month', quarterly: 'quarter', annually: 'year', annual: 'year' }[plan.interval] || plan.interval || 'month'}</span>}</p>
+        <ul className="landing-price-limits">{(plan.features || DEFAULT_PRICING.find((entry) => entry.key === plan.key)?.features || []).map((feature) => <li key={feature}>{feature}</li>)}</ul>
         <button type="button" className={`button ${plan.key === 'pro' ? 'button-primary' : 'button-secondary'}`} onClick={() => onEnterAuth('register')}>{plan.key === 'free' ? 'Get Started Free' : 'Choose ' + plan.name}</button>
       </article>)}</div>
     </section>
