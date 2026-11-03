@@ -116,6 +116,7 @@ export default function BillingPage({ token }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [feedbackScope, setFeedbackScope] = useState('plans');
   const flutterwave = useFlutterwave();
 
   const load = useCallback(async () => {
@@ -132,6 +133,7 @@ export default function BillingPage({ token }) {
       const next = nextPlanKey(current, plansData.plans || []);
       if (next) setSelectedPlan(next);
     } catch (loadError) {
+      setFeedbackScope('plans');
       setError(loadError.message);
     } finally {
       setLoading(false);
@@ -164,6 +166,7 @@ export default function BillingPage({ token }) {
 
   const upgrade = async (planKey) => {
     setBusy(planKey);
+    setFeedbackScope('plans');
     setError('');
     setNotice('');
     try {
@@ -184,7 +187,9 @@ export default function BillingPage({ token }) {
   const cancelSubscription = async () => {
     if (!window.confirm('Cancel renewal? You keep access until the end of the paid period.')) return;
     setBusy('cancel');
+    setFeedbackScope('current');
     setError('');
+    setNotice('');
     try {
       const result = await request('/api/billing/cancel', token, { method: 'POST' });
       setData((current) => ({ ...current, subscription: result.subscription }));
@@ -198,7 +203,9 @@ export default function BillingPage({ token }) {
 
   const resumeSubscription = async () => {
     setBusy('resume');
+    setFeedbackScope('current');
     setError('');
+    setNotice('');
     try {
       const result = await request('/api/billing/resume', token, { method: 'POST' });
       setData((current) => ({ ...current, subscription: result.subscription }));
@@ -225,9 +232,6 @@ export default function BillingPage({ token }) {
   const periodWord = (plan) => (plan?.interval === 'annually' || plan?.interval === 'yearly' ? 'year' : 'month');
 
   return <>
-    {error && <div className="alert alert-error global-alert" role="alert">{error}<button className="alert-close" type="button" onClick={() => setError('')}>×</button></div>}
-    {notice && <div className="alert alert-success global-alert" role="status" aria-live="polite">{notice}<button className="alert-close" type="button" onClick={() => setNotice('')}>×</button></div>}
-
     <section className="panel billing-current" aria-labelledby="current-plan-title">
       <div className="panel-heading">
         <div><p className="eyebrow">SUBSCRIPTION</p><h2 id="current-plan-title">Your plan</h2></div>
@@ -252,6 +256,8 @@ export default function BillingPage({ token }) {
           ? <button type="button" className="button button-primary button-small" disabled={busy === 'resume'} onClick={resumeSubscription}>{busy === 'resume' ? 'Resuming…' : 'Resume renewal'}</button>
           : <button type="button" className="button button-secondary button-small" disabled={busy === 'cancel'} onClick={cancelSubscription}>{busy === 'cancel' ? 'Canceling…' : 'Cancel renewal'}</button>}
       </div>}
+      {feedbackScope === 'current' && error ? <div className="alert alert-error" role="alert">{error}</div> : null}
+      {feedbackScope === 'current' && notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
       {!data?.configured && <div className="alert alert-info" role="status">Payments are temporarily unavailable. Please try again later.</div>}
     </section>
 
@@ -266,6 +272,8 @@ export default function BillingPage({ token }) {
           onSelect={(code) => { setCurrency(code); if (quote || quoteError) applyPromo({ code: promoCode }); }}
         />
       </div>
+      {feedbackScope === 'plans' && error ? <div className="alert alert-error" role="alert">{error}</div> : null}
+      {feedbackScope === 'plans' && notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
       <div className="billing-plan-grid">
         <article className={`billing-plan-card ${currentPlan === 'free' ? 'current' : ''}`}>
           <header><h3>Free</h3><p>Monitor signals without automating a broker account.</p></header>

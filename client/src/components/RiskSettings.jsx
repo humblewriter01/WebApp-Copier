@@ -13,7 +13,28 @@ import React from 'react';
  * set there, and the fields below are the only ones this page may change.
  */
 export default function RiskSettings({ settings, onChange, onSubmit, onOpenAdvanced = () => {}, saving = false, error = '', notice = '' }) {
-  const set = (key, value) => onChange({ ...settings, [key]: value });
+  const [localError, setLocalError] = React.useState('');
+  const [localNotice, setLocalNotice] = React.useState('');
+  const set = (key, value) => {
+    setLocalError('');
+    setLocalNotice('');
+    onChange({ ...settings, [key]: value });
+  };
+  const handleSubmit = async (event) => {
+    setLocalError('');
+    setLocalNotice('');
+    try {
+      const result = onSubmit ? onSubmit(event) : undefined;
+      if (result && typeof result.then === 'function') {
+        await result;
+      }
+      setLocalNotice('Risk settings saved.');
+    } catch (submitError) {
+      setLocalError(submitError?.message || 'We could not save your risk settings. Please try again.');
+    }
+  };
+  const activeError = error || localError;
+  const activeNotice = activeError ? '' : (notice || localNotice);
 
   return (
     <section className="panel settings-panel risk-settings-panel">
@@ -23,7 +44,7 @@ export default function RiskSettings({ settings, onChange, onSubmit, onOpenAdvan
       </div>
       <p className="risk-settings-intro">How much a trade may cost you. Limits are checked against the selected connected account before every order.</p>
 
-      <form className="form-stack risk-settings-form" onSubmit={onSubmit} aria-busy={saving}>
+      <form className="form-stack risk-settings-form" onSubmit={handleSubmit} aria-busy={saving}>
         <label htmlFor="risk-percent">Risk percent per position
           <input id="risk-percent" type="number" min="0.1" max="5" step="0.1" value={settings.riskPercent} onChange={(event) => set('riskPercent', event.target.value)} required />
         </label>
@@ -39,8 +60,8 @@ export default function RiskSettings({ settings, onChange, onSubmit, onOpenAdvan
           <input id="daily-loss-limit" type="number" min="1" max="25" step="0.5" value={settings.dailyLossLimit} onChange={(event) => set('dailyLossLimit', event.target.value)} required />
         </label>
         <p className="field-help">The open-trade limit counts open positions and pending orders; the daily limit counts new broker positions opened in the current UTC day. A position already open keeps its own stop.</p>
-        {error ? <div className="alert alert-error" role="alert">{error}</div> : null}
-        {notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
+        {activeError ? <div className="alert alert-error" role="alert">{activeError}</div> : null}
+        {activeNotice ? <div className="alert alert-success" role="status" aria-live="polite">{activeNotice}</div> : null}
         <button className="button button-primary" type="submit" disabled={saving}>{saving ? 'Saving risk settings…' : 'Save risk settings'}</button>
       </form>
       <p className="field-help risk-settings-crosslink">Whether an order is sent at all, which account it goes to, and how its stop is protected afterwards are power-user settings, on the <button type="button" className="text-button" onClick={onOpenAdvanced}>Advanced Settings</button> page. The Auto-Trading switch is there too &mdash; this page only changes what a trade risks once it is allowed to happen.</p>
