@@ -90,7 +90,8 @@ button,input,textarea,select{touch-action:manipulation}
 .compact-empty{min-height:110px}
 .telegram-form{gap:10px}
 .telegram-form .button{min-height:48px}
-.field-help{font-size:12px;color:#5f6d80;line-height:1.5;margin-top:-4px}
+.field-help{display:block;font-size:12px;color:#5f6d80;line-height:1.5;margin-top:12px;margin-bottom:0}
+.form-stack>.field-help{margin-top:0;margin-bottom:0}
 .code-destination{font-size:13px;color:#536176;line-height:1.5;margin:0}
 .change-number{align-self:flex-start;padding:4px 0;color:#155f70}
 .toast{position:fixed;z-index:40;right:20px;bottom:calc(20px + env(safe-area-inset-bottom));display:flex;align-items:center;gap:11px;width:min(430px,calc(100vw - 40px));padding:13px 14px;border-radius:12px;box-shadow:0 12px 36px #13253a2b;font-size:13px;line-height:1.45;animation:toast-in .18s ease-out}
@@ -346,7 +347,7 @@ button,input,textarea,select{touch-action:manipulation}
 .execution-breakeven-failed{background:#fff7e6;color:#8a5a00}
 .execution-breakeven-unknown{background:#fff0ed;color:#a43f35}
 .execution-settings-panel .form-row small,.execution-settings-panel label small{display:block;margin-top:5px;font-size:11px;color:#5f6d80;line-height:1.45;font-weight:500}
-.account-idle-policy{display:block;margin-top:10px;font-size:12px;color:#5f6d80;line-height:1.5}
+.account-idle-policy{display:block;margin-top:16px;font-size:12px;color:#5f6d80;line-height:1.5}
 .idle-warning-card{margin-top:14px;padding:12px 14px;border:1px solid #f0c9a6;border-left:4px solid #c2661f;border-radius:10px;background:#fff7ed;color:#7a3d0d}
 .idle-warning-card strong{display:block;font-size:13px;margin-bottom:6px}
 .idle-warning-card ul{margin:0;padding-left:18px;display:grid;gap:4px}
@@ -518,23 +519,25 @@ button,input,textarea,select{touch-action:manipulation}
 @media(max-width:700px){.modal-backdrop{padding:12px}.admin-action-modal{padding:18px;max-height:calc(100vh - 24px);gap:12px}.admin-action-modal .modal-actions .button{flex:1 1 auto;width:100%}.panel-heading{flex-wrap:wrap}.panel-heading-actions{margin-left:auto;flex-wrap:wrap;justify-content:flex-end;gap:8px}}
 /* ---- advanced settings: automation, trade management, and the strict group folded away ---- */
 /* The two longer passages inside the Advanced Safety bar. They kept their class names when the page became three folded bars, because they describe the reading order inside a bar, not the old wrapper. */.execution-advanced-intro{margin:0;font-size:11.5px;color:#65728a;line-height:1.55}.execution-advanced-facts{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:5px}.execution-advanced-facts li{font-size:11.5px;color:#65728a;line-height:1.55}.risk-settings-intro{margin:0;color:#778398;font-size:12.5px;line-height:1.55}
-.risk-settings-form{margin-top:18px}
+.risk-settings-form{margin-top:18px;margin-bottom:16px}
 .risk-settings-reminder{font-size:9px;text-transform:uppercase;letter-spacing:.04em}
 .risk-settings-reminder.on{background:#e6f7ef;color:#207554}
 .risk-settings-reminder.off{background:#f1f3f7;color:#778398}
+.risk-settings-crosslink{margin-top:16px;margin-bottom:0}
 .risk-settings-crosslink,.advanced-settings-crosslink{font-size:11.5px;line-height:1.6}
-.risk-settings-crosslink .text-button,.advanced-settings-crosslink .text-button{display:inline;padding:0;font-size:inherit;text-decoration:underline}
+.risk-settings-crosslink .text-button,.advanced-settings-crosslink .text-button{display:inline;min-height:0;margin:0;padding:0;font-size:inherit;line-height:inherit;text-decoration:underline}
 
 
 .profile-settings{display:flex;flex-direction:column}
 .profile-identity-panel,.profile-password-panel{max-width:620px}
-.profile-facts{display:grid;grid-template-columns:1fr;gap:0;margin:14px 0 0;border:1px solid #eef1f5;border-radius:10px;overflow:hidden;background:#fbfcfe}
+.profile-facts{display:grid;grid-template-columns:1fr;gap:0;margin:14px 0 16px;border:1px solid #eef1f5;border-radius:10px;overflow:hidden;background:#fbfcfe}
 .profile-fact{display:flex;justify-content:space-between;align-items:baseline;gap:14px;padding:11px 13px;border-top:1px solid #eef1f5}
 .profile-fact:first-child{border-top:0}
 .profile-fact dt{font-size:10px;font-weight:700;color:#778398;text-transform:uppercase;letter-spacing:.04em}
 .profile-fact dd{margin:0;font-size:12.5px;font-weight:600;color:#1b2a40;text-align:right;overflow-wrap:anywhere}
+.profile-password-target{margin:12px 0 16px}
 .profile-password-target strong{color:#1b2a40;font-weight:700}
-.profile-password-panel .button{align-self:flex-start;margin-top:4px}
+.profile-password-panel .button{align-self:flex-start;margin-top:8px;margin-bottom:16px}
 @media(max-width:700px){.profile-fact{flex-direction:column;align-items:flex-start;gap:3px}.profile-fact dd{text-align:left}}
 
 /* ---- admin data management ---- */
@@ -759,7 +762,13 @@ button,input,textarea,select{touch-action:manipulation}
 .broker-access-note-landing{margin-top:9px;padding:0;border:0;border-radius:0;background:transparent;color:#b6d2d0;font-size:12px}
 .broker-access-note-compact{margin-top:5px;padding:0;border:0;background:transparent;color:#637286;font-size:10px}
 
-.metaapi-token-toggle{align-self:flex-start;margin-top:2px;font-size:12px}
+.metaapi-token-toggle{align-self:flex-start;margin-top:4px;margin-bottom:12px;font-size:12px}
+#metaapi-own-token-fields{display:flex;flex-direction:column;gap:8px}
+
+/* Global button vertical spacing: buttons inside forms and panels leave breathing room above following helper text, paragraphs, and spans */
+form .button,.form-stack .button,form .button-primary,.profile-password-panel .button,.account-danger-zone>.button{margin-bottom:16px}
+.button-row .button,.modal-actions .button,.deletion-actions .button,.admin-row-actions .button,.account-actions .button,.admin-search .button,.billing-promo .button,.admin-signal-filters .button,.pricing-price-row .button,.admin-purge-card .form-row .button{margin-bottom:0}
+.button+p,.button+.field-help,.button+span,.button+small,button+p,button+.field-help,button+span,button+small,form+p,form+.field-help,form+span,.form-stack+p,.form-stack+.field-help,.button-row+p,.button-row+.field-help,.button-row+span{margin-top:16px}
 
 /* Global text-overflow and flex/grid container safeguards across User Dashboard and Admin Panel */
 code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}

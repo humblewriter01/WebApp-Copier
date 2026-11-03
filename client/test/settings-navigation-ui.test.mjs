@@ -234,3 +234,15 @@ test('the copy that pointed a reader at a page they were already on points at th
   assert.match(appSource, /autoTradingBannerView\(/, 'the banner is the helper\'s answer, not a ternary the shell invented');
   assert.equal(readSource('components', 'AdvancedSettings.jsx').includes('Auto-Trading is currently unavailable'), false, 'the runtime note says what is unavailable, not where the switch lives');
 });
+
+test('buttons on Risk Settings and Security / Password leave vertical breathing room above helper text', () => {
+  const styles = readSource('styles.css');
+  assert.equal(/\.field-help\{[^}]*margin-top:-/.test(styles), false, '.field-help never uses a negative top margin that pulls helper text into buttons');
+  assert.match(styles, /\.field-help\{[^}]*margin-top:12px/, '.field-help has a positive top margin outside flex form stacks');
+  assert.match(styles, /form \.button,\.form-stack \.button,form \.button-primary,\.profile-password-panel \.button,\.account-danger-zone>\.button\{margin-bottom:16px\}/, 'form and password-panel buttons declare a 16px bottom margin');
+  assert.match(styles, /\.button\+p,\.button\+\.field-help,\.button\+span,\.button\+small,button\+p,button\+\.field-help,button\+span,button\+small,form\+p,form\+\.field-help,form\+span,\.form-stack\+p,\.form-stack\+\.field-help,\.button-row\+p,\.button-row\+\.field-help,\.button-row\+span\{margin-top:16px\}/, 'paragraphs, helper text, and spans following buttons or forms have a 16px top margin');
+  assert.match(styles, /\.risk-settings-form\{margin-top:18px;margin-bottom:16px\}/, 'RiskSettings form leaves 16px below its submit button');
+  assert.match(styles, /\.risk-settings-crosslink\{margin-top:16px;margin-bottom:0\}/, 'RiskSettings crosslink paragraph has a 16px top margin');
+  assert.match(styles, /\.profile-password-panel \.button\{align-self:flex-start;margin-top:8px;margin-bottom:16px\}/, 'Change password button has explicit top and bottom margins');
+});
+

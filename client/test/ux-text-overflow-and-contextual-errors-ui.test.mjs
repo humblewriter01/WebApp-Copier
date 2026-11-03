@@ -24,6 +24,7 @@ await build({
       export { TelegramStatusProvider } from '../src/components/TelegramStatus.jsx';
       export { default as RiskSettings } from '../src/components/RiskSettings.jsx';
       export { default as AdvancedSettings } from '../src/components/AdvancedSettings.jsx';
+      export { default as ProfileSettings } from '../src/components/ProfileSettings.jsx';
     `,
     resolveDir: __dirname,
     loader: 'jsx',
@@ -41,7 +42,10 @@ await build({
   logLevel: 'silent',
 });
 
-const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost/' });
+const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { url: 'http://localhost/' });
+const styleEl = dom.window.document.createElement('style');
+styleEl.textContent = styles;
+dom.window.document.head.appendChild(styleEl);
 globalThis.window = dom.window;
 globalThis.document = dom.window.document;
 Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, configurable: true });
@@ -61,6 +65,7 @@ const {
   TelegramStatusProvider,
   RiskSettings,
   AdvancedSettings,
+  ProfileSettings,
 } = await import(pathToFileURL(bundleOutfile).href);
 
 async function click(element) {
@@ -376,3 +381,102 @@ test('Global layout CSS enforces min-width: 0 on flex/grid containers and break-
     );
   }
 });
+
+test('Buttons and following helper text / paragraphs maintain clear vertical spacing across RiskSettings, ProfileSettings, and forms', async () => {
+  // 1. Verify global CSS never uses a negative top margin on .field-help and enforces 16px breathing room
+  assert.equal(
+    /\.field-help\{[^}]*margin-top:-/.test(styles),
+    false,
+    '.field-help must never use a negative margin-top that overlaps preceding buttons or forms',
+  );
+  assert.match(
+    styles,
+    /form \.button,\.form-stack \.button,form \.button-primary,\.profile-password-panel \.button,\.account-danger-zone>\.button\{margin-bottom:16px\}/,
+    'Buttons inside forms and password/danger-zone panels have a 16px margin-bottom',
+  );
+  assert.match(
+    styles,
+    /\.button\+p,\.button\+\.field-help,\.button\+span,\.button\+small,button\+p,button\+\.field-help,button\+span,button\+small,form\+p,form\+\.field-help,form\+span,\.form-stack\+p,\.form-stack\+\.field-help,\.button-row\+p,\.button-row\+\.field-help,\.button-row\+span\{margin-top:16px\}/,
+    'Paragraphs, .field-help, spans, and small tags immediately following a button or form have a 16px margin-top',
+  );
+
+  // 2. Mount RiskSettings and ProfileSettings and verify computed styles on buttons and following helper text
+  const container = document.createElement('div');
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  const sampleSettings = {
+    riskPercent: 1,
+    maxOpenPositions: 3,
+    maxDailyTrades: 5,
+    dailyLossLimit: 5,
+    autoTradingEnabled: false,
+  };
+  const sampleUser = {
+    id: 'usr-spacing-test',
+    name: 'Ada Trader',
+    email: 'ada@example.com',
+    subscriptionPlan: 'pro',
+    createdAt: '2026-01-15T10:00:00.000Z',
+  };
+
+  try {
+    await act(async () => {
+      root.render(
+        React.createElement(
+          'div',
+          null,
+          React.createElement(RiskSettings, {
+            settings: sampleSettings,
+            onChange: () => {},
+            onSubmit: (e) => e.preventDefault(),
+            onOpenAdvancedSettings: () => {},
+          }),
+          React.createElement(ProfileSettings, {
+            user: sampleUser,
+            token: 'token-123',
+            onDeleted: () => {},
+            readOnly: false,
+          }),
+        ),
+      );
+    });
+
+    // Check RiskSettings: "Save risk settings" button and "Whether an order is sent at all..." crosslink paragraph
+    const riskForm = container.querySelector('form.risk-settings-form');
+    assert.ok(riskForm, 'RiskSettings form is rendered');
+    const saveRiskBtn = riskForm.querySelector('button.button.button-primary');
+    assert.ok(saveRiskBtn, 'Save risk settings button is rendered');
+    assert.match(saveRiskBtn.textContent, /Save risk settings/);
+    const riskCrosslink = container.querySelector('p.field-help.risk-settings-crosslink');
+    assert.ok(riskCrosslink, 'RiskSettings helper paragraph following the form is rendered');
+    assert.match(riskCrosslink.textContent, /Whether an order is sent at all/);
+
+    assert.equal(window.getComputedStyle(saveRiskBtn).marginBottom, '16px', 'Save risk settings button has 16px bottom margin');
+    assert.equal(window.getComputedStyle(riskForm).marginBottom, '16px', 'RiskSettings form has 16px bottom margin');
+    assert.equal(window.getComputedStyle(riskCrosslink).marginTop, '16px', 'Helper text below Save risk settings has 16px top margin');
+
+    // Check ProfileSettings Security / Password section: "Change password" button and "Signed in on a shared device?..." helper text
+    const passwordPanel = container.querySelector('.profile-password-panel');
+    assert.ok(passwordPanel, 'Security / Password panel is rendered in ProfileSettings');
+    const changePasswordBtn = passwordPanel.querySelector('button.button');
+    assert.ok(changePasswordBtn, 'Change password button is rendered');
+    assert.match(changePasswordBtn.textContent, /Change password/);
+    const passwordHelper = changePasswordBtn.nextElementSibling;
+    assert.ok(passwordHelper, 'Helper text immediately follows Change password button');
+    assert.match(passwordHelper.textContent, /Signed in on a shared device\?/);
+
+    assert.equal(window.getComputedStyle(changePasswordBtn).marginBottom, '16px', 'Change password button has 16px bottom margin');
+    assert.equal(window.getComputedStyle(passwordHelper).marginTop, '16px', 'Helper text below Change password button has 16px top margin');
+
+    // Check ProfileSettings Identity section: .profile-facts and following .field-help
+    const identityPanel = container.querySelector('.profile-identity-panel');
+    const profileFacts = identityPanel.querySelector('.profile-facts');
+    const identityHelper = identityPanel.querySelector('.field-help');
+    assert.equal(window.getComputedStyle(profileFacts).marginBottom, '16px', '.profile-facts leaves 16px bottom margin above helper text');
+    assert.equal(window.getComputedStyle(identityHelper).marginTop, '12px', '.field-help in identity panel has positive 12px top margin');
+  } finally {
+    await act(async () => { root.unmount(); });
+    container.remove();
+  }
+});
+
