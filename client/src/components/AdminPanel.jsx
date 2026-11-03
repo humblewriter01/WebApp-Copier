@@ -175,6 +175,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const [adjustFor, setAdjustFor] = useState(null);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [feedbackTarget, setFeedbackTarget] = useState({ scope: 'users-card', userId: '', promoId: '', announcementId: '' });
 
   const loadOverview = useCallback(async () => {
     const data = await request('/api/admin/overview', token);
@@ -253,6 +254,8 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
 
   const applySignalFilter = async () => {
     setSignalError('');
+    setNotice('');
+    setFeedbackTarget({ scope: 'data-signals', userId: '', promoId: '', announcementId: '' });
     setSignalsBusy(true);
     try {
       await loadSignals({ search: signalSearchInput.trim(), from: signalFrom, to: signalTo, offset: 0 });
@@ -266,6 +269,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const changeSignalPage = async (direction) => {
     const nextOffset = Math.max(0, signalOffset + direction * PAGE_SIZE);
     if (nextOffset === signalOffset) return;
+    setFeedbackTarget({ scope: 'data-signals', userId: '', promoId: '', announcementId: '' });
     setSignalsBusy(true);
     try {
       await loadSignals({ offset: nextOffset });
@@ -280,7 +284,8 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const runSignalDeletion = async () => {
     if (!signalConfirm || signalsBusy) return;
     const kind = signalConfirm.kind;
-    setSignalsBusy(true); setSignalError(''); setError('');
+    setFeedbackTarget({ scope: kind === 'purge' ? 'data-purge' : 'data-signals', userId: '', promoId: '', announcementId: '' });
+    setSignalsBusy(true); setSignalError(''); setError(''); setNotice('');
     try {
       let result = null;
       if (kind === 'row') result = await request(`/api/admin/signals/${signalConfirm.row.id}`, token, { method: 'DELETE' });
@@ -307,6 +312,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
         loadOverview(), loadUsers(nextSearch, nextOffset), loadPromoCodes(), loadBilling(), loadPricing(), loadAnnouncements(),
       ]);
     } catch (loadError) {
+      setFeedbackTarget({ scope: 'users-card', userId: '', promoId: '', announcementId: '' });
       setError(loadError.message);
     } finally {
       setLoading(false);
@@ -326,20 +332,29 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
    * whole refresh, because a useCallback identity changes with the state its defaults read. */
   useEffect(() => {
     if (loading || section !== 'health') return;
-    loadHealth(healthHours).catch((healthError) => setError(healthError.message));
+    loadHealth(healthHours).catch((healthError) => {
+      setFeedbackTarget({ scope: 'health-errors', userId: '', promoId: '', announcementId: '' });
+      setError(healthError.message);
+    });
   }, [loading, section, loadHealth, healthHours]);
 
   useEffect(() => {
     if (loading || section !== 'data') return;
     setSignalsBusy(true);
     Promise.all([loadSignals({ offset: 0 }), loadPurgePreview()])
-      .catch((dataError) => setSignalError(dataError.message))
+      .catch((dataError) => {
+        setFeedbackTarget({ scope: 'data-signals', userId: '', promoId: '', announcementId: '' });
+        setSignalError(dataError.message);
+      })
       .finally(() => setSignalsBusy(false));
   }, [loading, section, loadSignals, loadPurgePreview]);
 
   useEffect(() => {
     if (loading || section !== 'audit') return;
-    loadAudit({ action: auditAction, search: auditSearch, offset: auditOffset }).catch((auditError) => setError(auditError.message));
+    loadAudit({ action: auditAction, search: auditSearch, offset: auditOffset }).catch((auditError) => {
+      setFeedbackTarget({ scope: 'audit-log', userId: '', promoId: '', announcementId: '' });
+      setError(auditError.message);
+    });
   // Deliberately only on open: changeHealthWindow, applyAuditFilter and changeAuditPage fetch with
   // the values they were handed, so the request and the state change happen exactly once each.
   }, [loading, section, loadAudit]);
@@ -350,6 +365,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     // An open Suspend dialog is deliberately left alone here: it holds the id of the account it targets, not
     // a reference to a row that is about to scroll away, so closing it because the list moved would only
     // throw away what the administrator had typed.
+    setFeedbackTarget({ scope: 'users-card', userId: '', promoId: '', announcementId: '' });
     setSearch(nextSearch);
     setOffset(0);
     setLoading(true);
@@ -364,6 +380,12 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     setClearing(true);
     setError('');
     setNotice('');
+    setFeedbackTarget({
+      scope: key === 'errors' ? 'health-errors' : key === 'audit' ? 'audit-log' : 'announcement-history',
+      userId: '',
+      promoId: '',
+      announcementId: '',
+    });
     try {
       const data = await request(entry.endpoint, token, { method: 'DELETE', retryWhenUnanswered: true });
       // The server's count, quoted back: "it looks cleared" is not an answer an admin can act on.
@@ -383,6 +405,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const changePage = async (direction) => {
     const nextOffset = Math.max(0, offset + direction * PAGE_SIZE);
     if (nextOffset === offset) return;
+    setFeedbackTarget({ scope: 'users-card', userId: '', promoId: '', announcementId: '' });
     setOffset(nextOffset);
     setLoading(true);
     await loadEverything(search, nextOffset);
@@ -392,6 +415,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     setBusyUser(userId);
     setError('');
     setNotice('');
+    setFeedbackTarget({ scope: 'user-row', userId, promoId: '', announcementId: '' });
     try {
       /*
        * `retryWhenUnanswered` is what makes the Suspend button honest about a sleeping host: the
@@ -424,6 +448,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     setBusyUser(user.id);
     setError('');
     setNotice('');
+    setFeedbackTarget({ scope: 'user-row', userId: user.id, promoId: '', announcementId: '' });
     try {
       const result = await request(`/api/admin/users/${user.id}/telegram/reconnect`, token, { method: 'POST', body: { reason: 'admin-panel' }, retryWhenUnanswered: true });
       const caughtUp = Number(result?.caughtUp) || 0;
@@ -451,6 +476,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     setBusyUser(user.id);
     setError('');
     setNotice('');
+    setFeedbackTarget({ scope: 'user-row', userId: user.id, promoId: '', announcementId: '' });
     try {
       const result = await request(`/api/admin/users/${user.id}/telegram/pause`, token, { method: 'POST', body: { reason: 'admin-manual' } });
       setNotice(result?.notice || `${user.name}'s Telegram session is paused. The session stays linked, so resuming is a reconnect and not a sign-in.`);
@@ -466,6 +492,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     setBusyUser(user.id);
     setError('');
     setNotice('');
+    setFeedbackTarget({ scope: 'user-row', userId: user.id, promoId: '', announcementId: '' });
     try {
       const result = await request(`/api/admin/users/${user.id}/telegram/resume`, token, { method: 'POST', body: { reason: 'admin-resume' }, retryWhenUnanswered: true });
       const caughtUp = Number(result?.caughtUp) || 0;
@@ -485,7 +512,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     void updateUser(user.id, { role }, role === 'admin' ? `${user.name} is now an administrator.` : `${user.name} is now a standard user.`);
   };
 
-  const startSuspension = (user) => { setError(''); setNotice(''); setSuspension({ userId: user.id, name: user.name || user.email, reason: '' }); };
+  const startSuspension = (user) => { setError(''); setNotice(''); setFeedbackTarget({ scope: 'user-row', userId: user.id, promoId: '', announcementId: '' }); setSuspension({ userId: user.id, name: user.name || user.email, reason: '' }); };
   const cancelSuspension = () => { setError(''); setSuspension({ userId: '', name: '', reason: '' }); };
   /**
    * Sends exactly the two fields the endpoint writes: a real boolean and the trimmed reason. The
@@ -507,11 +534,13 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const changeHealthWindow = (hours) => {
     // Recording the window is enough: the section's effect refetches when it changes, so the
     // select cannot end up with a request that disagrees with what the dropdown says.
+    setFeedbackTarget({ scope: 'health-errors', userId: '', promoId: '', announcementId: '' });
     setError('');
     setHealthHours(hours);
   };
 
   const setSwitch = async (paused) => {
+    setFeedbackTarget({ scope: 'kill-switch', userId: '', promoId: '', announcementId: '' });
     const reason = switchReason.trim();
     if (paused && reason.length < 3) {
       setError('Add a short reason for the pause - every workspace that asks why will read it.');
@@ -537,6 +566,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   /* ------------------------------- announcements ------------------------------- */
   const publishAnnouncement = async (event) => {
     event.preventDefault();
+    setFeedbackTarget({ scope: 'announcement-publish', userId: '', promoId: '', announcementId: '' });
     const message = announcementForm.message.trim();
     if (message.length < 4) {
       setError('Write at least 4 characters for the announcement.');
@@ -561,6 +591,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   };
 
   const retireAnnouncement = async (item) => {
+    setFeedbackTarget({ scope: 'announcement-history', userId: '', promoId: '', announcementId: item.id });
     setError('');
     setNotice('');
     try {
@@ -573,6 +604,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   };
 
   const saveAnnouncementMessage = async (item) => {
+    setFeedbackTarget({ scope: 'announcement-history', userId: '', promoId: '', announcementId: item.id });
     const message = announcementEditing.message.trim();
     if (message.length < 4) {
       setError('Write at least 4 characters for the announcement.');
@@ -591,6 +623,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
 
   /* --------------------------------- audit log --------------------------------- */
   const applyAuditFilter = async (nextAction, nextSearch) => {
+    setFeedbackTarget({ scope: 'audit-log', userId: '', promoId: '', announcementId: '' });
     setAuditAction(nextAction);
     setAuditSearch(nextSearch);
     setAuditOffset(0);
@@ -605,6 +638,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const changeAuditPage = async (direction) => {
     const nextOffset = Math.max(0, auditOffset + direction * PAGE_SIZE);
     if (nextOffset === auditOffset) return;
+    setFeedbackTarget({ scope: 'audit-log', userId: '', promoId: '', announcementId: '' });
     setAuditOffset(nextOffset);
     try {
       await loadAudit({ action: auditAction, search: auditSearch, offset: nextOffset });
@@ -617,6 +651,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const openSupportAccess = (user) => {
     setError('');
     setNotice('');
+    setFeedbackTarget({ scope: 'user-row', userId: user.id, promoId: '', announcementId: '' });
     setSupportFor({ userId: user.id, name: user.name || user.email, reason: '' });
   };
   const closeSupportAccessForm = () => { setError(''); setSupportFor({ userId: '', name: '', reason: '' }); };
@@ -626,6 +661,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
      target whoever happens to be on screen. */
   const startImpersonation = async () => {
     if (!supportFor.userId) return;
+    setFeedbackTarget({ scope: 'user-row', userId: supportFor.userId, promoId: '', announcementId: '' });
     const reason = supportFor.reason.trim();
     if (reason.length < 3) {
       setError('Say why you need support access - it is written to the audit log.');
@@ -650,6 +686,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const openAdjustment = (user) => {
     setError('');
     setNotice('');
+    setFeedbackTarget({ scope: 'user-row', userId: user.id, promoId: '', announcementId: '' });
     setAdjustFor({
       userId: user.id,
       name: user.name || user.email,
@@ -668,6 +705,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const saveAdjustment = async () => {
     const form = adjustFor;
     if (!form?.userId) return;
+    setFeedbackTarget({ scope: 'user-row', userId: form.userId, promoId: '', announcementId: '' });
     const reason = form.reason.trim();
     if (reason.length < 5) {
       setError('Add a short reason for this adjustment (at least 5 characters).');
@@ -732,6 +770,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
 
   const savePricing = async (event) => {
     event?.preventDefault?.();
+    setFeedbackTarget({ scope: 'pricing-plans', userId: '', promoId: '', announcementId: '' });
     const plans = changedPlans();
     if (!Object.keys(plans).length) {
       setNotice(priceNote.trim() ? 'Enter a new price to go with that note.' : 'Enter a new price before saving.');
@@ -772,6 +811,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
      the panel names that number before it is what a customer sees. */
   const clearPlanPrice = async (plan, code) => {
     if (!window.confirm(`Stop storing a ${code} price for ${plan.name}? It falls back to the deployed default.`)) return;
+    setFeedbackTarget({ scope: 'pricing-plans', userId: '', promoId: '', announcementId: '' });
     setSavingPricing(true);
     setError('');
     setNotice('');
@@ -792,6 +832,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   };
 
   const syncPlans = async (planKey) => {
+    setFeedbackTarget({ scope: 'pricing-plans', userId: '', promoId: '', announcementId: '' });
     setSyncingPlans(true);
     setError('');
     setNotice('');
@@ -813,6 +854,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   };
 
   const toggleBillingSwitch = async (key, value) => {
+    setFeedbackTarget({ scope: 'pricing-plans', userId: '', promoId: '', announcementId: '' });
     setError('');
     setNotice('');
     try {
@@ -831,6 +873,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   /* ------------------------------- promos ------------------------------ */
   const createPromoCode = async (event) => {
     event.preventDefault();
+    setFeedbackTarget({ scope: 'promo-create', userId: '', promoId: '', announcementId: '' });
     setSavingPromo(true);
     setError('');
     setNotice('');
@@ -856,6 +899,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   };
 
   const togglePromoCode = async (promoCode) => {
+    setFeedbackTarget({ scope: 'promo-list', userId: '', promoId: promoCode.id, announcementId: '' });
     setError('');
     setNotice('');
     try {
@@ -871,6 +915,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
 
   const removePromoCode = async (promoCode) => {
     if (typeof window !== 'undefined' && !window.confirm(`Delete promo code ${promoCode.code}? This cannot be undone.`)) return;
+    setFeedbackTarget({ scope: 'promo-list', userId: '', promoId: promoCode.id, announcementId: '' });
     setError('');
     setNotice('');
     try {
@@ -893,11 +938,9 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const pendingChanges = Object.keys(changedPlans()).length;
   // Never inferred from the button that was pressed, and never "Live" while the read is missing.
   const killSwitch = killSwitchView(health);
+  const hasOpenActionModal = Boolean(suspension.userId || supportFor.userId || adjustFor);
 
   return <>
-    {error && <div className="alert alert-error global-alert" role="alert">{error}<button className="alert-close" type="button" onClick={() => setError('')}>×</button></div>}
-    {notice && <div className="alert alert-success global-alert" role="status" aria-live="polite">{notice}<button className="alert-close" type="button" onClick={() => setNotice('')}>×</button></div>}
-
     <div className="admin-tabs" role="tablist" aria-label="Admin sections">
       {SECTIONS.map((item) => <button
         key={item.key}
@@ -907,7 +950,12 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
         aria-selected={section === item.key}
         aria-controls={`admin-section-${item.key}`}
         className={`admin-tab ${section === item.key ? 'active' : ''}`}
-        onClick={() => setSection(item.key)}
+        onClick={() => {
+          setSection(item.key);
+          setError('');
+          setNotice('');
+          setSignalError('');
+        }}
       >
         {item.label}
         {item.key === 'pricing' && pendingChanges ? <span className="admin-tab-flag">{pendingChanges}</span> : null}
@@ -922,7 +970,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
         <Stat label="Paid plans" value={stats?.paidUsers ?? 0} note={`${pricing?.plans?.reduce((total, plan) => total + (plan.activeSubscribers || 0), 0) ?? 0} active subscriptions`} />
       </div>
 
-      <section className="panel admin-panel">
+      <section className="panel admin-panel users-management-panel">
         <div className="panel-heading">
           <div><p className="eyebrow">USER MANAGEMENT</p><h2>Users</h2></div>
           <span className="count-badge">{totalUsers}</span>
@@ -934,6 +982,9 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
           <button className="button button-primary button-small" disabled={loading}>{loading ? 'Searching…' : 'Search'}</button>
           {search && <button type="button" className="button button-secondary button-small" onClick={() => { setSearchInput(''); setSearch(''); setOffset(0); setLoading(true); void loadEverything('', 0); }}>Clear</button>}
         </form>
+
+        {!hasOpenActionModal && (feedbackTarget.scope === 'users-card' || (feedbackTarget.scope === 'user-row' && !users.some((u) => u.id === feedbackTarget.userId))) && error ? <div className="alert alert-error" role="alert">{error}</div> : null}
+        {!hasOpenActionModal && (feedbackTarget.scope === 'users-card' || (feedbackTarget.scope === 'user-row' && !users.some((u) => u.id === feedbackTarget.userId))) && notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
 
         {!users.length ? <div className="empty-state"><strong>No users found</strong><span>{search ? 'Try a different name or email address.' : 'New sign-ups will appear here.'}</span></div> : <>
           <div className="admin-table-wrap">
@@ -949,6 +1000,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
                   const busy = busyUser === user.id;
                   const supporting = supportFor.userId === user.id;
                   const adjusting = adjustFor?.userId === user.id;
+                  const isFeedbackRow = !hasOpenActionModal && feedbackTarget.scope === 'user-row' && feedbackTarget.userId === user.id;
                   return <tr key={user.id} className={isSuspended ? 'admin-row-suspended' : undefined}>
                     <td data-label="User">
                       <strong>{user.name}{isSelf ? ' (you)' : ''}</strong>
@@ -997,6 +1049,8 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
                             <button type="button" className="button button-secondary button-small" disabled={busy} onClick={() => reconnectTelegram(user)} title="Drop the Telegram connection, sign back in with the stored session, and replay what the channels posted while it was down">{busy ? 'Working…' : 'Reconnect Telegram'}</button>
                           </>) : null}
                       </div>
+                      {isFeedbackRow && error ? <div className="alert alert-error admin-row-feedback" role="alert">{error}</div> : null}
+                      {isFeedbackRow && notice ? <div className="alert alert-success admin-row-feedback" role="status" aria-live="polite">{notice}</div> : null}
                     </td>
                   </tr>;
                 })}
@@ -1139,8 +1193,8 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
             </label>
           </div>
 
-          {error ? <div className="alert alert-error" role="alert">{error}</div> : null}
-          {notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
+          {feedbackTarget.scope === 'pricing-plans' && error ? <div className="alert alert-error" role="alert">{error}</div> : null}
+          {feedbackTarget.scope === 'pricing-plans' && notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
           <div className="button-row pricing-actions">
             <button className="button button-primary" type="submit" disabled={savingPricing}>{savingPricing ? 'Saving…' : `Save changes${pendingChanges ? ` (${pendingChanges})` : ''}`}</button>
             <button className="button button-secondary" type="button" disabled={syncingPlans || savingPricing} onClick={() => syncPlans(null)}>{syncingPlans ? 'Syncing…' : 'Re-sync every plan and currency with Flutterwave'}</button>
@@ -1169,7 +1223,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
       </section>
 
       <div className="panel-grid">
-        <section className="panel admin-panel">
+        <section className="panel admin-panel promo-create-panel">
           <div className="panel-heading"><div><p className="eyebrow">DISCOUNTS</p><h2>Create promo code</h2></div></div>
           <p className="muted">Promo codes apply at checkout. A discounted period is billed once, because a Flutterwave payment plan charges its own price and cannot be discounted. A percentage applies in either currency; a fixed amount is read as major units of whatever the trader is charged in, so a naira code and a dollar code need separate values.</p>
           <form className="form-stack" onSubmit={createPromoCode}>
@@ -1182,32 +1236,39 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
               <label>Maximum uses<input type="number" min="1" step="1" value={promoForm.maxUses} onChange={(event) => setPromoForm({ ...promoForm, maxUses: event.target.value })} placeholder="Unlimited" /></label>
               <label>Expires<input type="datetime-local" value={promoForm.expiresAt} onChange={(event) => setPromoForm({ ...promoForm, expiresAt: event.target.value })} /></label>
             </div>
-            {error ? <div className="alert alert-error" role="alert">{error}</div> : null}
-            {notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
+            {feedbackTarget.scope === 'promo-create' && error ? <div className="alert alert-error" role="alert">{error}</div> : null}
+            {feedbackTarget.scope === 'promo-create' && notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
             <button className="button button-primary" disabled={savingPromo}>{savingPromo ? 'Creating…' : 'Create promo code'}</button>
           </form>
         </section>
 
-        <section className="panel admin-panel">
+        <section className="panel admin-panel promo-list-panel">
           <div className="panel-heading"><div><p className="eyebrow">DISCOUNTS</p><h2>Promo codes</h2></div><span className="count-badge">{promoCodes.length}</span></div>
+          {feedbackTarget.scope === 'promo-list' && !promoCodes.some((item) => item.id === feedbackTarget.promoId) && error ? <div className="alert alert-error" role="alert">{error}</div> : null}
+          {feedbackTarget.scope === 'promo-list' && !promoCodes.some((item) => item.id === feedbackTarget.promoId) && notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
           {!promoCodes.length ? <div className="empty-state"><strong>No promo codes yet</strong><span>Create a code to share a discount with your users.</span></div> : <div className="admin-table-wrap">
             <table className="admin-table">
               <caption className="sr-only">Existing promo codes</caption>
               <thead><tr><th scope="col">Code</th><th scope="col">Discount</th><th scope="col">Uses</th><th scope="col">Expires</th><th scope="col">Status</th><th scope="col">Actions</th></tr></thead>
               <tbody>
-                {promoCodes.map((promoCode) => <tr key={promoCode.id}>
-                  <td data-label="Code"><strong>{promoCode.code}</strong></td>
-                  <td data-label="Discount">{promoCode.discountType === 'percentage' ? `${promoCode.discountValue}%` : formatMoney(Number(promoCode.discountValue) * 100, currencyCode)}</td>
-                  <td data-label="Uses">{promoCode.currentUses}{promoCode.maxUses ? ` / ${promoCode.maxUses}` : ' / ∞'}</td>
-                  <td data-label="Expires">{formatDate(promoCode.expiresAt)}</td>
-                  <td data-label="Status"><span className={`badge ${promoCode.active ? 'badge-buy' : ''}`}>{promoCode.active ? 'Active' : 'Paused'}</span></td>
-                  <td data-label="Actions">
-                    <div className="admin-row-actions">
-                      <button type="button" className="icon-button" onClick={() => togglePromoCode(promoCode)}>{promoCode.active ? 'Pause' : 'Activate'}</button>
-                      <button type="button" className="icon-button" onClick={() => removePromoCode(promoCode)}>Delete</button>
-                    </div>
-                  </td>
-                </tr>)}
+                {promoCodes.map((promoCode) => {
+                  const isPromoRowFeedback = feedbackTarget.scope === 'promo-list' && feedbackTarget.promoId === promoCode.id;
+                  return <tr key={promoCode.id}>
+                    <td data-label="Code"><strong>{promoCode.code}</strong></td>
+                    <td data-label="Discount">{promoCode.discountType === 'percentage' ? `${promoCode.discountValue}%` : formatMoney(Number(promoCode.discountValue) * 100, currencyCode)}</td>
+                    <td data-label="Uses">{promoCode.currentUses}{promoCode.maxUses ? ` / ${promoCode.maxUses}` : ' / ∞'}</td>
+                    <td data-label="Expires">{formatDate(promoCode.expiresAt)}</td>
+                    <td data-label="Status"><span className={`badge ${promoCode.active ? 'badge-buy' : ''}`}>{promoCode.active ? 'Active' : 'Paused'}</span></td>
+                    <td data-label="Actions">
+                      <div className="admin-row-actions">
+                        <button type="button" className="icon-button" onClick={() => togglePromoCode(promoCode)}>{promoCode.active ? 'Pause' : 'Activate'}</button>
+                        <button type="button" className="icon-button" onClick={() => removePromoCode(promoCode)}>Delete</button>
+                      </div>
+                      {isPromoRowFeedback && error ? <div className="alert alert-error admin-row-feedback" role="alert">{error}</div> : null}
+                      {isPromoRowFeedback && notice ? <div className="alert alert-success admin-row-feedback" role="status" aria-live="polite">{notice}</div> : null}
+                    </td>
+                  </tr>;
+                })}
               </tbody>
             </table>
           </div>}
@@ -1268,8 +1329,8 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
           <form className="kill-switch-controls" onSubmit={(event) => { event.preventDefault(); setSwitch(!killSwitch.paused); }}>
             <label htmlFor="kill-switch-reason">Reason (required when pausing; shown to affected workspaces and stored in the audit log)</label>
             <input id="kill-switch-reason" value={switchReason} onChange={(event) => setSwitchReason(event.target.value)} maxLength={300} placeholder="For example: MetaAPI incident MT5-2291 - orders rejected until the broker is healthy" />
-            {error ? <div className="alert alert-error" role="alert">{error}</div> : null}
-            {notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
+            {feedbackTarget.scope === 'kill-switch' && error ? <div className="alert alert-error" role="alert">{error}</div> : null}
+            {feedbackTarget.scope === 'kill-switch' && notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
             <div className="button-row">
               <button type="submit" className={`button ${killSwitch.paused ? 'button-primary' : 'button-danger'}`} disabled={switchBusy || !killSwitch.ready}>
                 {switchBusy ? 'Saving…' : killSwitch.paused ? 'Resume automatic execution' : 'Pause execution for everyone'}
@@ -1293,6 +1354,8 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
             <button type="button" className="button button-secondary button-small" disabled={clearing || !health || health.errorsAvailable === false} onClick={() => setClearConfirm({ key: 'errors' })}>Clear parsing errors</button>
           </div>
         </div>
+        {feedbackTarget.scope === 'health-errors' && error ? <div className="alert alert-error" role="alert">{error}</div> : null}
+        {feedbackTarget.scope === 'health-errors' && notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
         {!health ? <div className="loading-shell inline-loading"><div className="spinner" /><span>Reading the platform state…</span></div> : <>
           <ul className="health-checks">
             {(health.checks || []).map((check) => <li key={check.key} className={`health-check tone-${healthCheckTone(check.state)}`}>
@@ -1359,7 +1422,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     </div>}
 
     {section === 'announcements' && <div id="admin-section-announcements" role="tabpanel" aria-labelledby="admin-tab-announcements">
-      <section className="panel admin-panel">
+      <section className="panel admin-panel announcement-publish-panel">
         <div className="panel-heading">
           <div><p className="eyebrow">EVERY DASHBOARD</p><h2>System announcements</h2></div>
           <span className="count-badge">{announcements.length}</span>
@@ -1384,8 +1447,8 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
               <input type="datetime-local" value={announcementForm.endsAt} onChange={(event) => setAnnouncementForm({ ...announcementForm, endsAt: event.target.value })} />
             </label>
           </div>
-          {error && !announcementEditing.id ? <div className="alert alert-error" role="alert">{error}</div> : null}
-          {notice && !announcementEditing.id ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
+          {feedbackTarget.scope === 'announcement-publish' && error && !announcementEditing.id ? <div className="alert alert-error" role="alert">{error}</div> : null}
+          {feedbackTarget.scope === 'announcement-publish' && notice && !announcementEditing.id ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
           <div className="button-row">
             <button type="submit" className="button button-primary" disabled={savingAnnouncement}>{savingAnnouncement ? 'Publishing…' : 'Publish banner'}</button>
             <button type="button" className="button button-secondary" onClick={() => setAnnouncementForm({ message: '', level: 'info', startsAt: '', endsAt: '' })}>Clear</button>
@@ -1393,41 +1456,48 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
         </form>
       </section>
 
-      <section className="panel admin-panel">
+      <section className="panel admin-panel announcement-history-panel">
         <div className="panel-heading">
           <div><p className="eyebrow">PUBLISHED</p><h2>Banner history</h2></div>
           <div className="panel-heading-actions">
             <button type="button" className="button button-secondary button-small" disabled={clearing} onClick={() => setClearConfirm({ key: 'banners' })}>Clear history</button>
           </div>
         </div>
+        {feedbackTarget.scope === 'announcement-history' && !announcementEditing.id && !announcements.some((item) => item.id === feedbackTarget.announcementId) && error ? <div className="alert alert-error" role="alert">{error}</div> : null}
+        {feedbackTarget.scope === 'announcement-history' && !announcementEditing.id && !announcements.some((item) => item.id === feedbackTarget.announcementId) && notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
         {!announcements.length ? <div className="empty-state"><strong>No announcements yet</strong><span>Publish one to put a banner on every dashboard.</span></div> : <div className="chat-list">
-          {announcements.map((item) => <div className="announcement-row" key={item.id}>
-            <div className="announcement-row-main">
-              <strong>{item.message}</strong>
-              <small>
-                <span className={`badge ${item.state === 'live' ? 'badge-buy' : item.state === 'scheduled' ? '' : 'badge-suspended'}`}>{item.state}</span>
-                {` · ${item.level} · `}
-                {item.startsAt ? `from ${formatDateTime(item.startsAt)}` : 'now'}
-                {item.endsAt ? ` until ${formatDateTime(item.endsAt)}` : ''}
-                {` · ${item.dismissalCount || 0} user${item.dismissalCount === 1 ? '' : 's'} dismissed it`}
-                {item.createdByEmail ? ` · published by ${item.createdByEmail}` : ''}
-              </small>
-              {announcementEditing.id === item.id ? <div className="announcement-edit">
-                <label>Correct the message
-                  <textarea rows="2" value={announcementEditing.message} onChange={(event) => setAnnouncementEditing({ ...announcementEditing, message: event.target.value })} maxLength={500} />
-                </label>
-                {error ? <div className="alert alert-error" role="alert">{error}</div> : null}
-                <div className="button-row">
-                  <button type="button" className="button button-primary button-small" onClick={() => saveAnnouncementMessage(item)}>Save</button>
-                  <button type="button" className="button button-secondary button-small" onClick={() => setAnnouncementEditing({ id: '', message: '' })}>Cancel</button>
-                </div>
-              </div> : null}
-            </div>
-            <div className="button-row">
-              {announcementEditing.id !== item.id ? <button type="button" className="button button-secondary button-small" onClick={() => setAnnouncementEditing({ id: item.id, message: item.message })}>Edit</button> : null}
-              {item.state !== 'retired' ? <button type="button" className="button button-danger button-small" onClick={() => retireAnnouncement(item)}>Retire</button> : <span className="muted">Retired</span>}
-            </div>
-          </div>)}
+          {announcements.map((item) => {
+            const isRowFeedback = feedbackTarget.scope === 'announcement-history' && !announcementEditing.id && feedbackTarget.announcementId === item.id;
+            return <div className="announcement-row" key={item.id}>
+              <div className="announcement-row-main">
+                <strong>{item.message}</strong>
+                <small>
+                  <span className={`badge ${item.state === 'live' ? 'badge-buy' : item.state === 'scheduled' ? '' : 'badge-suspended'}`}>{item.state}</span>
+                  {` · ${item.level} · `}
+                  {item.startsAt ? `from ${formatDateTime(item.startsAt)}` : 'now'}
+                  {item.endsAt ? ` until ${formatDateTime(item.endsAt)}` : ''}
+                  {` · ${item.dismissalCount || 0} user${item.dismissalCount === 1 ? '' : 's'} dismissed it`}
+                  {item.createdByEmail ? ` · published by ${item.createdByEmail}` : ''}
+                </small>
+                {announcementEditing.id === item.id ? <div className="announcement-edit">
+                  <label>Correct the message
+                    <textarea rows="2" value={announcementEditing.message} onChange={(event) => setAnnouncementEditing({ ...announcementEditing, message: event.target.value })} maxLength={500} />
+                  </label>
+                  {error ? <div className="alert alert-error" role="alert">{error}</div> : null}
+                  <div className="button-row">
+                    <button type="button" className="button button-primary button-small" onClick={() => saveAnnouncementMessage(item)}>Save</button>
+                    <button type="button" className="button button-secondary button-small" onClick={() => setAnnouncementEditing({ id: '', message: '' })}>Cancel</button>
+                  </div>
+                </div> : null}
+                {isRowFeedback && error ? <div className="alert alert-error admin-row-feedback" role="alert">{error}</div> : null}
+                {isRowFeedback && notice ? <div className="alert alert-success admin-row-feedback" role="status" aria-live="polite">{notice}</div> : null}
+              </div>
+              <div className="button-row">
+                {announcementEditing.id !== item.id ? <button type="button" className="button button-secondary button-small" onClick={() => { setError(''); setNotice(''); setAnnouncementEditing({ id: item.id, message: item.message }); }}>Edit</button> : null}
+                {item.state !== 'retired' ? <button type="button" className="button button-danger button-small" onClick={() => retireAnnouncement(item)}>Retire</button> : <span className="muted">Retired</span>}
+              </div>
+            </div>;
+          })}
         </div>}
       </section>
     </div>}
@@ -1452,6 +1522,8 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
           <button type="submit" className="button button-primary button-small">Search</button>
           {auditSearch || auditAction ? <button type="button" className="button button-secondary button-small" onClick={() => { setAuditSearchInput(''); applyAuditFilter('', ''); }}>Clear</button> : null}
         </form>
+        {feedbackTarget.scope === 'audit-log' && error ? <div className="alert alert-error" role="alert">{error}</div> : null}
+        {feedbackTarget.scope === 'audit-log' && notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
         {!audit.entries.length ? <div className="empty-state"><strong>No audit entries yet</strong><span>{auditSearch || auditAction ? 'No entries match that filter.' : 'Administrator changes will appear here.'}</span></div> : <>
           <div className="admin-table-wrap">
             <table className="admin-table audit-table">
@@ -1498,8 +1570,8 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
           </label>
           <button type="submit" className="button button-primary" disabled={signalsBusy}>{signalsBusy ? 'Searching…' : 'Search'}</button>
         </form>
-        {signalError ? <div className="alert alert-error" role="alert">{signalError}</div> : null}
-        {notice ? <div className="alert alert-success" role="status">{notice}</div> : null}
+        {feedbackTarget.scope === 'data-signals' && signalError ? <div className="alert alert-error" role="alert">{signalError}</div> : null}
+        {feedbackTarget.scope === 'data-signals' && notice ? <div className="alert alert-success" role="status">{notice}</div> : null}
         {!signals.length && !signalsBusy ? <div className="empty-state"><strong>Nothing matched</strong><span>No captured signal has that search or date range.</span></div> : (
           <div className="admin-signal-list">
             {signals.map((row) => <article className="admin-signal-row" key={row.id}>
@@ -1535,13 +1607,14 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
               ? `Nothing is older than ${purge.olderThanDays} days, so there is nothing to purge.`
               : `${purge.signals} captured signal(s) are older than ${purge.olderThanDays} days, across every workspace. ${purge.unlinkableTrades} linked trade record(s) would be kept and unlinked.`}
         </p>
-        <form className="form-row" onSubmit={(event) => { event.preventDefault(); loadPurgePreview(Number(purgeDays)).catch((previewError) => setSignalError(previewError.message)); }}>
+        <form className="form-row" onSubmit={(event) => { event.preventDefault(); setFeedbackTarget({ scope: 'data-purge', userId: '', promoId: '', announcementId: '' }); loadPurgePreview(Number(purgeDays)).catch((previewError) => setSignalError(previewError.message)); }}>
           <label htmlFor="purge-days">Older than (days)
             <input id="purge-days" type="number" min="1" max="3650" step="1" value={purgeDays} onChange={(event) => setPurgeDays(event.target.value)} required />
           </label>
           <button type="submit" className="button button-secondary" disabled={signalsBusy}>Recalculate</button>
         </form>
-        {signalError ? <div className="alert alert-error" role="alert">{signalError}</div> : null}
+        {feedbackTarget.scope === 'data-purge' && signalError ? <div className="alert alert-error" role="alert">{signalError}</div> : null}
+        {feedbackTarget.scope === 'data-purge' && notice ? <div className="alert alert-success" role="status">{notice}</div> : null}
         <p className="muted">A purge deletes every workspace&rsquo;s matching signals at once. A signal that is still queued for execution is dropped along with its pending job, so that order will never be sent. Trades already opened keep their records. This cannot be undone, and it is written to the audit log with the counts it moved.</p>
         <div className="button-row">
           <button type="button" className="button button-danger" disabled={signalsBusy || !purge || !purge.signals} onClick={() => setSignalConfirm({ kind: 'purge' })}>

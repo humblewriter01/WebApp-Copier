@@ -133,9 +133,36 @@ export function platformPauseNotice(platformPause) {
     : `Automatic execution is paused by Signal Desk for every workspace. Your own settings are untouched, and new signals are saved for review until the pause is lifted.${reason}`;
 }
 
-export default function AdvancedSettings({ settings, accounts = [], trades = [], runtimeAvailable = false, platformPause = null, subscriptionStatus = null, onChange, onSubmit, onToggle, onOpenRiskSettings = () => {}, onOpenTradingAccounts = () => {}, onOpenPlan = () => {}, saving = false, error = '', notice = '' }) {
+export default function AdvancedSettings({ settings, accounts = [], trades = [], runtimeAvailable = false, platformPause = null, subscriptionStatus = null, onChange, onSubmit, onToggle, onOpenRiskSettings = () => {}, onOpenTradingAccounts = () => {}, onOpenPlan = () => {}, saving = false, error = '', notice = '', toggleError = '', toggleNotice = '' }) {
   const [riskWarningOpen, setRiskWarningOpen] = React.useState(false);
+  const [lastAction, setLastAction] = React.useState(null);
+  const [localToggleError, setLocalToggleError] = React.useState('');
+  const [localToggleNotice, setLocalToggleNotice] = React.useState('');
+  const [localFormError, setLocalFormError] = React.useState('');
+  const [localFormNotice, setLocalFormNotice] = React.useState('');
   const pauseNotice = platformPauseNotice(platformPause);
+
+  const runToggle = async (enabled, extra) => {
+    setLastAction('toggle');
+    setLocalToggleError('');
+    setLocalToggleNotice('');
+    setLocalFormError('');
+    setLocalFormNotice('');
+    try {
+      const result = onToggle ? onToggle(enabled, extra) : set('autoTradingEnabled', enabled);
+      if (result && typeof result.then === 'function') {
+        await result;
+      }
+      setLocalToggleNotice(
+        enabled
+          ? 'Auto-Trading is on. New eligible Telegram signals may place live orders.'
+          : 'Auto-Trading is off. No new signal orders will be submitted.',
+      );
+    } catch (toggleFailure) {
+      setLocalToggleError(toggleFailure?.message || 'We could not update Auto-Trading. Please try again.');
+    }
+  };
+
   // Turning the switch on is the only action here that spends money, so it is the only one that
   // asks first. Cancelling is not an error: the switch simply stays where it was.
   const requestAutoTrading = (enabled) => {
@@ -143,13 +170,27 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
       setRiskWarningOpen(true);
       return;
     }
-    if (onToggle) onToggle(enabled);
-    else set('autoTradingEnabled', enabled);
+    void runToggle(enabled);
   };
   const confirmRiskWarning = () => {
     setRiskWarningOpen(false);
-    if (onToggle) onToggle(true, { hasAcceptedRiskWarning: true });
-    else set('autoTradingEnabled', true);
+    void runToggle(true, { hasAcceptedRiskWarning: true });
+  };
+  const handleFormSubmit = async (event) => {
+    setLastAction('submit');
+    setLocalToggleError('');
+    setLocalToggleNotice('');
+    setLocalFormError('');
+    setLocalFormNotice('');
+    try {
+      const result = onSubmit ? onSubmit(event) : undefined;
+      if (result && typeof result.then === 'function') {
+        await result;
+      }
+      setLocalFormNotice('Settings saved.');
+    } catch (submitFailure) {
+      setLocalFormError(submitFailure?.message || 'We could not save your settings. Please try again.');
+    }
   };
   const connectedAccounts = accounts.filter((account) => String(account.state || '').toUpperCase() === 'DEPLOYED');
   // Absent means on: the guard is the safe reading, and a settings object that has not been saved since
@@ -163,6 +204,10 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
   const targetMode = targetModeOf(settings);
   const targetModeLabel = MULTIPLE_TARGET_MODES.find((mode) => mode.value === targetMode)?.label || 'First Target Only';
   const set = (key, value) => onChange({ ...settings, [key]: value });
+  const switchError = toggleError || (lastAction === 'toggle' ? error : '') || localToggleError;
+  const switchNotice = switchError ? '' : (toggleNotice || (lastAction === 'toggle' ? notice : '') || localToggleNotice);
+  const formError = (lastAction === 'toggle' ? '' : error) || localFormError;
+  const formNotice = formError ? '' : ((lastAction === 'toggle' ? '' : notice) || localFormNotice);
 
   return (
     <section className="panel settings-panel execution-settings-panel">
@@ -177,7 +222,7 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
       {!runtimeAvailable && <div className="alert alert-info" role="status">Automatic execution is unavailable here, so no signal will place an order until it returns.</div>}
       {runtimeAvailable && <p className="field-help execution-runtime-note">The worker runs while Signal Desk is online; signals missed while it was offline are never executed late.</p>}
 
-      <form className="form-stack execution-settings-form" onSubmit={onSubmit} aria-busy={saving}>
+      <form className="form-stack execution-settings-form" onSubmit={handleFormSubmit} aria-busy={saving}>
         {/* Three bars, read top to bottom in the order a decision is made: may a signal become an order
             and on what account, what happens to the trade afterwards, and which signals are refused
             before any of it. Each bar carries its own one-line state so the page can be read folded. */}
@@ -197,6 +242,8 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
             <input id="auto-trading-enabled" type="checkbox" checked={Boolean(settings.autoTradingEnabled)} disabled={saving || (!settings.autoTradingEnabled && !runtimeAvailable)} onChange={(event) => requestAutoTrading(event.target.checked)} />
             <span><strong>Auto-Trading {settings.autoTradingEnabled ? 'ON' : 'OFF'}</strong><small>This toggle saves immediately. Turn it off whenever no new orders should be submitted.</small></span>
           </label>
+          {switchError ? <div className="alert alert-error auto-trading-toggle-feedback" role="alert">{switchError}</div> : null}
+          {switchNotice ? <div className="alert alert-success auto-trading-toggle-feedback" role="status" aria-live="polite">{switchNotice}</div> : null}
           {/* The switch is not the whole instruction. A workspace with the switch on and nothing behind it read
               this page as "ON" and nothing more, then wondered why signals were only ever saved for review - so
               the sentence the Overview banner shows is repeated here, where the switch is, from the same
@@ -400,8 +447,8 @@ export default function AdvancedSettings({ settings, accounts = [], trades = [],
 
         <p className="field-help">Break-even moves apply to positions Signal Desk opened; your own trades keep their stops.</p>
         <p className="field-help advanced-settings-crosslink">Position size, open-trade limit and daily loss limit live on the <button type="button" className="text-button" onClick={onOpenRiskSettings}>Risk Settings</button> page.</p>
-        {error ? <div className="alert alert-error" role="alert">{error}</div> : null}
-        {notice ? <div className="alert alert-success" role="status" aria-live="polite">{notice}</div> : null}
+        {formError ? <div className="alert alert-error" role="alert">{formError}</div> : null}
+        {formNotice ? <div className="alert alert-success" role="status" aria-live="polite">{formNotice}</div> : null}
         <button className="button button-primary" type="submit" disabled={saving}>{saving ? 'Saving settings…' : 'Save settings'}</button>
       </form>
       <RiskWarningModal

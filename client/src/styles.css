@@ -766,9 +766,18 @@ button,input,textarea,select{touch-action:manipulation}
 #metaapi-own-token-fields{display:flex;flex-direction:column;gap:8px}
 
 /* Global button vertical spacing: buttons inside forms and panels leave breathing room above following helper text, paragraphs, and spans */
-form .button,.form-stack .button,form .button-primary,.profile-password-panel .button,.account-danger-zone>.button{margin-bottom:16px}
+button[type="submit"],.button[type="submit"],form .button,.form-stack .button,form .button-primary,.profile-password-panel .button,.account-danger-zone>.button{margin-bottom:16px}
 .button-row .button,.modal-actions .button,.deletion-actions .button,.admin-row-actions .button,.account-actions .button,.admin-search .button,.billing-promo .button,.admin-signal-filters .button,.pricing-price-row .button,.admin-purge-card .form-row .button{margin-bottom:0}
 .button+p,.button+.field-help,.button+span,.button+small,button+p,button+.field-help,button+span,button+small,form+p,form+.field-help,form+span,.form-stack+p,.form-stack+.field-help,.button-row+p,.button-row+.field-help,.button-row+span{margin-top:16px}
+.risk-settings-form+.field-help,.risk-settings-crosslink{margin-top:16px;padding-top:4px;display:block}
+
+/* Standardized inline contextual alerts (green for success, red for error, amber for warning, blue for info) with breathing room */
+.alert{border-radius:10px;padding:12px 14px;font-size:12px;line-height:1.5;margin-top:12px;margin-bottom:12px}
+.alert-success{background:#ebf8f2;border:1px solid #bde7d2;color:#155e43}
+.alert-error{background:#fff1f0;border:1px solid #f4d1ce;color:#8d2f29}
+.alert-warning{background:#fff9eb;border:1px solid #f2ddb0;color:#8a5a10}
+.alert-info{background:#eef6fb;border:1px solid #d8e9f4;color:#355970}
+.auto-trading-toggle-feedback,.account-row-feedback,.admin-row-feedback,.telegram-inline-feedback{margin-top:10px;margin-bottom:6px}
 
 /* Global text-overflow and flex/grid container safeguards across User Dashboard and Admin Panel */
 code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
