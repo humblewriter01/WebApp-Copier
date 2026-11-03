@@ -1618,7 +1618,9 @@ app.get('/api/dashboard', authenticate, asyncRoute(async (req, res) => {
    * workspace's live settings, because that read is part of the service and not a step this route can skip.
    */
   const [signalsCount, channelsCount, accountsCount, dashboardSignals, settings, subscription] = await Promise.all([
-    pool.query('SELECT COUNT(*)::int AS count FROM signals WHERE user_id=$1', [req.userId]),
+    pool.query(`SELECT COUNT(*)::int AS count,
+                      COUNT(*) FILTER (WHERE status IN ('executed','filled'))::int AS executed
+               FROM signals WHERE user_id=$1`, [req.userId]),
     pool.query('SELECT COUNT(*)::int AS count FROM channels WHERE user_id=$1 AND enabled=TRUE', [req.userId]),
     pool.query('SELECT COUNT(*)::int AS count FROM accounts WHERE user_id=$1', [req.userId]),
     readDashboardSignals({ pool, userId: req.userId, withLiveBlockers }),
@@ -1628,7 +1630,12 @@ app.get('/api/dashboard', authenticate, asyncRoute(async (req, res) => {
     pool.query('SELECT subscription_status AS status,subscription_plan AS plan FROM users WHERE id=$1', [req.userId]),
   ]);
   res.set('Cache-Control', 'no-store').json({
-    stats: { totalSignals: signalsCount.rows[0].count, activeChannels: channelsCount.rows[0].count, accounts: accountsCount.rows[0].count },
+    stats: {
+      totalSignals: signalsCount.rows[0].count,
+      activeChannels: channelsCount.rows[0].count,
+      accounts: accountsCount.rows[0].count,
+      executedSignals: signalsCount.rows[0].executed,
+    },
     signals: dashboardSignals.rows,
     signalsScope: dashboardSignals.scope,
     // The two keys that let the panel say "and here is why the newest message is not one of these" instead of

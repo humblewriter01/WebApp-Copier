@@ -2,8 +2,8 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import Sidebar from './components/Sidebar.jsx';
 import SignalTable from './components/SignalTable.jsx';
 import ConfirmModal from './components/ConfirmModal.jsx';
-import { RISK_REMINDER } from './components/RiskWarningModal.jsx';
 import { signalsAwaitingUpgrade } from './lib/signal-outcome.js';
+import { AutoTradingStatusCard, OverviewHeader, SetupChecklist, overviewActivationView } from './components/OverviewActivation.jsx';
 import TelegramConnect from './components/TelegramConnect.jsx';
 import { TelegramStatusProvider, TelegramStatusPill, useTelegramStatus, monitoringLabel } from './components/TelegramStatus.jsx';
 import { MetaApiStatusProvider } from './components/MetaApiStatus.jsx';
@@ -347,6 +347,15 @@ function App() {
     executionAccountId: settings.executionAccountId,
     subscriptionStatus: dashboard?.subscription?.status ?? null,
   });
+  const overviewChannelCount = dashboard?.stats?.activeChannels ?? channels.filter((channel) => channel.enabled !== false).length;
+  const overviewActivation = overviewActivationView({
+    linkedAccounts,
+    autoTradingEnabled: settings.autoTradingEnabled,
+    executionAccountId: settings.executionAccountId,
+    channelCount: overviewChannelCount,
+    executionReady: autoTradingBanner.state === 'ready',
+    executionIssue: autoTradingBanner.message,
+  });
   const isAdmin = user?.role === 'admin';
   const tabs = navigationItemsForRole(user?.role).map(({ key, label }) => [key, label]);
 
@@ -373,12 +382,17 @@ function App() {
       <AnnouncementBanner token={authToken} />
       <div className="content-area">
         {tab === 'overview' && <>
-          <section className="welcome-row"><div><h2>Good to see you, {user?.name?.split(' ')[0] || 'trader'}.</h2><p>Monitor Telegram signals and keep your setup organized.</p></div><LiveLabel channelCount={channels.length} /></section>
+          <section className="welcome-row overview-welcome"><OverviewHeader userName={user?.name} activation={overviewActivation} /><LiveLabel channelCount={overviewChannelCount} /></section>
+          <SetupChecklist channelCount={overviewChannelCount} linkedAccounts={linkedAccounts} onNavigate={navigateToTab} />
           {error && <div className="alert alert-error" role="alert">{error}</div>}
           {notice && <div className="alert alert-success" role="status" aria-live="polite">{notice}</div>}
-          <div className="metrics-grid"><Metric label="Signals captured" value={dashboard?.stats?.totalSignals ?? 0} note="Across your workspace" /><Metric label="Active sources" value={dashboard?.stats?.activeChannels ?? 0} note="Telegram channels" /><Metric label="Account Notes" value={dashboard?.stats?.accounts ?? 0} note="Labels and references" /><Metric label="Auto-Trading" value={settings.autoTradingEnabled ? 'On' : 'Off'} note={autoTradingBanner.metricNote} /></div>
-          {settings.autoTradingEnabled && <p className="risk-reminder risk-reminder-compact"><span>{RISK_REMINDER} Use a demo account while you are testing, and turn this off in Advanced Settings whenever you want no new orders.</span></p>}
-          <div className={`notice-banner${autoTradingBanner.state === 'ready' ? '' : autoTradingBanner.state === 'off' ? '' : ' notice-banner-warn'}`} data-state={autoTradingBanner.state}><strong>{autoTradingBanner.headline}</strong><span>{autoTradingBanner.message}</span>{autoTradingBanner.action ? <button type="button" className="text-button notice-banner-action" onClick={() => navigateToTab(autoTradingBanner.action.tab)}>{autoTradingBanner.action.label}</button> : null}</div>
+          <div className="metrics-grid">
+            <Metric label="Signals captured" value={dashboard?.stats?.totalSignals ?? 0} note="Across your workspace" />
+            <Metric label="Active sources" value={overviewChannelCount} note="Telegram channels" />
+            <Metric label="Signals Executed" value={dashboard?.stats?.executedSignals ?? 0} note="Successfully sent to broker" />
+            <Metric label="Auto-Trading" value={overviewActivation.status} note={overviewActivation.metricNote} />
+          </div>
+          <AutoTradingStatusCard activation={overviewActivation} autoTradingEnabled={settings.autoTradingEnabled} action={autoTradingBanner.action} onNavigate={navigateToTab} />
           <section className="panel"><div className="panel-heading"><div><p className="eyebrow">LATEST ACTIVITY</p><h2>Recent signals</h2></div><button className="text-button" onClick={() => setTab('signals')}>View all</button></div>{dashboard?.signalsScope === 'recent' && dashboard?.signals?.length ? <p className="dashboard-signals-note">No setup has come through your channels yet, so this is your most recent captured traffic.</p> : null}{(() => { const note = dashboardFreshnessNote({ newerCaptures: dashboard?.signalsNewerCaptures, lastCaptureAt: dashboard?.signalsLastCaptureAt }); return dashboard?.signalsScope === 'actionable' && note ? <p className="dashboard-signals-note">{note}</p> : null; })()}<SignalTable signals={dashboard?.signals || []} compact channelCount={channels.length} onOpenTelegram={() => navigateToTab('telegram')} onUpgrade={() => navigateToTab('billing')} /></section>
         </>}
         {tab === 'telegram' && <TelegramConnect token={authToken} channels={channels} onRefresh={refresh} />}

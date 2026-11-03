@@ -272,3 +272,11 @@ test('the Overview selects the columns the re-decision reads', () => {
     assert.ok(keys.includes(needed), `${needed} is selected, or the overlay cannot see it`);
   }
 });
+
+test('Overview statistics include the workspace total of signals accepted by the broker', () => {
+  const dashboard = routes.slice(routes.indexOf("app.get('/api/dashboard'"), routes.indexOf("app.get('/api/channels'"));
+  assert.match(dashboard, /COUNT\(\*\) FILTER \(WHERE status IN \('executed','filled'\)\)::int AS executed/,
+    'only successfully executed or filled signals count, not captured or blocked messages');
+  assert.match(dashboard, /executedSignals: signalsCount\.rows\[0\]\.executed/,
+    'the dashboard sends the count the Overview metric reads');
+});
