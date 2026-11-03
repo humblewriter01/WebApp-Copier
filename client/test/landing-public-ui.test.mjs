@@ -157,6 +157,32 @@ test('the page requests only public prices and never reads visitor credentials o
   assert.match(landingSource, /useState\(DEFAULT_PRICING\)/, 'defaults render before the request completes');
 });
 
+test('each public pricing card lists its explicit plan limits', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => { throw new Error('offline'); };
+    const { host, unmount } = await mount();
+    const expected = new Map([
+      ['Free', ['No trading accounts', '2 Telegram channels', '50 signals per day']],
+      ['Starter', ['1 trading account', '10 Telegram channels', '200 signals per day']],
+      ['Pro', ['3 trading accounts', '50 Telegram channels', '500 signals per day']],
+      ['Premium', ['5 trading accounts', '100 Telegram channels', '2000 signals per day']],
+    ]);
+    const cards = [...host.querySelectorAll('.landing-price-card')];
+    assert.equal(cards.length, expected.size, 'all four plans have their own card');
+    for (const card of cards) {
+      const plan = text(card.querySelector('h3'));
+      assert.deepEqual(
+        [...card.querySelectorAll('.landing-plan-features li')].map(text),
+        expected.get(plan),
+        `${plan} shows its limits as a compact feature list`,
+      );
+      assert.equal(card.querySelector('.landing-plan-features')?.getAttribute('aria-label'), `${plan} plan limits`);
+    }
+    await unmount();
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test('the landing pricing defaults to USD and the NGN toggle still changes every displayed price', async () => {
   const originalFetch = globalThis.fetch;
   try {
@@ -185,18 +211,32 @@ test('pricing defaults render on an API failure and live prices replace them on 
     assert.match(text(fallback.host.querySelector('.landing-pricing')), /\$39/, 'failure leaves the USD defaults in place');
     await fallback.unmount();
 
-    globalThis.fetch = async () => new Response(JSON.stringify({ currency: 'USD', plans: [
-      { key: 'starter', name: 'Starter', amount: 27, currency: 'USD', interval: 'monthly' },
-      { key: 'pro', name: 'Pro', amount: 44, currency: 'USD', interval: 'monthly' },
-      { key: 'premium', name: 'Premium', amount: 79, currency: 'USD', interval: 'monthly' },
-    ] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    let requestedPath;
+    const livePlans = [
+      { key: 'starter', name: 'Starter', amount: 27, amountMinor: 2700, currency: 'USD', interval: 'monthly', prices: { USD: { amount: 27, amountMinor: 2700 }, NGN: { amount: 42000, amountMinor: 4_200_000 } } },
+      { key: 'pro', name: 'Pro', amount: 44, amountMinor: 4400, currency: 'USD', interval: 'monthly', prices: { USD: { amount: 44, amountMinor: 4400 }, NGN: { amount: 88000, amountMinor: 8_800_000 } } },
+      { key: 'premium', name: 'Premium', amount: 79, amountMinor: 7900, currency: 'USD', interval: 'monthly', prices: { USD: { amount: 79, amountMinor: 7900 }, NGN: { amount: 158000, amountMinor: 15_800_000 } } },
+    ];
+    globalThis.fetch = async (url) => {
+      requestedPath = url;
+      return new Response(JSON.stringify({ currency: 'USD', plans: livePlans }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
     const live = await mount();
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
-    const prices = text(live.host.querySelector('.landing-pricing'));
-    assert.match(prices, /\$27/);
-    assert.match(prices, /\$44/);
-    assert.match(prices, /\$79/);
-    assert.doesNotMatch(prices, /₦105,000/);
+    assert.equal(requestedPath, '/api/public/pricing', 'live amounts come from the public pricing endpoint');
+    const pricing = live.host.querySelector('.landing-pricing');
+    const usdPrices = text(pricing);
+    assert.match(usdPrices, /\$27/);
+    assert.match(usdPrices, /\$44/);
+    assert.match(usdPrices, /\$79/);
+    assert.doesNotMatch(usdPrices, /\$39|\$69|\$99/, 'the USD fallbacks were replaced by the API values');
+
+    await act(async () => { buttonNamed(live.host, 'NGN').click(); });
+    const ngnPrices = text(pricing);
+    assert.match(ngnPrices, /₦42,000/);
+    assert.match(ngnPrices, /₦88,000/);
+    assert.match(ngnPrices, /₦158,000/);
+    assert.doesNotMatch(ngnPrices, /₦60,000|₦105,000|₦150,000/, 'the NGN toggle uses live amounts rather than its fallbacks');
     await live.unmount();
   } finally { globalThis.fetch = originalFetch; }
 });

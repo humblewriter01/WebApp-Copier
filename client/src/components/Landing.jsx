@@ -6,9 +6,18 @@ import BrokerAccessNote from './BrokerAccessNote.jsx';
 const DEFAULT_PRICING = [
   { key: 'free', name: 'Free', amount: 0, currency: 'USD', prices: { USD: 0, NGN: 0 }, interval: 'monthly', description: 'Explore signal capture and review.' },
   { key: 'starter', name: 'Starter', amount: 39, currency: 'USD', prices: { USD: 39, NGN: 60000 }, interval: 'monthly', description: 'A focused setup for one trading account.' },
-  { key: 'pro', name: 'Pro', amount: 69, currency: 'USD', prices: { USD: 69, NGN: 105000 }, interval: 'monthly', description: 'More accounts and room for active channels.' },
-  { key: 'premium', name: 'Premium', amount: 99, currency: 'USD', prices: { USD: 99, NGN: 150000 }, interval: 'monthly', description: 'Higher limits for multiple accounts and busy channels.' },
+  { key: 'pro', name: 'Pro', amount: 69, currency: 'USD', prices: { USD: 69, NGN: 105000 }, interval: 'monthly', description: 'For active traders managing busier signal flow.' },
+  { key: 'premium', name: 'Premium', amount: 99, currency: 'USD', prices: { USD: 99, NGN: 150000 }, interval: 'monthly', description: 'Capacity for high-volume signal workflows.' },
 ];
+
+// Keep the public limits aligned with BillingPage. Prices remain a separate live-fed state above.
+const PLAN_FEATURES = Object.freeze({
+  free: ['No trading accounts', '2 Telegram channels', '50 signals per day'],
+  starter: ['1 trading account', '10 Telegram channels', '200 signals per day'],
+  pro: ['3 trading accounts', '50 Telegram channels', '500 signals per day'],
+  premium: ['5 trading accounts', '100 Telegram channels', '2000 signals per day'],
+});
+
 const SAMPLE_SIGNALS = [
   { id: 'eur-market', type: 'market', symbol: 'EURUSD', order: 'BUY EURUSD @ Market', stop: '1.0812', target: '1.0902', state: 'Executed', detail: 'Filled at 1.0845 · 0.4s after the post' },
   { id: 'us30-review', type: 'review', symbol: 'US30', order: 'SELL US30 @ 34,250.00', stop: '34,400.00', target: '34,000.00', state: 'Held for review', detail: 'Waiting for price to enter zone. Nothing sent yet.' },
@@ -133,6 +142,9 @@ export default function Landing({ onEnterAuth = () => {}, installPrompt = null, 
       <div className="landing-pricing-grid">{plans.map((plan) => <article className={`landing-price-card${plan.key === 'pro' ? ' landing-price-featured' : ''}`} key={plan.key}>
         {plan.key === 'pro' && <span className="landing-popular">POPULAR</span>}
         <h3>{plan.name}</h3><p className="landing-price-description">{plan.description}</p>
+        <ul className="landing-plan-features" aria-label={`${plan.name} plan limits`}>
+          {(PLAN_FEATURES[plan.key] || []).map((feature) => <li key={feature}>{feature}</li>)}
+        </ul>
         <p className="landing-price"><strong>{formatPrice(plan, currency)}</strong>{Number(priceAmount(plan, currency)) > 0 && <span> / {{ monthly: 'month', quarterly: 'quarter', annually: 'year', annual: 'year' }[plan.interval] || plan.interval || 'month'}</span>}</p>
         <button type="button" className={`button ${plan.key === 'pro' ? 'button-primary' : 'button-secondary'}`} onClick={() => onEnterAuth('register')}>{plan.key === 'free' ? 'Get Started Free' : 'Choose ' + plan.name}</button>
       </article>)}</div>
