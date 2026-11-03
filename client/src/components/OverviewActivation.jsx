@@ -4,7 +4,7 @@ import { RISK_REMINDER } from './RiskWarningModal.jsx';
 
 const STATUS_COPY = Object.freeze({
   off: 'Auto-Trading is disabled. Turn it on to execute signals.',
-  pending: 'Connect an MT4/MT5 account to enable execution.',
+  'awaiting-broker': 'Connect an MT4/MT5 account to enable execution.',
   active: 'Auto-Trading is live.',
 });
 
@@ -18,7 +18,7 @@ export function autoTradingStatusView({ linkedAccounts = [], autoTradingEnabled 
     return { state: 'off', tone: 'muted', status: 'Off', message: STATUS_COPY.off };
   }
   if (accounts.length === 0) {
-    return { state: 'pending', tone: 'pending', status: 'Pending', message: STATUS_COPY.pending };
+    return { state: 'awaiting-broker', tone: 'pending', status: 'Awaiting Broker', message: STATUS_COPY['awaiting-broker'] };
   }
   return { state: 'active', tone: 'good', status: 'Active', message: STATUS_COPY.active };
 }

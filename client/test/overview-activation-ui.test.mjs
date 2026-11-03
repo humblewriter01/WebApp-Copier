@@ -12,6 +12,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const srcDir = path.join(here, '..', 'src');
 const outfile = path.join(here, '.tmp', 'overview-activation.mjs');
 const appSource = readFileSync(path.join(srcDir, 'App.jsx'), 'utf8');
+const metaApiPanelSource = readFileSync(path.join(srcDir, 'components', 'MetaApiPanel.jsx'), 'utf8');
 const cssSource = readFileSync(path.join(srcDir, 'styles.css'), 'utf8');
 
 await build({
@@ -63,17 +64,23 @@ test('the explicit off switch renders Off even when no broker account is connect
     'Off uses the neutral grey status style');
 });
 
-test('an enabled switch without a connected account renders Pending in amber', () => {
+test('an enabled switch without a connected account renders Awaiting Broker in amber', () => {
   const activation = activationFor({ autoTradingEnabled: true, linkedAccounts: [] });
   assert.match(render(OverviewHeader, { userName: 'Amina Yusuf', activation }), /Your bot is listening\./);
+  assert.equal(activation.state, 'awaiting-broker');
 
   const card = render(AutoTradingStatusCard, { activation, autoTradingEnabled: true });
-  assert.match(card, /data-state="pending"/);
+  assert.match(card, /data-state="awaiting-broker"/);
   assert.match(card, /data-tone="pending"/);
-  assert.match(card, />Pending</);
+  assert.match(card, />Awaiting Broker</);
+  assert.doesNotMatch(card, />Pending</);
   assert.match(card, /Connect an MT4\/MT5 account to enable execution\./);
+  assert.match(cssSource, /\.overview-execution-card-awaiting-broker,\.overview-execution-card-attention\{[^}]*border-left-color:#d6a13c/,
+    'the large card keeps its amber warning edge');
   assert.match(cssSource, /\.overview-execution-pill-pending\{[^}]*color:#8b6417/,
-    'Pending uses the amber status style');
+    'the status pill keeps its amber warning styling');
+  assert.match(cssSource, /\.signal-outcome\.tone-warn\{[^}]*background:#fdf6e6;color:#8a6a1f/,
+    'Awaiting Broker signal chips also use the warning color');
 });
 
 test('a connected broker with Auto-Trading off keeps the Ready to execute header and Off card', () => {
@@ -123,6 +130,17 @@ test('the connected-account and enabled-switch state consistently drives Active 
   assert.equal(activation.message, 'Auto-Trading is live.');
   assert.equal(activation.headline, 'Your workspace is live.');
   assert.match(activation.subtext, /Monitoring 2 channels and executing on 1 account/);
+});
+
+test('Recent Signals and the execution card share live switch/account state, refreshed after account changes', () => {
+  assert.match(appSource, /<SignalTable signals=\{dashboard\?\.signals \|\| \[\]\} compact autoTradingEnabled=\{settings\.autoTradingEnabled\} linkedAccounts=\{linkedAccounts\}/,
+    'Recent Signals receives the same current switch and account snapshot as the card');
+  assert.match(appSource, /<AutoTradingStatusCard activation=\{overviewActivation\} autoTradingEnabled=\{settings\.autoTradingEnabled\}/,
+    'the status card uses that workspace switch');
+  assert.match(appSource, /<MetaApiPanel[^\n]*onAccountsChanged=\{refresh\}/,
+    'broker changes ask App to refresh the whole Overview snapshot');
+  assert.equal((metaApiPanelSource.match(/await onAccountsChanged\(\);/g) || []).length, 3,
+    'adding, refreshing, and removing a broker account each refresh both Overview statuses');
 });
 
 test('the Setup Checklist tracks all three steps and disappears after completion', () => {

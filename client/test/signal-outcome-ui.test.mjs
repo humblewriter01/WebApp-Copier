@@ -7,7 +7,7 @@ import { build } from 'esbuild';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
-import { entryZoneView, signalBadges, signalHasTradingData, signalOutcomeView, signalsAwaitingUpgrade } from '../src/lib/signal-outcome.js';
+import { entryZoneView, overviewSignalOutcomeView, signalBadges, signalHasTradingData, signalOutcomeView, signalsAwaitingUpgrade } from '../src/lib/signal-outcome.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -94,6 +94,49 @@ test('a free workspace sees its captured signals with the reason attached, not a
   assert.match(markup, /Sent for execution/);
   assert.match(markup, /outcome-warn/);
   assert.equal(markup.includes('Connect Telegram'), false, 'a workspace that is already capturing is never told to connect');
+});
+
+test('Recent Signals chips track the live broker and Auto-Trading state without rewriting history', () => {
+  const parsed = {
+    id: 'overview-awaiting-broker', source: 'telegram', status: 'unexecuted', executionReady: true,
+    needsReview: false, symbol: 'EURUSD', side: 'buy', entryPrice: 1.085, stopLoss: 1.08,
+    takeProfit: 1.095, message: 'BUY EURUSD 1.0850 SL 1.0800 TP 1.0950',
+  };
+  const connected = [{ metaApiAccountId: 'mt5-1', state: 'DEPLOYED' }];
+
+  const awaiting = overviewSignalOutcomeView(parsed, { autoTradingEnabled: true, linkedAccounts: [] });
+  assert.equal(awaiting.label, 'AWAITING BROKER');
+  assert.equal(awaiting.tone, 'warn');
+  const awaitingMarkup = renderToStaticMarkup(React.createElement(SignalTable, {
+    signals: [parsed], compact: true, autoTradingEnabled: true, linkedAccounts: [],
+  }));
+  assert.match(awaitingMarkup, /class="badge signal-outcome tone-warn">AWAITING BROKER<\/span>/,
+    'the Recent Signals chip uses the requested all-caps copy and warning tone');
+
+  const autoOff = overviewSignalOutcomeView(parsed, { autoTradingEnabled: false, linkedAccounts: connected });
+  assert.equal(autoOff.label, 'AUTO-TRADING OFF', 'a connected broker does not hide the switch being off');
+  const autoOffMarkup = renderToStaticMarkup(React.createElement(SignalTable, {
+    signals: [parsed], compact: true, autoTradingEnabled: false, linkedAccounts: connected,
+  }));
+  assert.match(autoOffMarkup, /class="badge signal-outcome tone-muted">AUTO-TRADING OFF<\/span>/);
+
+  const executed = { ...parsed, status: 'executed' };
+  assert.equal(overviewSignalOutcomeView(executed, { autoTradingEnabled: true, linkedAccounts: connected }).label, 'Executed');
+  const executedMarkup = renderToStaticMarkup(React.createElement(SignalTable, {
+    signals: [executed], compact: true, autoTradingEnabled: true, linkedAccounts: connected,
+  }));
+  assert.match(executedMarkup, /class="badge signal-outcome tone-good">Executed<\/span>/,
+    'an actual execution remains authoritative once the broker is connected');
+
+  const fullHistory = renderToStaticMarkup(React.createElement(SignalTable, {
+    signals: [parsed], autoTradingEnabled: false, linkedAccounts: connected,
+  }));
+  assert.match(fullHistory, /class="badge signal-outcome tone-warn">Not executed<\/span>/,
+    'the full Signals page keeps the saved outcome rather than a live Overview label');
+
+  const needsReview = { ...parsed, executionReady: false, status: 'unparsed', needsReview: true };
+  assert.notEqual(overviewSignalOutcomeView(needsReview, { autoTradingEnabled: true, linkedAccounts: [] }).label, 'AWAITING BROKER',
+    'an unreadable or review-held signal is not called Awaiting Broker');
 });
 
 /* --------------------- a market order: a level stated, no entry --------------------- */
