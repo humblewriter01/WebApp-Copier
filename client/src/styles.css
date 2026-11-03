@@ -797,3 +797,58 @@ code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace
   .pricing-plans,.pricing-price-fields,.pricing-sync-list,.admin-signal-filters{grid-template-columns:minmax(0,1fr)}
 }
 
+
+/* Overview activation flow: one greeting, one next step, and one execution status that all reflect the same workspace state. */
+.overview-welcome{align-items:flex-start;gap:18px}
+.overview-heading-copy{min-width:0;flex:1}
+.overview-greeting{margin:0 0 4px;color:#8491a3;font-size:11px;font-weight:600;line-height:1.4}
+.overview-welcome .overview-headline{margin:0 0 6px;color:#1a2a40;font:800 clamp(21px,2.2vw,27px) Manrope,sans-serif;letter-spacing:-.55px;line-height:1.2}
+.overview-welcome .overview-subtext{max-width:760px;margin:0;color:#657286;font-size:13px;line-height:1.55}
+.overview-welcome .live-label{align-self:center;flex:0 0 auto}
+
+.setup-checklist{padding:18px 20px}
+.setup-checklist-header{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:12px}
+.setup-checklist-header .eyebrow{margin-bottom:4px}
+.setup-checklist-header h2{margin:0;color:#1b2a40;font:700 16px Manrope,sans-serif}
+.setup-checklist-count{flex:0 0 auto;color:#647286;font-size:11px;font-weight:700}
+.setup-checklist-progress{height:6px;overflow:hidden;border-radius:99px;background:#edf1f4}
+.setup-checklist-progress>span{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,#1e8c72,#49b28c);transition:width .25s ease}
+.setup-checklist-list{display:grid;gap:8px;list-style:none;margin:13px 0 0;padding:0}
+.setup-checklist-step{display:flex;align-items:center;gap:11px;min-width:0;padding:10px 12px;border:1px solid #edf0f4;border-radius:10px;background:#fbfcfd}
+.setup-checklist-icon{display:grid;place-items:center;flex:0 0 27px;width:27px;height:27px;border-radius:50%;background:#edf1f5;color:#66758a;font-size:11px;font-weight:800}
+.setup-checklist-step-complete{border-color:#d8eee4;background:#f8fcfa}
+.setup-checklist-step-complete .setup-checklist-icon{background:#e2f4e9;color:#217b55;font-size:15px}
+.setup-checklist-label{min-width:0;color:#304058;font-size:12px;font-weight:700;line-height:1.4}
+.setup-checklist-step-complete .setup-checklist-label{color:#617166}
+.setup-checklist-action{display:inline-flex;align-items:center;gap:7px;flex:0 0 auto;min-height:40px;margin-left:auto;border:0;border-radius:7px;padding:6px 9px;background:#eef7f5;color:#1e6878;font-size:10px;font-weight:700}
+.setup-checklist-action:hover{background:#e3f2ee;color:#145764}
+.setup-checklist-action:focus-visible{outline:2px solid #087f8c;outline-offset:2px}
+
+.overview-execution-card{margin:0 0 20px;padding:18px 20px;border:1px solid #e8ebf0;border-left:4px solid #aeb8c5;border-radius:13px;background:linear-gradient(125deg,#fff,#fbfcfe);box-shadow:0 5px 18px #1b2a4008}
+.overview-execution-card-pending,.overview-execution-card-attention{border-left-color:#d6a13c;background:linear-gradient(120deg,#fffdf8,#fff)}
+.overview-execution-card-active{border-left-color:#35a075;background:linear-gradient(120deg,#f8fdf9,#fff)}
+.overview-execution-header{display:flex;align-items:center;justify-content:space-between;gap:14px}
+.overview-execution-header .eyebrow{margin:0 0 4px}
+.overview-execution-header h2{margin:0;color:#1b2a40;font:700 16px Manrope,sans-serif}
+.overview-execution-pill{display:inline-flex;align-items:center;justify-content:center;min-height:28px;border:1px solid transparent;border-radius:99px;padding:5px 11px;font-size:10px;font-weight:800;letter-spacing:.02em;white-space:nowrap}
+.overview-execution-pill-pending{border-color:#f1dfb6;background:#fff4dc;color:#8b6417}
+.overview-execution-pill-muted{border-color:#e1e5eb;background:#f1f3f6;color:#647184}
+.overview-execution-pill-good{border-color:#cbe9d9;background:#e9f7ef;color:#217b55}
+.overview-execution-message{margin:9px 0 0;color:#526176;font-size:12px;line-height:1.55}
+.overview-execution-action{display:inline-flex;align-items:center;gap:8px;min-height:40px;margin-top:10px;border:0;border-radius:8px;padding:7px 11px;background:#eef4f5;color:#1e6878;font-size:11px;font-weight:700}
+.overview-execution-action:hover{background:#e2eff0;color:#155965}
+.overview-execution-action:focus-visible{outline:2px solid #087f8c;outline-offset:2px}
+.overview-execution-warning{display:flex;align-items:flex-start;gap:9px;margin:13px 0 0;padding:10px 12px;border:1px solid #f0dfba;border-radius:9px;background:#fff9ec;color:#78591d;font-size:11px;line-height:1.5}
+.overview-execution-warning>span:first-child{display:grid;place-items:center;flex:0 0 17px;width:17px;height:17px;border-radius:50%;background:#f4e5c4;color:#795514;font-size:11px;font-weight:900}
+
+@media(max-width:700px){
+  .overview-welcome{flex-direction:column;gap:9px}
+  .overview-welcome .overview-headline{font-size:22px}
+  .overview-welcome .live-label{align-self:flex-start}
+  .setup-checklist{padding:16px}
+  .setup-checklist-step{gap:8px;padding:9px}
+  .setup-checklist-label{font-size:11px}
+  .setup-checklist-action{gap:5px;padding-inline:7px;font-size:9px}
+  .overview-execution-card{padding:16px}
+}
+@media(prefers-reduced-motion:reduce){.setup-checklist-progress>span{transition:none}}

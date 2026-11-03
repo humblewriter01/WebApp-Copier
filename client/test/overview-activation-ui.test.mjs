@@ -1,0 +1,161 @@
+/** The Overview activation header, checklist, and execution status stay tied to mocked workspace state. */
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { existsSync, readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { build } from 'esbuild';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const srcDir = path.join(here, '..', 'src');
+const outfile = path.join(here, '.tmp', 'overview-activation.mjs');
+const appSource = readFileSync(path.join(srcDir, 'App.jsx'), 'utf8');
+const cssSource = readFileSync(path.join(srcDir, 'styles.css'), 'utf8');
+
+await build({
+  stdin: {
+    contents: "export { AutoTradingStatusCard, OverviewHeader, SetupChecklist, overviewActivationView } from './OverviewActivation.jsx';",
+    resolveDir: path.join(srcDir, 'components'),
+    loader: 'jsx',
+  },
+  outfile,
+  bundle: true,
+  format: 'esm',
+  platform: 'node',
+  external: ['react', 'react-dom'],
+  define: { 'process.env.NODE_ENV': '"development"', 'import.meta.env': '{}' },
+  logLevel: 'silent',
+});
+assert.ok(existsSync(outfile), 'the activation components were bundled');
+const { AutoTradingStatusCard, OverviewHeader, SetupChecklist, overviewActivationView } = await import(pathToFileURL(outfile).href);
+const render = (Component, props) => renderToStaticMarkup(React.createElement(Component, props));
+const ACCOUNT = { metaApiAccountId: 'mt5-1', name: 'Kano Demo', login: '432109', state: 'DEPLOYED' };
+
+const activationFor = (overrides = {}) => overviewActivationView({
+  linkedAccounts: [],
+  autoTradingEnabled: false,
+  executionAccountId: '',
+  channelCount: 0,
+  ...overrides,
+});
+
+test('the greeting stays personalized and the no-account header guides the user to connect MT5', () => {
+  const activation = activationFor();
+  const html = render(OverviewHeader, { userName: 'Amina Yusuf', activation });
+  assert.match(html, /Good to see you, Amina\./, 'the greeting remains personalized and uses the first name');
+  assert.match(html, /Your bot is listening\./);
+  assert.match(html, /You have signals waiting\. Connect an MT5 account to start executing\./);
+  assert.match(cssSource, /\.overview-greeting\{[^}]*color:#8491a3;[^}]*font-size:11px/,
+    'the retained greeting is small and muted');
+
+  const card = render(AutoTradingStatusCard, { activation, autoTradingEnabled: false });
+  assert.match(card, /data-state="pending"/);
+  assert.match(card, /data-tone="pending"/);
+  assert.match(card, />Pending</);
+  assert.match(card, /Connect a broker account to enable execution\./);
+  assert.match(cssSource, /\.overview-execution-pill-pending\{[^}]*color:#8b6417/,
+    'Pending uses the amber status style');
+});
+
+test('a connected broker with Auto-Trading off asks the user to enable it', () => {
+  const activation = activationFor({ linkedAccounts: [ACCOUNT] });
+  const header = render(OverviewHeader, { userName: 'Amina Yusuf', activation });
+  assert.match(header, /Ready to execute\./);
+  assert.match(header, /Your broker is connected\. Turn on Auto-Trading in Advanced Settings to allow the bot to place trades\./);
+
+  const card = render(AutoTradingStatusCard, { activation, autoTradingEnabled: false });
+  assert.match(card, /data-state="off"/);
+  assert.match(card, /data-tone="muted"/);
+  assert.match(card, />Off</);
+  assert.match(card, /Auto-Trading is disabled\. Turn it on to execute signals\./);
+  assert.match(cssSource, /\.overview-execution-pill-muted\{[^}]*color:#647184/,
+    'Off uses the neutral grey status style');
+});
+
+test('a ready account and enabled switch show live channel, account, and execution details', () => {
+  const activation = activationFor({
+    linkedAccounts: [ACCOUNT],
+    autoTradingEnabled: true,
+    executionAccountId: ACCOUNT.metaApiAccountId,
+    channelCount: 5,
+    executionReady: true,
+  });
+  const header = render(OverviewHeader, { userName: 'Amina Yusuf', activation });
+  assert.match(header, /Your workspace is live\./);
+  assert.match(header, /Monitoring 5 channels and executing on 1 account\./);
+
+  const card = render(AutoTradingStatusCard, { activation, autoTradingEnabled: true });
+  assert.match(card, /data-state="active"/);
+  assert.match(card, /data-tone="good"/);
+  assert.match(card, />Active</);
+  assert.match(card, /Auto-Trading is live\. Executing on Kano Demo\./);
+  assert.match(card, /class="overview-execution-warning"[^>]*>[\s\S]*Auto-Trading executes live orders\. Trade at your own risk\./,
+    'the live-order warning is inside the status card');
+  assert.match(cssSource, /\.overview-execution-pill-good\{[^}]*color:#217b55/,
+    'Active uses the green status style');
+});
+
+test('a blocked enabled switch is not falsely announced as live', () => {
+  const activation = activationFor({
+    linkedAccounts: [ACCOUNT],
+    autoTradingEnabled: true,
+    executionAccountId: ACCOUNT.metaApiAccountId,
+    executionReady: false,
+    executionIssue: 'Execution is paused by Signal Desk.',
+  });
+  assert.equal(activation.state, 'attention');
+  assert.equal(activation.status, 'Needs attention');
+  assert.equal(activation.message, 'Execution is paused by Signal Desk.');
+  assert.notEqual(activation.headline, 'Your workspace is live.');
+});
+
+test('the Setup Checklist tracks all three steps and disappears after completion', () => {
+  const incomplete = render(SetupChecklist, {
+    telegramConnected: true,
+    channelCount: 1,
+    linkedAccounts: [],
+    onNavigate: () => {},
+  });
+  assert.match(incomplete, /Setup Checklist/);
+  assert.match(incomplete, /Connect Telegram/);
+  assert.match(incomplete, /Select at least one monitored channel/);
+  assert.match(incomplete, /Connect at least one trading account/);
+  assert.match(incomplete, /2 of 3 complete/);
+  assert.equal((incomplete.match(/data-complete="true"/g) || []).length, 2,
+    'Telegram and a selected channel carry completed state');
+  assert.match(incomplete, /class="setup-checklist-icon"[^>]*>✓</,
+    'completed steps use the checkmark icon');
+
+  const accountConnected = render(SetupChecklist, {
+    telegramConnected: false,
+    channelCount: 0,
+    linkedAccounts: [ACCOUNT],
+  });
+  const completedAccountStep = [...accountConnected.matchAll(/<li class="setup-checklist-step setup-checklist-step-complete" data-complete="true">([\s\S]*?)<\/li>/g)]
+    .map((match) => match[1]);
+  assert.equal(completedAccountStep.length, 1, 'a linked trading account completes its checklist step');
+  assert.match(completedAccountStep[0], /Connect at least one trading account/);
+  assert.match(completedAccountStep[0], />✓<\/span>/);
+
+  const complete = render(SetupChecklist, {
+    telegramConnected: true,
+    channelCount: 2,
+    linkedAccounts: [ACCOUNT],
+  });
+  assert.equal(complete, '', 'the activation checklist is hidden once every step is complete');
+});
+
+test('Overview replaces the Account Notes metric with the API-backed executed-signal count', () => {
+  const metrics = appSource.match(/<div className="metrics-grid">([\s\S]*?)<\/div>/)?.[1];
+  assert.ok(metrics, 'the Overview metrics grid exists');
+  assert.doesNotMatch(metrics, /label="Account Notes"/);
+  assert.match(metrics, /label="Signals Executed"/);
+  assert.match(metrics, /value=\{dashboard\?\.stats\?\.executedSignals \?\? 0\}/);
+  assert.match(metrics, /note="Successfully sent to broker"/);
+  assert.match(appSource, /<AutoTradingStatusCard activation=\{overviewActivation\}/,
+    'the metric and the status card share the same activation state');
+  assert.doesNotMatch(appSource, /risk-reminder-compact/,
+    'the live-order reminder no longer floats outside the status card');
+});
