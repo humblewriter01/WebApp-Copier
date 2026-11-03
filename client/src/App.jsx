@@ -3,7 +3,7 @@ import Sidebar from './components/Sidebar.jsx';
 import SignalTable from './components/SignalTable.jsx';
 import ConfirmModal from './components/ConfirmModal.jsx';
 import { signalsAwaitingUpgrade } from './lib/signal-outcome.js';
-import { AutoTradingStatusCard, OverviewHeader, SetupChecklist, overviewActivationView } from './components/OverviewActivation.jsx';
+import { AutoTradingStatusCard, OverviewHeader, OverviewLoadingShell, OverviewMetrics, SetupChecklist, overviewActivationView } from './components/OverviewActivation.jsx';
 import TelegramConnect from './components/TelegramConnect.jsx';
 import { TelegramStatusProvider, TelegramStatusPill, useTelegramStatus, monitoringLabel } from './components/TelegramStatus.jsx';
 import { MetaApiStatusProvider } from './components/MetaApiStatus.jsx';
@@ -33,10 +33,6 @@ function LiveLabel({ channelCount }) {
   const { view } = useTelegramStatus();
   const label = monitoringLabel({ view, channelCount });
   return <span className={`live-label ${label.live ? '' : 'idle'}`} role="status" aria-live="polite">{label.live ? <i aria-hidden="true" /> : null}<span>{label.text}</span></span>;
-}
-
-function Metric({ label, value, note }) {
-  return <div className="metric-card"><span className="metric-label">{label}</span><strong>{value ?? '—'}</strong><span className="metric-note">{note}</span></div>;
 }
 
 /* Pages that own a URL, so a refresh or a pasted link lands on the page and not on Overview. Anything
@@ -347,14 +343,13 @@ function App() {
     executionAccountId: settings.executionAccountId,
     subscriptionStatus: dashboard?.subscription?.status ?? null,
   });
+  const overviewDataUnavailable = dashboard == null;
   const overviewChannelCount = dashboard?.stats?.activeChannels ?? channels.filter((channel) => channel.enabled !== false).length;
   const overviewActivation = overviewActivationView({
     linkedAccounts,
     autoTradingEnabled: settings.autoTradingEnabled,
     executionAccountId: settings.executionAccountId,
     channelCount: overviewChannelCount,
-    executionReady: autoTradingBanner.state === 'ready',
-    executionIssue: autoTradingBanner.message,
   });
   const isAdmin = user?.role === 'admin';
   const tabs = navigationItemsForRole(user?.role).map(({ key, label }) => [key, label]);
@@ -371,7 +366,7 @@ function App() {
     // direction, and a workspace that has signed out keeps going straight to it as it always did.
     return <Landing onEnterAuth={setAuthIntent} installPrompt={installPrompt} onInstall={installApp} />;
   }
-  if (loading) return <main className="loading-shell"><div className="spinner" /><span>Loading your workspace…</span></main>;
+  if (loading) return <OverviewLoadingShell />;
   return <TelegramStatusProvider token={authToken}>
     <MetaApiStatusProvider token={authToken}>
     <div className={`app-shell ${sidebarVisible ? '' : 'sidebar-hidden'}`}>
@@ -382,17 +377,17 @@ function App() {
       <AnnouncementBanner token={authToken} />
       <div className="content-area">
         {tab === 'overview' && <>
-          <section className="welcome-row overview-welcome"><OverviewHeader userName={user?.name} activation={overviewActivation} /><LiveLabel channelCount={overviewChannelCount} /></section>
-          <SetupChecklist channelCount={overviewChannelCount} linkedAccounts={linkedAccounts} onNavigate={navigateToTab} />
+          <section className="welcome-row overview-welcome"><OverviewHeader userName={user?.name} activation={overviewActivation} unavailable={overviewDataUnavailable} /><LiveLabel channelCount={overviewChannelCount} /></section>
+          <SetupChecklist channelCount={overviewChannelCount} linkedAccounts={linkedAccounts} onNavigate={navigateToTab} unavailable={overviewDataUnavailable} />
           {error && <div className="alert alert-error" role="alert">{error}</div>}
           {notice && <div className="alert alert-success" role="status" aria-live="polite">{notice}</div>}
-          <div className="metrics-grid">
-            <Metric label="Signals captured" value={dashboard?.stats?.totalSignals ?? 0} note="Across your workspace" />
-            <Metric label="Active sources" value={overviewChannelCount} note="Telegram channels" />
-            <Metric label="Signals Executed" value={dashboard?.stats?.executedSignals ?? 0} note="Successfully sent to broker" />
-            <Metric label="Auto-Trading" value={overviewActivation.status} note={overviewActivation.metricNote} />
-          </div>
-          <AutoTradingStatusCard activation={overviewActivation} autoTradingEnabled={settings.autoTradingEnabled} action={autoTradingBanner.action} onNavigate={navigateToTab} />
+          <OverviewMetrics
+            totalSignals={dashboard?.stats?.totalSignals}
+            activeChannels={overviewChannelCount}
+            executedSignals={dashboard?.stats?.executedSignals}
+            unavailable={overviewDataUnavailable}
+          />
+          <AutoTradingStatusCard activation={overviewActivation} autoTradingEnabled={settings.autoTradingEnabled} action={autoTradingBanner.action} onNavigate={navigateToTab} unavailable={overviewDataUnavailable} />
           <section className="panel"><div className="panel-heading"><div><p className="eyebrow">LATEST ACTIVITY</p><h2>Recent signals</h2></div><button className="text-button" onClick={() => setTab('signals')}>View all</button></div>{dashboard?.signalsScope === 'recent' && dashboard?.signals?.length ? <p className="dashboard-signals-note">No setup has come through your channels yet, so this is your most recent captured traffic.</p> : null}{(() => { const note = dashboardFreshnessNote({ newerCaptures: dashboard?.signalsNewerCaptures, lastCaptureAt: dashboard?.signalsLastCaptureAt }); return dashboard?.signalsScope === 'actionable' && note ? <p className="dashboard-signals-note">{note}</p> : null; })()}<SignalTable signals={dashboard?.signals || []} compact channelCount={channels.length} onOpenTelegram={() => navigateToTab('telegram')} onUpgrade={() => navigateToTab('billing')} /></section>
         </>}
         {tab === 'telegram' && <TelegramConnect token={authToken} channels={channels} onRefresh={refresh} />}

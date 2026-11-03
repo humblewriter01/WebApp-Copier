@@ -308,12 +308,11 @@ test('a deployed and a connected account both count as able to trade', () => {
   }
 });
 
-test('the Overview activation metric and card share one state derived from execution readiness', () => {
-  assert.match(appSource, /executionReady: autoTradingBanner\.state === 'ready'/, 'the Overview only calls execution live when the shared readiness helper says it is');
-  assert.match(appSource, /executionIssue: autoTradingBanner\.message/, 'a blocker still carries the helper’s actionable explanation');
-  assert.match(appSource, /value=\{overviewActivation\.status\} note=\{overviewActivation\.metricNote\}/, 'the compact metric uses the same activation view as the card');
-  assert.match(appSource, /<AutoTradingStatusCard activation=\{overviewActivation\}/, 'the card uses that same view instead of a second status guess');
-  assert.equal(appSource.includes('autoTradingBanner.headline'), false, 'the old independent banner headline cannot contradict the new status card');
+test('the Overview keeps Auto-Trading in one status card and never duplicates it as a metric', () => {
+  assert.match(appSource, /overviewActivationView\(\{[\s\S]*?autoTradingEnabled: settings\.autoTradingEnabled/, 'the header and card share the explicit workspace switch state');
+  assert.match(appSource, /<AutoTradingStatusCard activation=\{overviewActivation\}[^>]*action=\{autoTradingBanner\.action\}/, 'the large status card uses the activation view and keeps blocker navigation');
+  assert.equal(/<Metric label="Auto-Trading"/.test(appSource), false, 'there is no second Auto-Trading metric');
+  assert.equal(appSource.includes('autoTradingBanner.headline'), false, 'the old independent banner headline cannot contradict the status card');
 });
 
 test('the settings page says what the switch is not enough of, in its own words', () => {
