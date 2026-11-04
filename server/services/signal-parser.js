@@ -200,9 +200,12 @@ function findSymbol(text) {
 const MARKED_CONNECTIVE = String.raw`(?:\s*(?:[:=@\u2013\u2014\u2022\u2192-]|\b(?:is|are|at|to|in|of|on|for|by|the|around|near|level|now|market|open|close)\b)\s*)`;
 const MARKED_GAP = `${MARKED_CONNECTIVE}{0,3}\\s*`;
 
-function findPipDistances(text, labelPattern) {
-  const regex = new RegExp(`\\b${NUMBER}\\s*(?:pips?|pts?|points?)\\s*(?:${labelPattern})\\b`, 'gi');
-  return [...text.matchAll(regex)].map((match) => parseNumber(match[1])).filter((value) => value !== null);
+function findPipDistances(text, labelPattern, claimedOffsets = new Set()) {
+  const regex = new RegExp(`\\b${NUMBER}[ \\t]*(?:pips?|pts?|points?)[ \\t]*(?:${labelPattern})\\b`, 'gi');
+  return [...text.matchAll(regex)]
+    .filter((match) => !claimedOffsets.has(match.index))
+    .map((match) => parseNumber(match[1]))
+    .filter((value) => value !== null);
 }
 
 function findMarkedValues(text, labelPattern) {
@@ -210,10 +213,12 @@ function findMarkedValues(text, labelPattern) {
   const regex = new RegExp(`\\b(?:${labelPattern})\\b${index}${MARKED_GAP}${NUMBER}(?!\\s*[:=@])`, 'gi');
   return [...text.matchAll(regex)].map((match) => {
     const end = match.index + match[0].length;
+    const numberStart = end - match[1].length;
     const tail = text.slice(end);
     return {
       value: parseNumber(match[1]),
       match,
+      numberStart,
       pips: isPipDistance(text, end),
       range: /^\s*(?:-|–|—|TO|\.\.)\s*(?:\d|\.)/i.test(tail),
     };
@@ -694,9 +699,10 @@ export function parseSignal(message) {
   const isTargetIndex = (match) => /^\d$/.test(String(match.match?.[1] ?? '').trim());
   const targetPriceMatches = takeProfitMatches.filter((match) => !match.pips && !isTargetIndex(match));
   const targetDistanceMatches = takeProfitMatches.filter((match) => match.pips);
+  const claimedLegOffsets = new Set([...stopMatches, ...takeProfitMatches].map((item) => item.numberStart));
   const stopPrices = distinctPrices(stopPriceMatches);
-  const stopPips = [...distinctPrices(stopDistanceMatches), ...findPipDistances(legText, 'SL|STOP(?:\\s*LOSS)?|INVALIDATION')];
-  const targetPipsAll = [...distinctPrices(targetDistanceMatches), ...findPipDistances(legText, 'TP\\d*|TAKE\\s*PROFIT|TARGET')];
+  const stopPips = [...distinctPrices(stopDistanceMatches), ...findPipDistances(legText, 'SL|STOP(?:\\s*LOSS)?|INVALIDATION', claimedLegOffsets)];
+  const targetPipsAll = [...distinctPrices(targetDistanceMatches), ...findPipDistances(legText, 'TP\\d*|TAKE\\s*PROFIT|TARGET', claimedLegOffsets)];
   const targetPips = [...new Set(targetPipsAll)];
   const stopLoss = stopPrices.length === 1 ? stopPrices[0] : null;
   /* A leg expressed in pips counts as *present* - `missing` is what the fallback nets and the Safety blocks
