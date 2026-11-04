@@ -74,9 +74,9 @@ function inFavourOfTrade({ side, price, marketPrice }) {
  * list have to change anything; a message that named one target has nothing to choose between.
  */
 export function selectTarget({ mode = 'first_target', takeProfit = null, levels = [] } = {}) {
-  const prices = (Array.isArray(levels) ? levels : []).map(number).filter((value) => value !== null);
+  const prices = (Array.isArray(levels) ? levels : []).map(number).filter((value) => value !== null && value > 0);
   if (!TARGET_MODES.includes(mode) || mode === 'first_target' || prices.length < 2) {
-    return { takeProfit, mode: TARGET_MODES.includes(mode) ? mode : 'first_target', source: 'signal' };
+    return { takeProfit: takeProfit ?? (prices[0] ?? null), mode: TARGET_MODES.includes(mode) ? mode : 'first_target', source: 'signal' };
   }
   return { takeProfit: prices[prices.length - 1], mode, source: 'final-level' };
 }

@@ -1624,7 +1624,7 @@ app.get('/api/dashboard', authenticate, asyncRoute(async (req, res) => {
     pool.query('SELECT COUNT(*)::int AS count FROM channels WHERE user_id=$1 AND enabled=TRUE', [req.userId]),
     pool.query('SELECT COUNT(*)::int AS count FROM accounts WHERE user_id=$1', [req.userId]),
     readDashboardSignals({ pool, userId: req.userId, withLiveBlockers }),
-    pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled" FROM settings WHERE user_id=$1', [req.userId]),
+    pool.query('SELECT risk_mode AS "riskMode",risk_percent AS "riskPercent",max_open_positions AS "maxOpenPositions",daily_loss_limit AS "dailyLossLimit",auto_trading_enabled AS "autoTradingEnabled",multiple_target_handling AS "multipleTargetHandling" FROM settings WHERE user_id=$1', [req.userId]),
     // The plan is part of the execution picture, not a billing detail: `Auto-Trading is on, but your plan does
     // not include automatic execution` is a sentence about the switch, and the banner cannot say it without it.
     pool.query('SELECT subscription_status AS status,subscription_plan AS plan FROM users WHERE id=$1', [req.userId]),
@@ -1643,7 +1643,7 @@ app.get('/api/dashboard', authenticate, asyncRoute(async (req, res) => {
     // route cannot report a number it did not read.
     signalsNewerCaptures: dashboardSignals.newerCaptures,
     signalsLastCaptureAt: dashboardSignals.lastCaptureAt,
-    settings: settings.rows[0] || { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 5, dailyLossLimit: 5, autoTradingEnabled: false },
+    settings: settings.rows[0] || { riskMode: 'fixed', riskPercent: 1, maxOpenPositions: 5, dailyLossLimit: 5, autoTradingEnabled: false, multipleTargetHandling: 'first_target' },
     subscription: { status: subscription.rows[0]?.status || null, plan: subscription.rows[0]?.plan || null },
     trading: { liveExecutionEnabled: autoTradingRuntimeEnabled, autoTradingEnabled: settings.rows[0]?.autoTradingEnabled === true, message: autoTradingRuntimeEnabled ? 'Auto-Trading is off by default for new workspaces; review your Risk Settings and confirm the live-trading warning before turning it on.' : 'Automatic execution is unavailable right now. Signals can still be reviewed.' },
   });

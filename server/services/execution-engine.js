@@ -847,7 +847,15 @@ export function createExecutionEngine(/** @type {ExecutionEngineDeps} */ { pool,
         stopLoss: item.fallback_stop_loss_points,
         takeProfit: item.fallback_take_profit_points,
       }, item.side);
-      if (takeProfit != null && (!Number.isFinite(takeProfit) || (item.side === 'buy' ? takeProfit <= legAsk : takeProfit >= legBid))) return stop(job, 'skipped', 'The signal take profit is on the wrong side of the market.');
+      /* Which of the channel's prices the position itself carries, and whether the rest of the ladder
+         becomes a plan. Both are decided from the stored level list rather than by re-reading the
+         message, so a parser change can never move the target of a signal somebody had already reviewed.
+         Selected before the wrong-side guard so "Final Target Only" ignores TP1/TP2 completely instead
+         of skipping an order whose earlier target has already been passed. */
+      const target = selectTarget({ mode: item.multipleTargetHandling, takeProfit, levels: item.takeProfitLevels });
+      if (target.mode !== 'scale_out' && target.takeProfit != null && (!Number.isFinite(target.takeProfit) || (item.side === 'buy' ? target.takeProfit <= legAsk : target.takeProfit >= legBid))) {
+        return stop(job, 'skipped', 'The signal take profit is on the wrong side of the market.');
+      }
 
       const volume = calculateOrderVolume({
         mode: item.lot_size_mode,
@@ -860,10 +868,6 @@ export function createExecutionEngine(/** @type {ExecutionEngineDeps} */ { pool,
         specification: state.specification,
         price: quote,
       });
-      /* Which of the channel's prices the position itself carries, and whether the rest of the ladder
-         becomes a plan. Both are decided from the stored level list rather than by re-reading the
-         message, so a parser change can never move the target of a signal somebody had already reviewed. */
-      const target = selectTarget({ mode: item.multipleTargetHandling, takeProfit, levels: item.takeProfitLevels });
       let scaleOut = /** @type {ScaleOutPlan} */ ({ eligible: false, reason: resting ? 'pending-order' : 'mode' });
       /* Scale-out starts from the first target and only moves the exit out once the plan is known to be
          tradeable, because the plan needs the volume the sizing just produced. That order matters: if the
