@@ -44,12 +44,17 @@ function parseNumber(value) {
  * mentioned one.
  */
 const EMOJI = /[\u{1F000}-\u{1FAFF}\u{1F1E6}-\u{1F1FF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}\u{2190}-\u{21FF}]/gu;
+const INVISIBLE_FORMAT = /[\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/g;
 const LINKS = /\b(?:https?:\/\/|www\.|t\.me\/|discord\.gg\/|vip\s*channel\b)[^\s|)]*/gi;
-const MENTIONS = /@[A-Za-z][A-Za-z0-9_]{3,31}/g;
+/* `@Market`, `@CurrentPrice`, `@Spot` and `@Instant` are market-entry instructions written without a space
+   after the at-sign, not Telegram usernames; excluding those words keeps `stripNoise` from erasing the
+   exact token `detectOrderType` needs to see. */
+const MENTIONS = /@(?!(?:market(?:_?(?:price|execution|order|entry|rate|fill))?|current(?:_?(?:market|price|rate|level))?|cmp|now|instant(?:ly)?|immediately|spot(?:_?price)?|live(?:_?price)?)\b)[A-Za-z][A-Za-z0-9_]{3,31}/gi;
 const EMPHASIS = /[*_~`#|]+/g;
 
 function stripNoise(text) {
   return String(text ?? '')
+    .replace(INVISIBLE_FORMAT, '')
     .replace(LINKS, ' ')
     .replace(MENTIONS, ' ')
     .replace(EMOJI, ' ')
@@ -270,7 +275,7 @@ const LABELLED_STOP = /\b(?:SL|STOP[- ]?LOSS|STOPLOSS|INVALIDATION)\b\s*[:=@-]?\
    it are blanked out of the order-type scope (blanked, not removed, so every other rule still reads the same
    offsets), and only they are blanked: the run stops at the first word that is not part of an exit clause, so
    `CLOSE ALL, then BUY GOLD 4016 NOW` keeps its `NOW`. */
-const EXIT_CLAUSE = /\b(?:CLOSE|CLOSES|CLOSED|CLOSING|EXIT|EXITS|EXITING|LIQUIDATE|LIQUIDATED|SCALE\s*OUT|PARTIAL\s*CLOSE)\b(?:\s+(?:ALL|EVERYTHING|HALF|MY|THE|A|AN|POSITION|POSITIONS|TRADE|TRADES|IT|NOW|IMMEDIATELY|AT|IN|MARKET|PROFIT|LOSS|EARLY|PARTIAL|ANYWAY|PLEASE|BE|BELOW|ABOVE))*(?!\s*\d)/gi;
+const EXIT_CLAUSE = /\b(?:CLOSE|CLOSES|CLOSED|CLOSING|EXIT|EXITS|EXITING|LIQUIDATE|LIQUIDATED|SCALE\s*OUT|PARTIAL\s*CLOSE)\b(?:\s+(?:ALL|EVERYTHING|HALF|MY|THE|A|AN|POSITION|POSITIONS|TRADE|TRADES|IT|NOW|IMMEDIATELY|AT|@|IN|MARKET|PROFIT|LOSS|EARLY|PARTIAL|ANYWAY|PLEASE|BE|BELOW|ABOVE))*(?!\s*\d)/gi;
 
 function pendingLevelPattern(text) {
   const stopAllowsSymbol = LABELLED_STOP.test(String(text || ''));
@@ -340,14 +345,21 @@ function parseBareEntry(text, names, taken) {
   return found.length === 1 ? found[0] : null;
 }
 
+/* `@ Market`, `Entry: Market` and `Entry: Current Price` with no price on the same line are complete
+   market-entry instructions; blanking them before `parseEntry` scans keeps `@ Market` from reaching across
+   a newline to treat a numbered bullet (`1) SL: 1.0820`) as an entry of 1, while leaving same-line
+   reference levels (`BUY GOLD NOW 4110`, `Entry @ Market 1.0850`) untouched. */
+const PURE_MARKET_ENTRY = /(?:@|\b(?:ENTRY|PRICE)\b[ \t]*[:=@-]?)[ \t]*(?:@[ \t]*)?(?:AT[ \t]+)?(?:THE[ \t]+)?(?:MARKET(?:[ \t_]*(?:PRICE|RATE|ORDER|EXECUTION|ENTRY|FILL))?|CURRENT[ \t_]*(?:MARKET[ \t_]*)?(?:PRICE|RATE|LEVEL)|CMP|NOW|INSTANT(?:LY)?(?:[ \t_]*EXECUTION)?|IMMEDIATELY|SPOT(?:[ \t_]*PRICE)?|LIVE[ \t_]*(?:MARKET[ \t_]*)?PRICE)\b(?![ \t]*[:=@-]?[ \t]*\d)/gi;
+
 function parseEntry(text) {
   /* The label has to be there; a small connective word after it is allowed, because channels write
      `Entry at 1.0850` and `price is 140.512` as naturally as `Entry: 1.0850`. `at` used to be a *label* of
      its own, and that is how `SELL US30 35000 - SL at 35100` came back with an entry of 35100: the English
      word in front of the stop, read as the entry. A word an ordinary sentence uses cannot be a marker - it
      can only ever be something a real label leans on. The same allowance is shared with `findMarkedValues`. */
+  const scanText = String(text || '').replace(PURE_MARKET_ENTRY, (match) => ' '.repeat(match.length));
   const regex = new RegExp(`(?:\\b${ENTRY_LABEL}|${ENTRY_MARKER})${MARKED_GAP}${NUMBER}(?:${RANGE_SEPARATOR}${NUMBER})?`, 'gi');
-  const matches = [...text.matchAll(regex)];
+  const matches = [...scanText.matchAll(regex)];
   if (!matches.length) {
     const pending = findPendingLevel(text);
     if (pending.error) return { value: null, range: null, error: pending.error, levels: null, pips: false };
@@ -424,18 +436,21 @@ function entryFromRange(range, side) {
  * taken at the market, and past the far edge the setup is gone and nothing is sent. An entry that was never
  * given at all has nothing to rest at and stays a market order.
  */
-const INSTRUCTION_LINE = /\b(?:BUY|SELL|LONG|SHORT|ENTRY|POSITION|ORDER|TRADE|LIMIT|STOP|SL|TP)\b/i;
+const INSTRUCTION_LINE = /\b(?:BUY|SELL|LONG|SHORT|BUYING|SELLING|ENTER|ENTRY|PRICE|EXECUTE|EXECUTION|POSITION|ORDER|TRADE|LIMIT|STOP|SL|TP|CMP|NOW)\b|@\s*(?:MARKET(?:_?(?:PRICE|EXECUTION|ORDER|ENTRY|RATE|FILL))?|CURRENT(?:_?(?:MARKET|PRICE|RATE|LEVEL))?|SPOT(?:_?PRICE)?|LIVE(?:_?PRICE)?|CMP|NOW)\b/i;
 /* A leg label and the number attached to it, removed from the clause before order-type words are looked
    for. Only the value is cut, not the rest of the line: a channel that writes `TP1 4050 - limit orders only`
    has something to say about the order type after the number. */
 const LEG_WITH_VALUE = /\b(?:SL|STOP[- ]?LOSS|STOPLOSS|INVALIDATION|TP\d*|TAKE[- ]?PROFIT|TARGET)\b\s*[:=@-]?\s*\d[\d.,]*(?:\s*-\s*\d[\d.,]*)?(?:\s*(?:USD|pips?|points?|usd))?/gi;
 const PROSE_LIMIT = /\b(?:daily|per[- ]?day|total|maximum|max|min(?:imum)?|loss|drawdown|risk|position(?:s)?|trade(?:s)?|order(?:s)?|exposure|withdrawal|deposit|betting|trading|per[- ]?trade)\s+(?:loss\s+|order\s+)?limit(?:s)?\b/gi;
 const PROSE_STOP = /\b(?:trailing|break[- ]?even|guaranteed|emergency)\s+stop\b|\bstop[- ]?(?:out|hunt(?:ing)?|level|move|moving)\b/gi;
-const IMMEDIATE_IN_CLAUSE = /\b(?:BUY|SELL|LONG|SHORT|ENTER|ENTRY|EXECUTE|EXECUTION|OPEN|ORDER|TRADE|SETUP|POSITION)\b[^\n]{0,20}?\b(?:NOW|CMP|INSTANT(?:LY)?|IMMEDIATELY|AT\s+MARKET(?:\s+PRICE)?|MARKET\s+(?:ORDER|PRICE|EXECUTION|ENTRY|FILL))\b/i;
-/* `MARKET` on its own is only a trading instruction when nothing but punctuation separates it from the verb:
-   `BUY MARKET` yes, `do not trade if market closes` no. */
-const MARKET_AFTER_INSTRUCTION = /\b(?:BUY|SELL|LONG|SHORT|ENTER|ENTRY|EXECUTE|OPEN|ORDER|TRADE)\b[\s,!.:'"\-]{0,3}MARKET\b/i;
-const BARE_CMP = /\bCMP\b/;
+const MARKET_ENTRY_PHRASE = String.raw`(?:NOW|CMP|INSTANT(?:LY)?(?:[\s_]*EXECUTION)?|IMMEDIATELY|(?:AT|@)\s*(?:THE\s+)?(?:MARKET(?:[\s_]*(?:PRICE|RATE|EXECUTION|ORDER|ENTRY|FILL))?|CURRENT[\s_]*(?:MARKET[\s_]*)?(?:PRICE|RATE|LEVEL)|LIVE[\s_]*(?:MARKET[\s_]*)?PRICE|SPOT(?:[\s_]*PRICE)?)|CURRENT\s+(?:MARKET\s+)?(?:PRICE|RATE)|MARKET\s+(?:ORDER|PRICE|RATE|EXECUTION|ENTRY|FILL)|SPOT\s+PRICE|LIVE\s+MARKET\s+PRICE)`;
+const IMMEDIATE_IN_CLAUSE = new RegExp(String.raw`\b(?:BUY|SELL|LONG|SHORT|BUYING|SELLING|ENTER|ENTRY|PRICE|EXECUTE|EXECUTION|OPEN|ORDER|TRADE|SETUP|POSITION)\b[^\n]{0,25}?${MARKET_ENTRY_PHRASE}\b`, 'i');
+/* `MARKET` on its own is only a trading instruction when nothing but punctuation or `@`/`=` separates it
+   from the verb or entry label: `BUY MARKET`, `BUY @ Market`, `Entry: Market`, `Price = Market` yes;
+   `do not trade if market is closed` or `market mover` no. */
+const MARKET_AFTER_INSTRUCTION = /\b(?:BUY|SELL|LONG|SHORT|BUYING|SELLING|ENTER|ENTRY(?:\s+PRICE)?|PRICE|EXECUTE|OPEN|ORDER|TRADE)\b[\s,!.:='"@/\-]{0,5}MARKET\b(?!\s+(?:IS|WAS|ARE|WERE|WILL|CAN|COULD|MAY|MIGHT|HAS|HAD|CLOSED|CLOSES|OPEN(?:S|ING)?|MOVER|OUTLOOK|UPDATE|NEWS|WRAP|ROUNDUP|RECAP|HOURS|SESSION|VOLATILITY|SENTIMENT|STRUCTURE|TREND|CRASH|DUMP))/i;
+const STANDALONE_AT_MARKET = /(?:^|[\s,(:=-])@\s*(?:MARKET(?:[\s_]*(?:PRICE|RATE|EXECUTION|ORDER|ENTRY|FILL))?|CURRENT(?:[\s_]*(?:MARKET[\s_]*)?(?:PRICE|RATE|LEVEL))?|CMP|NOW|INSTANT(?:LY)?|IMMEDIATELY|SPOT(?:[\s_]*PRICE)?|LIVE(?:[\s_]*PRICE)?)\b/i;
+const BARE_CMP = /\bCMP\b|\bMARKET\s+(?:EXECUTION|ORDER)\b/i;
 /* The number form of a limit needs the order type to be *pointing* at it (`LIMIT @ 4011`, `LIMIT: 4011`,
    `LIMIT AT 4011`), because `limit 4011` with nothing between is also how a channel writes a risk cap
    ("max positions limit 5"). A message that only says `BUY GOLD LIMIT 4011` still ends up a limit order - the
@@ -468,7 +483,10 @@ function orderTypeClause(text) {
  */
 export function detectOrderType(text, { entryPrice = null } = {}) {
   const { scope, hasInstructionLine } = orderTypeClause(text);
-  const immediate = IMMEDIATE_IN_CLAUSE.test(scope) || MARKET_AFTER_INSTRUCTION.test(scope) || BARE_CMP.test(scope);
+  const immediate = IMMEDIATE_IN_CLAUSE.test(scope)
+    || MARKET_AFTER_INSTRUCTION.test(scope)
+    || STANDALONE_AT_MARKET.test(scope)
+    || BARE_CMP.test(scope);
   // A request to be filled now outranks every other reading, and it is the safe one: it is what this product
   // has always done, and it cannot leave an order on the book after the setup has gone.
   if (immediate) return { orderType: 'market', stated: true };
