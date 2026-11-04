@@ -351,7 +351,7 @@ function App() {
     autoTradingEnabled: settings.autoTradingEnabled,
     executionAccountId: settings.executionAccountId,
     channelCount: overviewChannelCount,
-    telegramConnected: telegramView.key === 'connected',
+    telegramConnected: telegramView.key === 'connected' ? true : telegramView.key === 'disconnected' ? false : null,
   });
   const isAdmin = user?.role === 'admin';
   const tabs = navigationItemsForRole(user?.role).map(({ key, label }) => [key, label]);

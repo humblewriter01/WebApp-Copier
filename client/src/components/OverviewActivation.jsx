@@ -29,14 +29,22 @@ export function overviewActivationView({
   autoTradingEnabled = false,
   executionAccountId = '',
   channelCount = 0,
-  telegramConnected = false,
+  telegramConnected = null,
 } = {}) {
   const accounts = Array.isArray(linkedAccounts) ? linkedAccounts.filter((account) => account && typeof account === 'object') : [];
   const selectedAccount = accounts.find((account) => String(account.metaApiAccountId || '') === String(executionAccountId || '')) || null;
   const channelTotal = Math.max(0, Number.isFinite(Number(channelCount)) ? Math.floor(Number(channelCount)) : 0);
   const status = autoTradingStatusView({ linkedAccounts: accounts, autoTradingEnabled });
 
-  if (telegramConnected !== true) {
+  if (telegramConnected == null) {
+    return {
+      ...status,
+      headline: 'Checking Telegram…',
+      subtext: 'We are checking your Telegram connection before showing your monitoring status.',
+    };
+  }
+
+  if (telegramConnected === false) {
     return {
       ...status,
       headline: "Let's get you connected.",

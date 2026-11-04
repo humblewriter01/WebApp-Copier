@@ -53,6 +53,24 @@ test('the greeting stays personalized and the no-account header names MT4/MT5', 
     'the retained greeting is small and muted');
 });
 
+test('a connected Telegram workspace with a channel and no broker account shows the listening header', () => {
+  const activation = overviewActivationView({
+    telegramConnected: true,
+    channelCount: 1,
+    linkedAccounts: [],
+  });
+  const header = render(OverviewHeader, { activation });
+  assert.match(header, /Your bot is listening\./);
+  assert.doesNotMatch(header, /Let's get you connected/);
+});
+
+test('an unresolved Telegram status does not assert that the user is disconnected', () => {
+  const activation = overviewActivationView({ channelCount: 1, linkedAccounts: [] });
+  const header = render(OverviewHeader, { activation });
+  assert.match(header, /Checking Telegram/);
+  assert.doesNotMatch(header, /Let's get you connected/);
+});
+
 test('a disconnected Telegram workspace prompts connection, not listening', () => {
   const activation = activationFor({ telegramConnected: false, channelCount: 0, linkedAccounts: [] });
   const header = render(OverviewHeader, { userName: 'Amina Yusuf', activation });
