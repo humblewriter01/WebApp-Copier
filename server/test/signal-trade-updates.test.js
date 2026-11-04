@@ -182,3 +182,58 @@ test('the update sentence names the wording that triggered it, in the reader\'s 
   assert.match(MANAGEMENT_BLOCKER_MESSAGE, /nothing was taken from it/);
   assert.equal(/hallucin|invalid|parse/i.test(MANAGEMENT_BLOCKER_MESSAGE), false, 'and it does not describe the platform\'s internals');
 });
+
+test('the leg labels stop loss and take profit are never read as a closed-trade result', () => {
+  // `Stop loss 15 pips` and `Take profit 60 pips` name the protective legs of a trade a channel is
+  // entering. The result pattern used to match `loss 15` and `profit 60` because its `OF|IS|:` separator
+  // was optional, and every conversational entry carrying pip legs was cleared as a management update.
+  for (const text of ['Stop loss 15 pips', 'Take profit 60 pips', 'stop loss 15 pips', 'take profit 60 pips']) {
+    const markers = findManagementMarkers(text);
+    assert.equal(markers.includes('pips-result'), false, `"${text}" carries no pip result`);
+    assert.deepEqual(markers, [], 'and no other management wording either');
+  }
+  // The signed-distance form is excluded the same way when the sign follows a leg label: there the sign
+  // is a separator (`stop loss - 15 pips`), not a result.
+  for (const text of ['stop loss - 15 pips', 'take profit - 60 pips']) {
+    const markers = findManagementMarkers(text);
+    assert.equal(markers.includes('pips-result'), false, `"${text}" carries no pip result`);
+  }
+  // A bare leg fragment is not a management update either - it is a leg with no direction, and the
+  // row says so in its own words rather than in the update sentence.
+  assert.equal(parseSignal('Stop loss 15 pips').stopLossPips, 15, 'the stop leg is still read');
+  assert.equal(parseSignal('Take profit 60 pips').takeProfitPips, 60, 'and the target leg');
+  assert.equal(parseSignal('Stop loss 15 pips').managementUpdate, false);
+  assert.equal(parseSignal('Take profit 60 pips').managementUpdate, false);
+});
+
+test('a conversational entry with pip-based legs is a signal, not a closed-trade update', () => {
+  const parsed = parseSignal('Going long GBPUSD here around 1.2500. Stop loss 15 pips, take profit 60 pips.');
+  assert.deepEqual(parsed.managementMarkers, [], 'the leg labels carry no management wording');
+  assert.equal(parsed.managementUpdate, false);
+  assert.equal(parsed.side, 'buy');
+  assert.equal(parsed.symbol, 'GBPUSD');
+  assert.equal(parsed.stopLossPips, 15);
+  assert.equal(parsed.takeProfitPips, 60);
+  assert.equal(parsed.executionReady, true);
+  assert.equal(parsed.parseError, null);
+});
+
+test('past-tense results still read as closed-trade updates', () => {
+  // The three shapes a result arrives in: a separator word, a colon with a currency amount, and a
+  // signed distance behind a close verb. All three must keep triggering the management classification.
+  const cases = [
+    ['Profit of 60 pips', ['pips-result']],
+    ['Loss: $150', ['pips-result']],
+    ['Closed for +50', ['close-instruction']],
+    ['Made a profit of 30 pips', ['pips-result']],
+    ['made a loss of 150 pips', ['pips-result']],
+  ];
+  for (const [text, expected] of cases) {
+    const parsed = parseSignal(text);
+    assert.equal(parsed.managementUpdate, true, `"${text}" is a trade update`);
+    assert.equal(parsed.parseError, MANAGEMENT_BLOCKER_MESSAGE);
+    for (const marker of expected) {
+      assert.ok(parsed.managementMarkers.includes(marker), `"${text}" reports ${marker}, got ${parsed.managementMarkers.join('|') || 'nothing'}`);
+    }
+  }
+});
