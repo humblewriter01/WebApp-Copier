@@ -38,7 +38,8 @@ const activationFor = (overrides = {}) => overviewActivationView({
   linkedAccounts: [],
   autoTradingEnabled: false,
   executionAccountId: '',
-  channelCount: 0,
+  channelCount: 1,
+  telegramConnected: true,
   ...overrides,
 });
 
@@ -50,6 +51,21 @@ test('the greeting stays personalized and the no-account header names MT4/MT5', 
   assert.match(html, /You have signals waiting\. Connect an MT4\/MT5 account to start executing\./);
   assert.match(cssSource, /\.overview-greeting\{[^}]*color:#8491a3;[^}]*font-size:11px/,
     'the retained greeting is small and muted');
+});
+
+test('a disconnected Telegram workspace prompts connection, not listening', () => {
+  const activation = activationFor({ telegramConnected: false, channelCount: 0, linkedAccounts: [] });
+  const header = render(OverviewHeader, { userName: 'Amina Yusuf', activation });
+  assert.match(header, /Let&#x27;s get you connected\./);
+  assert.doesNotMatch(header, /Your bot is listening\./);
+  assert.match(header, /Connect Telegram to start capturing signals from your channels\./);
+});
+
+test('a connected Telegram workspace with no selected channels prompts channel selection', () => {
+  const activation = activationFor({ telegramConnected: true, channelCount: 0, linkedAccounts: [] });
+  const header = render(OverviewHeader, { activation });
+  assert.match(header, /Telegram connected\./);
+  assert.match(header, /Choose which channels you want Signal Desk to monitor\./);
 });
 
 test('the explicit off switch renders Off even when no broker account is connected', () => {
