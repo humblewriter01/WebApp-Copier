@@ -577,8 +577,18 @@ const MANAGEMENT_HIT = /\b(?:TP|TAKE\s*PROFIT|TARGET|SL|STOP\s*LOSS)\s*\d*\s*(?:
 const MANAGEMENT_EXIT = /\b(?:CLOSE|CLOSES|CLOSED|CLOSING|EXIT|EXITS|EXITING|LIQUIDATE|SCALE\s*OUT|PARTIAL\s*CLOSE)\b\s*(?:ALL|EVERYTHING|HALF|MY|THE|A|POSITION|POSITIONS|TRADE|TRADES|NOW|IT|EARLY|PARTIAL|AT\s+MARKET)?\b/gi;
 /** Moving a stop to the entry price - management of an open trade, in every channel that writes it. */
 const MANAGEMENT_BREAK_EVEN = /\b(?:SET|MOVE|MOVED|SHIFT|ADJUST|SLIDE|CHANGE)\s+(?:THE\s+|MY\s+|YOUR\s+)?(?:SL|STOP|STOP\s*LOSS)?\s*(?:TO|AT|AT\s+THE)?\s*(?:BE|B\/E|BREAK\s*EVEN|ENTRY)\b|\b(?:SL|STOP)\s*(?:TO|ON|AT)\s*(?:BE|BREAK\s*EVEN|ENTRY)\b|\bSET\s*(?:BE|BREAK\s*EVEN)\b|\bBREAK\s*EVEN\s+(?:SET|DONE|ACTIVATED?)\b|\b(?:IN\s+)?BREAK\s*EVEN\b/gi;
-/** The result of a closed trade: a signed distance, or the words that go with one. */
-const MANAGEMENT_RESULT = /(?:^|[\s(,|:])[-+] ?\d+(?:[.,]\d+)? ?(?:PIPS?|POINTS?|PTS)\b|\b(?:WITH|MAKING|UP|DOWN|IN|FOR)\s+(?:A\s+)?(?:PROFIT|LOSS)\b|\b(?:PROFIT|LOSS)\s+(?:OF|IS|:)?\s*\d|\b(?:GOOD\s+TRADE|WELL\s+DONE|CONGRATS|CONGRATULATIONS|GG)\b/gi;
+/**
+ * The result of a closed trade: a signed distance, or the words that go with one.
+ *
+ * The leg labels are the reason this is not simply "a number after profit or loss": `Stop loss 15 pips`
+ * and `Take profit 60 pips` name the protective legs of a trade a channel is *entering*, and the old
+ * pattern read its optional `OF|IS|:` separator as optional enough to match `loss 15` and `profit 60`
+ * straight through. Both leg labels are excluded by what stands immediately before the word - `STOP`
+ * and `TAKE` - and the signed-distance form is excluded the same way when the sign follows a leg label
+ * (`stop loss - 15 pips`), because there the sign is a separator, not a result. A result still arrives
+ * as `Profit of 60 pips`, `Loss: $150` or a bare `loss 150`.
+ */
+const MANAGEMENT_RESULT = /(?:^|[\s(,|:])(?<!LOSS\s)(?<!PROFIT\s)[-+] ?\d+(?:[.,]\d+)? ?(?:PIPS?|POINTS?|PTS)\b|\b(?:WITH|MAKING|UP|DOWN|IN|FOR)\s+(?:A\s+)?(?:PROFIT|LOSS)\b|(?<!STOP[-\s]+)(?<!TAKE[-\s]+)\b(?:PROFIT|LOSS)\s*(?:(?:OF|IS)\s*|[:]\s*)?[$¥€£]?\s*\d|\b(?:GOOD\s+TRADE|WELL\s+DONE|CONGRATS|CONGRATULATIONS|GG)\b/gi;
 /** The trade is still being described, not ordered. */
 const MANAGEMENT_RUNNING = /\b(?:TRADE|POSITION|SETUP)\s+(?:IS\s+)?(?:STILL\s+)?(?:RUNNING|LIVE|OPEN|ACTIVE)\b|\b(?:LET\s+IT\s+RUN|RUN\s+IT|HOLD\s+(?:THE|YOUR|IT)?\s*(?:POSITION|TRADE|WINNERS?)|TP\s*\d+\s+(?:PENDING|OPEN|RUNNING))\b/gi;
 
