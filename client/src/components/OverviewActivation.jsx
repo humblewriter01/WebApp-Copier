@@ -29,11 +29,28 @@ export function overviewActivationView({
   autoTradingEnabled = false,
   executionAccountId = '',
   channelCount = 0,
+  telegramConnected = false,
 } = {}) {
   const accounts = Array.isArray(linkedAccounts) ? linkedAccounts.filter((account) => account && typeof account === 'object') : [];
   const selectedAccount = accounts.find((account) => String(account.metaApiAccountId || '') === String(executionAccountId || '')) || null;
   const channelTotal = Math.max(0, Number.isFinite(Number(channelCount)) ? Math.floor(Number(channelCount)) : 0);
   const status = autoTradingStatusView({ linkedAccounts: accounts, autoTradingEnabled });
+
+  if (telegramConnected !== true) {
+    return {
+      ...status,
+      headline: "Let's get you connected.",
+      subtext: 'Connect Telegram to start capturing signals from your channels.',
+    };
+  }
+
+  if (channelTotal === 0) {
+    return {
+      ...status,
+      headline: 'Telegram connected.',
+      subtext: 'Choose which channels you want Signal Desk to monitor.',
+    };
+  }
 
   if (!accounts.length) {
     return {

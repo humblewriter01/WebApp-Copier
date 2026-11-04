@@ -345,11 +345,13 @@ function App() {
   });
   const overviewDataUnavailable = dashboard == null;
   const overviewChannelCount = dashboard?.stats?.activeChannels ?? channels.filter((channel) => channel.enabled !== false).length;
+  const { view: telegramView } = useTelegramStatus();
   const overviewActivation = overviewActivationView({
     linkedAccounts,
     autoTradingEnabled: settings.autoTradingEnabled,
     executionAccountId: settings.executionAccountId,
     channelCount: overviewChannelCount,
+    telegramConnected: telegramView.key === 'connected',
   });
   const isAdmin = user?.role === 'admin';
   const tabs = navigationItemsForRole(user?.role).map(({ key, label }) => [key, label]);
