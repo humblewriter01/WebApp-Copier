@@ -422,8 +422,10 @@ test('a new workspace starts with 500 and 1000, and an existing one is not hande
 test('a pip distance becomes a price only when the broker is in the room', () => {
   assert.equal(pipSizeFor('EURUSD'), 0.0001);
   assert.equal(pipSizeFor('USDJPY'), 0.01);
-  assert.equal(pipSizeFor('XAUUSD'), null, 'gold has no pip - brokers write points, and a guessed step is a guessed stop');
+  assert.equal(pipSizeFor('XAUUSD'), 0.01, 'gold uses the standard 1 pip = $0.01 retail convention');
+  assert.equal(pipSizeFor('XAGUSD'), 0.001, 'silver uses the standard 1 pip = $0.001 retail convention');
   assert.equal(pipSizeFor('US30'), null);
+  assert.equal(pipSizeFor('BTCUSD'), null);
 
   const nets = applySafetyNets({
     side: 'buy', marketPrice: 1.0851, bid: 1.085, ask: 1.0851, tickSize: 0.0001, stopsLevelPoints: 20,
@@ -435,11 +437,11 @@ test('a pip distance becomes a price only when the broker is in the room', () =>
   assert.equal(nets.blocking, false);
 
   const refused = applySafetyNets({
-    side: 'buy', marketPrice: 4050.2, bid: 4050, ask: 4050.2, tickSize: 0.01, stopsLevelPoints: 10,
-    stopLoss: 4041.5, takeProfit: null, takeProfitPips: 50, fallbackTakeProfitPoints: null,
-    blockExecutionWithoutTakeProfit: true, blockExecutionWithoutStopLoss: true, lotSizeMode: 'fixed', symbol: 'XAUUSD',
+    side: 'buy', marketPrice: 80050, bid: 80040, ask: 80050, tickSize: 1, stopsLevelPoints: 10,
+    stopLoss: 79500, takeProfit: null, takeProfitPips: 50, fallbackTakeProfitPoints: null,
+    blockExecutionWithoutTakeProfit: true, blockExecutionWithoutStopLoss: true, lotSizeMode: 'fixed', symbol: 'BTCUSD',
   });
-  assert.ok(refused.problems.some((problem) => problem.code === 'take-profit-pips-unusable'), 'on gold, "50 pips" is refused out loud rather than priced on a hunch');
+  assert.ok(refused.problems.some((problem) => problem.code === 'take-profit-pips-unusable'), 'on crypto and indices, "50 pips" is refused out loud rather than priced on a hunch');
 });
 
 test('the engine converts a pip target onto the order it sends', async () => {

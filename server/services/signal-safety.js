@@ -73,21 +73,47 @@ export function readFallbackPoints(value, label = 'The fallback distance') {
 /**
  * What one pip is worth on this instrument, or `null` when the question has no honest answer.
  *
- * A pip is only a defined distance where the market quotes in decimals a pip can be read out of: four
- * places for a currency pair, two for one quoted in yen. On gold, an index or a crypto asset brokers write
- * "points", and a point is whatever that server decides it is - so `null` here is deliberate. Returning a
- * confident guess would turn `TP 50 pips` into a price that nobody can check, which is the failure this
- * whole file is arranged against; refusing says so in a sentence the trader can act on.
+ * Currency pairs use the standard four-decimal (0.0001) or two-decimal JPY (0.01) pip. Spot metals use the
+ * standard retail broker convention required by metal-focused channels: 1 pip = 0.01 ($0.01/oz) on Gold
+ * (`XAUUSD`) and 1 pip = 0.001 ($0.001/oz) on Silver (`XAGUSD`). Indices, energies, crypto and unknown
+ * tickers have no single convention across brokers and keep returning `null`, so `applySafetyNets` blocks
+ * them explicitly with `*-pips-unusable` rather than guessing a stop or target.
  */
-const NOT_A_CURRENCY_PAIR = /^(?:XAU|XAG|XPT|XPD|BTC|ETH|LTC|XRP|SOL|DOGE|USOIL|UKOIL|WTI|BRENT|CFD)/;
+const FIAT_CURRENCIES = new Set([
+  'USD', 'EUR', 'JPY', 'GBP', 'CHF', 'AUD', 'NZD', 'CAD', 'CNY', 'CNH', 'HKD', 'SGD', 'SEK', 'NOK', 'DKK',
+  'PLN', 'CZK', 'HUF', 'RUB', 'TRY', 'ZAR', 'MXN', 'BRL', 'ARS', 'CLP', 'COP', 'PEN', 'INR', 'IDR',
+  'MYR', 'THB', 'PHP', 'VND', 'KRW', 'TWD', 'AED', 'SAR', 'QAR', 'OMR', 'BHD', 'KWD', 'EGP', 'EGY', 'NGN',
+  'GHS', 'KES', 'MAD', 'TND', 'ILS', 'PKR', 'BDT', 'LKR', 'NPR', 'UAH', 'KZT', 'UZS', 'GEL', 'AMD',
+  'AZN', 'BYN', 'MDL',
+]);
+
+/** @type {Readonly<Record<string, number>>} */
+const METAL_PIP_SIZES = Object.freeze({
+  XAUUSD: 0.01,
+  GOLD: 0.01,
+  XAGUSD: 0.001,
+  SILVER: 0.001,
+});
+
+function canonicalInstrumentCode(symbol) {
+  const trimmed = String(symbol ?? '').trim().replaceAll('/', '');
+  if (!trimmed) return '';
+  // Strip punctuation-delimited broker suffixes (`XAUUSD.a`, `XAUUSD#`, `EURUSD_i`, `XAUUSD-pro`)
+  // as well as lowercase MT4/MT5 account-type suffixes (`XAUUSDm`, `XAGUSDm`, `EURUSDc`, `GOLDm`).
+  const head = trimmed.split(/[.#_\-\s]/)[0] || '';
+  const withoutCaseSuffix = /^[A-Z]{4,6}[a-z]{1,4}$/.test(head) ? head.replace(/[a-z]+$/, '') : head;
+  return withoutCaseSuffix.toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
 
 export function pipSizeFor(symbol) {
-  const code = String(symbol ?? '').toUpperCase().replace(/[^A-Z]/g, '');
-  // `XAUUSD` is six letters and no more a currency pair than `BTCUSD` is, so the metal and coin codes are
-  // excluded by name: reading a gold "pip" as 0.0001 would put a stop four decimal places from the price and
-  // the broker would refuse the order - or accept it, which is worse.
-  if (!/^[A-Z]{6}$/.test(code) || NOT_A_CURRENCY_PAIR.test(code)) return null;
-  return code.endsWith('JPY') ? 0.01 : 0.0001;
+  const code = canonicalInstrumentCode(symbol);
+  if (!code) return null;
+  if (Object.hasOwn(METAL_PIP_SIZES, code)) return METAL_PIP_SIZES[code];
+  if (!/^[A-Z]{6}$/.test(code)) return null;
+  const base = code.slice(0, 3);
+  const quote = code.slice(3);
+  if (!FIAT_CURRENCIES.has(base) || !FIAT_CURRENCIES.has(quote) || base === quote) return null;
+  return quote === 'JPY' ? 0.01 : 0.0001;
 }
 
 /** The same reading for a value already in the database: a bad row means "no net", never a guess. */
@@ -100,6 +126,11 @@ function storedPoints(value) {
 
 function priceDecimals(step) {
   const text = String(step);
+  if (/e-/i.test(text)) {
+    const [coeff, exp] = text.toLowerCase().split('e-');
+    const frac = coeff.includes('.') ? coeff.length - coeff.indexOf('.') - 1 : 0;
+    return frac + Number(exp || 0);
+  }
   return text.includes('.') ? text.length - text.indexOf('.') - 1 : 0;
 }
 
