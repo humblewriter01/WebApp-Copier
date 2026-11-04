@@ -40,7 +40,7 @@ export function overviewActivationView({
     return {
       ...status,
       headline: 'Checking Telegram…',
-      subtext: 'We are checking your Telegram connection before showing your monitoring status.',
+      subtext: 'Verifying your connection status.',
     };
   }
 

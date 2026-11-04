@@ -43,6 +43,60 @@ const activationFor = (overrides = {}) => overviewActivationView({
   ...overrides,
 });
 
+test('the Overview header renders the exact copy for every setup state in onboarding order', () => {
+  const secondAccount = { ...ACCOUNT, metaApiAccountId: 'mt4-2' };
+  const states = [
+    {
+      name: 'State 0: Telegram status unknown',
+      input: { telegramConnected: null, channelCount: 2, linkedAccounts: [ACCOUNT] },
+      headline: 'Checking Telegram…',
+      subtext: 'Verifying your connection status.',
+    },
+    {
+      name: 'State 1: Telegram disconnected',
+      input: { telegramConnected: false, channelCount: 0, linkedAccounts: [] },
+      headline: "Let's get you connected.",
+      subtext: 'Connect Telegram to start capturing signals from your channels.',
+    },
+    {
+      name: 'State 2: Telegram connected, no channels',
+      input: { telegramConnected: true, channelCount: 0, linkedAccounts: [] },
+      headline: 'Telegram connected.',
+      subtext: 'Choose which channels you want Signal Desk to monitor.',
+      mustNotShowListening: true,
+    },
+    {
+      name: 'State 3: channels selected, no trading accounts',
+      input: { telegramConnected: true, channelCount: 2, linkedAccounts: [] },
+      headline: 'Your bot is listening.',
+      subtext: 'You have signals waiting. Connect an MT4/MT5 account to start executing.',
+    },
+    {
+      name: 'State 4: trading accounts connected, Auto-Trading off',
+      input: { telegramConnected: true, channelCount: 2, linkedAccounts: [ACCOUNT], autoTradingEnabled: false },
+      headline: 'Ready to execute.',
+      subtext: 'Your broker is connected. Turn on Auto-Trading in Advanced Settings to allow the bot to place trades.',
+    },
+    {
+      name: 'State 5: trading accounts connected, Auto-Trading on',
+      input: { telegramConnected: true, channelCount: 2, linkedAccounts: [ACCOUNT, secondAccount], autoTradingEnabled: true },
+      headline: 'Your workspace is live.',
+      subtext: 'Monitoring 2 channels and executing on 2 accounts.',
+    },
+  ];
+
+  for (const state of states) {
+    const activation = overviewActivationView(state.input);
+    const markup = render(OverviewHeader, { activation });
+    const renderedHeadline = state.headline.replace("'", '&#x27;');
+    assert.ok(markup.includes(`<h2 class="overview-headline">${renderedHeadline}</h2>`), `${state.name}: headline`);
+    assert.ok(markup.includes(`<p class="overview-subtext">${state.subtext}</p>`), `${state.name}: subtext`);
+    if (state.mustNotShowListening) {
+      assert.doesNotMatch(markup, /Your bot is listening\\./, 'State 2 must not skip channel selection and enter State 3');
+    }
+  }
+});
+
 test('the greeting stays personalized and the no-account header names MT4/MT5', () => {
   const activation = activationFor();
   const html = render(OverviewHeader, { userName: 'Amina Yusuf', activation });
