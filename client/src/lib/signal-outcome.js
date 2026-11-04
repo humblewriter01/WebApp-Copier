@@ -59,6 +59,34 @@ export function signalStatesAPrice(signal) {
 }
 
 /**
+ * How a signal's take-profit leg is shown on the summary line, given the workspace's
+ * Multiple Target Handling setting (`first_target`, `final_target`, or `scale_out`).
+ *
+ * A signal with one target always shows `TP <price>`. When the channel published a ladder of
+ * two or more targets (`takeProfitLevels`), "First Target Only" shows TP1 (`TP 2655`),
+ * "Final Target Only" shows the last target (`TP 2665`), and "Split & Scale-Out" lists every
+ * exit in order (`TP1 2655 | TP2 2660 | TP3 2665`).
+ */
+export function takeProfitSummary(signal, multipleTargetHandling = 'first_target') {
+  const levels = Array.isArray(signal?.takeProfitLevels)
+    ? signal.takeProfitLevels.filter((value) => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value)) && Number(value) > 0)
+    : [];
+  const hasPrimary = signal?.takeProfit != null && signal?.takeProfit !== '' && Number.isFinite(Number(signal.takeProfit));
+  if (levels.length >= 2) {
+    if (multipleTargetHandling === 'scale_out') {
+      return levels.map((level, index) => `TP${index + 1} ${level}`).join(' | ');
+    }
+    if (multipleTargetHandling === 'final_target') {
+      return `TP ${levels[levels.length - 1]}`;
+    }
+    return `TP ${hasPrimary ? signal.takeProfit : levels[0]}`;
+  }
+  if (hasPrimary) return `TP ${signal.takeProfit}`;
+  if (levels.length === 1) return `TP ${levels[0]}`;
+  return null;
+}
+
+/**
  * The entry a zone signal shows: the range the channel published, with the bound in force named on hover.
  *
  * A row that reads `Entry 4026` for `BUY GOLD ZONE 4016 - 4026` is half wrong twice. The channel never offered

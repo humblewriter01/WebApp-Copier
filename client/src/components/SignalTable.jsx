@@ -1,6 +1,6 @@
 import React from 'react';
 import { LISTENER_NOT_ATTACHED_MESSAGE, PAUSED_MESSAGE, useTelegramStatus, WAITING_FOR_MESSAGES_MESSAGE } from './TelegramStatus.jsx';
-import { entryZoneView, overviewSignalOutcomeView, signalBadges, signalOutcomeView } from '../lib/signal-outcome.js';
+import { entryZoneView, overviewSignalOutcomeView, signalBadges, signalOutcomeView, takeProfitSummary } from '../lib/signal-outcome.js';
 import { DASHBOARD_SIGNAL_LIMIT, summarizeSignalMessage } from '../lib/signal-summary.js';
 
 /**
@@ -66,7 +66,7 @@ function SignalEmpty({ channelCount, onOpenTelegram, view }) {
  * account connected, is exactly the case where silence reads as failure: the signal is there, and
  * the reason it was not traded has to be as visible as the signal itself.
  */
-export default function SignalTable({ signals, channelCount = 0, onOpenTelegram, onUpgrade, onDeleteSignal, deletingId = null, compact = false, linkedAccounts = [], autoTradingEnabled = false }) {
+export default function SignalTable({ signals, channelCount = 0, multipleTargetHandling = 'first_target', onOpenTelegram, onUpgrade, onDeleteSignal, deletingId = null, compact = false, linkedAccounts = [], autoTradingEnabled = false }) {
   const { view } = useTelegramStatus();
   if (!signals?.length) return <SignalEmpty channelCount={channelCount} onOpenTelegram={onOpenTelegram} view={view} />;
   /* The Overview is a glance, so it shows a bounded list with a bounded amount of text per row, and the
@@ -81,11 +81,12 @@ export default function SignalTable({ signals, channelCount = 0, onOpenTelegram,
     // A zone is shown as the range it was published as, with the bound in force one hover away; a single
     // price is shown exactly as it always was.
     const zone = entryZoneView(signal);
+    const targetText = takeProfitSummary(signal, multipleTargetHandling);
     const summary = compact ? summarizeSignalMessage(signal.message) : null;
     return <article className={`signal-item outcome-${outcome.tone}${compact ? ' signal-item-compact' : ''}`} key={signal.id}>
     <div className="signal-top"><div><strong>{signal.symbol || 'Signal message'}</strong><span className="signal-source">{signal.channelTitle || 'Telegram chat'}</span></div><div className="signal-flags">{signal.side ? <span className={`badge ${signal.side === 'buy' ? 'badge-buy' : 'badge-sell'}`}>{signal.side}</span> : null}<span className={`badge signal-outcome tone-${outcome.tone}`}>{outcome.label}</span>{badges.map((badge) => <span key={badge.key} className={`badge signal-flag-badge tone-${badge.tone}`} title={badge.title}>{badge.label}</span>)}{onDeleteSignal ? <button className="signal-delete-button" type="button" title="Remove this signal from your history" aria-label={`Remove ${signal.symbol || 'this signal'} from your history`} disabled={deletingId === signal.id} onClick={() => onDeleteSignal(signal)}>{deletingId === signal.id ? '…' : '✕'}</button> : null}</div></div>
     <p className="signal-message"{...(summary?.truncated ? { title: signal.message } : {})}>{summary ? summary.text : signal.message}</p>
-    <div className="signal-meta">{zone ? <span title={zone.title}>Entry {zone.text}</span> : (signal.entryPrice != null && <span>Entry {signal.entryPrice}</span>)}{signal.stopLoss != null && <span>SL {signal.stopLoss}</span>}{signal.takeProfit != null && <span>TP {signal.takeProfit}</span>}{signal.stopLossPips != null && <span>SL {signal.stopLossPips} pips</span>}{signal.takeProfitPips != null && <span>TP {signal.takeProfitPips} pips</span>}<time>{signal.createdAt ? new Date(signal.createdAt).toLocaleString() : ''}</time></div>
+    <div className="signal-meta">{zone ? <span title={zone.title}>Entry {zone.text}</span> : (signal.entryPrice != null && <span>Entry {signal.entryPrice}</span>)}{signal.stopLoss != null && <span>SL {signal.stopLoss}</span>}{targetText != null && <span>{targetText}</span>}{signal.stopLossPips != null && <span>SL {signal.stopLossPips} pips</span>}{signal.takeProfitPips != null && <span>TP {signal.takeProfitPips} pips</span>}<time>{signal.createdAt ? new Date(signal.createdAt).toLocaleString() : ''}</time></div>
     {outcome.showNote ? <p className="signal-outcome-note"><span>{outcome.note}</span>{outcome.upgradeRequired && onUpgrade ? <button className="text-button" type="button" onClick={onUpgrade}>See plans</button> : null}</p> : null}
   </article>;
 })}</div>;
