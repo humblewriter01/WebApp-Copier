@@ -718,7 +718,7 @@ test('the prompt says out loud that an open position is not an entry instruction
 
 test('a capture that outlives its patience writes the row from Layer 1 and says so', async () => {
   const hanging = async () => new Promise(() => {});
-  const result = await parseSignalTwoLayer('GBPUSD buy now, sl 1.0910, tp 1.1100', {
+  const result = await parseSignalTwoLayer('GBPUSD buy now, tp 1.1100 - stop should be 1.0910', {
     source: 'telegram', config: CONFIG, fetchImpl: hanging, logger: { warn() {}, info() {} }, captureBudgetMs: 25,
   });
   assert.equal(result.parsed.symbol, 'GBPUSD', 'the message is not lost while the model is unreachable');
@@ -730,8 +730,8 @@ test('a capture that outlives its patience writes the row from Layer 1 and says 
 
   // The same message with a model that answers inside the budget is unaffected: the deadline is a ceiling,
   // not a switch that quietly turns Layer 2 off for every capture.
-  const quick = countingFetch(llmReply({ symbol: 'GBPUSD', side: 'buy', entry: 1.0910, stop_loss: 1.0910, take_profit: 1.1100, confidence: 0.9 }));
-  const answered = await parseSignalTwoLayer('GBPUSD buy now, sl 1.0910, tp 1.1100', {
+  const quick = countingFetch(llmReply({ symbol: 'GBPUSD', side: 'buy', entry: null, stop_loss: 1.0910, take_profit: 1.1100, confidence: 0.9 }));
+  const answered = await parseSignalTwoLayer('GBPUSD buy now, tp 1.1100 - stop should be 1.0910', {
     source: 'telegram', config: CONFIG, fetchImpl: quick.fetchImpl, logger: { warn() {}, info() {} }, captureBudgetMs: 5_000,
   });
   assert.equal(answered.provenance.llmUsed, true, 'a model that replies in time is still asked, still used, and still credited on the row');

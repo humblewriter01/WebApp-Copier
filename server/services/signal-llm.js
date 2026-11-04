@@ -50,7 +50,8 @@ const SYSTEM_PROMPT = [
   '- symbol is only reported when the message names the instrument. Use the broker form: XAUUSD for gold, XAGUSD for silver, UKOIL for Brent, USOIL for WTI, US30 for the Dow, NAS100 for the Nasdaq 100, US500 for the S&P 500, GER40 for the DAX, BTCUSD, ETHUSD, or a six-letter currency pair such as EURUSD or GBPJPY.',
   '- side is "buy" for BUY, LONG or CALL and "sell" for SELL, SHORT or PUT. A message that says both is contradictory: return null for every field and confidence 0.',
   '- If the text is a news headline or market commentary rather than a trade instruction, return null for the direction. "JUST IN", "breaking", "report", "headline", "news", a market "dumping" or a price that "falls under" or "rises above" a level are reporting what happened, not telling anyone what to do: return null for side, and null for any other field the message does not state as an instruction. A direction must never be chosen from the tone of a headline.',
-  '- An entry of "now", "market" or "current price" means entry null. That is not a missing value; do not fill it in.',
+  '- An entry of "@ Market", "@Market", "market", "at market", "market price", "market execution", "current price", "CMP", "spot", "live price", or "now" means entry is JSON null (never return a string such as "@ Market" or "Market" for entry). That is not a missing value; do not fill it in.',
+  '- When multiple targets are listed (such as TP1, TP2, TP3), return the first target price (TP1) as a single number in take_profit — never return an array.',
   '- A message about a position that is already open is not an entry instruction. "TP 1 HIT", "close now", "close half", "set BE", "SL to entry" and "+50 PIPS" describe how a trade finished or how it is being managed: return null for side, and never turn an instruction to close into a direction to open. A numbered target ("TP 1", "TP2 ✅") is the index of a level, not a price.',
   '- A target or stop given in pips or points is a distance, not a price: return null for that field.',
   '- confidence is how sure you are that this message is a trade instruction and that you read it correctly: 1 only when every value you returned is written in the message in plain form.',
@@ -58,8 +59,34 @@ const SYSTEM_PROMPT = [
 ].join('\n');
 
 function numberValue(value) {
-  const number = Number(value);
-  return Number.isFinite(number) && number > 0 ? number : null;
+  if (typeof value === 'number') return Number.isFinite(value) && value > 0 ? value : null;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const direct = Number(trimmed);
+    if (Number.isFinite(direct) && direct > 0) return direct;
+    const stripped = normalizeSignalNumbers(trimmed.replace(/^[$€£¥₹\s]+|[$€£¥₹\s]+$/g, ''));
+    if (stripped.ambiguous.length > 0) return null;
+    const cleaned = Number(stripped.text.trim());
+    return Number.isFinite(cleaned) && cleaned > 0 ? cleaned : null;
+  }
+  return null;
+}
+
+const MARKET_ENTRY_VALUE = /^(?:@\s*)?(?:at\s+)?(?:the\s+)?(?:market(?:[\s_]*(?:price|rate|order|execution|entry|fill|level))?|current(?:[\s_]*(?:market[\s_]*)?(?:price|rate|level))?|cmp|now|(?:buy|sell|enter)[\s_]*now|right[\s_]*now|instant(?:ly)?(?:[\s_]*execution)?|immediate(?:ly)?(?:[\s_]*execution)?|live(?:[\s_]*(?:market[\s_]*)?(?:price|rate))?|spot(?:[\s_]*(?:price|rate))?|here|at[\s_]*current|open(?:[\s_]*price)?)$/i;
+const NULLISH_FIELD_VALUE = /^(?:null|none|nil|n\/?a|not\s+(?:stated|specified|given|provided|applicable)|unspecified|tbd|-+|—+)$/i;
+
+/**
+ * Whether a non-numeric `entry` reported by a model is simply naming a market-order fill ("@ Market",
+ * "Market", "Current Price", "CMP", "Now", "Spot", "Live Price") or an explicit null placeholder rather than
+ * a garbled price. Treating those synonyms as `entry: null` keeps an obediently literal model from turning a
+ * valid market order into a `malformed-price` review flag.
+ */
+export function isMarketEntryValue(value) {
+  if (typeof value !== 'string') return false;
+  const cleaned = value.trim().replace(/^['"`(\[]+|['"`)\].!?,;:]+$/g, '').trim().replace(/\s+/g, ' ');
+  if (!cleaned || /\d/.test(cleaned)) return false;
+  return MARKET_ENTRY_VALUE.test(cleaned) || NULLISH_FIELD_VALUE.test(cleaned);
 }
 
 /**
@@ -125,8 +152,14 @@ export function needsLayer2(parsed) {
      how a headline ends up with a direction attached: the model is paid to find a trade, it will find one.
      Refusing the request outright is cheaper and surer than hoping the answer is cautious. */
   if (parsed.newsOnly === true || parsed.managementUpdate === true) return false;
+  /* A market order has no numerical entry price by definition (`entryPrice` is null, filled at the live
+     quote when executed). When Layer 1 has already identified the instrument, an explicit BUY/SELL
+     direction, a valid stop loss, and at least one take-profit target with no blockers, asking Layer 2
+     can add nothing and would hold a valid "@ Market" signal hostage to model availability. */
+  const entrySettled = parsed.missing?.entryPrice === false || parsed.orderType === 'market';
   const complete = parsed.executionReady === true && parsed.missing
-    && parsed.missing.stopLoss === false && parsed.missing.takeProfit === false && parsed.missing.entryPrice === false;
+    && Boolean(parsed.symbol) && Boolean(parsed.side) && parsed.directionInferred !== true
+    && parsed.missing.stopLoss === false && parsed.missing.takeProfit === false && entrySettled;
   if (complete) return false;
   /* A direction and a price, in any combination, is a message about a trade. A symbol on its own is not:
      a channel's disclaimer, its VIP pitch and its member count all name instruments, and sending those to a
@@ -161,8 +194,18 @@ export function buildMessages(message, config = {}) {
  * prefers the last object in a reply, so without this step an example the model waved at *after* its answer
  * would outrank the answer. Inside the fence is what the model meant to send.
  */
+function stripReasoningBlocks(text) {
+  const raw = String(text ?? '');
+  if (!/<think\b/i.test(raw)) return raw;
+  // An unclosed `<think>` means the model ran out of output budget mid-thought before writing its JSON;
+  // refusing it avoids mistaking an example inside the scratchpad for the final answer.
+  const withoutClosed = raw.replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, '');
+  if (/<think\b/i.test(withoutClosed)) return '';
+  return withoutClosed;
+}
+
 function stripJsonFence(text) {
-  const trimmed = String(text ?? '').trim().replace(/^\uFEFF/, '');
+  const trimmed = stripReasoningBlocks(text).trim().replace(/^\uFEFF/, '');
   if (!trimmed.includes('`')) return trimmed;
   const closed = trimmed.match(/```[ \t]*(?:json|JSON|javascript|js)?[ \t]*\r?\n([\s\S]*?)\r?\n?[ \t]*```/);
   if (closed) return closed[1].trim();
@@ -231,14 +274,22 @@ const tryParseObject = (text) => {
  * after being helpful about syntax is being helpful about prices, and that is the line this layer exists to
  * hold.
  */
+const UNQUOTED_MARKET_OR_NULL_LITERAL = /("(?:entry|stop_loss|take_profit)"\s*:\s*)(?:@\s*market(?:\s+(?:price|rate|order|execution|entry|fill))?|@\s*current(?:\s+(?:market\s+)?(?:price|rate))?|market(?:\s+(?:price|rate|order|execution|entry|fill))?|current\s+(?:market\s+)?(?:price|rate)|@\s*cmp|cmp|@\s*now|now|@\s*spot(?:\s+price)?|spot(?:\s+price)?|live\s+(?:market\s+)?price|none|nil|null|undefined|n\/a|open)(\s*[,}])/gi;
+
+function repairCandidateSyntax(candidate) {
+  return String(candidate ?? '')
+    .replace(UNQUOTED_MARKET_OR_NULL_LITERAL, '$1null$2')
+    .replace(/,\s*([}\]])/g, '$1');
+}
+
 export function extractJsonObject(content) {
   const text = stripJsonFence(content);
   if (!text) return null;
-  const direct = tryParseObject(text);
+  const direct = tryParseObject(text) ?? tryParseObject(repairCandidateSyntax(text));
   if (direct) return direct;
   const candidates = topLevelObjects(text);
   for (let index = candidates.length - 1; index >= 0; index -= 1) {
-    const parsed = tryParseObject(candidates[index]) ?? tryParseObject(candidates[index].replace(/,\s*([}\]])/g, '$1'));
+    const parsed = tryParseObject(candidates[index]) ?? tryParseObject(repairCandidateSyntax(candidates[index]));
     if (parsed) return parsed;
   }
   return null;
@@ -300,8 +351,46 @@ export function validateExtraction(json, /** @type {ValidateExtractionInput} */ 
   const prices = {};
   for (const field of FIELDS) {
     if (field === 'symbol' || field === 'side') continue;
-    const value = numberValue(json[field]);
-    if (json[field] === null || json[field] === undefined || json[field] === '') { prices[field] = null; continue; }
+    const raw = json[field];
+    if (raw === null || raw === undefined || raw === '') { prices[field] = null; continue; }
+    if (field === 'entry' && isMarketEntryValue(raw)) { prices[field] = null; continue; }
+    if ((field === 'stop_loss' || field === 'take_profit') && typeof raw === 'string') {
+      const cleaned = raw.trim().replace(/^['"`(\[]+|['"`)\].!?,;:]+$/g, '').trim();
+      if (NULLISH_FIELD_VALUE.test(cleaned) || (field === 'take_profit' && /^open$/i.test(cleaned))) {
+        prices[field] = null;
+        continue;
+      }
+    }
+    if (field === 'take_profit' && Array.isArray(raw)) {
+      const nonNull = raw.filter((item) => {
+        if (item === null || item === undefined || item === '') return false;
+        if (typeof item === 'string') {
+          const cleaned = item.trim();
+          if (NULLISH_FIELD_VALUE.test(cleaned) || /^open$/i.test(cleaned)) return false;
+        }
+        return true;
+      });
+      if (nonNull.length === 0) { prices[field] = null; continue; }
+      const validatedTargets = [];
+      for (const item of nonNull) {
+        const target = numberValue(item);
+        if (target === null) {
+          return { ok: false, code: 'malformed-price', reason: 'The AI reader returned a price that is not a price, so this signal was saved for review.', confidence };
+        }
+        if (!sameNumber(values, target)) {
+          return {
+            ok: false,
+            code: 'invented-price',
+            reason: `The AI reader reported a price (${target}) that does not appear in the message, so nothing from that reading is used.`,
+            confidence,
+          };
+        }
+        validatedTargets.push(target);
+      }
+      prices[field] = validatedTargets[0];
+      continue;
+    }
+    const value = numberValue(raw);
     if (value === null) return { ok: false, code: 'malformed-price', reason: 'The AI reader returned a price that is not a price, so this signal was saved for review.', confidence };
     if (!sameNumber(values, value)) {
       return {
@@ -450,7 +539,11 @@ async function llmRequest(message, /** @type {LlmRequestInput} */ { config, fetc
   const payload = JSON.stringify({
     model: config.model,
     temperature: 0,
-    max_tokens: 300,
+    /* Reasoning-enabled models on OpenAI-compatible providers (such as Groq's `gpt-oss-20b`) charge their
+       internal reasoning tokens against `max_tokens`; 300 tokens can be exhausted before `message.content`
+       starts, leaving an empty string with `finish_reason: "length"`. 1024 leaves headroom for reasoning
+       plus the single JSON object while keeping the four-key request contract unchanged. */
+    max_tokens: 1024,
     messages: buildMessages(message, config),
   });
   const send = async () => {
@@ -482,9 +575,16 @@ async function llmRequest(message, /** @type {LlmRequestInput} */ { config, fetc
     let content;
     try {
       const payload = JSON.parse(result.text);
-      content = payload?.choices?.[0]?.message?.content;
-      if (content === undefined || content === null) {
-        return { ok: false, code: 'empty-reply', reason: FRIENDLY_NOTES.readerUnavailable, technical: describeTechnicalNote('The AI reader returned an answer with no content in it.') };
+      const choice = payload?.choices?.[0];
+      content = choice?.message?.content;
+      if (content === undefined || content === null || (typeof content === 'string' && !content.trim())) {
+        const finishHint = choice?.finish_reason ? ` (finish_reason: ${choice.finish_reason})` : '';
+        return {
+          ok: false,
+          code: 'empty-reply',
+          reason: FRIENDLY_NOTES.readerUnavailable,
+          technical: describeTechnicalNote(`The AI reader returned an answer with no content in it${finishHint}.`),
+        };
       }
     } catch {
       return { ok: false, code: 'malformed-reply', reason: FRIENDLY_NOTES.readerUnavailable, technical: describeTechnicalNote(`The AI reader returned something that was not an answer: ${result.text.slice(0, 200)}`) };
