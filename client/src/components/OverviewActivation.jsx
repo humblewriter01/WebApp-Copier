@@ -35,10 +35,12 @@ export function overviewActivationView({
   const selectedAccount = accounts.find((account) => String(account.metaApiAccountId || '') === String(executionAccountId || '')) || null;
   const channelTotal = Math.max(0, Number.isFinite(Number(channelCount)) ? Math.floor(Number(channelCount)) : 0);
   const status = autoTradingStatusView({ linkedAccounts: accounts, autoTradingEnabled });
+  const headerInput = { linkedAccounts: accounts, autoTradingEnabled, executionAccountId, channelCount: channelTotal };
 
   if (telegramConnected == null) {
     return {
       ...status,
+      headerInput,
       headline: 'Checking Telegram…',
       subtext: 'Verifying your connection status.',
     };
@@ -47,6 +49,7 @@ export function overviewActivationView({
   if (telegramConnected === false) {
     return {
       ...status,
+      headerInput,
       headline: "Let's get you connected.",
       subtext: 'Connect Telegram to start capturing signals from your channels.',
     };
@@ -55,6 +58,7 @@ export function overviewActivationView({
   if (channelTotal === 0) {
     return {
       ...status,
+      headerInput,
       headline: 'Telegram connected.',
       subtext: 'Choose which channels you want Signal Desk to monitor.',
     };
@@ -63,6 +67,7 @@ export function overviewActivationView({
   if (!accounts.length) {
     return {
       ...status,
+      headerInput,
       headline: 'Your bot is listening.',
       subtext: 'You have signals waiting. Connect an MT4/MT5 account to start executing.',
     };
@@ -71,6 +76,7 @@ export function overviewActivationView({
   if (autoTradingEnabled !== true) {
     return {
       ...status,
+      headerInput,
       headline: 'Ready to execute.',
       subtext: 'Your broker is connected. Turn on Auto-Trading in Advanced Settings to allow the bot to place trades.',
     };
@@ -79,12 +85,14 @@ export function overviewActivationView({
   const executionAccountCount = selectedAccount ? 1 : accounts.length;
   return {
     ...status,
+    headerInput,
     headline: 'Your workspace is live.',
     subtext: `Monitoring ${channelTotal} ${channelTotal === 1 ? 'channel' : 'channels'} and executing on ${executionAccountCount} ${executionAccountCount === 1 ? 'account' : 'accounts'}.`,
   };
 }
 
 export function OverviewHeader({ userName = 'trader', activation, loading = false, unavailable = false }) {
+  const { view: telegramView } = useTelegramStatus();
   const firstName = String(userName || 'trader').trim().split(/\s+/)[0] || 'trader';
   if (loading) return <div className="overview-heading-copy overview-header-skeleton" aria-label="Loading workspace summary" aria-busy="true">
     <span className="overview-skeleton overview-skeleton-greeting" aria-hidden="true" />
@@ -92,10 +100,16 @@ export function OverviewHeader({ userName = 'trader', activation, loading = fals
     <span className="overview-skeleton overview-skeleton-subtext" aria-hidden="true" />
   </div>;
 
-  const headline = unavailable ? 'Workspace status unavailable.' : activation.headline;
+  const resolvedActivation = activation?.headerInput && ['connected', 'disconnected'].includes(telegramView.key)
+    ? overviewActivationView({
+      ...activation.headerInput,
+      telegramConnected: telegramView.key === 'connected',
+    })
+    : activation;
+  const headline = unavailable ? 'Workspace status unavailable.' : resolvedActivation.headline;
   const subtext = unavailable
     ? 'Refresh your workspace to load the latest setup and execution status.'
-    : activation.subtext;
+    : resolvedActivation.subtext;
   return <div className="overview-heading-copy" aria-live="polite" aria-atomic="true">
     <p className="overview-greeting">Good to see you, {firstName}.</p>
     <h2 className="overview-headline">{headline}</h2>

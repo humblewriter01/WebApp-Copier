@@ -17,7 +17,7 @@ const cssSource = readFileSync(path.join(srcDir, 'styles.css'), 'utf8');
 
 await build({
   stdin: {
-    contents: "export { AutoTradingStatusCard, OverviewHeader, OverviewLoadingShell, OverviewMetrics, SetupChecklist, overviewActivationView } from './OverviewActivation.jsx';",
+    contents: "export { AutoTradingStatusCard, OverviewHeader, OverviewLoadingShell, OverviewMetrics, SetupChecklist, overviewActivationView } from './OverviewActivation.jsx'; export { TelegramStatusContext } from './TelegramStatus.jsx';",
     resolveDir: path.join(srcDir, 'components'),
     loader: 'jsx',
   },
@@ -30,7 +30,7 @@ await build({
   logLevel: 'silent',
 });
 assert.ok(existsSync(outfile), 'the activation components were bundled');
-const { AutoTradingStatusCard, OverviewHeader, OverviewLoadingShell, OverviewMetrics, SetupChecklist, overviewActivationView } = await import(pathToFileURL(outfile).href);
+const { AutoTradingStatusCard, OverviewHeader, OverviewLoadingShell, OverviewMetrics, SetupChecklist, overviewActivationView, TelegramStatusContext } = await import(pathToFileURL(outfile).href);
 const render = (Component, props = {}) => renderToStaticMarkup(React.createElement(Component, props));
 const ACCOUNT = { metaApiAccountId: 'mt5-1', name: 'Kano Demo', login: '432109', state: 'DEPLOYED' };
 
@@ -92,7 +92,7 @@ test('the Overview header renders the exact copy for every setup state in onboar
     assert.ok(markup.includes(`<h2 class="overview-headline">${renderedHeadline}</h2>`), `${state.name}: headline`);
     assert.ok(markup.includes(`<p class="overview-subtext">${state.subtext}</p>`), `${state.name}: subtext`);
     if (state.mustNotShowListening) {
-      assert.doesNotMatch(markup, /Your bot is listening\\./, 'State 2 must not skip channel selection and enter State 3');
+      assert.doesNotMatch(markup, /Your bot is listening\./, 'State 2 must not skip channel selection and enter State 3');
     }
   }
 });
@@ -115,6 +115,17 @@ test('a connected Telegram workspace with a channel and no broker account shows 
   });
   const header = render(OverviewHeader, { activation });
   assert.match(header, /Your bot is listening\./);
+  assert.doesNotMatch(header, /Let's get you connected/);
+});
+
+test('the header reads the resolved provider status even when its parent activation was computed outside the provider', () => {
+  const activation = overviewActivationView({ channelCount: 1, linkedAccounts: [] });
+  assert.equal(activation.headline, 'Checking Telegram…', 'the App parent cannot consume the provider it returns');
+  const header = render(() => React.createElement(TelegramStatusContext.Provider, {
+    value: { view: { key: 'connected' } },
+  }, React.createElement(OverviewHeader, { activation })));
+  assert.match(header, /Your bot is listening\./);
+  assert.doesNotMatch(header, /Checking Telegram/);
   assert.doesNotMatch(header, /Let's get you connected/);
 });
 
