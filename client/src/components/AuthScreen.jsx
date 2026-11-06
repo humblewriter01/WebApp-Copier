@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { PASSWORD_RESET_SENT, sendPasswordResetEmail } from '../lib/password-reset.js';
 import { request } from '../lib/api.js';
 
-export default function AuthScreen({ onAuthenticated, installPrompt, onInstall, initialMode = 'login', onBackToOverview = null }) {
+export default function AuthScreen({ onAuthenticated, installPrompt, onInstall, initialMode = 'login', onBackToHome = null }) {
   // Which door the visitor came through, so the landing page's "Log in" opens the card on the form
   // they asked for instead of whatever the default happens to be.
   const [mode, setMode] = useState(initialMode);
@@ -27,10 +27,10 @@ export default function AuthScreen({ onAuthenticated, installPrompt, onInstall, 
   return <main className="auth-shell">
     <div className="auth-brand"><div className="brand-mark"><img src="/icons/signal-desk-icon-192.png" alt="" /></div><span>Signal Desk</span></div>
     <section className="auth-card">
+      {onBackToHome && <button type="button" className="button auth-back" onClick={onBackToHome}><span aria-hidden="true">←</span> Back to home</button>}
       <p className="eyebrow">{mode === 'forgot' ? 'ACCOUNT RECOVERY' : 'AUTOMATED SIGNAL EXECUTION'}</p>
       <h1>{mode === 'login' ? 'Welcome back' : mode === 'register' ? 'Create your workspace' : resetSent ? 'Check your email' : 'Reset your password'}</h1>
       <p className="muted">{mode === 'forgot' ? 'Enter the email address for your Signal Desk account. If it exists, we will send a secure reset link.' : 'Automate your trading by executing Telegram signals directly to your broker.'}</p>
-      {onBackToOverview && <button type="button" className="landing-link auth-back" onClick={onBackToOverview}>Back to the overview</button>}
       {mode === 'forgot' && resetSent ? <>
         <div className="alert alert-success" role="status">{PASSWORD_RESET_SENT}</div>
         <button type="button" className="button button-secondary button-wide auth-mode-button" onClick={() => changeMode('login')}>Back to sign in</button>

@@ -633,7 +633,7 @@ button,input,textarea,select{touch-action:manipulation}
 .landing-fine{margin:15px 0 0;font-size:13px;color:#8493a8}
 .landing-link{appearance:none;background:none;border:0;padding:0;margin:0;font:inherit;color:#63d7bb;font-size:13px;cursor:pointer;text-decoration:underline;text-underline-offset:3px}
 .landing-link:hover{color:#8ce7d0}
-.auth-back{display:block;margin:0 0 15px;color:#5d6c82;font-size:12px;text-decoration:none}
+.auth-back{display:inline-flex;align-items:center;gap:8px;min-height:44px;padding:0 13px;margin:0 0 22px;background:#f7f9fb;border:1px solid #dce2ea;border-radius:9px;color:#536176;font-size:12px;text-decoration:none;box-shadow:none}.auth-back:hover{background:#eef2f6;border-color:#cbd4df;color:#344258}.auth-back:focus-visible{outline:3px solid #428c9f55;outline-offset:2px}.auth-back span{font-size:17px;line-height:1}
 .landing-demo{display:grid;gap:11px;background:#fff;border-radius:22px;padding:15px;box-shadow:0 30px 80px #030b1766;color:#172338}
 .landing-demo-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:1px 4px 10px;border-bottom:1px solid #eef1f5}
 .landing-demo-title{font-size:13px;font-weight:800}

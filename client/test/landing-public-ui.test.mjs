@@ -270,7 +270,7 @@ test('App shows this page to an unauthenticated visitor and the sign-in card onl
   assert.match(gate, /return <Landing onEnterAuth=\{setAuthIntent\}/, 'and the landing view is what an unasked visitor gets');
   assert.ok(appSource.indexOf('return <Landing') < appSource.indexOf('if (loading)'), 'in that order');
   // The card is reachable in both directions: a way back is what makes an overview page safe to show first.
-  assert.match(appSource, /onBackToOverview=\{\(\) => setAuthIntent\(null\)\}/, 'a visitor who came in through the wrong door can go back out');
+  assert.match(appSource, /onBackToHome=\{\(\) => setAuthIntent\(null\)\}/, 'a visitor who came in through the wrong door can go back out');
   assert.match(appSource, /if \(normalizedPath === '\/billing\/callback'\) return authToken\n\s*\? <BillingCallbackPage \/>\n\s*: <AuthScreen/, 'a callback keeps its sign-in card - nobody arrives there to browse');
   assert.match(appSource, /autoTradingEnabled: false/, 'the client’s own idea of a new workspace is an unarmed one, agreeing with the column default');
 });

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test, { after } from 'node:test';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { build } from 'esbuild';
@@ -40,6 +40,34 @@ const { createRoot } = await import('react-dom/client');
 const act = (callback) => React.act(callback);
 const { default: AuthScreen } = await import(pathToFileURL(outfile).href);
 const normalize = (node) => (node?.textContent || '').replace(/\s+/g, ' ').trim();
+
+test('the auth back-to-home control is a tappable button that returns to the public landing state', async () => {
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  const root = createRoot(host);
+  let returnedToHome = false;
+  await act(async () => {
+    root.render(React.createElement(AuthScreen, {
+      initialMode: 'login',
+      onAuthenticated: () => {},
+      onBackToHome: () => { returnedToHome = true; },
+    }));
+  });
+
+  const backButton = host.querySelector('.auth-back');
+  assert.ok(backButton, 'the login screen renders the back action');
+  assert.equal(backButton.tagName, 'BUTTON', 'the action is semantically a button');
+  assert.equal(normalize(backButton), '← Back to home');
+  assert.match(backButton.getAttribute('class'), /\bbutton\b/, 'it uses button styling');
+  assert.equal(backButton.compareDocumentPosition(host.querySelector('.auth-card .eyebrow')) & dom.window.Node.DOCUMENT_POSITION_FOLLOWING, dom.window.Node.DOCUMENT_POSITION_FOLLOWING,
+    'the back control precedes the product eyebrow at the top of the card');
+  assert.match(readFileSync(path.join(srcDir, 'styles.css'), 'utf8'), /\.auth-back\{[^}]*min-height:44px/,
+    'the ghost button meets the 44px mobile touch target');
+
+  await act(async () => backButton.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })));
+  assert.equal(returnedToHome, true, 'clicking the button invokes the callback that clears authIntent and returns to Landing');
+  await act(() => root.unmount());
+});
 
 test('registration explains that live trading is off until the user confirms the warning', async () => {
   const host = document.createElement('div');
