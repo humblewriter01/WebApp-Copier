@@ -360,7 +360,7 @@ function App() {
     : <AuthScreen onAuthenticated={authenticated} installPrompt={installPrompt} onInstall={installApp} />;
   if (normalizedPath === '/update-password') return <UpdatePasswordPage />;
   if (!authToken) {
-    if (authIntent) return <AuthScreen onAuthenticated={authenticated} installPrompt={installPrompt} onInstall={installApp} initialMode={authIntent} onBackToOverview={() => setAuthIntent(null)} />;
+    if (authIntent) return <AuthScreen onAuthenticated={authenticated} installPrompt={installPrompt} onInstall={installApp} initialMode={authIntent} onBackToHome={() => setAuthIntent(null)} />;
     // The whole product used to sit behind a login box, which asked a stranger to sign in to something they had no
     // way to see. Landing holds no state and sends no request, so the sign-in card is one click away in either
     // direction, and a workspace that has signed out keeps going straight to it as it always did.
