@@ -23,14 +23,17 @@ export default function Sidebar({ active, onNavigate, user, onSignOut, onContact
         aria-current={active === key ? 'page' : undefined}
         onClick={() => onNavigate(key)}
       ><NavIcon path={iconPath} /><span>{label}</span></button>)}
-    </nav>
-    <div className="sidebar-bottom">
-      <div className="user-mini"><span className="avatar" aria-hidden="true">{(user?.name || 'U').slice(0, 1).toUpperCase()}</span><div><strong>{user?.name}</strong><small>{user?.email}</small></div></div>
-      {onContactSupport ? <button className="sidebar-contact-support" type="button" aria-label="Contact Support" title="Contact Support" onClick={onContactSupport}>
+      {onContactSupport ? <button className="nav-item sidebar-contact-support" type="button" onClick={onContactSupport}>
         <NavIcon path="M4 5h16v11H8l-4 4V5Zm4 4h8m-8 4h5" />
         <span>Contact Support</span>
       </button> : null}
-      <button className="logout-button" type="button" onClick={onSignOut}>Sign out</button>
+    </nav>
+    <div className="sidebar-bottom">
+      <div className="user-mini"><span className="avatar" aria-hidden="true">{(user?.name || 'U').slice(0, 1).toUpperCase()}</span><div><strong>{user?.name}</strong><small>{user?.email}</small></div></div>
+      <button className="logout-button" type="button" onClick={onSignOut}>
+        <NavIcon path="M14 12h7m-3-3 3 3-3 3M14 5v14H4V5h10" />
+        <span>Sign out</span>
+      </button>
     </div>
   </aside>;
 }
