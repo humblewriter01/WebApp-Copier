@@ -25,6 +25,7 @@
     "metaapi.cloud-sdk": "29.3.4",
     "pg": "^8.13.1",
     "socket.io": "^4.6.1",
+    "svix": "^2.10.0",
     "telegram": "^2.19.10",
     "teleproto": "1.232.0"
   },

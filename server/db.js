@@ -81,6 +81,24 @@ const SCHEMA_SQL = `
     ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_paused BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_paused_at TIMESTAMPTZ;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_pause_reason TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS marketing_opt_out BOOLEAN DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS unsubscribe_token TEXT;
+    CREATE UNIQUE INDEX IF NOT EXISTS users_unsubscribe_token_unique_idx ON users(unsubscribe_token) WHERE unsubscribe_token IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS email_replies (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      from_email TEXT,
+      subject TEXT,
+      body_html TEXT,
+      body_text TEXT,
+      received_at TIMESTAMPTZ DEFAULT NOW(),
+      in_reply_to TEXT,
+      "read" BOOLEAN DEFAULT FALSE,
+      resend_email_id TEXT
+    );
+    ALTER TABLE email_replies ADD COLUMN IF NOT EXISTS resend_email_id TEXT;
+    CREATE UNIQUE INDEX IF NOT EXISTS email_replies_resend_email_id_unique_idx ON email_replies(resend_email_id);
+    CREATE INDEX IF NOT EXISTS email_replies_received_at_idx ON email_replies(received_at DESC);
     CREATE TABLE IF NOT EXISTS channels (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,

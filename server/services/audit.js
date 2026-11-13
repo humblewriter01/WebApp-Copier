@@ -42,6 +42,7 @@ export const AUDIT_ACTIONS = Object.freeze({
   'announcement.publish': 'Announcement published',
   'announcement.update': 'Announcement changed',
   'announcement.retire': 'Announcement retired',
+  'email.broadcast': 'Email broadcast sent',
   'impersonation.start': 'Support access opened',
   'impersonation.stop': 'Support access closed',
   /* Signal history is application data an administrator can remove, so every path that removes it is in

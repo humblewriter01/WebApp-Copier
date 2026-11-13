@@ -11,6 +11,8 @@ const SECTIONS = [
   { key: 'pricing', label: 'Pricing & Plans' },
   { key: 'billing', label: 'Payments' },
   { key: 'announcements', label: 'Announcements' },
+  { key: 'email', label: 'Email Broadcast' },
+  { key: 'inbox', label: 'Inbox' },
   { key: 'audit', label: 'Audit log' },
   { key: 'data', label: 'Data management' },
 ];
@@ -74,6 +76,24 @@ function formatDateTime(value) {
   if (!value) return 'Never';
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? 'Never' : date.toLocaleString();
+}
+
+/* Incoming email is untrusted HTML. Show the text representation inside React rather than injecting the
+   provider's markup into the admin document, while retaining readable line breaks for HTML-only replies. */
+function emailReplyBody(reply) {
+  if (typeof reply?.bodyText === 'string' && reply.bodyText.length) return reply.bodyText;
+  return String(reply?.bodyHtml || '')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<(script|style|head)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '')
+    .replace(/<br\s*\/?\s*>/gi, '\n')
+    .replace(/<\/(p|div|li|tr|h[1-6]|blockquote|pre)\s*>/gi, '\n')
+    .replace(/<[^>]*>/g, '')
+    .replace(/&nbsp;|&#160;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'");
 }
 
 function formatMoney(amountMinor, currency = 'NGN') {
@@ -152,6 +172,19 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const [auditSearchInput, setAuditSearchInput] = useState('');
   const [auditSearch, setAuditSearch] = useState('');
   const [auditOffset, setAuditOffset] = useState(0);
+  const [broadcastAudience, setBroadcastAudience] = useState('all');
+  const [broadcastSubject, setBroadcastSubject] = useState('');
+  const [broadcastBody, setBroadcastBody] = useState('');
+  const [broadcastPreview, setBroadcastPreview] = useState({ audience: '', count: null, loading: false, error: '' });
+  const [broadcastConfirmOpen, setBroadcastConfirmOpen] = useState(false);
+  const [broadcastBusy, setBroadcastBusy] = useState(false);
+  const [broadcastError, setBroadcastError] = useState('');
+  const [broadcastNotice, setBroadcastNotice] = useState('');
+  const [emailReplies, setEmailReplies] = useState([]);
+  const [repliesLoading, setRepliesLoading] = useState(false);
+  const [replyError, setReplyError] = useState('');
+  const [openReplyId, setOpenReplyId] = useState('');
+  const [readingReplyId, setReadingReplyId] = useState('');
   /* Data management: captured signals across every workspace, and the three ways they can be removed.
      The list is read with the same filters it is deleted with, so an administrator is always confirming
      the count they can see rather than a number that was estimated somewhere else. */
@@ -233,6 +266,19 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     if (search) query.set('search', search);
     const data = await request(`/api/admin/audit-logs?${query.toString()}`, token);
     setAudit({ entries: data.entries || [], total: data.total || 0, totalEntries: data.totalEntries || 0, actions: data.actions || [] });
+  }, [token]);
+
+  const loadEmailReplies = useCallback(async () => {
+    setRepliesLoading(true);
+    setReplyError('');
+    try {
+      const data = await request('/api/admin/replies', token);
+      setEmailReplies(data.replies || []);
+    } catch (loadError) {
+      setReplyError(loadError.message || 'The inbox could not be loaded.');
+    } finally {
+      setRepliesLoading(false);
+    }
   }, [token]);
 
   const loadSignals = useCallback(async ({ search: nextSearch = signalSearch, from = signalFrom, to = signalTo, offset: nextOffset = signalOffset } = {}) => {
@@ -358,6 +404,30 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   // Deliberately only on open: changeHealthWindow, applyAuditFilter and changeAuditPage fetch with
   // the values they were handed, so the request and the state change happen exactly once each.
   }, [loading, section, loadAudit]);
+
+  useEffect(() => {
+    if (loading || section !== 'email') return undefined;
+    let active = true;
+    const query = new URLSearchParams({ targetAudience: broadcastAudience });
+    setBroadcastPreview({ audience: broadcastAudience, count: null, loading: true, error: '' });
+    request(`/api/admin/broadcast/recipients?${query.toString()}`, token)
+      .then((data) => {
+        if (!active) return;
+        const count = Number(data?.recipientCount);
+        if (!Number.isSafeInteger(count) || count < 0) throw new Error('The eligible recipient count could not be read.');
+        setBroadcastPreview({ audience: broadcastAudience, count, loading: false, error: '' });
+      })
+      .catch((previewError) => {
+        if (!active) return;
+        setBroadcastPreview({ audience: broadcastAudience, count: null, loading: false, error: previewError.message || 'The eligible recipient count could not be read.' });
+      });
+    return () => { active = false; };
+  }, [loading, section, broadcastAudience, token]);
+
+  useEffect(() => {
+    if (loading || section !== 'inbox') return;
+    void loadEmailReplies();
+  }, [loading, section, loadEmailReplies]);
 
   const applySearch = async (event) => {
     event.preventDefault();
@@ -929,6 +999,58 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     }
   };
 
+  const openBroadcastConfirmation = (event) => {
+    event.preventDefault();
+    if (broadcastBusy || broadcastPreview.loading || broadcastPreview.error
+      || broadcastPreview.audience !== broadcastAudience || broadcastPreview.count === null) return;
+    setBroadcastError('');
+    setBroadcastNotice('');
+    setBroadcastConfirmOpen(true);
+  };
+
+  const sendBroadcast = async () => {
+    if (!broadcastConfirmOpen || broadcastBusy) return;
+    setBroadcastBusy(true);
+    setBroadcastError('');
+    setBroadcastNotice('');
+    try {
+      const result = await request('/api/admin/broadcast', token, {
+        method: 'POST',
+        body: { targetAudience: broadcastAudience, subject: broadcastSubject.trim(), body: broadcastBody.trim() },
+      });
+      const total = Number(result?.recipientCount ?? broadcastPreview.count) || 0;
+      const sent = Number(result?.sentRecipients) || 0;
+      const failed = Number(result?.failedRecipients) || 0;
+      setBroadcastNotice(failed
+        ? `Brevo accepted ${sent} of ${total} recipients; ${failed} could not be queued. Check the server logs before retrying.`
+        : `Brevo accepted the broadcast for ${sent} user${sent === 1 ? '' : 's'}.`);
+      setBroadcastConfirmOpen(false);
+    } catch (sendError) {
+      setBroadcastError(sendError.message || 'The broadcast could not be sent.');
+    } finally {
+      setBroadcastBusy(false);
+    }
+  };
+
+  const toggleReply = async (reply) => {
+    if (openReplyId === reply.id) {
+      setOpenReplyId('');
+      return;
+    }
+    setOpenReplyId(reply.id);
+    if (reply.read === true || readingReplyId === reply.id) return;
+    setReadingReplyId(reply.id);
+    setReplyError('');
+    try {
+      await request(`/api/admin/replies/${reply.id}/read`, token, { method: 'PATCH' });
+      setEmailReplies((current) => current.map((item) => (item.id === reply.id ? { ...item, read: true } : item)));
+    } catch (markError) {
+      setReplyError(markError.message || 'This reply could not be marked as read.');
+    } finally {
+      setReadingReplyId('');
+    }
+  };
+
   // Only ever on the first paint. A refresh - a search, a page turn, the write that just landed - must never
   // replace the panel with a spinner, because the panel is where the dialogs are opened from and a subtree
   // that is swapped away takes the open form, and the reason being typed into it, with it.
@@ -936,6 +1058,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
 
   const currencyCode = pricing?.currency || billing?.summary?.currency || 'NGN';
   const pendingChanges = Object.keys(changedPlans()).length;
+  const unreadReplyCount = emailReplies.filter((reply) => reply.read !== true).length;
   // Never inferred from the button that was pressed, and never "Live" while the read is missing.
   const killSwitch = killSwitchView(health);
   const hasOpenActionModal = Boolean(suspension.userId || supportFor.userId || adjustFor);
@@ -959,6 +1082,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
       >
         {item.label}
         {item.key === 'pricing' && pendingChanges ? <span className="admin-tab-flag">{pendingChanges}</span> : null}
+        {item.key === 'inbox' && unreadReplyCount ? <span className="admin-tab-flag">{unreadReplyCount}</span> : null}
       </button>)}
     </div>
 
@@ -1502,6 +1626,92 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
       </section>
     </div>}
 
+    {section === 'email' && <div id="admin-section-email" role="tabpanel" aria-labelledby="admin-tab-email">
+      <section className="panel admin-panel email-broadcast-panel">
+        <div className="panel-heading">
+          <div><p className="eyebrow">DIRECT TO YOUR USERS</p><h2>Email Broadcast</h2></div>
+          <span className="count-badge">Brevo</span>
+        </div>
+        <p className="muted">Send one message to an audience by plan. Users who opted out of marketing are always excluded. The count below is refreshed for the selected audience before you confirm.</p>
+        <form className="admin-email-form" onSubmit={openBroadcastConfirmation}>
+          <div className="admin-email-fields">
+            <label htmlFor="admin-broadcast-audience">Audience
+              <select id="admin-broadcast-audience" value={broadcastAudience} onChange={(event) => setBroadcastAudience(event.target.value)}>
+                <option value="all">All users</option>
+                <option value="free">Free</option>
+                <option value="starter">Starter</option>
+                <option value="pro">Pro</option>
+                <option value="premium">Premium</option>
+              </select>
+            </label>
+            <label htmlFor="admin-broadcast-subject">Subject
+              <input id="admin-broadcast-subject" type="text" value={broadcastSubject} onChange={(event) => setBroadcastSubject(event.target.value)} maxLength={200} required placeholder="A subject your users will recognise" />
+            </label>
+          </div>
+          <label htmlFor="admin-broadcast-body">Body
+            <textarea id="admin-broadcast-body" value={broadcastBody} onChange={(event) => setBroadcastBody(event.target.value)} maxLength={100000} rows={12} required placeholder="Write your message. Line breaks are preserved in the delivered email." />
+          </label>
+          <p className="admin-email-count" role="status" aria-live="polite">
+            {broadcastPreview.loading && broadcastPreview.audience === broadcastAudience
+              ? 'Counting eligible recipients…'
+              : broadcastPreview.error
+                ? 'The eligible recipient count is unavailable.'
+                : broadcastPreview.audience === broadcastAudience && broadcastPreview.count !== null
+                  ? `${broadcastPreview.count} eligible user${broadcastPreview.count === 1 ? '' : 's'} for this audience.`
+                  : 'Choose an audience to count eligible recipients.'}
+          </p>
+          {broadcastPreview.error ? <div className="alert alert-error" role="alert">{broadcastPreview.error}</div> : null}
+          {broadcastError ? <div className="alert alert-error" role="alert">{broadcastError}</div> : null}
+          {broadcastNotice ? <div className="alert alert-success" role="status" aria-live="polite">{broadcastNotice}</div> : null}
+          <div className="button-row">
+            <button type="submit" className="button button-primary" disabled={broadcastBusy || broadcastPreview.loading || Boolean(broadcastPreview.error) || broadcastPreview.audience !== broadcastAudience || broadcastPreview.count === null || broadcastPreview.count === 0}>
+              {broadcastBusy ? 'Sending…' : 'Send Broadcast'}
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>}
+
+    {section === 'inbox' && <div id="admin-section-inbox" role="tabpanel" aria-labelledby="admin-tab-inbox">
+      <section className="panel admin-panel admin-inbox-panel">
+        <div className="panel-heading">
+          <div><p className="eyebrow">RESEND REPLIES</p><h2>Inbox</h2></div>
+          <span className="count-badge">{unreadReplyCount} unread</span>
+        </div>
+        <p className="muted">Replies received at your Resend address. Open a message to read it; unread messages are marked automatically.</p>
+        {replyError ? <div className="alert alert-error" role="alert">{replyError}</div> : null}
+        {repliesLoading ? <div className="loading-shell inline-loading"><div className="spinner" /><span>Loading replies…</span></div> : !emailReplies.length
+          ? <div className="empty-state"><strong>Your inbox is clear</strong><span>Replies to your broadcasts will appear here.</span></div>
+          : <div className="admin-inbox-list">
+            {emailReplies.map((reply) => {
+              const expanded = openReplyId === reply.id;
+              const unread = reply.read !== true;
+              const body = emailReplyBody(reply);
+              return <article className={`admin-inbox-item ${unread ? 'unread' : ''}`} key={reply.id}>
+                <button
+                  type="button"
+                  className="admin-inbox-trigger"
+                  aria-expanded={expanded}
+                  aria-controls={`admin-reply-body-${reply.id}`}
+                  aria-label={`From ${reply.fromEmail || 'unknown sender'}, ${reply.subject || '(no subject)'}, ${formatDateTime(reply.receivedAt)}, ${unread ? 'unread' : 'read'}`}
+                  disabled={readingReplyId === reply.id}
+                  onClick={() => { void toggleReply(reply); }}
+                >
+                  <span className="admin-inbox-from"><strong>From</strong><span>{reply.fromEmail || 'Unknown sender'}</span></span>
+                  <span className="admin-inbox-subject"><strong>Subject</strong><span>{reply.subject || '(no subject)'}</span></span>
+                  <span className="admin-inbox-date"><strong>Date</strong><span>{formatDateTime(reply.receivedAt)}</span></span>
+                  <span className={`admin-inbox-status ${unread ? 'is-unread' : ''}`}>{unread ? 'Unread' : 'Read'}</span>
+                </button>
+                {expanded ? <div id={`admin-reply-body-${reply.id}`} className="admin-inbox-message">
+                  <p className="admin-inbox-message-label">Message</p>
+                  <pre>{body || 'This reply did not include a readable message body.'}</pre>
+                </div> : null}
+              </article>;
+            })}
+          </div>}
+      </section>
+    </div>}
+
     {section === 'audit' && <div id="admin-section-audit" role="tabpanel" aria-labelledby="admin-tab-audit">
       <section className="panel admin-panel audit-panel">
         <div className="panel-heading">
@@ -1705,6 +1915,20 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
         <input value={adjustFor?.reason || ''} onChange={(event) => setAdjustFor({ ...adjustFor, reason: event.target.value })} maxLength={200} required placeholder="For example: goodwill after the MetaAPI outage on 2 March" />
       </label>
     </AdminActionModal>
+
+    <ConfirmModal
+      open={broadcastConfirmOpen}
+      busy={broadcastBusy}
+      tone="danger"
+      title="Confirm email broadcast"
+      confirmLabel="Send broadcast"
+      onCancel={() => (broadcastBusy ? null : setBroadcastConfirmOpen(false))}
+      onConfirm={() => { void sendBroadcast(); }}
+    >
+      <p className="confirm-modal-count">Are you sure you want to send this to {broadcastPreview.count} {broadcastPreview.count === 1 ? 'user' : 'users'}?</p>
+      <p>This email cannot be recalled after Brevo accepts it. Users who opted out are excluded by the server.</p>
+      <p><strong>Subject:</strong> {broadcastSubject.trim()}</p>
+    </ConfirmModal>
 
     <ConfirmModal
       open={Boolean(clearConfirm)}

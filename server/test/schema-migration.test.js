@@ -75,9 +75,24 @@ test('the columns this app ships are each their own statement', () => {
     'users ADD COLUMN IF NOT EXISTS telegram_paused BOOLEAN NOT NULL DEFAULT FALSE',
     'users ADD COLUMN IF NOT EXISTS telegram_paused_at TIMESTAMPTZ',
     'users ADD COLUMN IF NOT EXISTS telegram_pause_reason TEXT',
+    'users ADD COLUMN IF NOT EXISTS marketing_opt_out BOOLEAN DEFAULT FALSE',
+    'users ADD COLUMN IF NOT EXISTS unsubscribe_token TEXT',
+    'CREATE TABLE IF NOT EXISTS email_replies',
+    'email_replies ADD COLUMN IF NOT EXISTS resend_email_id TEXT',
+    'email_replies_resend_email_id_unique_idx',
+    'email_replies_received_at_idx',
     'execution_jobs_backoff_idx',
   ]) {
     assert.equal(find(needle).length, 1, `${needle} appears exactly once, as one statement`);
+  }
+  const emailRepliesTable = find('CREATE TABLE IF NOT EXISTS email_replies')[0];
+  for (const field of [
+    'id UUID PRIMARY KEY DEFAULT gen_random_uuid()',
+    'user_id UUID REFERENCES users(id) ON DELETE SET NULL',
+    'from_email TEXT', 'subject TEXT', 'body_html TEXT', 'body_text TEXT',
+    'received_at TIMESTAMPTZ DEFAULT NOW()', 'in_reply_to TEXT', '"read" BOOLEAN DEFAULT FALSE',
+  ]) {
+    assert.ok(emailRepliesTable.includes(field), `email_replies includes ${field}`);
   }
   // The comment above a statement is prose; it must never be able to look like the end of one.
   assert.ok(!find('next_attempt_at').some((statement) => statement.includes('the wait is the point')));
