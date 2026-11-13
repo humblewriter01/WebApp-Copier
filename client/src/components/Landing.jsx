@@ -150,6 +150,7 @@ export default function Landing({ onEnterAuth = () => {}, installPrompt = null, 
       </article>)}</div>
     </section>
     <section className="landing-faq" aria-labelledby="landing-faq-title"><div className="landing-section-heading"><p className="eyebrow">GOOD TO KNOW</p><h2 id="landing-faq-title">Frequently asked questions</h2></div><div className="landing-faq-list">{FAQS.map(([question, answer]) => <article className="landing-faq-item" key={question}><h3>{question}</h3><p>{answer}</p></article>)}</div></section>
-    <footer className="landing-footer"><span>© {new Date().getFullYear()} Signal Desk</span><span>Tools for disciplined execution.</span><a href="mailto:support.signaldesk@gmail.com">Contact Support</a></footer>
+    <div className="landing-support-cta"><p>Still have questions? <a href="mailto:support.signaldesk@gmail.com">Contact our support team →</a></p></div>
+    <footer className="landing-footer"><span>© {new Date().getFullYear()} Signal Desk</span><span>Tools for disciplined execution.</span><a className="landing-footer-support" href="mailto:support.signaldesk@gmail.com"><svg className="landing-support-mail-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/></svg><span>Contact Support</span></a></footer>
   </main>;
 }
