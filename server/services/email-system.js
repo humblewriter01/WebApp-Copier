@@ -7,6 +7,7 @@ const BREVO_BATCH_SIZE = 50;
 const BREVO_CONCURRENCY = 3;
 const MAX_SUBJECT_LENGTH = 200;
 const MAX_BODY_LENGTH = 100_000;
+const MAX_SUPPORT_MESSAGE_LENGTH = 10_000;
 const BREVO_API_URL = 'https://api.brevo.com/v3/smtp/email';
 const RESEND_API_URL = 'https://api.resend.com/emails/receiving';
 
@@ -65,6 +66,23 @@ function normalizeIndividualEmailDraft(input = {}) {
     throw emailError(400, `Keep the message to ${MAX_BODY_LENGTH} characters or fewer.`, 'INVALID_EMAIL_BODY');
   }
   return { userId: userId || null, to: to || null, subject, body };
+}
+
+function normalizeSupportContactDraft(input = {}) {
+  const userId = String(input.userId ?? '').trim();
+  if (!UUID_PATTERN.test(userId)) throw emailError(401, 'Sign in again before contacting support.', 'INVALID_SUPPORT_CONTACT_USER');
+
+  const subject = String(input.subject ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
+  const message = String(input.message ?? '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').trim();
+  if (!subject) throw emailError(400, 'Enter a subject for your support message.', 'INVALID_SUPPORT_CONTACT_SUBJECT');
+  if (subject.length > MAX_SUBJECT_LENGTH) {
+    throw emailError(400, `Keep the subject to ${MAX_SUBJECT_LENGTH} characters or fewer.`, 'INVALID_SUPPORT_CONTACT_SUBJECT');
+  }
+  if (!message) throw emailError(400, 'Write a message for the support team.', 'INVALID_SUPPORT_CONTACT_MESSAGE');
+  if (message.length > MAX_SUPPORT_MESSAGE_LENGTH) {
+    throw emailError(400, `Keep your support message to ${MAX_SUPPORT_MESSAGE_LENGTH} characters or fewer.`, 'INVALID_SUPPORT_CONTACT_MESSAGE');
+  }
+  return { userId, subject, message };
 }
 
 function audienceFilter(targetAudience) {
@@ -321,6 +339,59 @@ export function createEmailSystem(/** @type {EmailSystemDependencies} */ {
     };
   }
 
+  async function sendSupportContact(input = {}) {
+    const draft = normalizeSupportContactDraft(input);
+    const { rows } = await pool.query(
+      'SELECT id, name, email FROM users WHERE id=$1 LIMIT 1',
+      [draft.userId],
+    );
+    const user = rows[0];
+    if (!user) throw emailError(404, 'Your Signal Desk account could not be found.', 'SUPPORT_CONTACT_USER_NOT_FOUND');
+
+    const userEmail = String(user.email ?? '').trim().toLowerCase();
+    if (userEmail.length > 254 || !EMAIL_PATTERN.test(userEmail)) {
+      throw emailError(422, 'Your account does not have a valid email address for support replies.', 'SUPPORT_CONTACT_USER_EMAIL_INVALID');
+    }
+    const apiKey = String(env.BREVO_API_KEY || '').trim();
+    const supportEmail = String(env.BREVO_SENDER_EMAIL || '').trim().toLowerCase();
+    if (!apiKey) throw emailError(503, 'Support email is not configured right now.', 'BREVO_NOT_CONFIGURED');
+    if (supportEmail.length > 254 || !EMAIL_PATTERN.test(supportEmail)) {
+      throw emailError(503, 'Support email is not configured right now.', 'BREVO_SENDER_NOT_CONFIGURED');
+    }
+
+    const textContent = `Contact Support request\nFrom: ${userEmail}\n\n${draft.message}`;
+    const htmlContent = `<div><p><strong>From:</strong> ${escapeHtml(userEmail)}</p><p><strong>Subject:</strong> ${escapeHtml(draft.subject)}</p><p>${escapeHtml(draft.message).replace(/\r\n?/g, '\n').replace(/\n/g, '<br />')}</p></div>`;
+    const payload = {
+      sender: {
+        email: supportEmail,
+        name: String(env.BREVO_SENDER_NAME || 'Signal Desk Support').trim() || 'Signal Desk Support',
+      },
+      to: [{ email: supportEmail }],
+      replyTo: { email: userEmail },
+      subject: draft.subject,
+      htmlContent,
+      textContent,
+    };
+
+    let response;
+    try {
+      response = await fetchImpl(BREVO_API_URL, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json', 'api-key': apiKey },
+        body: JSON.stringify(payload),
+        ...(typeof AbortSignal?.timeout === 'function' ? { signal: AbortSignal.timeout(20_000) } : {}),
+      });
+    } catch (error) {
+      logger?.error?.('Brevo support contact request failed', { code: error?.code || error?.name || 'BREVO_REQUEST_FAILED' });
+      throw emailError(502, 'Your message could not be sent right now. Please try again in a moment.', 'BREVO_SUPPORT_REQUEST_FAILED');
+    }
+    if (!response?.ok) {
+      logger?.error?.('Brevo rejected a support contact request', { status: Number(response?.status) || 0 });
+      throw emailError(502, 'Your message could not be sent right now. Please try again in a moment.', 'BREVO_SUPPORT_REQUEST_REJECTED');
+    }
+    return { sent: true };
+  }
+
   async function sendUserEmail(input = {}) {
     const draft = normalizeIndividualEmailDraft(input);
     let recipient;
@@ -529,6 +600,7 @@ export function createEmailSystem(/** @type {EmailSystemDependencies} */ {
   return {
     countBroadcastRecipients,
     sendBroadcast,
+    sendSupportContact,
     sendUserEmail,
     handleResendWebhook,
     listReplies,

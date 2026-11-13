@@ -718,6 +718,8 @@ button,input,textarea,select{touch-action:manipulation}
 .landing-faq-item h3{margin:0 0 7px;color:#fff;font-size:14px;line-height:1.4}
 .landing-faq-item p{margin:0;color:#a9b8cc;font-size:13px;line-height:1.65}
 .landing-footer{display:flex;justify-content:space-between;gap:16px;max-width:1140px;margin:55px auto 0;padding-top:18px;border-top:1px solid #ffffff17;color:#788ba2;font-size:11px}
+.landing-footer a{color:inherit;text-decoration:underline;text-underline-offset:3px}
+.landing-footer a:hover{color:#d5e3ec}
 .landing-demo{transition:transform .22s ease,box-shadow .22s ease}
 .landing-demo:hover{transform:translateY(-2px);box-shadow:0 36px 88px #030b1777}
 @media(max-width:940px){.landing-pricing-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.landing-steps{grid-template-columns:repeat(3,minmax(0,1fr))}.landing-how,.landing-pricing,.landing-faq{margin-top:48px}}
@@ -919,3 +921,12 @@ code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace
 .admin-inbox-message pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:#3d4b60;font:inherit;font-size:12px;line-height:1.65}
 @media(max-width:850px){.admin-inbox-trigger{grid-template-columns:minmax(0,1fr) minmax(0,1.2fr) auto}.admin-inbox-date{grid-column:1 / 3}.admin-inbox-status{grid-column:3;grid-row:1 / 3}}
 @media(max-width:600px){.admin-email-fields{grid-template-columns:minmax(0,1fr)}.admin-inbox-trigger{grid-template-columns:minmax(0,1fr) auto;gap:10px}.admin-inbox-subject{grid-column:1 / -1;grid-row:2}.admin-inbox-date{grid-column:1;grid-row:3}.admin-inbox-status{grid-column:2;grid-row:1 / 4;align-self:start}.admin-inbox-trigger{padding:12px}.admin-inbox-message{padding:12px}}
+
+/* Shared support-contact entry points in the workspace shell. */
+.sidebar-contact-support{display:flex;align-items:center;gap:7px;margin:12px 0 0 41px;padding:0;border:0;background:none;color:#8be0ca;text-align:left;font-size:11px;font-weight:700}
+.sidebar-contact-support:hover{color:#fff}
+.sidebar-contact-support .nav-icon{width:17px;height:17px;flex:0 0 17px}
+.footer{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.footer-contact-support{min-height:0;padding:0;font-size:inherit;line-height:inherit;text-decoration:underline;text-underline-offset:2px}
+.contact-support-modal h2{margin:0;color:#22344b;font:700 17px Manrope,sans-serif}
+@media(max-width:700px){.sidebar-contact-support{width:42px;height:38px;justify-content:center;margin:9px auto 0}.sidebar-contact-support span{display:none}.sidebar-contact-support .nav-icon{width:18px;height:18px;flex-basis:18px}.footer{gap:8px}.footer-contact-support{font-size:10px}}
