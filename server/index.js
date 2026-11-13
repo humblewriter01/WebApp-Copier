@@ -195,6 +195,7 @@ app.use(express.json({
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false }));
 app.use('/api/metaapi', rateLimit({ windowMs: 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false }));
 const passwordResetLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 5, standardHeaders: true, legacyHeaders: false });
+const supportContactLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 5, standardHeaders: true, legacyHeaders: false });
 const billingLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
 const webhookLimiter = rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false });
 
@@ -1616,6 +1617,15 @@ app.get('/api/auth/me', authenticate, asyncRoute(async (req, res) => {
   const { rows } = await pool.query('SELECT id,name,email,role,created_at FROM users WHERE id=$1', [req.userId]);
   if (!rows[0]) return fail(res, 404, 'User not found.');
   res.json({ user: publicUser(rows[0]) });
+}));
+
+app.post('/api/support/contact', authenticate, supportContactLimiter, asyncRoute(async (req, res) => {
+  const result = await emailSystem.sendSupportContact({
+    userId: req.userId,
+    subject: req.body?.subject,
+    message: req.body?.message,
+  });
+  res.json(result);
 }));
 
 app.get('/api/dashboard', authenticate, asyncRoute(async (req, res) => {

@@ -198,6 +198,44 @@ test('single-user Brevo email resolves the user from Supabase Postgres, sets rep
   }]);
 });
 
+test('Contact Support sends a user-authenticated message to the Brevo support address with user Reply-To', async () => {
+  const user = { id: USER_ID, name: 'Amina Yusuf', email: 'Amina@example.com' };
+  const pool = recordingPool({ users: [user] });
+  const calls = [];
+  const system = createEmailSystem({
+    pool,
+    env: { ...broadcastEnv, BREVO_SENDER_EMAIL: 'support.signaldesk@gmail.com' },
+    logger: { error() {}, warn() {} },
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options, payload: JSON.parse(options.body) });
+      return responseJson({ messageId: 'support-message-1' }, { status: 201 });
+    },
+  });
+
+  const result = await system.sendSupportContact({
+    userId: USER_ID,
+    subject: '  Help with my account  ',
+    message: 'I cannot connect my account.\nPlease help. <script>bad()</script>',
+  });
+
+  assert.equal(pool.calls.length, 1, 'the authenticated user is resolved from the database, not from request fields');
+  assert.match(pool.calls[0].sql, /SELECT id, name, email FROM users WHERE id=\$1 LIMIT 1/);
+  assert.deepEqual(pool.calls[0].params, [USER_ID]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'https://api.brevo.com/v3/smtp/email');
+  assert.equal(calls[0].options.headers['api-key'], 'brevo-test-key');
+  assert.deepEqual(calls[0].payload.to, [{ email: 'support.signaldesk@gmail.com' }]);
+  assert.equal(calls[0].payload.sender.email, 'support.signaldesk@gmail.com');
+  assert.deepEqual(calls[0].payload.replyTo, { email: 'amina@example.com' });
+  assert.equal(calls[0].payload.subject, 'Help with my account');
+  assert.match(calls[0].payload.textContent, /From: amina@example\.com/);
+  assert.match(calls[0].payload.textContent, /I cannot connect my account\./);
+  assert.match(calls[0].payload.htmlContent, /From:<\/strong> amina@example\.com/);
+  assert.match(calls[0].payload.htmlContent, /&lt;script&gt;bad\(\)&lt;\/script&gt;/, 'user-authored markup is escaped in the support email HTML');
+  assert.deepEqual(result, { sent: true });
+  await assert.rejects(() => system.sendSupportContact({ userId: USER_ID, subject: '', message: 'Help' }), /Enter a subject/);
+});
+
 test('Inbox compose can send a validated direct address and a missing user is never sent to', async () => {
   const pool = recordingPool();
   const providerCalls = [];
@@ -336,6 +374,16 @@ test('the admin email routes are mounted behind administrator authentication', (
   assert.match(index, /emailSystem\.sendUserEmail\(\{/);
   assert.match(index, /emailSystem\.listReplies\(\)/);
   assert.match(index, /emailSystem\.markReplyRead\(req\.params\.id\)/);
+});
+
+test('Contact Support requires the authenticated identity and cannot take a user ID from the request body', () => {
+  const index = readFileSync(path.join(SERVER, 'index.js'), 'utf8');
+  const routeAt = index.indexOf("app.post('/api/support/contact'");
+  const route = index.slice(routeAt, index.indexOf("app.get('/api/dashboard'", routeAt));
+  assert.ok(routeAt >= 0, 'the support contact route is mounted');
+  assert.match(route, /app\.post\('\/api\/support\/contact', authenticate, supportContactLimiter, asyncRoute/);
+  assert.match(route, /emailSystem\.sendSupportContact\(\{[\s\S]*?userId: req\.userId/);
+  assert.equal(/userId:\s*req\.body/.test(route), false, 'the body cannot choose which user address is used for Reply-To');
 });
 
 test('the Resend raw JSON route is mounted before the global JSON parser', () => {

@@ -175,6 +175,22 @@ test('the sidebar no longer renders the Account Notes link', () => {
   assert.match(sidebar, /Trading Accounts/);
 });
 
+test('Contact Support opens the shared modal from the sidebar and footer, except in read-only support sessions', () => {
+  const sidebar = render(Sidebar, {
+    active: 'overview',
+    onNavigate() {},
+    onSignOut() {},
+    onContactSupport() {},
+    onClose() {},
+    user: { role: 'user', name: 'Amina Yusuf', email: 'amina@example.com' },
+  });
+  assert.match(sidebar, /aria-label="Contact Support"/);
+  assert.ok(sidebar.indexOf('Contact Support') < sidebar.indexOf('Sign out'), 'the sidebar trigger sits above Sign out');
+  assert.match(appSource, /onContactSupport=\{readOnlySupport \? undefined : openContactSupport\}/);
+  assert.match(appSource, /className="text-button footer-contact-support" onClick=\{openContactSupport\}>Contact Support/);
+  assert.match(appSource, /<ContactSupportModal open=\{contactSupportOpen && !readOnlySupport\} token=\{authToken\}/);
+});
+
 test('the new pages have URLs, and the static host is told about them', () => {
   const table = appSource.slice(appSource.indexOf('const PATH_FOR_TAB'), appSource.indexOf('const TAB_FOR_PATH'));
   for (const [tab, route] of [['advanced', '/advanced'], ['profile', '/profile'], ['billing', '/billing'], ['admin', '/admin']]) {

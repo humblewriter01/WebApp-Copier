@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import Sidebar from './components/Sidebar.jsx';
 import SignalTable from './components/SignalTable.jsx';
+import ContactSupportModal from './components/ContactSupportModal.jsx';
 import ConfirmModal from './components/ConfirmModal.jsx';
 import { signalsAwaitingUpgrade } from './lib/signal-outcome.js';
 import { AutoTradingStatusCard, OverviewHeader, OverviewLoadingShell, OverviewMetrics, SetupChecklist, overviewActivationView } from './components/OverviewActivation.jsx';
@@ -88,6 +89,7 @@ function App() {
   const [signalDeleting, setSignalDeleting] = useState(false);
   const [accountForm, setAccountForm] = useState({ label: '', broker: '', platform: '', accountReference: '' });
   const [installPrompt, setInstallPrompt] = useState(null);
+  const [contactSupportOpen, setContactSupportOpen] = useState(false);
   /* null, or the mode an unauthenticated visitor asked for. A visitor who has not signed in is shown the landing
      view - the product explained, a workspace pictured - and the sign-in card only appears when they ask for it.
      Which mode they asked for is kept here rather than inside the card, so the two doors stay two doors. */
@@ -182,7 +184,7 @@ function App() {
     setSupport(null);
     setNotice('Support view closed. That workspace is no longer being watched.');
   }, []);
-  const logout = useCallback(() => { try { void supabaseReady().then((client) => client?.auth.signOut({ scope: 'local' })).catch(() => {}); } catch {} try { localStorage.removeItem('signal-token'); } catch {} sessionStorage.removeItem('signal-token'); clearSupportSession(); setSupport(null); setToken(''); setUser(null); setDashboard(null); setLoading(false); }, []);
+  const logout = useCallback(() => { try { void supabaseReady().then((client) => client?.auth.signOut({ scope: 'local' })).catch(() => {}); } catch {} try { localStorage.removeItem('signal-token'); } catch {} sessionStorage.removeItem('signal-token'); clearSupportSession(); setSupport(null); setContactSupportOpen(false); setToken(''); setUser(null); setDashboard(null); setLoading(false); }, []);
   const refresh = useCallback(async () => {
     if (!authToken) return;
     try {
@@ -268,6 +270,11 @@ function App() {
     setToken(data.token); setUser(data.user); setLoading(true);
   };
   const readOnlySupport = Boolean(support);
+  const openContactSupport = () => {
+    if (readOnlySupport) return;
+    closeMobileSidebar();
+    setContactSupportOpen(true);
+  };
   const addManualSignal = async (event) => {
     event.preventDefault(); setError(''); setNotice(''); setSignalHistoryError(''); setSignalHistoryNotice('');
     if (readOnlySupport) { setError('Support view is read-only.'); return; }
@@ -370,7 +377,7 @@ function App() {
   return <TelegramStatusProvider token={authToken}>
     <MetaApiStatusProvider token={authToken}>
     <div className={`app-shell ${sidebarVisible ? '' : 'sidebar-hidden'}`}>
-    <Sidebar active={tab} onNavigate={navigateToTab} user={user} onSignOut={logout} onClose={closeMobileSidebar} visible={sidebarVisible} />
+    <Sidebar active={tab} onNavigate={navigateToTab} user={user} onSignOut={logout} onContactSupport={readOnlySupport ? undefined : openContactSupport} onClose={closeMobileSidebar} visible={sidebarVisible} />
     {isMobileViewport && sidebarVisible && <button type="button" className="sidebar-backdrop" aria-label="Close navigation menu" onClick={closeMobileSidebar} />}
     <main className="main-area"><header className="topbar"><div><span className="eyebrow">PERSONAL WORKSPACE</span><h1>{tabs.find(([key]) => key === tab)?.[1] || 'Overview'}</h1></div><div className="topbar-right"><button type="button" className="button button-secondary button-small sidebar-toggle" aria-controls="workspace-sidebar" aria-expanded={sidebarVisible} aria-label={isMobileViewport ? (sidebarVisible ? 'Close navigation menu' : 'Open navigation menu') : (sidebarVisible ? 'Hide sidebar' : 'Show sidebar')} title={isMobileViewport ? (sidebarVisible ? 'Close navigation menu' : 'Open navigation menu') : (sidebarVisible ? 'Hide sidebar' : 'Show sidebar')} onClick={toggleSidebar}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{isMobileViewport ? <path d="M4 6h16M4 12h16M4 18h16" /> : <><rect x="3" y="4" width="18" height="16" rx="2"/><path d={sidebarVisible ? 'M9 4v16' : 'M15 4v16'} /></>}</svg><span>{sidebarVisible ? 'Hide sidebar' : 'Show sidebar'}</span></button>{installPrompt && <button className="button button-primary button-small install-app-button" onClick={installApp}>Install app</button>}<TelegramStatusPill /><button className="button button-secondary button-small" onClick={refresh}>Refresh</button></div></header>
       {support ? <SupportSessionBar session={support} onExit={() => { void exitSupport(support); }} /> : null}
@@ -421,8 +428,12 @@ function App() {
         {tab === 'advanced' && <AdvancedSettings settings={settings} accounts={linkedAccounts} trades={trades} runtimeAvailable={executionRuntimeEnabled} platformPause={executionPaused} onChange={setSettings} onSubmit={saveSettings} onToggle={toggleAutoTrading} onOpenRiskSettings={() => navigateToTab('settings')} onOpenTradingAccounts={() => navigateToTab('metaapi')} onOpenPlan={() => navigateToTab('billing')} subscriptionStatus={dashboard?.subscription?.status ?? null} saving={settingsSaving} error={error} notice={notice} toggleError={toggleError} toggleNotice={toggleNotice} />}
         {tab === 'profile' && <ProfileSettings user={user} token={authToken} onDeleted={logout} readOnly={readOnlySupport} />}
       </div>
-      <footer className="footer">Not financial advice. Use at your own risk.</footer>
+      <footer className="footer">
+        <span>Not financial advice. Use at your own risk.</span>
+        {!readOnlySupport ? <button type="button" className="text-button footer-contact-support" onClick={openContactSupport}>Contact Support</button> : null}
+      </footer>
     </main>
+    <ContactSupportModal open={contactSupportOpen && !readOnlySupport} token={authToken} onClose={() => setContactSupportOpen(false)} />
     </div>
     </MetaApiStatusProvider>
   </TelegramStatusProvider>;
