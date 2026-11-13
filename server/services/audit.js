@@ -18,7 +18,7 @@ const SECRET_KEY_PATTERN = /(token|password|secret|authorization|credential|sess
 /** Values that look like a credential are redacted even under a harmless key. */
 const SECRET_VALUE_PATTERN = /(authorization|auth[-_ ]?token|access[-_ ]?token|api[-_ ]?token|password|secret|bearer)\s*[:=]\s*[^\s,;]+/gi;
 
-export const AUDIT_TARGET_TYPES = Object.freeze(['user', 'promo_code', 'plan', 'announcement', 'platform', 'support_session']);
+export const AUDIT_TARGET_TYPES = Object.freeze(['user', 'email', 'promo_code', 'plan', 'announcement', 'platform', 'support_session']);
 
 /**
  * The closed vocabulary of recorded actions. A typo in a route should fail loudly in review,
@@ -42,6 +42,8 @@ export const AUDIT_ACTIONS = Object.freeze({
   'announcement.publish': 'Announcement published',
   'announcement.update': 'Announcement changed',
   'announcement.retire': 'Announcement retired',
+  'email.broadcast': 'Email broadcast sent',
+  'email.user': 'Individual email sent',
   'impersonation.start': 'Support access opened',
   'impersonation.stop': 'Support access closed',
   /* Signal history is application data an administrator can remove, so every path that removes it is in

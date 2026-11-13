@@ -51,6 +51,7 @@ import { createPlatformControls, normalizeKillSwitchInput, KILL_SWITCH_SETTING_K
 import { createSystemHealthService, normalizeHealthQuery, buildParseErrorClear } from './services/system-health.js';
 import { createAnnouncementService, normalizeAnnouncementDraft, normalizeAnnouncementListQuery, buildRetiredAnnouncementClear } from './services/announcements.js';
 import { createSupportSessionService, normalizeSupportReason, buildSupportClaims, SUPPORT_SESSION_MINUTES } from './services/support-sessions.js';
+import { createEmailSystem } from './services/email-system.js';
 
 const app = express();
 app.set('trust proxy', 1);
@@ -175,6 +176,13 @@ app.use(cors({
     return callback(new Error('Origin not allowed'));
   },
   credentials: true,
+}));
+// Resend signs the exact bytes it posts. This route must be registered before express.json so no parser can
+// consume or re-serialize its body before Svix verifies it. Its payload is parsed only after signature success.
+const resendWebhookLimiter = rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false });
+app.post('/api/webhooks/resend', resendWebhookLimiter, express.raw({ type: 'application/json', limit: '2mb' }), asyncRoute(async (req, res) => {
+  const result = await emailSystem.handleResendWebhook({ rawBody: req.body, headers: req.headers });
+  res.status(result.status).json(result.body);
 }));
 // The raw body is captured so a Flutterwave webhook can be refused for a malformed payload before the JSON is
 // trusted. Flutterwave does not sign its body - the `verif-hash` header is the check - so nothing here is
@@ -305,6 +313,7 @@ async function resolveExecutionToken(userId, accountId, managedByApp) {
  */
 const platformControls = createPlatformControls({ pool, logger: console });
 const auditLog = createAuditLogger({ pool, logger: console });
+const emailSystem = createEmailSystem({ pool, audit: auditLog, logger: serviceLogger });
 const systemHealth = createSystemHealthService({ pool, controls: platformControls, runtimeEnabled: autoTradingRuntimeEnabled, logger: console, capture: () => ({ ...telegramCapture.telegramFleetSummary(), gitCommit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || null, startup: { ...boot } }), llm: () => ({ ...describeLlmConfig(parserConfig), ...llmGate.summary(), lastFailure: describeLastReaderFailure() }) });
 const announcementService = createAnnouncementService({ pool, logger: console });
 const supportSessions = createSupportSessionService({ pool, logger: console });
@@ -2221,6 +2230,39 @@ const adminUserColumns = `u.id,u.name,u.email,u.role,u.subscription_status AS "s
 const promoCodeColumns = `id,code,discount_type AS "discountType",discount_value AS "discountValue",
   max_uses AS "maxUses",current_uses AS "currentUses",expires_at AS "expiresAt",active,
   created_at AS "createdAt",updated_at AS "updatedAt"`;
+
+app.get('/api/admin/broadcast/recipients', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const result = await emailSystem.countBroadcastRecipients(req.query.targetAudience || 'all');
+  res.set('Cache-Control', 'no-store').json(result);
+}));
+
+app.post('/api/admin/broadcast', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const result = await emailSystem.sendBroadcast({
+    ...(req.body || {}),
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+  });
+  res.status(result.failedRecipients ? 207 : 200).json(result);
+}));
+
+app.post('/api/admin/email/user', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const result = await emailSystem.sendUserEmail({
+    ...(req.body || {}),
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+  });
+  res.json(result);
+}));
+
+app.get('/api/admin/replies', authenticate, requireAdmin, asyncRoute(async (_req, res) => {
+  const replies = await emailSystem.listReplies();
+  res.set('Cache-Control', 'no-store').json({ replies });
+}));
+
+app.patch('/api/admin/replies/:id/read', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const reply = await emailSystem.markReplyRead(req.params.id);
+  res.set('Cache-Control', 'no-store').json({ reply });
+}));
 
 app.get('/api/admin/overview', authenticate, requireAdmin, asyncRoute(async (_req, res) => {
   const { rows } = await pool.query(`SELECT

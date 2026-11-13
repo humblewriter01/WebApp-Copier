@@ -95,6 +95,20 @@ services:
         value: "6900"
       - key: FLW_PLAN_PREMIUM_USD_AMOUNT
         value: "9900"
+      # The broadcast sender must be verified in Brevo. Resend's API key fetches the full
+      # inbound message body when it is not part of the signed email.received event.
+      - key: BREVO_API_KEY
+        sync: false
+      - key: BREVO_SENDER_EMAIL
+        sync: false
+      - key: BREVO_SENDER_NAME
+        value: Signal Desk
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_WEBHOOK_SECRET
+        sync: false
+      - key: RESEND_REPLY_TO
+        sync: false
   - type: web
     name: telegram-copier-web
     runtime: static
