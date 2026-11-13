@@ -150,6 +150,6 @@ export default function Landing({ onEnterAuth = () => {}, installPrompt = null, 
       </article>)}</div>
     </section>
     <section className="landing-faq" aria-labelledby="landing-faq-title"><div className="landing-section-heading"><p className="eyebrow">GOOD TO KNOW</p><h2 id="landing-faq-title">Frequently asked questions</h2></div><div className="landing-faq-list">{FAQS.map(([question, answer]) => <article className="landing-faq-item" key={question}><h3>{question}</h3><p>{answer}</p></article>)}</div></section>
-    <footer className="landing-footer"><span>© {new Date().getFullYear()} Signal Desk</span><span>Tools for disciplined execution.</span></footer>
+    <footer className="landing-footer"><span>© {new Date().getFullYear()} Signal Desk</span><span>Tools for disciplined execution.</span><a href="mailto:support.signaldesk@gmail.com">Contact Support</a></footer>
   </main>;
 }

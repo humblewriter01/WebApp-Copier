@@ -718,6 +718,8 @@ button,input,textarea,select{touch-action:manipulation}
 .landing-faq-item h3{margin:0 0 7px;color:#fff;font-size:14px;line-height:1.4}
 .landing-faq-item p{margin:0;color:#a9b8cc;font-size:13px;line-height:1.65}
 .landing-footer{display:flex;justify-content:space-between;gap:16px;max-width:1140px;margin:55px auto 0;padding-top:18px;border-top:1px solid #ffffff17;color:#788ba2;font-size:11px}
+.landing-footer a{color:inherit;text-decoration:underline;text-underline-offset:3px}
+.landing-footer a:hover{color:#d5e3ec}
 .landing-demo{transition:transform .22s ease,box-shadow .22s ease}
 .landing-demo:hover{transform:translateY(-2px);box-shadow:0 36px 88px #030b1777}
 @media(max-width:940px){.landing-pricing-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.landing-steps{grid-template-columns:repeat(3,minmax(0,1fr))}.landing-how,.landing-pricing,.landing-faq{margin-top:48px}}

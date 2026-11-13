@@ -77,6 +77,17 @@ test('the first screen explains the product instead of asking for a password', a
   await unmount();
 });
 
+test('the public footer uses a direct support email link rather than a public form endpoint', async () => {
+  const { host, unmount } = await mount();
+  const footer = host.querySelector('.landing-footer');
+  const contactLink = footer?.querySelector('a[href="mailto:support.signaldesk@gmail.com"]');
+  assert.ok(contactLink, 'the public footer links directly to the support email');
+  assert.equal(text(contactLink), 'Contact Support');
+  assert.equal(host.querySelector('form'), null, 'the public landing page does not expose a form');
+  assert.doesNotMatch(landingSource, /ContactSupportModal|\/api\/support\/contact/, 'the public landing page does not wire into the authenticated support form');
+  await unmount();
+});
+
 test('the hero explicitly promises channel-scoped read-only access and no passwords', async () => {
   const { host, unmount } = await mount();
   const note = host.querySelector('.landing-security-note');
