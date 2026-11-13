@@ -175,17 +175,36 @@ test('the sidebar no longer renders the Account Notes link', () => {
   assert.match(sidebar, /Trading Accounts/);
 });
 
-test('Contact Support opens the shared modal from the sidebar and footer, except in read-only support sessions', () => {
-  const sidebar = render(Sidebar, {
+test('Contact Support follows Admin Panel in the nav, while Sign out is a grouped-profile ghost action', () => {
+  const props = {
     active: 'overview',
     onNavigate() {},
     onSignOut() {},
     onContactSupport() {},
     onClose() {},
-    user: { role: 'user', name: 'Amina Yusuf', email: 'amina@example.com' },
-  });
-  assert.match(sidebar, /aria-label="Contact Support"/);
-  assert.ok(sidebar.indexOf('Contact Support') < sidebar.indexOf('Sign out'), 'the sidebar trigger sits above Sign out');
+  };
+  const sidebar = render(Sidebar, { ...props, user: { role: 'user', name: 'Amina Yusuf', email: 'amina@example.com' } });
+  const adminSidebar = render(Sidebar, { ...props, user: { role: 'admin', name: 'Amina Yusuf', email: 'amina@example.com' } });
+  const navStart = adminSidebar.indexOf('<nav class="sidebar-nav"');
+  const navEnd = adminSidebar.indexOf('</nav>', navStart);
+  const adminPanelAt = adminSidebar.indexOf('Admin Panel');
+  const supportAt = adminSidebar.indexOf('Contact Support');
+  assert.ok(navStart >= 0 && adminPanelAt > navStart && supportAt > adminPanelAt && supportAt < navEnd, 'Contact Support sits before the nav ends and divider begins');
+  assert.match(adminSidebar, /<span>Admin Panel<\/span><\/button><button class="nav-item sidebar-contact-support"/, 'Contact Support directly follows Admin Panel as a standard nav item');
+  assert.ok(sidebar.indexOf('Contact Support') < sidebar.indexOf('sidebar-bottom'), 'users see the Contact Support nav item above the divider too');
+
+  const bottomStart = sidebar.indexOf('<div class="sidebar-bottom">');
+  const profileAt = sidebar.indexOf('class="user-mini"', bottomStart);
+  const logoutAt = sidebar.indexOf('class="logout-button"', bottomStart);
+  const bottom = sidebar.slice(bottomStart);
+  assert.ok(profileAt >= 0 && profileAt < logoutAt, 'avatar, name, and email remain grouped above Sign out');
+  assert.match(bottom, /class="user-mini"[\s\S]*?Amina Yusuf[\s\S]*?amina@example\.com[\s\S]*?class="logout-button"/);
+  assert.match(sidebar, /<button class="logout-button"[^>]*>[\s\S]*?<svg class="nav-icon"[^>]*>[\s\S]*?<span>Sign out<\/span>/, 'Sign out is left-aligned with an icon and readable label');
+  assert.equal(bottom.includes('Contact Support'), false, 'Contact Support is no longer in the bottom profile group');
+  const styles = readSource('styles.css');
+  assert.match(styles, /\.sidebar \.logout-button\{[^}]*display:flex[^}]*justify-content:flex-start/, 'Sign out shares the nav items’ left alignment');
+  assert.match(styles, /\.sidebar \.logout-button:hover:not\(:disabled\)\{[^}]*color:#ff979b/, 'the ghost action stays muted until hover, then signals red');
+
   assert.match(appSource, /onContactSupport=\{readOnlySupport \? undefined : openContactSupport\}/);
   assert.match(appSource, /className="text-button footer-contact-support" onClick=\{openContactSupport\}>Contact Support/);
   assert.match(appSource, /<ContactSupportModal open=\{contactSupportOpen && !readOnlySupport\} token=\{authToken\}/);

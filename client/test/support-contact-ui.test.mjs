@@ -127,9 +127,18 @@ test('the sidebar Contact Support button invokes the shared open-modal callback'
     onClose() {},
   }));
   try {
-    await click(document.querySelector('.sidebar-contact-support'));
+    const sidebar = document.querySelector('#workspace-sidebar');
+    const nav = sidebar.querySelector('.sidebar-nav');
+    const contactButton = nav.querySelector('.sidebar-contact-support');
+    const profile = sidebar.querySelector('.user-mini');
+    const signOutButton = sidebar.querySelector('.logout-button');
+    assert.equal(contactButton.classList.contains('nav-item'), true, 'Contact Support uses the standard navigation-item layout');
+    assert.equal(contactButton, nav.lastElementChild, 'Contact Support is the final nav item above the divider');
+    assert.ok(profile.compareDocumentPosition(signOutButton) & dom.window.Node.DOCUMENT_POSITION_FOLLOWING, 'the profile block stays grouped above Sign out');
+    assert.equal(signOutButton.querySelector('.nav-icon')?.getAttribute('aria-hidden'), 'true', 'Sign out has a decorative logout icon');
+    assert.equal(signOutButton.querySelector('span')?.textContent, 'Sign out');
+    await click(contactButton);
     assert.equal(opened, 1);
-    assert.ok(document.querySelector('.logout-button'), 'Contact Support appears alongside the account and Sign out controls');
   } finally {
     await panel.unmount();
   }

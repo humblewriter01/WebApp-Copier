@@ -77,8 +77,10 @@ button,input,textarea,select{touch-action:manipulation}
 .nav-icon{width:18px;height:18px;flex:0 0 18px}
 .sidebar .nav-item.active{color:#9af0d8;background:#1b3345}
 .sidebar .nav-item:hover{color:#fff}
-.sidebar .nav-item:focus-visible,.logout-button:focus-visible{outline-color:#79e0c7}
-.logout-button{color:#d3dce8;margin-left:41px;padding:0 8px}
+.sidebar .nav-item:focus-visible,.sidebar .logout-button:focus-visible{outline-color:#79e0c7}
+.sidebar .logout-button{display:flex;width:100%;min-height:46px;align-items:center;justify-content:flex-start;gap:12px;margin:10px 0 0;padding:10px 7px;border:0;border-radius:9px;background:transparent;color:#aeb9c9;text-align:left;font-size:12px;line-height:1.3;transition:background .15s,color .15s}
+.sidebar .logout-button:hover:not(:disabled){background:#ff6b7212;color:#ff979b}
+.sidebar .logout-button .nav-icon{width:18px;height:18px;flex:0 0 18px}
 .user-mini strong{color:#fff}
 .content-area{padding-bottom:calc(30px + env(safe-area-inset-bottom))}
 .footer{padding-bottom:calc(22px + env(safe-area-inset-bottom))}
@@ -120,8 +122,9 @@ button,input,textarea,select{touch-action:manipulation}
   .sidebar .user-mini strong,.sidebar .user-mini small{max-width:calc(var(--sidebar-width) - 54px);font-size:9px;white-space:normal;overflow-wrap:anywhere}
   .sidebar .user-mini small{font-size:8px}
   .sidebar .avatar{width:26px;height:26px;flex:0 0 26px}
-  .sidebar .logout-button{display:block;font-size:10px;margin:8px 0 0 32px;padding:0 6px;min-height:40px}
+  .sidebar .logout-button{display:flex;width:100%;min-height:44px;gap:8px;margin:8px 0 0;padding:9px 7px;font-size:11px}
   .sidebar .logout-button:after{content:none}
+  .sidebar .logout-button .nav-icon{width:17px;height:17px;flex-basis:17px}
   .main-area{margin-left:var(--sidebar-width);width:calc(100% - var(--sidebar-width));min-width:0;padding-bottom:env(safe-area-inset-bottom)}
   .topbar{height:auto;min-height:75px;padding:12px 12px;align-items:flex-start;gap:7px;flex-direction:column}
   .topbar h1{font-size:15px;overflow-wrap:anywhere}
@@ -717,13 +720,18 @@ button,input,textarea,select{touch-action:manipulation}
 .landing-faq-item{padding:18px;border:1px solid #ffffff18;border-radius:15px;background:#ffffff09}
 .landing-faq-item h3{margin:0 0 7px;color:#fff;font-size:14px;line-height:1.4}
 .landing-faq-item p{margin:0;color:#a9b8cc;font-size:13px;line-height:1.65}
-.landing-footer{display:flex;justify-content:space-between;gap:16px;max-width:1140px;margin:55px auto 0;padding-top:18px;border-top:1px solid #ffffff17;color:#788ba2;font-size:11px}
-.landing-footer a{color:inherit;text-decoration:underline;text-underline-offset:3px}
-.landing-footer a:hover{color:#d5e3ec}
+.landing-support-cta{max-width:1140px;margin:30px auto 0;padding:22px 24px;border:1px solid #63d7bb58;border-radius:16px;background:linear-gradient(110deg,#167c6c33,#ffffff0a 62%,#63d7bb12);box-shadow:0 14px 34px #02081232;text-align:center}
+.landing-support-cta p{margin:0;color:#dce9ed;font-size:16px;font-weight:700;line-height:1.6}
+.landing-support-cta a{display:inline-block;margin-left:6px;color:#63d7bb;font-weight:800;text-decoration:none;text-underline-offset:3px}
+.landing-support-cta a:hover{color:#8be0ca;text-decoration:underline}
+.landing-footer{display:flex;justify-content:space-between;gap:16px;max-width:1140px;margin:24px auto 0;padding-top:18px;border-top:1px solid #ffffff17;color:#788ba2;font-size:11px}
+.landing-footer .landing-footer-support{display:inline-flex;align-items:center;gap:7px;margin-top:12px;color:#63d7bb;text-decoration:none;text-underline-offset:3px;transition:color .15s}
+.landing-footer .landing-footer-support:hover{color:#8be0ca;text-decoration:underline}
+.landing-support-mail-icon{width:14px;height:14px;flex:0 0 14px}
 .landing-demo{transition:transform .22s ease,box-shadow .22s ease}
 .landing-demo:hover{transform:translateY(-2px);box-shadow:0 36px 88px #030b1777}
 @media(max-width:940px){.landing-pricing-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.landing-steps{grid-template-columns:repeat(3,minmax(0,1fr))}.landing-how,.landing-pricing,.landing-faq{margin-top:48px}}
-@media(max-width:700px){.landing-steps,.landing-faq-list{grid-template-columns:minmax(0,1fr)}.landing-step{min-height:0}.landing-trust-bar{justify-content:center;text-align:center}.landing-footer{margin-top:40px}}
+@media(max-width:700px){.landing-steps,.landing-faq-list{grid-template-columns:minmax(0,1fr)}.landing-step{min-height:0}.landing-trust-bar{justify-content:center;text-align:center}.landing-support-cta{margin-top:24px;padding:18px 16px}.landing-support-cta p,.landing-support-cta a{font-size:14px}.landing-footer{margin-top:20px}}
 @media(max-width:480px){.landing-shell{padding-inline:16px}.landing-pricing-grid{grid-template-columns:minmax(0,1fr)}.landing-price-description{min-height:0}.landing-trust-bar{gap:8px 9px;font-size:11px}.landing-guarantee-bar{gap:7px 9px;font-size:11px}.landing-footer{flex-direction:column;gap:6px}}
 @media(prefers-reduced-motion:reduce){.landing-step,.landing-price-card,.landing-demo{transition:none}.landing-step:hover,.landing-price-card:hover,.landing-demo:hover{transform:none}}
 
@@ -922,11 +930,8 @@ code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace
 @media(max-width:850px){.admin-inbox-trigger{grid-template-columns:minmax(0,1fr) minmax(0,1.2fr) auto}.admin-inbox-date{grid-column:1 / 3}.admin-inbox-status{grid-column:3;grid-row:1 / 3}}
 @media(max-width:600px){.admin-email-fields{grid-template-columns:minmax(0,1fr)}.admin-inbox-trigger{grid-template-columns:minmax(0,1fr) auto;gap:10px}.admin-inbox-subject{grid-column:1 / -1;grid-row:2}.admin-inbox-date{grid-column:1;grid-row:3}.admin-inbox-status{grid-column:2;grid-row:1 / 4;align-self:start}.admin-inbox-trigger{padding:12px}.admin-inbox-message{padding:12px}}
 
-/* Shared support-contact entry points in the workspace shell. */
-.sidebar-contact-support{display:flex;align-items:center;gap:7px;margin:12px 0 0 41px;padding:0;border:0;background:none;color:#8be0ca;text-align:left;font-size:11px;font-weight:700}
-.sidebar-contact-support:hover{color:#fff}
-.sidebar-contact-support .nav-icon{width:17px;height:17px;flex:0 0 17px}
+/* Dashboard footer and modal styling for support-contact entry points. */
 .footer{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .footer-contact-support{min-height:0;padding:0;font-size:inherit;line-height:inherit;text-decoration:underline;text-underline-offset:2px}
 .contact-support-modal h2{margin:0;color:#22344b;font:700 17px Manrope,sans-serif}
-@media(max-width:700px){.sidebar-contact-support{width:42px;height:38px;justify-content:center;margin:9px auto 0}.sidebar-contact-support span{display:none}.sidebar-contact-support .nav-icon{width:18px;height:18px;flex-basis:18px}.footer{gap:8px}.footer-contact-support{font-size:10px}}
+@media(max-width:700px){.footer{gap:8px}.footer-contact-support{font-size:10px}}

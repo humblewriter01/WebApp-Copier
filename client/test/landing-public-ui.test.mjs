@@ -77,14 +77,32 @@ test('the first screen explains the product instead of asking for a password', a
   await unmount();
 });
 
-test('the public footer uses a direct support email link rather than a public form endpoint', async () => {
+test('the public footer emphasizes the support mailto link with an envelope icon', async () => {
   const { host, unmount } = await mount();
   const footer = host.querySelector('.landing-footer');
   const contactLink = footer?.querySelector('a[href="mailto:support.signaldesk@gmail.com"]');
   assert.ok(contactLink, 'the public footer links directly to the support email');
   assert.equal(text(contactLink), 'Contact Support');
+  assert.ok(contactLink.querySelector('.landing-support-mail-icon[aria-hidden="true"]'), 'the support link has a decorative envelope icon');
   assert.equal(host.querySelector('form'), null, 'the public landing page does not expose a form');
   assert.doesNotMatch(landingSource, /ContactSupportModal|\/api\/support\/contact/, 'the public landing page does not wire into the authenticated support form');
+  assert.match(cssSource, /\.landing-footer \.landing-footer-support\{[^}]*margin-top:12px[^}]*color:#63d7bb/);
+  assert.match(cssSource, /\.landing-footer \.landing-footer-support:hover\{[^}]*text-decoration:underline/);
+  await unmount();
+});
+
+test('the FAQ support call-to-action is visible and links directly to the support email', async () => {
+  const { host, unmount } = await mount();
+  const cta = host.querySelector('.landing-support-cta');
+  const contactLink = cta?.querySelector('a[href="mailto:support.signaldesk@gmail.com"]');
+  assert.ok(cta, 'the centered support call-to-action renders below the FAQ');
+  assert.equal(text(cta), 'Still have questions? Contact our support team →');
+  assert.ok(contactLink, 'the CTA links directly to the support email');
+  assert.equal(text(contactLink), 'Contact our support team →');
+  assert.equal(cta.nextElementSibling, host.querySelector('.landing-footer'), 'the CTA sits immediately above the footer');
+  assert.match(cssSource, /\.landing-support-cta\{[^}]*text-align:center/);
+  assert.match(cssSource, /\.landing-support-cta a\{[^}]*color:#63d7bb/);
+  assert.doesNotMatch(landingSource, /ContactSupportModal|\/api\/support\/contact/, 'the public CTA does not use the authenticated form endpoint');
   await unmount();
 });
 
