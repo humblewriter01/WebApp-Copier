@@ -42,6 +42,7 @@ const { createRoot } = await import('react-dom/client');
 const act = (callback) => React.act(callback);
 const { default: AdminPanel } = await import(pathToFileURL(outfile).href);
 const REPLY_ID = '33333333-3333-4333-8333-333333333333';
+const USER_ID = '22222222-2222-4222-8222-222222222222';
 const reply = {
   id: REPLY_ID,
   userId: '22222222-2222-4222-8222-222222222222',
@@ -56,7 +57,7 @@ const reply = {
 
 const json = (data, status = 200) => ({ ok: status >= 200 && status < 300, status, async text() { return JSON.stringify(data); } });
 
-async function mountPanel() {
+async function mountPanel({ users = [] } = {}) {
   const calls = [];
   globalThis.fetch = async (url, options = {}) => {
     const pathname = String(url).replace(/^https?:\/\/[^/]+/, '').split('?')[0];
@@ -64,13 +65,14 @@ async function mountPanel() {
     const body = options.body ? JSON.parse(options.body) : null;
     calls.push({ path: pathname, method, body });
     if (pathname === '/api/admin/overview') return json({ stats: {} });
-    if (pathname === '/api/admin/users') return json({ users: [], total: 0 });
+    if (pathname === '/api/admin/users') return json({ users, total: users.length });
     if (pathname === '/api/admin/promo-codes') return json({ promoCodes: [] });
     if (pathname === '/api/admin/billing') return json({ summary: { currency: 'NGN' }, transactions: [] });
     if (pathname === '/api/admin/pricing') return json({ currency: 'NGN', plans: [] });
     if (pathname === '/api/admin/announcements') return json({ announcements: [] });
     if (pathname === '/api/admin/broadcast/recipients') return json({ targetAudience: 'all', recipientCount: 2 });
     if (pathname === '/api/admin/broadcast' && method === 'POST') return json({ targetAudience: 'all', recipientCount: 2, sentRecipients: 2, failedRecipients: 0, batchCount: 1 });
+    if (pathname === '/api/admin/email/user' && method === 'POST') return json({ sent: true, recipientEmail: body?.to || 'ada@example.com' });
     if (pathname === '/api/admin/replies' && method === 'GET') return json({ replies: [{ ...reply }] });
     if (pathname === `/api/admin/replies/${REPLY_ID}/read` && method === 'PATCH') return json({ reply: { id: REPLY_ID, read: true } });
     return json({});
@@ -162,6 +164,74 @@ test('Inbox renders replies and expanding an unread message displays its body an
     assert.match(section.textContent, /Read/);
     assert.ok(panel.calls.some((call) => call.path === `/api/admin/replies/${REPLY_ID}/read` && call.method === 'PATCH'), 'opening the reply marks it read through the admin endpoint');
     assert.match(section.querySelector('.admin-inbox-message pre').textContent, /I have a question\./);
+  } finally {
+    await panel.unmount();
+  }
+});
+
+test('a user-row Send Email button opens the recipient-specific modal and sends to that user ID', async () => {
+  const user = {
+    id: USER_ID,
+    name: 'Ada Trader',
+    email: 'ada@example.com',
+    role: 'user',
+    subscriptionPlan: 'free',
+    subscriptionStatus: 'active',
+    isSuspended: false,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    lastLogin: '2026-11-13T10:00:00.000Z',
+    signalCount: 0,
+    telegramConnected: false,
+    telegramPaused: false,
+    monitorCount: 0,
+  };
+  const panel = await mountPanel({ users: [user] });
+  try {
+    await click(byText('.admin-row-actions button', 'Send Email'));
+    const dialog = document.querySelector('[role="dialog"]');
+    assert.ok(dialog, 'the individual email dialog is open');
+    assert.match(dialog.textContent, /Send email to Ada Trader/);
+    assert.match(dialog.textContent, /ada@example\.com/);
+    assert.ok(document.querySelector('#admin-email-subject'), 'the subject field is present');
+    assert.ok(document.querySelector('#admin-email-body'), 'the body field is present');
+    assert.equal(document.querySelector('#admin-email-to'), null, 'the user-specific recipient is not editable');
+
+    await typeInto(document.querySelector('#admin-email-subject'), 'Account update');
+    await typeInto(document.querySelector('#admin-email-body'), 'Hello Ada');
+    await click(byText('button', 'Send'));
+    await settle();
+
+    const send = panel.calls.find((call) => call.path === '/api/admin/email/user' && call.method === 'POST');
+    assert.deepEqual(send?.body, { userId: USER_ID, subject: 'Account update', body: 'Hello Ada' });
+    assert.match(document.querySelector('#admin-section-overview').textContent, /Email sent to ada@example\.com/);
+  } finally {
+    await panel.unmount();
+  }
+});
+
+test('Inbox Compose opens the same email form with an editable To field and sends to any address', async () => {
+  const panel = await mountPanel();
+  try {
+    await click(byText('[role="tab"]', 'Inbox'));
+    await settle();
+    const section = document.querySelector('#admin-section-inbox');
+    await click(byText('button', 'Compose'));
+
+    const dialog = document.querySelector('[role="dialog"]');
+    assert.ok(dialog, 'Compose opens the shared email dialog');
+    assert.equal(dialog.querySelector('#admin-email-to')?.type, 'email', 'Inbox compose has an editable email To field');
+    assert.ok(dialog.querySelector('#admin-email-subject'), 'the shared subject field is present');
+    assert.ok(dialog.querySelector('#admin-email-body'), 'the shared body field is present');
+
+    await typeInto(document.querySelector('#admin-email-to'), 'someone@example.com');
+    await typeInto(document.querySelector('#admin-email-subject'), 'A direct note');
+    await typeInto(document.querySelector('#admin-email-body'), 'Hello there');
+    await click(byText('button', 'Send'));
+    await settle();
+
+    const send = panel.calls.find((call) => call.path === '/api/admin/email/user' && call.method === 'POST');
+    assert.deepEqual(send?.body, { to: 'someone@example.com', subject: 'A direct note', body: 'Hello there' });
+    assert.match(section.textContent, /Email sent to someone@example\.com/);
   } finally {
     await panel.unmount();
   }

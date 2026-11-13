@@ -131,15 +131,16 @@ test('the capture card kept its numbers and lost the paragraph about the host', 
   assert.match(panel, /Sessions held/);
 });
 
-test('Suspend, Impersonate and Adjust plan open as dialogs, not as rows of the table', () => {
-  assert.equal((panel.match(/<AdminActionModal/g) || []).length, 3, 'three tools, three modals');
-  assert.equal((panel.match(/<\/AdminActionModal>/g) || []).length, 3);
+test('user actions and the shared email composer open as dialogs, not as rows of the table', () => {
+  assert.equal((panel.match(/<AdminActionModal/g) || []).length, 4, 'three user tools plus the email composer use the shared dialog');
+  assert.equal((panel.match(/<\/AdminActionModal>/g) || []).length, 4);
   for (const open of [
     'open={Boolean(suspension.userId)}',
     'open={Boolean(supportFor.userId)}',
     'open={Boolean(adjustFor)}',
+    'open={Boolean(emailComposer)}',
   ]) {
-    assert.ok(panel.includes(open), `${open} ties a dialog to the state its row button sets`);
+    assert.ok(panel.includes(open), `${open} ties a dialog to the state its button sets`);
   }
   // The geometry that made them unusable: a form inside a table cell, and a strip under the table that
   // scrolled away before the button could be reached.

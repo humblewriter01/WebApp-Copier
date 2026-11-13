@@ -40,6 +40,33 @@ function normalizeBroadcastDraft(input = {}) {
   return { targetAudience, subject, body };
 }
 
+function normalizeIndividualEmailDraft(input = {}) {
+  const userId = String(input.userId ?? '').trim();
+  const to = String(input.to ?? '').trim().toLowerCase();
+  if (userId && to) {
+    throw emailError(400, 'Choose a user account or enter a direct email address, not both.', 'INVALID_EMAIL_RECIPIENT');
+  }
+  if (!userId && !to) throw emailError(400, 'Choose a user account or enter an email address.', 'INVALID_EMAIL_RECIPIENT');
+  if (userId && !UUID_PATTERN.test(userId)) {
+    throw emailError(400, 'Choose a valid user account.', 'INVALID_EMAIL_RECIPIENT');
+  }
+  if (to && (to.length > 254 || !EMAIL_PATTERN.test(to))) {
+    throw emailError(400, 'Enter a valid recipient email address.', 'INVALID_EMAIL_RECIPIENT');
+  }
+
+  const subject = String(input.subject ?? '').trim();
+  const body = String(input.body ?? '').trim();
+  if (!subject) throw emailError(400, 'Enter a subject for the email.', 'INVALID_EMAIL_SUBJECT');
+  if (subject.length > MAX_SUBJECT_LENGTH) {
+    throw emailError(400, `Keep the subject to ${MAX_SUBJECT_LENGTH} characters or fewer.`, 'INVALID_EMAIL_SUBJECT');
+  }
+  if (!body) throw emailError(400, 'Write a message before sending the email.', 'INVALID_EMAIL_BODY');
+  if (body.length > MAX_BODY_LENGTH) {
+    throw emailError(400, `Keep the message to ${MAX_BODY_LENGTH} characters or fewer.`, 'INVALID_EMAIL_BODY');
+  }
+  return { userId: userId || null, to: to || null, subject, body };
+}
+
 function audienceFilter(targetAudience) {
   if (targetAudience === 'all') return { sql: '', params: [] };
   return {
@@ -294,6 +321,91 @@ export function createEmailSystem(/** @type {EmailSystemDependencies} */ {
     };
   }
 
+  async function sendUserEmail(input = {}) {
+    const draft = normalizeIndividualEmailDraft(input);
+    let recipient;
+    if (draft.userId) {
+      const { rows } = await pool.query(
+        'SELECT id, name, email FROM users WHERE id=$1 LIMIT 1',
+        [draft.userId],
+      );
+      recipient = rows[0];
+      if (!recipient) throw emailError(404, 'That user account could not be found.', 'EMAIL_USER_NOT_FOUND');
+      const email = String(recipient.email ?? '').trim().toLowerCase();
+      if (email.length > 254 || !EMAIL_PATTERN.test(email)) {
+        throw emailError(422, 'That user account does not have a valid email address.', 'EMAIL_USER_ADDRESS_INVALID');
+      }
+      recipient = { ...recipient, email };
+    } else {
+      recipient = { email: draft.to };
+    }
+
+    const apiKey = String(env.BREVO_API_KEY || '').trim();
+    const senderEmail = String(env.BREVO_SENDER_EMAIL || '').trim().toLowerCase();
+    const replyToEmail = String(env.RESEND_REPLY_TO || '').trim().toLowerCase();
+    if (!apiKey) throw emailError(503, 'Brevo is not configured for individual email.', 'BREVO_NOT_CONFIGURED');
+    if (!EMAIL_PATTERN.test(senderEmail)) {
+      throw emailError(503, 'Set a valid BREVO_SENDER_EMAIL address before sending individual email.', 'BREVO_SENDER_NOT_CONFIGURED');
+    }
+    if (!EMAIL_PATTERN.test(replyToEmail)) {
+      throw emailError(503, 'Set a valid RESEND_REPLY_TO address before sending individual email.', 'RESEND_REPLY_TO_NOT_CONFIGURED');
+    }
+
+    const payload = {
+      sender: {
+        email: senderEmail,
+        name: String(env.BREVO_SENDER_NAME || 'Signal Desk').trim() || 'Signal Desk',
+      },
+      to: [{
+        email: recipient.email,
+        ...(recipient.name ? { name: String(recipient.name).trim() } : {}),
+      }],
+      replyTo: { email: replyToEmail },
+      subject: draft.subject,
+      htmlContent: plainTextToHtml(draft.body),
+      textContent: draft.body,
+    };
+
+    let response;
+    try {
+      response = await fetchImpl(BREVO_API_URL, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json', 'api-key': apiKey },
+        body: JSON.stringify(payload),
+        ...(typeof AbortSignal?.timeout === 'function' ? { signal: AbortSignal.timeout(20_000) } : {}),
+      });
+    } catch (error) {
+      logger?.error?.('Brevo individual email request failed', { code: error?.code || error?.name || 'BREVO_REQUEST_FAILED' });
+      throw emailError(502, 'Brevo could not be reached. Try again in a moment.', 'BREVO_REQUEST_FAILED');
+    }
+    if (!response?.ok) {
+      logger?.error?.('Brevo rejected an individual email', { status: Number(response?.status) || 0 });
+      throw emailError(502, 'Brevo could not accept the email. Check the provider settings and try again.', 'BREVO_EMAIL_REJECTED');
+    }
+
+    if (audit?.record) {
+      try {
+        await audit.record({
+          actorId: input.actorId,
+          actorEmail: input.actorEmail,
+          action: 'email.user',
+          targetType: draft.userId ? 'user' : 'email',
+          targetId: draft.userId || recipient.email,
+          summary: `Admin sent an individual email to ${recipient.email}.`,
+          metadata: {
+            recipientEmail: recipient.email,
+            recipientKind: draft.userId ? 'user' : 'direct',
+            subject: draft.subject,
+          },
+        });
+      } catch (error) {
+        logger?.error?.('Individual email audit entry could not be written', { code: error?.code || 'AUDIT_WRITE_FAILED' });
+      }
+    }
+
+    return { sent: true, recipientEmail: recipient.email };
+  }
+
   async function fetchResendEmail(emailId, apiKey) {
     const response = await fetchImpl(`${RESEND_API_URL}/${encodeURIComponent(emailId)}`, {
       method: 'GET',
@@ -417,6 +529,7 @@ export function createEmailSystem(/** @type {EmailSystemDependencies} */ {
   return {
     countBroadcastRecipients,
     sendBroadcast,
+    sendUserEmail,
     handleResendWebhook,
     listReplies,
     markReplyRead,

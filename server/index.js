@@ -2245,6 +2245,15 @@ app.post('/api/admin/broadcast', authenticate, requireAdmin, asyncRoute(async (r
   res.status(result.failedRecipients ? 207 : 200).json(result);
 }));
 
+app.post('/api/admin/email/user', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const result = await emailSystem.sendUserEmail({
+    ...(req.body || {}),
+    actorId: req.userId,
+    actorEmail: req.userEmail,
+  });
+  res.json(result);
+}));
+
 app.get('/api/admin/replies', authenticate, requireAdmin, asyncRoute(async (_req, res) => {
   const replies = await emailSystem.listReplies();
   res.set('Cache-Control', 'no-store').json({ replies });

@@ -185,6 +185,11 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const [replyError, setReplyError] = useState('');
   const [openReplyId, setOpenReplyId] = useState('');
   const [readingReplyId, setReadingReplyId] = useState('');
+  const [emailComposer, setEmailComposer] = useState(null);
+  const [emailDraft, setEmailDraft] = useState({ to: '', subject: '', body: '' });
+  const [emailSending, setEmailSending] = useState(false);
+  const [emailSendError, setEmailSendError] = useState('');
+  const [emailFeedback, setEmailFeedback] = useState(null);
   /* Data management: captured signals across every workspace, and the three ways they can be removed.
      The list is read with the same filters it is deleted with, so an administrator is always confirming
      the count they can see rather than a number that was estimated somewhere else. */
@@ -1032,6 +1037,49 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     }
   };
 
+  const openUserEmailComposer = (user) => {
+    setEmailComposer({ source: 'user', userId: user.id, recipient: user.email || '', name: user.name || '' });
+    setEmailDraft({ to: '', subject: '', body: '' });
+    setEmailSendError('');
+    setEmailFeedback(null);
+  };
+
+  const openInboxEmailComposer = () => {
+    setEmailComposer({ source: 'inbox', userId: '', recipient: '', name: '' });
+    setEmailDraft({ to: '', subject: '', body: '' });
+    setEmailSendError('');
+    setEmailFeedback(null);
+  };
+
+  const closeEmailComposer = () => {
+    if (emailSending) return;
+    setEmailComposer(null);
+    setEmailSendError('');
+  };
+
+  const sendUserEmail = async () => {
+    if (!emailComposer || emailSending) return;
+    setEmailSending(true);
+    setEmailSendError('');
+    try {
+      const body = {
+        ...(emailComposer.userId ? { userId: emailComposer.userId } : { to: emailDraft.to.trim() }),
+        subject: emailDraft.subject.trim(),
+        body: emailDraft.body.trim(),
+      };
+      const result = await request('/api/admin/email/user', token, { method: 'POST', body });
+      const recipient = result?.recipientEmail || emailComposer.recipient || emailDraft.to.trim();
+      const message = `Email sent to ${recipient}.`;
+      setEmailFeedback({ source: emailComposer.source, userId: emailComposer.userId, message });
+      setEmailComposer(null);
+      setEmailDraft({ to: '', subject: '', body: '' });
+    } catch (sendError) {
+      setEmailSendError(sendError.message || 'The email could not be sent.');
+    } finally {
+      setEmailSending(false);
+    }
+  };
+
   const toggleReply = async (reply) => {
     if (openReplyId === reply.id) {
       setOpenReplyId('');
@@ -1061,7 +1109,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
   const unreadReplyCount = emailReplies.filter((reply) => reply.read !== true).length;
   // Never inferred from the button that was pressed, and never "Live" while the read is missing.
   const killSwitch = killSwitchView(health);
-  const hasOpenActionModal = Boolean(suspension.userId || supportFor.userId || adjustFor);
+  const hasOpenActionModal = Boolean(suspension.userId || supportFor.userId || adjustFor || emailComposer);
 
   return <>
     <div className="admin-tabs" role="tablist" aria-label="Admin sections">
@@ -1162,6 +1210,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
                           ? <button type="button" className="button button-secondary button-small" disabled={busy} onClick={() => liftSuspension(user)}>{busy ? 'Saving…' : 'Restore access'}</button>
                           : <button type="button" className="button button-danger button-small" disabled={busy} onClick={() => startSuspension(user)}>Suspend</button>}
                         <button type="button" className="button button-secondary button-small" disabled={busy || isSelf} onClick={() => (supporting ? closeSupportAccessForm() : openSupportAccess(user))}>Impersonate</button>
+                        <button type="button" className="button button-secondary button-small" disabled={busy || !user.email} onClick={() => openUserEmailComposer(user)}>Send Email</button>
                         <button type="button" className="button button-secondary button-small" disabled={busy} onClick={() => (adjusting ? cancelAdjustment() : openAdjustment(user))}>Adjust plan</button>
                         {/* One Telegram control per state, never two that contradict each other. While a session
                             is paused the only honest button is the one that un-pauses it - a "Reconnect" sitting
@@ -1175,6 +1224,9 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
                       </div>
                       {isFeedbackRow && error ? <div className="alert alert-error admin-row-feedback" role="alert">{error}</div> : null}
                       {isFeedbackRow && notice ? <div className="alert alert-success admin-row-feedback" role="status" aria-live="polite">{notice}</div> : null}
+                      {emailFeedback?.source === 'user' && emailFeedback.userId === user.id
+                        ? <div className="alert alert-success admin-row-feedback" role="status" aria-live="polite">{emailFeedback.message}</div>
+                        : null}
                     </td>
                   </tr>;
                 })}
@@ -1676,9 +1728,15 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
       <section className="panel admin-panel admin-inbox-panel">
         <div className="panel-heading">
           <div><p className="eyebrow">RESEND REPLIES</p><h2>Inbox</h2></div>
-          <span className="count-badge">{unreadReplyCount} unread</span>
+          <div className="panel-heading-actions">
+            <span className="count-badge">{unreadReplyCount} unread</span>
+            <button type="button" className="button button-primary button-small" onClick={openInboxEmailComposer}>Compose</button>
+          </div>
         </div>
         <p className="muted">Replies received at your Resend address. Open a message to read it; unread messages are marked automatically.</p>
+        {emailFeedback?.source === 'inbox' && section === 'inbox'
+          ? <div className="alert alert-success" role="status" aria-live="polite">{emailFeedback.message}</div>
+          : null}
         {replyError ? <div className="alert alert-error" role="alert">{replyError}</div> : null}
         {repliesLoading ? <div className="loading-shell inline-loading"><div className="spinner" /><span>Loading replies…</span></div> : !emailReplies.length
           ? <div className="empty-state"><strong>Your inbox is clear</strong><span>Replies to your broadcasts will appear here.</span></div>
@@ -1913,6 +1971,53 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
       </div>
       <label>Reason (written to the audit log)
         <input value={adjustFor?.reason || ''} onChange={(event) => setAdjustFor({ ...adjustFor, reason: event.target.value })} maxLength={200} required placeholder="For example: goodwill after the MetaAPI outage on 2 March" />
+      </label>
+    </AdminActionModal>
+
+    <AdminActionModal
+      open={Boolean(emailComposer)}
+      title={emailComposer?.userId ? `Send email to ${emailComposer.name || emailComposer.recipient}` : 'Compose email'}
+      intro={emailComposer?.userId
+        ? `This email will be sent to ${emailComposer.recipient}.`
+        : 'Enter the recipient email address, then write your subject and message.'}
+      confirmLabel="Send"
+      busy={emailSending}
+      error={emailSendError}
+      onCancel={closeEmailComposer}
+      onSubmit={() => { void sendUserEmail(); }}
+    >
+      {!emailComposer?.userId ? <label htmlFor="admin-email-to">To
+        <input
+          id="admin-email-to"
+          type="email"
+          value={emailDraft.to}
+          onChange={(event) => setEmailDraft({ ...emailDraft, to: event.target.value })}
+          maxLength={254}
+          required
+          placeholder="name@example.com"
+        />
+      </label> : null}
+      <label htmlFor="admin-email-subject">Subject
+        <input
+          id="admin-email-subject"
+          type="text"
+          value={emailDraft.subject}
+          onChange={(event) => setEmailDraft({ ...emailDraft, subject: event.target.value })}
+          maxLength={200}
+          required
+          placeholder="A subject your recipient will recognise"
+        />
+      </label>
+      <label htmlFor="admin-email-body">Body
+        <textarea
+          id="admin-email-body"
+          value={emailDraft.body}
+          onChange={(event) => setEmailDraft({ ...emailDraft, body: event.target.value })}
+          maxLength={100000}
+          rows={10}
+          required
+          placeholder="Write your message. Line breaks are preserved in the delivered email."
+        />
       </label>
     </AdminActionModal>
 

@@ -43,6 +43,9 @@ function recordingPool({ users = [], matchedUser = { id: USER_ID }, insertRows =
           && (!audience || String(user.subscription_plan || 'free').toLowerCase() === audience)).length;
         return { rows: [{ count }] };
       }
+      if (sql.includes('SELECT id, name, email FROM users WHERE id=$1 LIMIT 1')) {
+        return { rows: users.filter((user) => user.id === params[0]).map(({ id, name, email }) => ({ id, name, email })) };
+      }
       if (sql.includes('SELECT id, name, email') && sql.includes('FROM users')) {
         const audience = params[0];
         const eligible = users.filter((user) => user.marketing_opt_out !== true
@@ -147,6 +150,85 @@ test('broadcast audience preview uses the same opt-out and plan filters as sendi
   await assert.rejects(() => system.countBroadcastRecipients('enterprise'), /Choose an audience/);
 });
 
+test('single-user Brevo email resolves the user from Supabase Postgres, sets replyTo, and records an audit row', async () => {
+  const user = { id: USER_ID, name: 'Ada Trader', email: 'ADA@example.com' };
+  const pool = recordingPool({ users: [user] });
+  const providerCalls = [];
+  const auditRows = [];
+  const system = createEmailSystem({
+    pool,
+    env: broadcastEnv,
+    logger: { error() {}, warn() {} },
+    audit: { async record(row) { auditRows.push(row); } },
+    fetchImpl: async (url, options) => {
+      providerCalls.push({ url, options, payload: JSON.parse(options.body) });
+      return responseJson({ messageId: 'brevo-message-1' }, { status: 201 });
+    },
+  });
+
+  const result = await system.sendUserEmail({
+    userId: USER_ID,
+    subject: '  Account update  ',
+    body: 'Hello Ada\nYour account is ready.',
+    actorId: ADMIN_ID,
+    actorEmail: 'admin@example.com',
+  });
+
+  assert.equal(pool.calls.length, 1);
+  assert.match(pool.calls[0].sql, /SELECT id, name, email FROM users WHERE id=\$1 LIMIT 1/);
+  assert.deepEqual(pool.calls[0].params, [USER_ID]);
+  assert.equal(providerCalls.length, 1, 'an individual email creates one provider request');
+  assert.equal(providerCalls[0].url, 'https://api.brevo.com/v3/smtp/email');
+  assert.equal(providerCalls[0].options.headers['api-key'], 'brevo-test-key');
+  assert.deepEqual(providerCalls[0].payload.to, [{ email: 'ada@example.com', name: 'Ada Trader' }]);
+  assert.deepEqual(providerCalls[0].payload.replyTo, { email: 'replies@example.com' });
+  assert.equal(providerCalls[0].payload.sender.email, 'broadcast@example.com');
+  assert.equal(providerCalls[0].payload.subject, 'Account update');
+  assert.equal(providerCalls[0].payload.textContent, 'Hello Ada\nYour account is ready.');
+  assert.match(providerCalls[0].payload.htmlContent, /Hello Ada<br \/>/);
+  assert.deepEqual(result, { sent: true, recipientEmail: 'ada@example.com' });
+  assert.deepEqual(auditRows, [{
+    actorId: ADMIN_ID,
+    actorEmail: 'admin@example.com',
+    action: 'email.user',
+    targetType: 'user',
+    targetId: USER_ID,
+    summary: 'Admin sent an individual email to ada@example.com.',
+    metadata: { recipientEmail: 'ada@example.com', recipientKind: 'user', subject: 'Account update' },
+  }]);
+});
+
+test('Inbox compose can send a validated direct address and a missing user is never sent to', async () => {
+  const pool = recordingPool();
+  const providerCalls = [];
+  const auditRows = [];
+  const system = createEmailSystem({
+    pool,
+    env: broadcastEnv,
+    logger: { error() {}, warn() {} },
+    audit: { async record(row) { auditRows.push(row); } },
+    fetchImpl: async (_url, options) => {
+      providerCalls.push(JSON.parse(options.body));
+      return responseJson({}, { status: 201 });
+    },
+  });
+
+  const result = await system.sendUserEmail({ to: ' Someone@Example.com ', subject: 'A direct note', body: 'Hello there' });
+  assert.deepEqual(result, { sent: true, recipientEmail: 'someone@example.com' });
+  assert.equal(pool.calls.length, 0, 'the user supplied a direct address rather than a database account');
+  assert.deepEqual(providerCalls[0].to, [{ email: 'someone@example.com' }]);
+  assert.deepEqual(providerCalls[0].replyTo, { email: 'replies@example.com' });
+  assert.equal(auditRows[0].targetType, 'email');
+  assert.equal(auditRows[0].targetId, 'someone@example.com');
+  assert.equal(auditRows[0].action, 'email.user');
+
+  await assert.rejects(
+    () => system.sendUserEmail({ userId: USER_ID, subject: 'Missing', body: 'Do not send' }),
+    (error) => error.status === 404 && /could not be found/.test(error.message),
+  );
+  assert.equal(providerCalls.length, 1, 'a user ID that is not in Supabase is not sent to');
+});
+
 test('the Resend webhook verifies Svix against raw bytes before saving sender, bodies, and In-Reply-To', async () => {
   const pool = recordingPool();
   const event = {
@@ -244,12 +326,14 @@ test('the admin email routes are mounted behind administrator authentication', (
   const index = readFileSync(path.join(SERVER, 'index.js'), 'utf8');
   for (const route of [
     "app.post('/api/admin/broadcast', authenticate, requireAdmin",
+    "app.post('/api/admin/email/user', authenticate, requireAdmin",
     "app.get('/api/admin/replies', authenticate, requireAdmin",
     "app.patch('/api/admin/replies/:id/read', authenticate, requireAdmin",
   ]) {
     assert.ok(index.includes(route), `${route} is admin-only`);
   }
   assert.match(index, /emailSystem\.sendBroadcast\(\{/);
+  assert.match(index, /emailSystem\.sendUserEmail\(\{/);
   assert.match(index, /emailSystem\.listReplies\(\)/);
   assert.match(index, /emailSystem\.markReplyRead\(req\.params\.id\)/);
 });
