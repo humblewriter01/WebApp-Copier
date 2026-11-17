@@ -862,7 +862,6 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
           plans,
           billing: {
             recurringEnabled: pricing?.billing?.recurringEnabled !== false,
-            updateExistingSubscriptions: pricing?.billing?.updateExistingSubscriptions !== false,
           },
           note: priceNote.trim() || undefined,
         },
@@ -935,9 +934,9 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
     try {
       const data = await request('/api/admin/pricing', token, { method: 'PUT', body: { billing: { [key]: value } } });
       setPricing(data.pricing);
-      setNotice(key === 'recurringEnabled'
-        ? (value ? 'Recurring billing is on: users who pay through a synced Flutterwave payment plan are billed again each period.' : 'Recurring billing is off: every checkout is a one-time payment for one period.')
-        : (value ? 'Price changes are applied to the existing payment plan, so subscribers pay the new amount next cycle.' : 'Price changes create a new payment plan for new customers; existing subscribers keep the amount they agreed to.'));
+      setNotice(value
+        ? 'Recurring billing is on: users who pay through a synced Flutterwave payment plan are billed again each period.'
+        : 'Recurring billing is off: every checkout is a one-time payment for one period.');
       const syncs = data.syncs || [];
       if (syncs.length) reportSyncs(data);
     } catch (toggleError) {
@@ -1359,11 +1358,7 @@ export default function AdminPanel({ token, currentUser, onImpersonate }) {
               <span>Automatic renewal through Flutterwave payment plans</span>
             </label>
             <small className="muted">Turn this off to make every checkout a single payment for one period. A synced payment plan is only used when the price matches Flutterwave exactly in that currency, and discounted checkouts are always one-time.</small>
-            <label className="checkbox-row">
-              <input type="checkbox" checked={pricing?.billing?.updateExistingSubscriptions !== false} onChange={(event) => toggleBillingSwitch('updateExistingSubscriptions', event.target.checked)} />
-              <span>Re-price existing subscribers with a new plan</span>
-            </label>
-            <small className="muted">When off, a price change applies to new subscribers only and existing customers keep paying the price they signed up at.</small>
+            <small className="muted">Flutterwave payment-plan amounts cannot be changed in place. Each price change creates a replacement plan for future checkouts; current subscribers remain on the plan and price they originally accepted.</small>
             <label>Change note (optional, stored in the price history)
               <input value={priceNote} onChange={(event) => setPriceNote(event.target.value)} maxLength={200} placeholder="For example: launch pricing for October" />
             </label>

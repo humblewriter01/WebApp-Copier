@@ -2,22 +2,22 @@
  * Keeps the Flutterwave payment plan for each Signal Desk plan at exactly the stored price, per currency.
  *
  * Flutterwave raises a subscription's recurring charge from the plan, not from the amount a checkout passes, so
- * a price saved in the admin panel is only real once `POST /v3/payment-plans` or `PUT /v3/payment-plans/:id`
- * has applied it. A Flutterwave plan holds one amount in one currency, which is why this runs per
- * (plan, currency) pair and why a workspace that sells in NGN and USD keeps two mirrored plans per tier.
+ * a price saved in the admin panel is only real once `POST /v3/payment-plans` has applied it. Flutterwave does
+ * not allow a payment plan's amount to be changed: whenever a stored plan no longer matches, this synchroniser
+ * creates a replacement instead of sending a `PUT`. A Flutterwave plan holds one amount in one currency, which
+ * is why this runs per (plan, currency) pair and why a workspace that sells in NGN and USD keeps two mirrored
+ * plans per tier.
  *
  * Four rules make this safe:
  *
- * 1. The provider state is always read back with `GET /v3/payment-plans/:id` after a write. If the amount
- *    Flutterwave reports is not the amount we asked for, the sync is marked failed.
+ * 1. The newly-created provider state is checked against the amount, currency, and interval we asked for. If
+ *    Flutterwave reports something else, the sync is marked failed.
  * 2. A failed or unverified sync makes checkout fall back to a one-time charge, so a provider outage can never
  *    raise the wrong recurring amount - and never stops the workspace charging the price just saved.
  * 3. A price is only ever pushed in a currency the plan has a stored price for. "USD is not priced yet" is a
  *    skipped sync with a reason, not a plan created for 0.
- * 4. Paystack had an `update_existing_subscriptions` flag; Flutterwave does not. The same choice is made
- *    structurally instead: when an administrator has asked not to re-price people who already pay, the sync
- *    creates a new plan for the customers who arrive from now on and leaves the existing subscribers on the
- *    plan id they were charged from.
+ * 4. Replacing a plan persists the replacement id before it is considered usable. Future checkouts read that
+ *    id from `plan_provider_sync`, while existing Flutterwave subscriptions remain attached to their old plan.
  */
 
 import { providerPlanName } from './pricing.js';
@@ -69,7 +69,7 @@ export function createPlanSynchronizer(/** @type {PlanSynchronizerDeps} */ { flu
   }
 
   /**
-   * Creates or updates the Flutterwave payment plan for one Signal Desk plan in one currency, and verifies the
+   * Creates or replaces the Flutterwave payment plan for one Signal Desk plan in one currency, and verifies the
    * result. Never throws: the returned object always describes what an administrator should do next.
  *
  * @typedef {Object} SyncPlanInput
@@ -106,7 +106,6 @@ async function syncPlan(/** @type {SyncPlanInput} */ { planKey, currency = null,
     }
 
     const existingId = plan.provider?.[code]?.planId ?? null;
-    const keepExistingSubscribers = plan.updateExistingSubscriptions === false;
     try {
       let provider = null;
       if (existingId) {
@@ -119,7 +118,7 @@ async function syncPlan(/** @type {SyncPlanInput} */ { planKey, currency = null,
         }
       }
 
-      if (!keepExistingSubscribers && provider && providerMatches(provider, desired)) {
+      if (provider && providerMatches(provider, desired)) {
         const sync = {
           status: 'in_sync',
           planId: provider.planId ?? existingId,
@@ -133,23 +132,18 @@ async function syncPlan(/** @type {SyncPlanInput} */ { planKey, currency = null,
         return withPlan(plan, code, { ...sync, usable: true });
       }
 
-      let message;
-      let created = null;
-      let updated = null;
-      if (provider && !keepExistingSubscribers) {
-        updated = await flutterwave.updatePlan(existingId, desired);
-        message = updated?.message || 'Flutterwave plan updated.';
-      } else {
-        /* Either there is no plan yet, or the administrator asked that existing subscribers not be re-priced -
-           and a new id is how that is expressed against a provider with no per-subscription flag. */
-        created = await flutterwave.createPlan(desired);
-        message = provider && keepExistingSubscribers
-          ? `Flutterwave plan created (${created.planId}) for new customers. Subscribers who joined under ${existingId} keep the amount they agreed to.`
-          : `Flutterwave plan created (${created.planId}).`;
-      }
+      /* Flutterwave rejects amount updates on existing payment plans. A mismatch therefore always gets a new
+         provider plan, even when a record already points at an older plan. Persisting this id below changes
+         the plan bound to all future checkouts; Flutterwave leaves customers already subscribed to the old id
+         on the price they accepted. */
+      const created = await flutterwave.createPlan(desired);
+      const replacing = Boolean(provider && existingId);
+      const message = replacing
+        ? `Flutterwave plan created (${created.planId}) for future subscriptions. Existing subscribers on ${existingId} remain on their original plan.`
+        : `Flutterwave plan created (${created.planId}).`;
 
-      const targetId = created?.planId ?? updated?.plan?.planId ?? provider?.planId ?? existingId;
-      let verified = created ? { ...created } : updated?.plan || provider;
+      const targetId = created?.planId ?? null;
+      let verified = { ...created };
       if (!providerMatches(verified, desired)) {
         try {
           verified = (await flutterwave.fetchPlan(targetId)) || verified;
@@ -209,7 +203,7 @@ async function syncPlan(/** @type {SyncPlanInput} */ { planKey, currency = null,
         currency: desired.currency,
         interval: desired.interval,
         name: desired.name,
-        message: error.userMessage || 'Flutterwave could not update the plan price. The price is saved here, and checkouts stay one-time until the plan syncs.',
+        message: error.userMessage || 'Flutterwave could not create the replacement plan. The price is saved here, and checkouts stay one-time until the plan syncs.',
         error: error.code || 'PLAN_SYNC_FAILED',
       };
       await persist(plan.key, code, sync, actorId);
