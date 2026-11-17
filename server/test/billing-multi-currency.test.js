@@ -198,6 +198,24 @@ test('a payment plan is attached per currency, only where the mirror is confirme
   assert.equal(stale.checkout.renewsAutomatically, false);
 });
 
+test('a checkout automatically binds the replacement plan id stored after a price change', async () => {
+  // This is the snapshot read after plan-sync has written its replacement id to plan_provider_sync.
+  const snapshot = mergePlanPricing({
+    config,
+    planRows: { pro: { NGN: 12_000_000, USD: 6_900, interval: 'monthly', history: [], updatedAt: null, updatedBy: null } },
+    providerPlans: {
+      pro: {
+        NGN: { planId: 501, syncStatus: 'synced', syncedAmountMinor: 12_000_000, currency: 'NGN', interval: 'monthly' },
+      },
+    },
+  });
+
+  const futureCheckout = await checkoutFor({ planKey: 'pro', currency: 'NGN', snapshot });
+  assert.equal(futureCheckout.provider.last().body.amount, '120000');
+  assert.equal(futureCheckout.provider.last().body.payment_plan, 501, 'the replacement id, not the superseded plan id, is sent to Flutterwave');
+  assert.equal(futureCheckout.checkout.renewsAutomatically, true);
+});
+
 /* ----------------------------------------------- which country, and which payment methods the page offers ------------------------------------------------ */
 
 test('a dollar checkout names the country and the one method that can settle it', async () => {

@@ -14,7 +14,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { billingConfig, planPriceMinor } from '../services/billing.js';
-import { mergePlanPricing } from '../services/pricing.js';
+import { mergePlanPricing, planChargeDecision } from '../services/pricing.js';
 import { createPlanSynchronizer } from '../services/plan-sync.js';
 
 const config = billingConfig({ FLW_SECRET_KEY: 'sk_test' });
@@ -40,7 +40,7 @@ function fakePricing(plan, saves = []) {
 }
 
 /** The provider double: every call is recorded, and each answer is scripted per method. */
-function fakeFlutterwave({ plan, creates, updates, throwsError = null, configured = true } = {}) {
+function fakeFlutterwave({ plan, creates, throwsError = null, configured = true } = {}) {
   const calls = [];
   return {
     calls,
@@ -54,11 +54,6 @@ function fakeFlutterwave({ plan, creates, updates, throwsError = null, configure
       calls.push(['createPlan', desired]);
       if (throwsError === 'create') throw throwsErrorWith();
       return typeof creates === 'function' ? creates(desired) : { planId: 100, ...creates, ...desired };
-    },
-    updatePlan: async (id, desired) => {
-      calls.push(['updatePlan', id, desired]);
-      if (throwsError === 'update') throw throwsErrorWith();
-      return typeof updates === 'function' ? updates(id, desired) : { plan: { planId: Number(id), ...desired, ...(updates || {}) } };
     },
   };
 }
@@ -140,32 +135,55 @@ test('an unchanged price is confirmed without a write', async () => {
 
 /* ---------------------------------------------------------------------------- re-pricing -------------------------------------------------------------------------- */
 
-test('a price that moved is updated, then read back before it is believed', async () => {
+test('a price update creates a replacement Flutterwave plan, stores its id, and makes that id checkout-ready', async () => {
   const pricing = fakePricing(planWith({ NGN: 12_000_000, provider: { NGN: { planId: 42, syncStatus: 'synced', syncedAmountMinor: 10_500_000, currency: 'NGN', interval: 'monthly' } } }));
-  const seen = [];
-  let reads = 0;
+  const calls = [];
   const flutterwave = {
     isConfigured: () => true,
-    // The first read is the provider's current state (the old price, which is why there is work to do); the
-    // second is the verification read after the write, and it is the only thing the result is judged on.
-    fetchPlan: async () => { reads += 1; seen.push(`fetch${reads}`); return providerPlan({ amountMinor: reads === 1 ? 10_500_000 : 12_000_000 }); },
-    createPlan: async () => { throw new Error('must not create when an id exists'); },
-    updatePlan: async (id, desired) => { seen.push(['update', id, desired.amountMinor]); return { plan: providerPlan({ amountMinor: 0 }) }; },
+    fetchPlan: async (id) => { calls.push(['fetchPlan', id]); return providerPlan({ amountMinor: 10_500_000 }); },
+    createPlan: async (desired) => { calls.push(['createPlan', desired]); return { planId: 501, ...desired }; },
+    // Deliberately no updatePlan: Flutterwave rejects amount updates, so calling one would fail this sync.
   };
   const sync = createPlanSynchronizer({ flutterwave, pricing, config, logger: silent });
-  const result = await sync.syncPlan({ planKey: 'pro', currency: 'NGN' });
-  assert.deepEqual(seen, ['fetch1', ['update', 42, 12_000_000], 'fetch2'], 'read, write, read again');
-  assert.equal(result.status, 'synced', 'the answer is checked by reading the plan back, not by trusting the update response');
-  assert.equal(result.syncedAmountMinor, 12_000_000);
+  const result = await sync.syncPlan({ planKey: 'pro', currency: 'NGN', actorId: 'a1' });
+
+  assert.deepEqual(calls, [
+    ['fetchPlan', 42],
+    ['createPlan', { name: 'Signal Desk Pro (monthly)', amountMinor: 12_000_000, interval: 'monthly', currency: 'NGN' }],
+  ], 'a changed amount replaces the old provider plan instead of attempting a PUT');
+  assert.equal(result.status, 'synced');
+  assert.equal(result.planId, 501);
+  assert.match(result.message, /future subscriptions/);
+
+  // `recordPlanSync` upserts this exact value to plan_provider_sync in production.
+  assert.equal(pricing.saves.length, 1);
+  assert.deepEqual(pricing.saves[0], {
+    planKey: 'pro',
+    currency: 'NGN',
+    status: 'synced',
+    planId: 501,
+    planToken: null,
+    syncedAmountMinor: 12_000_000,
+    interval: 'monthly',
+    name: 'Signal Desk Pro (monthly)',
+    message: result.message,
+    actorId: 'a1',
+  });
+
+  // Checkout asks `planChargeDecision` for the persisted mirror, so the replacement id is automatically bound
+  // to all future subscriptions rather than the old id 42.
+  const checkoutPlan = planWith({ NGN: 12_000_000, provider: { NGN: { ...pricing.saves[0], syncStatus: 'synced' } } });
+  assert.deepEqual(planChargeDecision({ plan: checkoutPlan, currency: 'NGN', amountMinor: 12_000_000 }), {
+    usePlan: true, reason: 'ready', planId: 501, currency: 'NGN',
+  });
 });
 
-test('a provider that did not apply the amount is recorded as failed, with the plan left usable-but-one-time', async () => {
+test('a replacement plan whose amount is not confirmed is recorded as failed, with checkout left one-time', async () => {
   const pricing = fakePricing(planWith({ NGN: 12_000_000, provider: { NGN: { planId: 42, syncStatus: 'synced', syncedAmountMinor: 10_500_000, currency: 'NGN', interval: 'monthly' } } }));
   const flutterwave = {
     isConfigured: () => true,
     fetchPlan: async () => providerPlan({ amountMinor: 10_500_000 }),
-    createPlan: async () => { throw new Error('nope'); },
-    updatePlan: async () => ({ plan: providerPlan({ amountMinor: 11_000_000 }) }),
+    createPlan: async (desired) => ({ planId: 501, ...desired, amountMinor: 11_000_000 }),
   };
   const sync = createPlanSynchronizer({ flutterwave, pricing, config, logger: silent });
   const result = await sync.syncPlan({ planKey: 'pro', currency: 'NGN' });
@@ -173,21 +191,21 @@ test('a provider that did not apply the amount is recorded as failed, with the p
   assert.equal(result.error, 'PLAN_AMOUNT_UNCONFIRMED');
   assert.match(result.message, /one-time until the plan syncs/);
   assert.equal(pricing.saves[0].status, 'failed', 'the failed state is written down, not just returned');
-  assert.equal(pricing.saves[0].planId, 42, 'and it keeps the id the administrator needs to go look at');
+  assert.equal(pricing.saves[0].planId, 501, 'the failed replacement id is retained for support to inspect');
   assert.match(String(pricing.saves[0].message), /did not confirm/);
 });
 
-test('a plan in the wrong currency or interval is a mismatch, not a near enough', async () => {
+test('a replacement plan in the wrong currency or interval is a mismatch, not a near enough', async () => {
   const pricing = fakePricing(planWith({ provider: { NGN: { planId: 42, syncStatus: 'synced', syncedAmountMinor: 10_500_000, currency: 'NGN', interval: 'monthly' } } }));
   const flutterwave = {
     isConfigured: () => true,
-    fetchPlan: async () => providerPlan({ currency: 'USD' }),
-    createPlan: async () => { throw new Error('nope'); },
-    updatePlan: async () => ({ plan: providerPlan({ currency: 'USD', interval: 'annually' }) }),
+    fetchPlan: async (id) => providerPlan({ planId: Number(id), currency: 'USD', interval: 'annually' }),
+    createPlan: async (desired) => ({ planId: 501, ...desired, currency: 'USD', interval: 'annually' }),
   };
   const sync = createPlanSynchronizer({ flutterwave, pricing, config, logger: silent });
   const result = await sync.syncPlan({ planKey: 'pro', currency: 'NGN' });
   assert.equal(result.error, 'PLAN_MISMATCH');
+  assert.equal(pricing.saves[0].planId, 501);
   assert.match(result.message, /FLW_CURRENCY and FLW_PLAN_INTERVAL/);
 });
 
@@ -200,7 +218,6 @@ test('a stored plan id the provider no longer recognises is replaced, not retrie
     isConfigured: () => true,
     fetchPlan: async () => { throw notFound; },
     createPlan: async (desired) => ({ planId: 900, ...desired }),
-    updatePlan: async () => { throw new Error('must not update a plan that is gone'); },
   };
   const sync = createPlanSynchronizer({ flutterwave, pricing, config, logger: silent });
   const result = await sync.syncPlan({ planKey: 'pro', currency: 'NGN' });
@@ -211,7 +228,7 @@ test('a stored plan id the provider no longer recognises is replaced, not retrie
 
 /* ----------------------------------------------------------------- existing subscribers, new price ---------------------------------------------------------------- */
 
-test('declining to re-price subscribers creates a plan for the customers who arrive next', async () => {
+test('a replacement leaves existing subscribers on the old Flutterwave plan', async () => {
   const pricing = fakePricing(planWith({
     NGN: 12_000_000,
     provider: { NGN: { planId: 42, syncStatus: 'synced', syncedAmountMinor: 10_500_000, currency: 'NGN', interval: 'monthly' } },
@@ -221,13 +238,12 @@ test('declining to re-price subscribers creates a plan for the customers who arr
     isConfigured: () => true,
     fetchPlan: async () => providerPlan({ amountMinor: 10_500_000 }),
     createPlan: async (desired) => ({ planId: 501, ...desired }),
-    updatePlan: async () => { throw new Error('must not touch the existing plan when the switch says no'); },
   };
   const sync = createPlanSynchronizer({ flutterwave, pricing, config, logger: silent });
   const result = await sync.syncPlan({ planKey: 'pro', currency: 'NGN' });
   assert.equal(result.status, 'synced');
   assert.equal(result.planId, 501);
-  assert.match(result.message, /Subscribers who joined under 42 keep the amount they agreed to/);
+  assert.match(result.message, /Existing subscribers on 42 remain on their original plan/);
 });
 
 /* ---------------------------------------------------------------------------- failures ---------------------------------------------------------------------------- */
@@ -249,7 +265,6 @@ test('a provider outage is a reported failure, and the price the workspace saved
     isConfigured: () => true,
     fetchPlan: async () => { throw Object.assign(new Error('socket hang up'), { code: 'FLUTTERWAVE_NETWORK_ERROR', userMessage: 'The payment provider could not be reached. No payment was taken.' }); },
     createPlan: async () => ({ planId: 1 }),
-    updatePlan: async () => ({ plan: providerPlan() }),
   };
   const logged = [];
   const sync = createPlanSynchronizer({ flutterwave, pricing, config, logger: { info() {}, warn() {}, error: (message, extra) => logged.push([message, extra]) } });

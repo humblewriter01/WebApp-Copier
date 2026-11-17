@@ -13,7 +13,9 @@
  *     the mirror of the Flutterwave payment plan used for recurring charges, one row per (plan, currency),
  *     because a Flutterwave plan holds one amount in one currency.
  *
- * `admin_settings.billing_settings` keeps the two behaviour switches, which are not prices.
+ * `admin_settings.billing_settings` keeps the recurring-billing switch, which is not a price. It also retains
+ * a legacy price-migration value for backwards-compatible reads, but Flutterwave plan amounts are immutable and
+ * every changed price now receives a replacement plan.
  *
  * Three rules make this safe to run a business on:
  *
@@ -680,7 +682,7 @@ async function recordPlanSync(/** @type {RecordPlanSyncInput} */ { planKey, curr
       [
         BILLING_SETTINGS_KEY,
         JSON.stringify(value),
-        'Billing behaviour switches (recurring plan charges and plan migration on price changes)',
+        'Billing behaviour settings (recurring plan charges and legacy price-migration preference)',
         actorId,
       ],
     );

@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
  *
  * Collections:      POST /v3/payments                          (hosted checkout link)
  * Verification:     GET  /v3/transactions/verify_by_reference  (by the reference we generated)
- * Payment plans:    POST /v3/payment-plans, GET|PUT /v3/payment-plans/:id   (recurring mirror)
+ * Payment plans:    POST /v3/payment-plans, GET /v3/payment-plans/:id       (recurring mirror)
  * Subscriptions:    GET  /v3/subscriptions/:id, PUT /v3/subscriptions/:id/cancel|activate
  *
  * The secret key never leaves this process, every reply is reduced to the fields we persist, and provider
@@ -452,8 +452,8 @@ export function createFlutterwaveClient(/** @type {FlutterwaveClientDeps} */ { c
 
   /* ------------------------------ Payment plans (the recurring mirror) ------------------------------
    * A Flutterwave plan carries an amount and a currency, so a two-currency workspace needs one plan per
-   * (Signal Desk plan, currency). `PUT /v3/payment-plans/:id` rewrites the plan itself, which - unlike
-   * Paystack - is what existing subscribers are charged next cycle, so the admin panel says so plainly.
+   * (Signal Desk plan, currency). Flutterwave does not permit changing a plan amount in place; the plan
+   * synchroniser creates a new one when a stored price changes and records that replacement id for checkout.
    */
   async function createPlan({ name, amountMinor, interval, currency }) {
     const body = {
@@ -478,27 +478,12 @@ export function createFlutterwaveClient(/** @type {FlutterwaveClientDeps} */ { c
     return toSafePlan(payload?.data);
   }
 
-  async function updatePlan(id, { name, amountMinor, interval, currency }) {
-    const body = {
-      amount: amountString(amountMinor),
-      interval: INTERVAL_MAP[String(interval || 'monthly').toLowerCase()] || 'monthly',
-      currency: String(currency || DEFAULT_CURRENCY).toUpperCase(),
-    };
-    if (name) body.name = String(name).slice(0, 90);
-    const payload = await call(`/payment-plans/${encodeURIComponent(String(id))}`, { method: 'PUT', body });
-    return {
-      message: typeof payload?.message === 'string' ? payload.message.slice(0, 300) : 'Plan updated',
-      plan: toSafePlan(payload?.data),
-    };
-  }
-
   return Object.freeze({
     isConfigured: () => Boolean(settings.secretKey),
     initializeTransaction,
     verifyTransaction,
     createPlan,
     fetchPlan,
-    updatePlan,
     fetchSubscription,
     cancelSubscription,
     activateSubscription,
