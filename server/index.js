@@ -22,6 +22,7 @@ import { TARGET_MODES } from './services/scale-out.js';
 import { captureSafety, readFallbackPoints } from './services/signal-safety.js';
 import { entryRangeBounds, readExpirySetting, readSlippageSetting, ORDER_TYPES } from './services/order-routing.js';
 import { readDashboardSignals } from './services/dashboard-signals.js';
+import { SIGNAL_MESSAGE_PREVIEW_SQL, toSignalPreview, readSignalMessage } from './services/signal-payload.js';
 import { HEARTBEAT_INTERVAL_MS, createTelegramListener, isValidWorkspaceId } from './services/telegram-listener.js';
 import { createTelegramKeepAliveGuard, createUnhandledRejectionGuard, isProviderKeepAliveTimeout } from './services/telegram-keepalive.js';
 import { createPassGuard, createSingleFlight } from './services/single-flight.js';
@@ -403,10 +404,9 @@ const { withLiveBlockers } = createSignalOutcomeReader({
   runtimeEnabled: () => autoTradingRuntimeEnabled,
 });
 
-/* The capture's read of one signal row, in the camelCase every reader of it uses: the row pushed to the socket,
-   the row a redelivered message answers with, and the row an edited message returns after its UPDATE. One list
-   rather than three, because "what a captured signal contains" is one fact, and the day it is written out twice
-   is the day a client renders a field the write path stopped selecting. */
+/* Internal capture shape, shared by inserts, redeliveries and edits. Keep the original message here for
+   execution and edit decisions; toSignalPreview explicitly selects and bounds the public socket/POST copy.
+   Read-only list routes truncate in SQL instead, before the database transfers the message to this process. */
 const SIGNAL_CAPTURE_ROW_COLUMNS = `id,channel_id AS "channelId",channel_title AS "channelTitle",telegram_message_id AS "telegramMessageId",source,message,symbol,side,
   entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt",
   direction_inferred AS "directionInferred",take_profit_levels AS "takeProfitLevels",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",needs_review AS "needsReview",order_type AS "orderType",order_type_stated AS "orderTypeStated",is_scalping AS "isScalping",entry_range AS "entryRange",sent_at AS "sentAt",edited_at AS "editedAt"`;
@@ -502,7 +502,7 @@ async function saveSignal(userId, message, channel = {}) {
          signal with a headline is the case this branch exists for, and "the text moved, the trade did not" is the
          whole answer to the question a trader asks next. */
       log('info', 'Telegram edit refreshed the message only', { userId, messageId: telegramMessageId, signalId: row?.id ?? null, reason: editPlan.reason, lost: editPlan.lost?.length ? editPlan.lost.join('|') : null });
-      io.to(`user:${userId}`).emit('signal:received', row);
+      io.to(`user:${userId}`).emit('signal:received', toSignalPreview(row));
       return row;
     }
     /* The row is being rewritten from a reading that is not this message alone, so from here down every judgement
@@ -666,7 +666,7 @@ async function saveSignal(userId, message, channel = {}) {
        design: an order that takes a second must not hold up the row the trader is waiting to see. */
     executionWorker.notify();
   }
-  io.to(`user:${userId}`).emit('signal:received', signal);
+  io.to(`user:${userId}`).emit('signal:received', toSignalPreview(signal));
   return signal;
 }
 
@@ -1703,18 +1703,27 @@ app.delete('/api/channels/:id', authenticate, asyncRoute(async (req, res) => {
 
 app.get('/api/signals', authenticate, asyncRoute(async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
-  const { rows } = await pool.query(`SELECT id,channel_title AS "channelTitle",source,message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",direction_inferred AS "directionInferred",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",take_profit_levels AS "takeProfitLevels",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",needs_review AS "needsReview",order_type AS "orderType",order_type_stated AS "orderTypeStated",is_scalping AS "isScalping",entry_range AS "entryRange",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2`, [req.userId, limit]);
+  const { rows } = await pool.query(`SELECT id,channel_title AS "channelTitle",source,${SIGNAL_MESSAGE_PREVIEW_SQL},edited_at AS "editedAt",symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",direction_inferred AS "directionInferred",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",take_profit_levels AS "takeProfitLevels",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",needs_review AS "needsReview",order_type AS "orderType",order_type_stated AS "orderTypeStated",is_scalping AS "isScalping",entry_range AS "entryRange",status,created_at AS "createdAt" FROM signals WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2`, [req.userId, limit]);
   // A row carries the sentence its workspace is in *now*, so the list can never contradict the banner above
   // it. See `withLiveBlockers`: when the live picture cannot be read, the stored sentences are shown as they
   // were written, because an unavailable setting is not a reason to invent one.
   const signals = await withLiveBlockers(req.userId, rows);
   res.set('Cache-Control', 'no-store').json({ signals });
 }));
+// The list never needs the original body; fetch it only when a reader expands a message.
+app.get('/api/signals/:id/message', authenticate, asyncRoute(async (req, res) => {
+  const signalId = String(req.params.id || '').trim();
+  if (!UUID_PATTERN.test(signalId)) return fail(res, 400, 'Choose a valid signal.');
+  const signal = await readSignalMessage(pool, req.userId, signalId);
+  res.set('Cache-Control', 'no-store');
+  if (!signal) return fail(res, 404, 'That signal was not found.');
+  res.json({ signal });
+}));
 app.post('/api/signals', authenticate, asyncRoute(async (req, res) => {
   const message = String(req.body.message || '').trim().slice(0, 5000);
   if (!message) return fail(res, 400, 'Enter a signal message.');
   const signal = await saveSignal(req.userId, message, { source: 'manual', title: 'Manual entry' });
-  res.status(201).json({ signal });
+  res.status(201).json({ signal: toSignalPreview(signal) });
 }));
 
 /* ------------------------------------------------------------------ signal history deletion
