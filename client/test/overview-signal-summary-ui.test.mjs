@@ -78,7 +78,7 @@ test('the compact mode is what the Overview asks for, and the Signals page is no
   assert.match(table, /compact = false/, 'the default is the full list, so the Signals page needs no change to keep showing everything');
   assert.match(table, /const summary = compact \? summarizeSignalMessage\(signal\.message\) : null/, 'truncation is opt-in per screen, not baked into the row');
   assert.match(table, /summary \? summary\.text : signal\.message/);
-  assert.match(table, /\{\.\.\.\(summary\?\.truncated \? \{ title: signal\.message \} : \{\}\)\}/, 'the full message is a tooltip when, and only when, something was removed - spread, not a bare attribute, which is not valid JSX');
+  assert.match(table, /View all for the full message/, 'a server-truncated preview does not claim to be the full message');
   assert.match(table, /signal-item-compact/, 'and the compact row is addressable in CSS');
   assert.match(styles, /\.signal-item-compact \.signal-message\{/, 'with its own tighter spacing');
 
@@ -165,6 +165,19 @@ test('without compact the same rows are rendered whole, because that is the hist
   assert.ok(html.includes(NOISE), 'and the recap is quoted in full, because the Signals page is where it belongs');
   assert.equal(html.includes('signal-item-compact'), false, 'no compact styling leaks into the full list');
   assert.equal(html.includes(`title="${SETUP}"`), false, 'and nothing is hidden, so nothing needs a tooltip');
+});
+
+test('server and socket previews are clearly marked until the full history row arrives', () => {
+  const preview = { ...fiveSignals[3], message: 'SELL GBPJPY', messageTruncated: true };
+  const compact = render({ signals: [preview], compact: true });
+  assert.match(compact, /SELL GBPJPY…/);
+  assert.match(compact, /View all for the full message/);
+  const history = render({ signals: [preview] });
+  assert.match(history, /SELL GBPJPY…/);
+  assert.match(history, /Message preview; the full message is available after refresh/);
+  const full = render({ signals: [{ ...preview, message: 'SELL GBPJPY and the rest', messageTruncated: false }] });
+  assert.match(full, /SELL GBPJPY and the rest/);
+  assert.doesNotMatch(full, /Message preview/);
 });
 
 test('a card is not made to look truncated when nothing was removed', () => {

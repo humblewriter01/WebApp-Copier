@@ -94,7 +94,7 @@ test('a push can only reach the workspace that owns the row', () => {
   assert.match(guard, /jwt\.verify\(socket\.handshake\.auth\?\.token, process\.env\.JWT_SECRET\)/, 'the handshake token is verified with the same secret the REST routes use');
   assert.match(guard, /socket\.userId = payload\.sub;/, 'and the identity the room is built from is the token\'s, not anything the client claims');
   assert.match(index.slice(connection, connection + 260), /socket\.join\(`user:\$\{socket\.userId\}`\)/, 'so a connection joins exactly one workspace room');
-  assert.match(index, /io\.to\(`user:\$\{userId\}`\)\.emit\('signal:received', signal\);[\s\S]{0,60}return signal;\s*\}/, 'and the only emit targets that room, using the row owner\'s id');
+  assert.match(index, /io\.to\(`user:\$\{userId\}`\)\.emit\('signal:received', signalFeedPayload\(signal\)\);[\s\S]{0,60}return signal;\s*\}/, 'and the only emit targets that room, using the row owner\'s id');
   const scoped = index.match(/io\.to\(`user:\$\{userId\}`\)\.emit\('signal:received'/g) || [];
   const emits = index.match(/emit\('signal:received'/g) || [];
   /* Two writers announce a row: the capture path, and the path that refreshes only a message's text after an
