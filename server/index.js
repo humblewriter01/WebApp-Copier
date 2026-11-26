@@ -22,6 +22,7 @@ import { TARGET_MODES } from './services/scale-out.js';
 import { captureSafety, readFallbackPoints } from './services/signal-safety.js';
 import { entryRangeBounds, readExpirySetting, readSlippageSetting, ORDER_TYPES } from './services/order-routing.js';
 import { readDashboardSignals } from './services/dashboard-signals.js';
+import { signalFeedPayload } from './services/signal-feed-payload.js';
 import { HEARTBEAT_INTERVAL_MS, createTelegramListener, isValidWorkspaceId } from './services/telegram-listener.js';
 import { createTelegramKeepAliveGuard, createUnhandledRejectionGuard, isProviderKeepAliveTimeout } from './services/telegram-keepalive.js';
 import { createPassGuard, createSingleFlight } from './services/single-flight.js';
@@ -403,7 +404,7 @@ const { withLiveBlockers } = createSignalOutcomeReader({
   runtimeEnabled: () => autoTradingRuntimeEnabled,
 });
 
-/* The capture's read of one signal row, in the camelCase every reader of it uses: the row pushed to the socket,
+/* The capture's read of one signal row, in the camelCase every reader of it uses: the row used to build a socket preview,
    the row a redelivered message answers with, and the row an edited message returns after its UPDATE. One list
    rather than three, because "what a captured signal contains" is one fact, and the day it is written out twice
    is the day a client renders a field the write path stopped selecting. */
@@ -502,7 +503,7 @@ async function saveSignal(userId, message, channel = {}) {
          signal with a headline is the case this branch exists for, and "the text moved, the trade did not" is the
          whole answer to the question a trader asks next. */
       log('info', 'Telegram edit refreshed the message only', { userId, messageId: telegramMessageId, signalId: row?.id ?? null, reason: editPlan.reason, lost: editPlan.lost?.length ? editPlan.lost.join('|') : null });
-      io.to(`user:${userId}`).emit('signal:received', row);
+      io.to(`user:${userId}`).emit('signal:received', signalFeedPayload(row));
       return row;
     }
     /* The row is being rewritten from a reading that is not this message alone, so from here down every judgement
@@ -666,7 +667,7 @@ async function saveSignal(userId, message, channel = {}) {
        design: an order that takes a second must not hold up the row the trader is waiting to see. */
     executionWorker.notify();
   }
-  io.to(`user:${userId}`).emit('signal:received', signal);
+  io.to(`user:${userId}`).emit('signal:received', signalFeedPayload(signal));
   return signal;
 }
 
