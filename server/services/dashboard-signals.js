@@ -30,11 +30,20 @@
 /** The most recent messages this screen will ever hold. The Signals page has no such limit. */
 export const DASHBOARD_SIGNAL_LIMIT = 3;
 
+/**
+ * How much of each message the Overview is sent. The card shows at most three lines / 150 characters
+ * (`summarizeSignalMessage` in the client), and the full text is one click away on the Signals page, which
+ * still reads the whole column. Sending up to 5000 characters per row for a 150-character card was egress the
+ * dashboard poll paid on every tick; `messageTruncated` tells the card the cut happened here, so it can still
+ * show an ellipsis when the first 200 characters happen to fit inside its own budget.
+ */
+export const DASHBOARD_MESSAGE_PREVIEW_CHARS = 200;
+
 /** The columns the Overview card renders, aliased the way the client reads them. */
-export const DASHBOARD_SIGNAL_COLUMNS = `id,channel_title AS "channelTitle",source,message,symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",direction_inferred AS "directionInferred",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt",
+export const DASHBOARD_SIGNAL_COLUMNS = `id,channel_title AS "channelTitle",source,LEFT(message, 200) AS message,(char_length(message) > 200) AS "messageTruncated",symbol,side,entry_price AS "entryPrice",stop_loss AS "stopLoss",take_profit AS "takeProfit",direction_inferred AS "directionInferred",execution_ready AS "executionReady",parse_error AS "parseError",execution_note AS "executionNote",status,created_at AS "createdAt",
   take_profit_levels AS "takeProfitLevels",needs_review AS "needsReview",parsed_by AS "parsedBy",parse_confidence AS "parseConfidence",
   llm_used AS "llmUsed",stop_loss_pips AS "stopLossPips",take_profit_pips AS "takeProfitPips",
-  order_type AS "orderType",order_type_stated AS "orderTypeStated",is_scalping AS "isScalping",expiry_timestamp AS "expiryTimestamp",
+  order_type AS "orderType",order_type_stated AS "orderTypeStated",is_scalping AS "isScalping",
   entry_range AS "entryRange"`;
 
 /* Which rows are worth a place on a summary screen, decided against the production table rather than

@@ -189,3 +189,15 @@ test('the header of a card cannot be squeezed out of the screen by its own badge
   assert.match(styles, /\.signal-top>div\{min-width:0\}/, 'the text side may shrink below its content, which is what makes an ellipsis possible at all');
   assert.match(styles, /\.signal-top strong,\.signal-source\{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap\}/, 'so a long channel name clips instead of pushing the outcome off the edge');
 });
+
+test('a preview the server already cut still reads as a cut, even when it fits inside the card', () => {
+  /* The Overview payload and the live push send the first 200 characters and say so with `messageTruncated`.
+     Three short lines fit the card's own budget, so only the flag can tell the reader there is more. */
+  const preview = { id: 'p', symbol: 'EURUSD', side: 'buy', status: 'received', channelTitle: 'FX Desk', message: 'BUY EURUSD\nEntry: 1.0850\nSL: 1.0800\n', messageTruncated: true, createdAt: '2026-10-24T09:00:00.000Z' };
+  const compact = render({ signals: [preview], compact: true });
+  assert.ok(compact.includes('>BUY EURUSD\nEntry: 1.0850\nSL: 1.0800…<'), 'the card ends in an ellipsis, with no dangling whitespace before it');
+  const full = render({ signals: [preview] });
+  assert.ok(full.includes('SL: 1.0800…<'), 'and a pushed preview on the Signals page says the same until its refresh brings the whole post');
+  const whole = render({ signals: [{ ...preview, messageTruncated: false }], compact: true });
+  assert.equal(whole.includes('…'), false, 'while an uncut message is still printed as it is');
+});

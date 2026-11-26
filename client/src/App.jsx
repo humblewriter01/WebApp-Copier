@@ -234,7 +234,14 @@ function App() {
     refresh();
     // The poll is the safety net, not the mechanism: while the feed is open a slower sweep is enough, and the
     // instant one comes back the moment it is not.
-    const timer = setInterval(() => { void refreshRef.current(); }, feedLive ? LIVE_SWEEP_INTERVAL_MS : FALLBACK_POLL_INTERVAL_MS);
+    /* A hidden tab polls nothing. Each tick is eight reads (the Signals page alone is up to 50 full messages),
+       and a tab left open in the background used to pay that every 20-60 seconds, all day, for a screen nobody
+       was looking at - the bulk of the API's egress. Coming back is already covered: the visibility/focus
+       handler below refreshes the moment the tab is shown, and a pushed signal still schedules its own refresh. */
+    const timer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      void refreshRef.current();
+    }, feedLive ? LIVE_SWEEP_INTERVAL_MS : FALLBACK_POLL_INTERVAL_MS);
     return () => clearInterval(timer);
   }, [authToken, feedLive, refresh]);
 
@@ -243,9 +250,13 @@ function App() {
   // reconnect: the first event after the wake can be seconds away, and the interval may be minutes.
   useEffect(() => {
     if (!authToken) return undefined;
+    /* Returning to a tab fires both `visibilitychange` and `focus`, back to back. Both used to start their own
+       eight-request refresh; one that is still in flight now answers for the other. */
+    let inFlight = null;
     const onVisible = () => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
-      void refreshRef.current();
+      if (inFlight) return;
+      inFlight = Promise.resolve().then(() => refreshRef.current()).catch(() => {}).finally(() => { inFlight = null; });
     };
     window.addEventListener('focus', onVisible);
     document.addEventListener('visibilitychange', onVisible);

@@ -383,7 +383,8 @@ test('the technical half of a row is written for the admin panel and read by nob
     assert.equal(block.includes('technical_note'), false, `${marker} never selects the technical half`);
   }
   assert.equal((index.match(/technical_note AS "technicalNote"/g) || []).length, 1, 'one SELECT in the whole server reads it back, and it is the admin one');
-  assert.match(index, /io\.to\(`user:\$\{userId\}`\)\.emit\('signal:received', signal\);/, 'the socket pushes the object the capture RETURNING produced');
+  assert.match(index, /io\.to\(`user:\$\{userId\}`\)\.emit\('signal:received', toSignalPush\(signal\)\);/, 'the socket pushes the object the capture RETURNING produced, through the card-sized projection');
+  assert.equal(/emit\('signal:received', (?!toSignalPush\()/.test(index), false, 'and no announce site pushes a raw row, so a `SELECT *` fallback cannot carry the technical half out either');
   assert.equal(/RETURNING[^']*technical_note/.test(index), false, 'and no RETURNING list of a capture statement carries it, so nothing pushed or POSTed can contain it');
 });
 
