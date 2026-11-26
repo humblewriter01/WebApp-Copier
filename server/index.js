@@ -52,6 +52,7 @@ import { createSystemHealthService, normalizeHealthQuery, buildParseErrorClear }
 import { createAnnouncementService, normalizeAnnouncementDraft, normalizeAnnouncementListQuery, buildRetiredAnnouncementClear } from './services/announcements.js';
 import { createSupportSessionService, normalizeSupportReason, buildSupportClaims, SUPPORT_SESSION_MINUTES } from './services/support-sessions.js';
 import { createEmailSystem } from './services/email-system.js';
+import { toSignalPush } from './services/signal-push.js';
 
 const app = express();
 app.set('trust proxy', 1);
@@ -502,7 +503,7 @@ async function saveSignal(userId, message, channel = {}) {
          signal with a headline is the case this branch exists for, and "the text moved, the trade did not" is the
          whole answer to the question a trader asks next. */
       log('info', 'Telegram edit refreshed the message only', { userId, messageId: telegramMessageId, signalId: row?.id ?? null, reason: editPlan.reason, lost: editPlan.lost?.length ? editPlan.lost.join('|') : null });
-      io.to(`user:${userId}`).emit('signal:received', row);
+      io.to(`user:${userId}`).emit('signal:received', toSignalPush(row));
       return row;
     }
     /* The row is being rewritten from a reading that is not this message alone, so from here down every judgement
@@ -666,7 +667,8 @@ async function saveSignal(userId, message, channel = {}) {
        design: an order that takes a second must not hold up the row the trader is waiting to see. */
     executionWorker.notify();
   }
-  io.to(`user:${userId}`).emit('signal:received', signal);
+  // The push is the card, not the row: see `services/signal-push.js` for what it carries and why.
+  io.to(`user:${userId}`).emit('signal:received', toSignalPush(signal));
   return signal;
 }
 

@@ -83,9 +83,15 @@ export default function SignalTable({ signals, channelCount = 0, multipleTargetH
     const zone = entryZoneView(signal);
     const targetText = takeProfitSummary(signal, multipleTargetHandling);
     const summary = compact ? summarizeSignalMessage(signal.message) : null;
+    /* The Overview payload and the live push carry a preview of the message, not the whole post, and say so
+       with `messageTruncated`. A preview that happens to fit inside the card's own budget must still read as a
+       cut, so the ellipsis comes from either side; the full text is the Signals page's, after its next read. */
+    const clippedUpstream = signal.messageTruncated === true && !summary?.truncated;
+    const messageText = summary ? summary.text : signal.message;
+    const shownMessage = clippedUpstream ? `${String(messageText ?? '').replace(/\s+$/, '')}…` : messageText;
     return <article className={`signal-item outcome-${outcome.tone}${compact ? ' signal-item-compact' : ''}`} key={signal.id}>
     <div className="signal-top"><div><strong>{signal.symbol || 'Signal message'}</strong><span className="signal-source">{signal.channelTitle || 'Telegram chat'}</span></div><div className="signal-flags">{signal.side ? <span className={`badge ${signal.side === 'buy' ? 'badge-buy' : 'badge-sell'}`}>{signal.side}</span> : null}<span className={`badge signal-outcome tone-${outcome.tone}`}>{outcome.label}</span>{badges.map((badge) => <span key={badge.key} className={`badge signal-flag-badge tone-${badge.tone}`} title={badge.title}>{badge.label}</span>)}{onDeleteSignal ? <button className="signal-delete-button" type="button" title="Remove this signal from your history" aria-label={`Remove ${signal.symbol || 'this signal'} from your history`} disabled={deletingId === signal.id} onClick={() => onDeleteSignal(signal)}>{deletingId === signal.id ? '…' : '✕'}</button> : null}</div></div>
-    <p className="signal-message"{...(summary?.truncated ? { title: signal.message } : {})}>{summary ? summary.text : signal.message}</p>
+    <p className="signal-message"{...(summary?.truncated ? { title: signal.message } : {})}>{shownMessage}</p>
     <div className="signal-meta">{zone ? <span title={zone.title}>Entry {zone.text}</span> : (signal.entryPrice != null && <span>Entry {signal.entryPrice}</span>)}{signal.stopLoss != null && <span>SL {signal.stopLoss}</span>}{targetText != null && <span>{targetText}</span>}{signal.stopLossPips != null && <span>SL {signal.stopLossPips} pips</span>}{signal.takeProfitPips != null && <span>TP {signal.takeProfitPips} pips</span>}<time>{signal.createdAt ? new Date(signal.createdAt).toLocaleString() : ''}</time></div>
     {outcome.showNote ? <p className="signal-outcome-note"><span>{outcome.note}</span>{outcome.upgradeRequired && onUpgrade ? <button className="text-button" type="button" onClick={onUpgrade}>See plans</button> : null}</p> : null}
   </article>;

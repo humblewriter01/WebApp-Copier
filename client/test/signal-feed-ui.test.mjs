@@ -230,7 +230,11 @@ test('one refresh reconciles a burst of captures, not one per message', async ()
 test('the dashboard shell wires the feed, and keeps the poll as the safety net', () => {
   assert.match(appSource, /connectSignalFeed\(\{[^}]*url: API_URL[^}]*token: authToken/, 'opened against the API origin with this session\'s token');
   assert.match(appSource, /onSignal: applyIncomingSignal/, 'a pushed row is applied to the page');
-  assert.match(appSource, /const timer = setInterval\(\(\) => \{ void refreshRef\.current\(\); \}, feedLive \? LIVE_SWEEP_INTERVAL_MS : FALLBACK_POLL_INTERVAL_MS\)/, 'the poll slows down only while the feed is open');
+  assert.match(appSource, /const timer = setInterval\(\(\) => \{[\s\S]{0,200}void refreshRef\.current\(\);\s*\}, feedLive \? LIVE_SWEEP_INTERVAL_MS : FALLBACK_POLL_INTERVAL_MS\)/, 'the poll slows down only while the feed is open');
+  const tick = appSource.slice(appSource.indexOf('const timer = setInterval('), appSource.indexOf('FALLBACK_POLL_INTERVAL_MS)', appSource.indexOf('const timer = setInterval(')));
+  assert.match(tick, /document\.visibilityState === 'hidden'\) return;[\s\S]*void refreshRef\.current\(\)/, 'and a hidden tab skips the tick entirely, because a background tab polling all day was most of the API egress');
+  const onVisible = appSource.slice(appSource.indexOf('const onVisible = () => {'), appSource.indexOf("window.addEventListener('focus', onVisible)"));
+  assert.match(onVisible, /if \(inFlight\) return;/, 'and the focus + visibilitychange pair that fires on every tab return costs one refresh, not two');
   assert.match(appSource, /return \(\) => \{ feed\.close\(\)/, 'and the socket is closed when the session ends');
   assert.equal(/setInterval\(refresh, 20_000\)/.test(appSource), false, 'the fixed 20-second poll is gone');
   assert.equal(FALLBACK_POLL_INTERVAL_MS, 20_000, 'the fallback is the interval the page used to have, so nothing is worse when the feed fails');
